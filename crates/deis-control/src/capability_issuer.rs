@@ -5,97 +5,208 @@
 //! the audience, an auth_epoch for mass revocation, and the set of
 //! (tenant, binding) pairs the node may access.
 //!
-//! This module owns the signing key, which is either stored encrypted in the
-//! database or generated fresh on every start (single-box mode, when no
-//! master key is available).
+//! # The signing keys
+//!
+//! Keys live in `capability_signing_keys`, each named by its RFC 7638
+//! thumbprint (the `kid` every token carries). The private half is stored as
+//! AES-256-GCM ciphertext under the secrets master key (`secret_key_file`),
+//! with the kid as associated data; the control database - and every
+//! Litestream replica of it - never holds a usable signing key. There is no
+//! plaintext fallback: a control plane without a master key refuses to start
+//! rather than mint tokens under a key that dies with the process or sits in
+//! the clear in a backup.
+//!
+//! # Rotation
+//!
+//! Each key is in one of three states, and [`CapabilityIssuer::maintain`]
+//! moves them along on a schedule ([`RotationPolicy`]):
+//!
+//! - `pending`: published in the JWKS, not yet signing. Staged when the
+//!   active key reaches `rotate_after`, so every verifier has fetched it
+//!   before the first token signed with it exists.
+//! - `active`: signs every new token. Exactly one.
+//! - `previous`: the key that was active before; still published so the
+//!   tokens it signed keep verifying, then deleted once they cannot be
+//!   accepted anywhere - not even under T8 degraded-mode grace.
+//!
+//! Every published key is served at [`JWKS_ROUTE`].
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use deis_capability::{CapabilityClaims, CapabilityResource, encode};
-use ed25519_dalek::SigningKey;
-use rusqlite::Connection;
+use deis_capability::{CapabilityClaims, CapabilityResource, Jwks, encode, key_id};
+use ed25519_dalek::{SigningKey, VerifyingKey};
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
+
+use crate::catalog::secrets::SecretCipher;
+use crate::database::{Database, DatabaseError};
 
 /// How long a capability token is valid for.
 pub const CAPABILITY_LIFETIME: Duration = Duration::from_secs(900); // 15 minutes
 
 /// The audience strings used for each backend.
-pub const AUD_STORE: &str = "store";
-pub const AUD_QUEUE: &str = "queue";
+pub use deis_capability::{AUD_QUEUE, AUD_STORE};
 pub const AUD_TELEMETRY: &str = "telemetry";
+
+/// Where every published verifying key is served, as a JWKS document. On
+/// both listeners: store and queue have no machine identity and fetch it
+/// from the human one.
+pub const JWKS_ROUTE: &str = "/.well-known/deis/capability-jwks.json";
+
+/// How often the rotation schedule is checked.
+pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// When keys move between states.
+#[derive(Debug, Clone)]
+pub struct RotationPolicy {
+    /// Age of the active key at which a successor is staged.
+    pub rotate_after: Duration,
+    /// How long a staged key is published before it starts signing. Must
+    /// comfortably exceed a verifier's periodic JWKS refresh (5 minutes).
+    pub publish_lead: Duration,
+    /// How long a replaced key stays published. Must cover the longest a
+    /// token it signed can still be accepted: its lifetime plus the T8
+    /// degraded-mode grace window.
+    pub retire_after: Duration,
+}
+
+impl Default for RotationPolicy {
+    fn default() -> Self {
+        Self {
+            rotate_after: Duration::from_secs(30 * 24 * 3600),
+            publish_lead: Duration::from_secs(3600),
+            retire_after: CAPABILITY_LIFETIME
+                + Duration::from_secs(deis_capability::MAX_GRACE_PERIOD_SECS)
+                + Duration::from_secs(3600),
+        }
+    }
+}
+
+/// Why the issuer could not load or change its keys.
+#[derive(Debug, thiserror::Error)]
+pub enum IssuerError {
+    #[error("capability signing key storage: {0}")]
+    Database(#[from] rusqlite::Error),
+    #[error("capability signing key storage: {0}")]
+    Connection(#[from] DatabaseError),
+    #[error("capability signing key {kid}: {reason}")]
+    Key { kid: String, reason: String },
+    #[error("no active capability signing key is stored")]
+    NoActiveKey,
+}
 
 /// The issuer of capability tokens.
 ///
-/// Holds the active signing key behind a read-write lock so key rotation can
-/// replace it without stopping traffic.
+/// Holds the key state behind a read-write lock so rotation can replace it
+/// without stopping traffic.
 #[derive(Clone)]
 pub struct CapabilityIssuer {
-    inner: Arc<RwLock<IssuerInner>>,
+    inner: Arc<RwLock<KeyState>>,
     /// The SPIFFE ID used as the `iss` field in every token.
     issuer_id: String,
+    /// The master key the stored private keys are encrypted under. `None`
+    /// for an in-memory issuer, which never rotates.
+    vault: Option<Arc<SecretCipher>>,
+    policy: RotationPolicy,
 }
 
-struct IssuerInner {
-    key: SigningKey,
+/// What the issuer signs and publishes with.
+struct KeyState {
+    signing: SigningKey,
+    /// Every published key: pending, active and previous.
+    published: Vec<VerifyingKey>,
     /// Current auth epoch, loaded from DB or defaulted to 1.
     auth_epoch: u64,
 }
 
-impl CapabilityIssuer {
-    /// Create an ephemeral issuer with a freshly-generated signing key.
-    ///
-    /// Used when the database is not yet available (early startup) or when
-    /// DB-backed persistence is not needed.
-    pub async fn ephemeral(issuer_id: &str) -> Self {
-        let mut seed = [0u8; 32];
-        rand::Rng::fill(&mut rand::rngs::OsRng, &mut seed);
-        let key = SigningKey::from_bytes(&seed);
+/// The state a key is generated into. A key only reaches `previous` by
+/// being replaced, which [`rotation_step`] does in SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Pending,
+    Active,
+}
 
-        let public_hex = hex::encode(key.verifying_key().as_bytes());
-        info!(
-            key_id = %public_hex,
-            "Capability issuer ready (ephemeral)"
-        );
-
-        Self {
-            inner: Arc::new(RwLock::new(IssuerInner { key, auth_epoch: 1 })),
-            issuer_id: issuer_id.to_string(),
+impl Stage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Stage::Pending => "pending",
+            Stage::Active => "active",
         }
     }
+}
 
-    /// Synchronous constructor for tests that can't use `ephemeral()`.
-    /// Generates a fresh key every time; the caller must be inside a Tokio
-    /// runtime for `RwLock` to function.
+impl CapabilityIssuer {
+    /// An in-memory issuer with a freshly generated key that is never
+    /// stored. For tests: tokens it signs stop verifying when it is dropped.
+    pub async fn ephemeral(issuer_id: &str) -> Self {
+        Self::for_test(issuer_id)
+    }
+
+    /// Synchronous form of [`Self::ephemeral`].
     #[doc(hidden)]
     pub fn for_test(issuer_id: &str) -> Self {
-        let mut seed = [0u8; 32];
-        rand::Rng::fill(&mut rand::rngs::OsRng, &mut seed);
-        let key = SigningKey::from_bytes(&seed);
+        let signing = generate_key();
         Self {
-            inner: Arc::new(RwLock::new(IssuerInner { key, auth_epoch: 1 })),
+            inner: Arc::new(RwLock::new(KeyState {
+                published: vec![signing.verifying_key()],
+                signing,
+                auth_epoch: 1,
+            })),
             issuer_id: issuer_id.to_string(),
+            vault: None,
+            policy: RotationPolicy::default(),
         }
     }
 
-    /// Load or generate the signing key from the database.
-    ///
-    /// When `master_key` is `None` (single-box mode), the key is stored
-    /// plain in the database.
-    pub async fn open(
+    /// Load the stored keys, generating and storing the first one on a
+    /// fresh database. Private keys are encrypted under `vault`.
+    pub fn open(
         conn: &Connection,
-        master_key: Option<&[u8; 32]>,
+        vault: Arc<SecretCipher>,
         issuer_id: &str,
-    ) -> rusqlite::Result<Self> {
-        let (key, auth_epoch) = load_or_create_key(conn, master_key)?;
+    ) -> Result<Self, IssuerError> {
+        let now = now_secs();
+        let tx = conn.unchecked_transaction()?;
+        let has_active: bool = tx
+            .query_row(
+                "SELECT 1 FROM capability_signing_keys WHERE state = 'active'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !has_active {
+            let kid = insert_key(&tx, &vault, Stage::Active, now)?;
+            info!(kid = %kid, "Generated the first capability signing key");
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO capability_auth_epoch (id, epoch, created_at) VALUES (1, 1, ?1)",
+            rusqlite::params![now],
+        )?;
+        tx.commit()?;
 
-        info!(auth_epoch = auth_epoch, "Capability issuer ready");
-
+        let state = load_state(conn, &vault)?;
+        info!(
+            kid = %key_id(&state.signing.verifying_key()),
+            published = state.published.len(),
+            auth_epoch = state.auth_epoch,
+            "Capability issuer ready; its private keys are stored encrypted under the secrets master key"
+        );
         Ok(Self {
-            inner: Arc::new(RwLock::new(IssuerInner { key, auth_epoch })),
+            inner: Arc::new(RwLock::new(state)),
             issuer_id: issuer_id.to_string(),
+            vault: Some(vault),
+            policy: RotationPolicy::default(),
         })
+    }
+
+    /// Replace the rotation schedule; tests use a short one.
+    pub fn with_policy(mut self, policy: RotationPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Issue a capability token for a node.
@@ -114,13 +225,83 @@ impl CapabilityIssuer {
             CAPABILITY_LIFETIME,
             resources,
         );
-        encode(&claims, &inner.key)
+        encode(&claims, &inner.signing)
     }
 
-    /// The verifying key that store/queue/telemetry need in order to
-    /// verify tokens issued by this control plane.
-    pub async fn verifying_key(&self) -> ed25519_dalek::VerifyingKey {
-        self.inner.read().await.key.verifying_key()
+    /// The key new tokens are signed with.
+    pub async fn verifying_key(&self) -> VerifyingKey {
+        self.inner.read().await.signing.verifying_key()
+    }
+
+    /// Every key a verifier must accept right now.
+    pub async fn published_keys(&self) -> Vec<VerifyingKey> {
+        self.inner.read().await.published.clone()
+    }
+
+    /// The JWKS document served at [`JWKS_ROUTE`].
+    pub async fn jwks(&self) -> Jwks {
+        Jwks::from_keys(&self.inner.read().await.published)
+    }
+
+    /// Run one step of the rotation schedule against `db` and install the
+    /// result. A no-op for an in-memory issuer.
+    pub async fn maintain(&self, db: &Database) -> Result<(), IssuerError> {
+        let Some(vault) = self.vault.clone() else {
+            return Ok(());
+        };
+        let policy = self.policy.clone();
+        let changed = db
+            .with_connection(move |conn| rotation_step(conn, &vault, &policy, now_secs()))
+            .await?;
+        if let Some(state) = changed {
+            self.install(state).await;
+        }
+        Ok(())
+    }
+
+    /// [`Self::maintain`] on a bare connection at a chosen time, for tests.
+    #[doc(hidden)]
+    pub async fn maintain_at(&self, conn: &Connection, now: i64) -> Result<(), IssuerError> {
+        let Some(vault) = self.vault.as_ref() else {
+            return Ok(());
+        };
+        if let Some(state) = rotation_step(conn, vault, &self.policy, now)? {
+            self.install(state).await;
+        }
+        Ok(())
+    }
+
+    /// Check the rotation schedule every [`MAINTENANCE_INTERVAL`] until
+    /// `shutdown` fires.
+    pub fn spawn_maintenance(
+        self,
+        db: Arc<Database>,
+        shutdown: crate::shutdown::Shutdown,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(MAINTENANCE_INTERVAL) => {}
+                    _ = shutdown.wait() => return,
+                }
+                if let Err(error) = self.maintain(&db).await {
+                    warn!(
+                        %error,
+                        "Could not advance the capability key rotation; the current keys keep \
+                         signing and verifying, and the step is retried on the next check"
+                    );
+                }
+            }
+        })
+    }
+
+    async fn install(&self, state: KeyState) {
+        let kid = key_id(&state.signing.verifying_key());
+        let published: Vec<String> = state.published.iter().map(key_id).collect();
+        let mut inner = self.inner.write().await;
+        inner.signing = state.signing;
+        inner.published = state.published;
+        info!(signing_kid = %kid, published = ?published, "Capability signing keys changed");
     }
 
     /// The current auth epoch.
@@ -184,226 +365,326 @@ fn now_secs() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-/// Load the active signing key from the database, or generate a fresh one.
-fn load_or_create_key(
+fn generate_key() -> SigningKey {
+    let mut seed = [0u8; 32];
+    rand::Rng::fill(&mut rand::rngs::OsRng, &mut seed);
+    SigningKey::from_bytes(&seed)
+}
+
+/// Associated data for a stored private key: binds the ciphertext to its
+/// kid and keeps it from ever decrypting as a secret value, or a secret
+/// value as a key.
+fn key_aad(kid: &str) -> Vec<u8> {
+    format!("capability-signing-key\u{1f}{kid}").into_bytes()
+}
+
+/// Generate a key, store it in `stage`, and return its kid.
+fn insert_key(
     conn: &Connection,
-    master_key: Option<&[u8; 32]>,
-) -> rusqlite::Result<(SigningKey, u64)> {
-    let now = now_secs();
-    let key_id: Option<String> = conn
+    vault: &SecretCipher,
+    stage: Stage,
+    now: i64,
+) -> Result<String, IssuerError> {
+    let key = generate_key();
+    let public = key.verifying_key();
+    let kid = key_id(&public);
+    let ciphertext = vault
+        .encrypt(&key.to_bytes(), &key_aad(&kid))
+        .map_err(|e| IssuerError::Key {
+            kid: kid.clone(),
+            reason: e.to_string(),
+        })?;
+    conn.execute(
+        "INSERT INTO capability_signing_keys
+             (kid, public_key, private_key, state, created_at, state_changed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        rusqlite::params![kid, &public.as_bytes()[..], ciphertext, stage.as_str(), now],
+    )?;
+    Ok(kid)
+}
+
+/// Read every stored key; decrypt the active one.
+fn load_state(conn: &Connection, vault: &SecretCipher) -> Result<KeyState, IssuerError> {
+    let mut statement = conn.prepare(
+        "SELECT kid, public_key, private_key, state FROM capability_signing_keys
+         ORDER BY created_at, kid",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+
+    let mut signing = None;
+    let mut published = Vec::new();
+    for row in rows {
+        let (kid, public, private, state) = row?;
+        let bad = |reason: &str| IssuerError::Key {
+            kid: kid.clone(),
+            reason: reason.to_string(),
+        };
+        let public: [u8; 32] = public
+            .try_into()
+            .map_err(|_| bad("stored public key is not 32 bytes"))?;
+        let public =
+            VerifyingKey::from_bytes(&public).map_err(|_| bad("stored public key is invalid"))?;
+        if key_id(&public) != kid {
+            return Err(bad("stored kid is not the thumbprint of the stored public key"));
+        }
+        if state == Stage::Active.as_str() {
+            let raw = vault.decrypt(&private, &key_aad(&kid)).map_err(|_| {
+                bad("private key does not decrypt with the configured secret_key_file; the \
+                     master key was replaced or the row was copied from another installation")
+            })?;
+            let raw: [u8; 32] = raw
+                .try_into()
+                .map_err(|_| bad("decrypted private key is not 32 bytes"))?;
+            let key = SigningKey::from_bytes(&raw);
+            if key.verifying_key() != public {
+                return Err(bad("private key does not match the stored public key"));
+            }
+            signing = Some(key);
+        }
+        published.push(public);
+    }
+
+    let auth_epoch: Option<i64> = conn
         .query_row(
-            "SELECT key_id FROM capability_signing_keys WHERE active = 1 LIMIT 1",
+            "SELECT epoch FROM capability_auth_epoch WHERE id = 1",
             [],
             |row| row.get(0),
         )
         .optional()?;
 
-    match key_id {
-        Some(_kid) => {
-            let private_key_bytes: Vec<u8> = conn.query_row(
-                "SELECT private_key FROM capability_signing_keys WHERE active = 1",
-                [],
-                |row| row.get(0),
-            )?;
+    Ok(KeyState {
+        signing: signing.ok_or(IssuerError::NoActiveKey)?,
+        published,
+        auth_epoch: auth_epoch.unwrap_or(1) as u64,
+    })
+}
 
-            let raw_key = if let Some(mk) = master_key {
-                decrypt_key(&private_key_bytes, mk).map_err(|_| {
-                    rusqlite::Error::InvalidParameterName(
-                        "cannot decrypt stored signing key: master key mismatch".to_string(),
-                    )
-                })?
-            } else {
-                // Single-box: the stored key is plain
-                private_key_bytes
-            };
+/// Advance the rotation schedule by whatever is due at `now`, in one
+/// transaction. Returns the new key state when anything changed.
+fn rotation_step(
+    conn: &Connection,
+    vault: &SecretCipher,
+    policy: &RotationPolicy,
+    now: i64,
+) -> Result<Option<KeyState>, IssuerError> {
+    let age = |secs: Duration| now.saturating_sub(secs.as_secs() as i64);
+    let tx = conn.unchecked_transaction()?;
+    let mut changed = false;
 
-            let raw: [u8; 32] = raw_key.try_into().map_err(|_| {
-                rusqlite::Error::InvalidParameterName(
-                    "stored signing key is not 32 bytes".to_string(),
-                )
-            })?;
-
-            let signing_key = SigningKey::from_bytes(&raw);
-
-            let auth_epoch: Option<i64> = conn
-                .query_row(
-                    "SELECT epoch FROM capability_auth_epoch WHERE id = 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            let epoch = auth_epoch.unwrap_or(1) as u64;
-
-            info!(
-                key_id = %hex::encode(signing_key.verifying_key().as_bytes()),
-                auth_epoch = epoch,
-                "Loaded existing signing key"
-            );
-            Ok((signing_key, epoch))
-        }
-        None => {
-            // No existing key: generate a fresh one.
-            let mut seed = [0u8; 32];
-            rand::Rng::fill(&mut rand::rngs::OsRng, &mut seed);
-            let signing_key = SigningKey::from_bytes(&seed);
-            let public_key = signing_key.verifying_key().to_bytes();
-            let private_key_raw = signing_key.to_bytes();
-
-            let stored = if let Some(mk) = master_key {
-                encrypt_key(&private_key_raw, mk).map_err(|_| {
-                    rusqlite::Error::InvalidParameterName("cannot encrypt signing key".to_string())
-                })?
-            } else {
-                private_key_raw.to_vec()
-            };
-
-            conn.execute(
-                "INSERT INTO capability_signing_keys (key_id, public_key, private_key, created_at, active)
-                 VALUES (?1, ?2, ?3, ?4, 1)",
-                rusqlite::params![hex::encode(public_key), &public_key[..], stored, now],
-            )?;
-
-            // Seed the auth_epoch
-            conn.execute(
-                "INSERT OR IGNORE INTO capability_auth_epoch (id, epoch, created_at) VALUES (1, 1, ?1)",
-                rusqlite::params![now],
-            )?;
-
-            info!(
-                key_id = %hex::encode(public_key),
-                "Generated new signing key"
-            );
-
-            Ok((signing_key, 1))
-        }
+    // Retire: a previous key whose every token is past acceptance.
+    let retired = tx.execute(
+        "DELETE FROM capability_signing_keys WHERE state = 'previous' AND state_changed_at <= ?1",
+        rusqlite::params![age(policy.retire_after)],
+    )?;
+    if retired > 0 {
+        info!(retired, "Retired capability signing key(s); tokens they signed no longer verify anywhere");
+        changed = true;
     }
-}
 
-// ---- trivial encryption helpers for key-at-rest -------------------------
-//
-// In a standalone deployment the signing key is stored plain in the SQLite
-// database. When a master key is configured the key bytes are encrypted with
-// AES-256-GCM. This is the same crypto that protects environment secrets.
-// The nonce is prefixed, and the tag is appended.
-
-fn encrypt_key(plain: &[u8], master_key: &[u8; 32]) -> Result<Vec<u8>, &'static str> {
-    use aes_gcm::aead::Aead;
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-    use rand::Rng;
-
-    let cipher = Aes256Gcm::new_from_slice(master_key).map_err(|_| "bad key size")?;
-    let nonce_bytes: [u8; 12] = rand::rngs::OsRng.r#gen();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let mut ciphertext = cipher
-        .encrypt(nonce, plain.as_ref())
-        .map_err(|_| "encrypt failure")?;
-    // Prepend nonce (12 bytes) to ciphertext (plain + 16-byte tag)
-    let mut out = nonce_bytes.to_vec();
-    out.append(&mut ciphertext);
-    Ok(out)
-}
-
-fn decrypt_key(encrypted: &[u8], master_key: &[u8; 32]) -> Result<Vec<u8>, &'static str> {
-    use aes_gcm::aead::Aead;
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-
-    if encrypted.len() < 12 + 16 {
-        return Err("ciphertext too short");
+    // Activate: a pending key published for long enough that every verifier
+    // has fetched it. The key it replaces becomes previous.
+    let ready: Option<String> = tx
+        .query_row(
+            "SELECT kid FROM capability_signing_keys
+             WHERE state = 'pending' AND state_changed_at <= ?1
+             ORDER BY created_at LIMIT 1",
+            rusqlite::params![age(policy.publish_lead)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(kid) = ready {
+        tx.execute(
+            "UPDATE capability_signing_keys SET state = 'previous', state_changed_at = ?1
+             WHERE state = 'active'",
+            rusqlite::params![now],
+        )?;
+        tx.execute(
+            "UPDATE capability_signing_keys SET state = 'active', state_changed_at = ?1
+             WHERE kid = ?2",
+            rusqlite::params![now, kid],
+        )?;
+        info!(kid = %kid, "A new capability signing key is now signing every token");
+        changed = true;
     }
-    let (nonce_bytes, ciphertext) = encrypted.split_at(12);
-    let cipher = Aes256Gcm::new_from_slice(master_key).map_err(|_| "bad key size")?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    cipher
-        .decrypt(nonce, ciphertext.as_ref())
-        .map_err(|_| "decrypt failure")
-}
 
-// The `optional()` combinator rusqlite does not provide by default.
-use rusqlite::OptionalExtension;
+    // Stage: the active key is due for replacement and no successor is
+    // published yet.
+    let due: bool = tx
+        .query_row(
+            "SELECT 1 FROM capability_signing_keys
+             WHERE state = 'active' AND state_changed_at <= ?1",
+            rusqlite::params![age(policy.rotate_after)],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    let pending: bool = tx
+        .query_row(
+            "SELECT 1 FROM capability_signing_keys WHERE state = 'pending'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if due && !pending {
+        let kid = insert_key(&tx, vault, Stage::Pending, now)?;
+        info!(
+            kid = %kid,
+            publish_lead_secs = policy.publish_lead.as_secs(),
+            "Staged the next capability signing key; it is published now and starts signing after the publish lead"
+        );
+        changed = true;
+    }
+
+    if !changed {
+        tx.finish()?;
+        return Ok(None);
+    }
+    tx.commit()?;
+    Ok(Some(load_state(conn, vault)?))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::secrets::MASTER_KEY_LEN;
+    use deis_capability::{CapabilityVerifier, KeyRing, resources_for_audience};
+
+    const ISSUER: &str = "spiffe://deislet/control/main";
+    const TENANT: &str = "demo.production";
 
     fn in_memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        // Run the capability migration manually for tests.
-        // We can't rely on the full migration framework here, so run the SQL directly.
-        conn.execute_batch(include_str!(
-            "database/migrations/0003_capability_signing.sql"
-        ))
-        .unwrap();
+        crate::database::schema::run_migrations(&conn).unwrap();
         conn
+    }
+
+    fn vault(byte: u8) -> Arc<SecretCipher> {
+        Arc::new(SecretCipher::from_key_bytes(&[byte; MASTER_KEY_LEN]).unwrap())
+    }
+
+    async fn store_token(issuer: &CapabilityIssuer) -> String {
+        issuer
+            .issue(AUD_STORE, "spiffe://deislet/node/n1", resources_for_audience(TENANT, AUD_STORE))
+            .await
     }
 
     #[tokio::test]
     async fn issuer_generates_key_on_first_start() {
         let conn = in_memory_db();
-        let issuer = CapabilityIssuer::open(&conn, None, "spiffe://deislet/control/main")
-            .await
-            .unwrap();
-
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
         assert_eq!(issuer.auth_epoch().await, 1);
 
-        let token = issuer.issue(
-            AUD_STORE,
-            "spiffe://deislet/node/n1",
-            vec![CapabilityResource {
-                tenant: "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002".into(),
-                binding: "kv".into(),
-                generation: None,
-            }],
-        ).await;
-
-        assert!(token.starts_with("v1."));
-
-        // Verify with the matching key
-        let vk = issuer.verifying_key().await;
-        let claims = deis_capability::decode(&token, &vk).unwrap();
+        let token = store_token(&issuer).await;
+        let claims = deis_capability::decode(&token, &issuer.verifying_key().await).unwrap();
         assert_eq!(claims.aud, AUD_STORE);
-        assert_eq!(claims.sub, "spiffe://deislet/node/n1");
-        assert!(claims.resources.len() == 1);
+        assert_eq!(claims.kid, key_id(&issuer.verifying_key().await));
+        assert_eq!(issuer.jwks().await.keys.len(), 1);
     }
 
+    /// The property the ephemeral issuer lacked: a token minted before a
+    /// restart verifies against the key set published after it.
     #[tokio::test]
     async fn issuer_persists_and_reloads_key() {
         let conn = in_memory_db();
-        let issuer = CapabilityIssuer::open(&conn, None, "spiffe://deislet/control/main")
-            .await
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let token = store_token(&issuer).await;
+
+        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        assert_eq!(issuer.verifying_key().await, restarted.verifying_key().await);
+
+        let ring = KeyRing::from_keys(restarted.jwks().await.verifying_keys().unwrap());
+        CapabilityVerifier::with_key_ring(ring)
+            .verify(&token, AUD_STORE, TENANT, "kv")
+            .expect("a token from before the restart verifies after it");
+    }
+
+    #[tokio::test]
+    async fn the_stored_private_key_is_ciphertext_bound_to_the_master_key() {
+        let conn = in_memory_db();
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let signing = issuer.inner.read().await.signing.to_bytes();
+        let stored: Vec<u8> = conn
+            .query_row("SELECT private_key FROM capability_signing_keys", [], |r| r.get(0))
             .unwrap();
+        assert!(
+            !stored.windows(signing.len()).any(|w| w == signing),
+            "the private key must not be stored in the clear"
+        );
 
-        let vk_before = issuer.verifying_key().await;
-        let token = issuer
-            .issue(AUD_STORE, "spiffe://deislet/node/n1", vec![])
-            .await;
+        match CapabilityIssuer::open(&conn, vault(8), ISSUER) {
+            Err(IssuerError::Key { .. }) => {}
+            Err(other) => panic!("expected a key error, got {other}"),
+            Ok(_) => panic!("a different master key must not open the stored key"),
+        }
+    }
 
-        // Re-open the same issuer (simulates restart)
-        let issuer2 = CapabilityIssuer::open(&conn, None, "spiffe://deislet/control/main")
-            .await
-            .unwrap();
+    /// The whole schedule: stage (published, not signing), activate (old
+    /// key still verifies), retire (old key's tokens stop).
+    #[tokio::test]
+    async fn rotation_publishes_first_signs_next_and_retires_last() {
+        let conn = in_memory_db();
+        let policy = RotationPolicy {
+            rotate_after: Duration::from_secs(100),
+            publish_lead: Duration::from_secs(10),
+            retire_after: Duration::from_secs(50),
+        };
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER)
+            .unwrap()
+            .with_policy(policy);
+        let t0 = now_secs();
+        let first = issuer.verifying_key().await;
+        let old_token = store_token(&issuer).await;
 
-        let vk_after = issuer2.verifying_key().await;
-        assert_eq!(vk_before, vk_after, "key must survive restart");
+        issuer.maintain_at(&conn, t0 + 50).await.unwrap();
+        assert_eq!(issuer.published_keys().await, vec![first], "nothing due yet");
 
-        // Token from before must verify after restart
-        let claims = deis_capability::decode(&token, &vk_after).unwrap();
-        assert_eq!(claims.sub, "spiffe://deislet/node/n1");
+        issuer.maintain_at(&conn, t0 + 101).await.unwrap();
+        let published = issuer.published_keys().await;
+        assert_eq!(published.len(), 2, "the successor is published");
+        assert_eq!(issuer.verifying_key().await, first, "but does not sign yet");
+
+        issuer.maintain_at(&conn, t0 + 112).await.unwrap();
+        let second = issuer.verifying_key().await;
+        assert_ne!(second, first, "the successor signs after the publish lead");
+        let ring = KeyRing::from_keys(issuer.published_keys().await);
+        let verifier = CapabilityVerifier::with_key_ring(ring.clone());
+        verifier
+            .verify(&old_token, AUD_STORE, TENANT, "kv")
+            .expect("the previous key still verifies");
+        let new_token = store_token(&issuer).await;
+        assert_eq!(
+            deis_capability::decode(&new_token, &second).unwrap().kid,
+            key_id(&second)
+        );
+
+        issuer.maintain_at(&conn, t0 + 163).await.unwrap();
+        assert_eq!(issuer.published_keys().await, vec![second]);
+        ring.replace(issuer.published_keys().await);
+        assert!(verifier.verify(&old_token, AUD_STORE, TENANT, "kv").is_err());
+        verifier
+            .verify(&new_token, AUD_STORE, TENANT, "kv")
+            .expect("the active key verifies");
+
+        // And the state survives a restart.
+        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        assert_eq!(restarted.verifying_key().await, second);
     }
 
     #[tokio::test]
     async fn bump_auth_epoch_increments() {
         let conn = in_memory_db();
-        let issuer = CapabilityIssuer::open(&conn, None, "spiffe://deislet/control/main")
-            .await
-            .unwrap();
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
 
         assert_eq!(issuer.auth_epoch().await, 1);
-
-        let epoch = issuer.bump_auth_epoch(&conn).await.unwrap();
-        assert_eq!(epoch, 2);
-
-        let epoch = issuer.bump_auth_epoch(&conn).await.unwrap();
-        assert_eq!(epoch, 3);
+        assert_eq!(issuer.bump_auth_epoch(&conn).await.unwrap(), 2);
+        assert_eq!(issuer.bump_auth_epoch(&conn).await.unwrap(), 3);
     }
 }

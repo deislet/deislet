@@ -40,7 +40,7 @@ use rusqlite::{Connection, OptionalExtension};
 pub const APPLICATION_ID: i64 = 0x0DE1_5001;
 
 /// The metadata database currently understands schemas up to this version.
-pub const LATEST_VERSION: i64 = 3;
+pub const LATEST_VERSION: i64 = 4;
 
 /// One numbered migration.
 struct Migration {
@@ -77,6 +77,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "capability_signing",
         fk_off: false,
         sql: include_str!("migrations/0003_capability_signing.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "capability_key_rotation",
+        fk_off: false,
+        sql: include_str!("migrations/0004_capability_key_rotation.sql"),
     },
 ];
 

@@ -141,6 +141,27 @@ fn announce_restore_set(config: &deis_control::ControlConfig, database: &Path) {
     );
 }
 
+/// The master key the capability signing keys are encrypted under.
+///
+/// Required, unlike for secrets (which answer 503 without it): the control
+/// plane cannot mint a single storage or queue capability without a signing
+/// key, and the only alternatives to an encrypted stored key are one that
+/// dies with the process - every token in the fleet failing after each
+/// restart - or one stored in the clear in `control.db` and every replica of
+/// it.
+fn load_capability_vault(
+    config: &deis_control::ControlConfig,
+) -> anyhow::Result<Arc<deis_control::catalog::secrets::SecretCipher>> {
+    let path = config.secret_key_file.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "secret_key_file is not set. The capability signing keys are stored encrypted under              that master key and this control plane will not start without it; generate one              with `openssl rand -hex 32 > <data_dir>/keys/master.key` and name it in the              configuration file"
+        )
+    })?;
+    let cipher = deis_control::catalog::secrets::SecretCipher::load_from_file(path)
+        .map_err(|e| anyhow::anyhow!("the capability signing keys need the master key: {e}"))?;
+    Ok(Arc::new(cipher))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     init_logging();
@@ -213,6 +234,9 @@ async fn main() -> Result<(), anyhow::Error> {
                  and the routing table. Without it no machine can reach this control plane at all"
             )
         })?;
+        // The capability signing keys are stored encrypted under the master
+        // key and startup refuses without it; the same check, here.
+        load_capability_vault(&config)?;
         println!(
             "configuration is usable: port {}, machine channel {}:{}, human API authenticated \
              (bootstrap credential written to {} on a first start with no live token)",
@@ -272,10 +296,19 @@ async fn main() -> Result<(), anyhow::Error> {
     // `CatalogStore::anchor_bundle_paths`.
     deis_control::api::anchor_bundle_paths(&database, &api_config).await;
 
-    let capability_issuer = deis_control::capability_issuer::CapabilityIssuer::ephemeral(
-        "spiffe://deislet/control/main",
-    )
-    .await;
+    // Persistent, encrypted under the master key, and rotated on a schedule;
+    // see `capability_issuer`. Loaded before anything can issue a token.
+    let capability_vault = load_capability_vault(&config)?;
+    let capability_issuer = database
+        .with_connection(move |conn| {
+            deis_control::capability_issuer::CapabilityIssuer::open(
+                conn,
+                capability_vault,
+                "spiffe://deislet/control/main",
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot load the capability signing keys: {e}"))?;
 
     // One stop signal for the whole process, taken before anything is
     // started so every part gets the same edge: the listener stops
@@ -290,6 +323,12 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let sessions = server.sessions();
     let db = server.database().expect("Database not initialized");
+
+    // Stops on the signal by itself; a step cut short is one transaction
+    // that either landed or did not.
+    capability_issuer
+        .clone()
+        .spawn_maintenance(Arc::clone(&db), shutdown.clone());
 
     let config_manager = Arc::new(deis_control::ConfigManager::new(
         Arc::clone(&db),

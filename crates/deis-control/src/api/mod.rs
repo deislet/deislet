@@ -225,6 +225,16 @@ pub async fn build_api_router(
         .with_state(revocation::RevocationState {
             issuer: issuer.clone(),
         })
+        // Public keys, for store and queue, which have no machine identity
+        // to fetch them over the machine channel with.
+        .merge(
+            Router::new()
+                .route(
+                    crate::capability_issuer::JWKS_ROUTE,
+                    get(crate::machine::listen::capability_jwks),
+                )
+                .with_state(issuer.clone()),
+        )
         .merge(protected_routes);
 
     // Cross-origin access to the human API, which is off unless the file

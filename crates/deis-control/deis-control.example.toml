@@ -242,12 +242,13 @@ data_dir = "/var/lib/deis-control"
 # host or reach the control plane through a proxy.
 # public_base_url = "https://control.internal:8080"
 
-# File holding the 32-byte master key that encrypts environment secrets
-# (AES-256-GCM, nonce prefixed). Either 32 raw bytes or 64 hex characters:
+# File holding the 32-byte master key that encrypts environment secrets and
+# the capability signing keys (AES-256-GCM, nonce prefixed). Either 32 raw
+# bytes or 64 hex characters:
 #   openssl rand -hex 32 > /etc/deis/secret.key && chmod 600 /etc/deis/secret.key
-# The key never enters the database and is never logged. Without it the
-# control plane still runs, but every secret endpoint answers 503 rather
-# than storing a value in the clear.
+# The key never enters the database and is never logged. Required: the
+# control plane refuses to start without it, because it cannot sign a single
+# storage or queue capability without a signing key it can keep.
 # secret_key_file = "/etc/deis/secret.key"
 
 # ========================================

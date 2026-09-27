@@ -67,14 +67,19 @@ pub fn load_identity(config: &MachineChannelConfig) -> anyhow::Result<Arc<Machin
     Ok(identity)
 }
 
-/// Route for public key distribution so downstream services can discover
-/// the verifying key at startup.
-pub const CAPABILITY_KEY_ROUTE: &str = "/.well-known/deis/capability-public-key";
-
-/// Serve the raw 32-byte Ed25519 verifying key.
-async fn capability_public_key(State(issuer): State<CapabilityIssuer>) -> impl IntoResponse {
-    let vk = issuer.verifying_key().await;
-    (StatusCode::OK, vk.as_bytes().to_vec())
+/// Serve every published capability verifying key as a JWKS document.
+///
+/// Public keys only, so it needs no credential; it is on this listener for
+/// callers that hold a machine identity, and on the human one for store and
+/// queue, which do not.
+pub async fn capability_jwks(State(issuer): State<CapabilityIssuer>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        // Short: a verifier that meets an unknown kid refetches anyway, and
+        // an intermediary must not pin a set that has since rotated.
+        [(axum::http::header::CACHE_CONTROL, "max-age=60")],
+        axum::Json(issuer.jwks().await),
+    )
 }
 
 /// Everything a machine may call, and nothing else.
@@ -106,7 +111,7 @@ pub fn router(
         )
         .merge(
             Router::new()
-                .route(CAPABILITY_KEY_ROUTE, get(capability_public_key))
+                .route(crate::capability_issuer::JWKS_ROUTE, get(capability_jwks))
                 .with_state(issuer_for_key_endpoint),
         )
 }
