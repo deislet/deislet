@@ -2230,6 +2230,7 @@ name = "deis-capability"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "deis-identity",
  "deis-wire",
  "ed25519-dalek",
  "reqwest",

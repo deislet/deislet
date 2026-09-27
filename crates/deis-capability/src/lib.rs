@@ -536,6 +536,9 @@ pub struct CapabilityVerifier {
     pull_interval_secs: u64,
     /// Total number of expired tokens accepted under T8 degraded-mode grace rules.
     grace_accepted_total: Arc<AtomicU64>,
+    /// The trust domain a node subject must be in to get T8 grace, when the
+    /// verifier knows its own; `None` accepts a node of any trust domain.
+    trust_domain: Option<String>,
 }
 
 impl CapabilityVerifier {
@@ -558,6 +561,7 @@ impl CapabilityVerifier {
             skew_secs: DEFAULT_DEGRADED_SKEW_SECS,
             pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
             grace_accepted_total: Arc::new(AtomicU64::new(0)),
+            trust_domain: None,
         }
     }
 
@@ -580,6 +584,11 @@ impl CapabilityVerifier {
     /// [`MAX_GRACE_PERIOD_SECS`] (24 hours).
     pub fn set_grace_max_secs(&mut self, secs: u64) {
         self.grace_max_secs = secs.min(MAX_GRACE_PERIOD_SECS);
+    }
+
+    /// Only grant T8 grace to nodes of `trust_domain` - this installation's.
+    pub fn set_trust_domain(&mut self, trust_domain: impl Into<String>) {
+        self.trust_domain = Some(trust_domain.into());
     }
 
     /// Set the revocation-list pull interval in seconds.
@@ -654,15 +663,16 @@ impl CapabilityVerifier {
 
     /// Verify with T8 degraded-mode grace period.
     ///
-    /// When the token's `sub` identifies a node SPIFFE identity
-    /// (`spiffe://deislet/node/…`) and the verifier is in degraded mode,
-    /// expired tokens are accepted if:
+    /// When the token's `sub` is a runtime node's SPIFFE name
+    /// (`spiffe://<trust domain>/deislet/node/<id>`, see [`is_node_subject`])
+    /// and the verifier is in degraded mode, expired tokens are accepted if:
     /// 1. `exp ≥ last_sync_unix − skew_secs` (the token was still valid when
     ///    the control plane was last reachable), and
     /// 2. `now ≤ exp + grace_max_secs` (within the grace window).
     ///
-    /// Human / CLI tokens are never eligible for grace — their `sub` starts
-    /// with `spiffe://deislet/human/`.
+    /// Revocation (`jti` and `auth_epoch`, from the last list fetched) and
+    /// every other check still apply. Human / CLI tokens are never eligible
+    /// for grace: their subject is not a node's name.
     pub fn verify_with_grace(
         &self,
         token: &str,
@@ -673,7 +683,7 @@ impl CapabilityVerifier {
         let claims = decode_with(token, &self.keys)?;
         let now = now_secs();
         let grace_accepted = claims.is_expired()
-            && is_node_subject(&claims.sub)
+            && is_node_subject(&claims.sub, self.trust_domain.as_deref())
             && self.is_degraded()
             && self.grace_applies(&claims, now);
 
@@ -712,11 +722,22 @@ impl CapabilityVerifier {
 
 // ---- helpers --------------------------------------------------------------
 
-/// Returns `true` if the subject identifies a node principal
-/// (SPIFFE `spiffe://deislet/node/…`).  Human and CLI tokens use
-/// `spiffe://deislet/human/…` and are excluded from T8 grace.
-fn is_node_subject(sub: &str) -> bool {
-    sub.starts_with("spiffe://deislet/node/")
+/// Returns `true` if the subject is a runtime node's SPIFFE name,
+/// `spiffe://<trust domain>/deislet/node/<id>` - and, when `trust_domain` is
+/// given, one in that trust domain.
+///
+/// Parsed with the same code every machine handshake uses, so what counts as
+/// a node here is exactly what the machine channel admits as one. Anything
+/// else - a human capability's subject, the control plane's own name, a name
+/// that does not parse - is not a node and gets no T8 grace.
+fn is_node_subject(sub: &str, trust_domain: Option<&str>) -> bool {
+    let Ok(id) = deis_identity::SpiffeId::parse(sub) else {
+        return false;
+    };
+    if trust_domain.is_some_and(|domain| id.trust_domain() != domain) {
+        return false;
+    }
+    deis_identity::names::service_kind(&id) == Some(deis_identity::ServiceKind::Node)
 }
 
 /// JCS-canonicalize the claims to deterministic bytes for signing.
@@ -1318,6 +1339,13 @@ mod tests {
 
     // ---- T8 degraded-mode / grace-period tests ---------------------------
 
+    /// A node's name exactly as `deis_identity::names::node` spells it and
+    /// as `IssueCapability` puts it in `sub`: the name the node proved.
+    const NODE_SUBJECT: &str = "spiffe://deis.internal/deislet/node/n1";
+
+    /// What this check used to look for, and no node's name ever matched.
+    const LEGACY_SHAPE: &str = "spiffe://deislet/node/n1";
+
     /// Make a token for a node principal that expires in `offset_secs`
     /// (negative = already expired).
     fn make_node_token(
@@ -1331,7 +1359,7 @@ mod tests {
             aud: "store".into(),
             kid: String::new(),
             iss: "spiffe://deislet/control/main".into(),
-            sub: "spiffe://deislet/node/n1".into(),
+            sub: NODE_SUBJECT.into(),
             jti: uuid::Uuid::now_v7().to_string(),
             exp,
             iat,
@@ -1375,21 +1403,55 @@ mod tests {
     }
 
     #[test]
-    fn is_node_subject_identifies_node_spiffe() {
-        assert!(is_node_subject("spiffe://deislet/node/n1"));
-        assert!(is_node_subject("spiffe://deislet/node/runtime-42"));
+    fn is_node_subject_identifies_the_names_nodes_really_carry() {
+        let issued = deis_identity::names::node("deis.internal", "runtime-42").unwrap();
+        assert!(is_node_subject(issued.as_str(), None));
+        assert!(is_node_subject(NODE_SUBJECT, None));
+        assert!(is_node_subject("spiffe://prod.example/deislet/node/n1", None));
     }
 
     #[test]
     fn is_node_subject_rejects_human_spiffe() {
-        assert!(!is_node_subject("spiffe://deislet/human/root"));
-        assert!(!is_node_subject("spiffe://deislet/human/alice"));
+        assert!(!is_node_subject("spiffe://deislet/human/root", None));
+        assert!(!is_node_subject("spiffe://deislet/human/alice", None));
     }
 
     #[test]
     fn is_node_subject_rejects_arbitrary_sub() {
-        assert!(!is_node_subject("admin"));
-        assert!(!is_node_subject("spiffe://other/node/n1"));
+        assert!(!is_node_subject("admin", None));
+        // The shape this check used to look for, which no node carries.
+        assert!(!is_node_subject(LEGACY_SHAPE, None));
+        assert!(!is_node_subject("spiffe://deis.internal/deislet/control", None));
+        assert!(!is_node_subject("spiffe://deis.internal/deislet/proxy/p1", None));
+        assert!(!is_node_subject("spiffe://deis.internal/deislet/node/n1/extra", None));
+    }
+
+    #[test]
+    fn is_node_subject_holds_a_node_to_the_verifiers_trust_domain() {
+        assert!(is_node_subject(NODE_SUBJECT, Some("deis.internal")));
+        assert!(!is_node_subject(NODE_SUBJECT, Some("other.internal")));
+    }
+
+    /// The acceptance line for T8: a capability minted for a node as the
+    /// control plane really mints it gets grace in degraded mode, and one
+    /// from another trust domain does not once the verifier knows its own.
+    #[test]
+    fn grace_accepts_a_real_format_node_subject_and_only_in_its_trust_domain() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, -60);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(3600));
+        let tenant = "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002";
+        let accepted = verifier
+            .verify_with_grace(&token, "store", tenant, "kv")
+            .expect("an expired node capability in degraded mode");
+        assert!(accepted.grace_accepted);
+
+        verifier.set_trust_domain("other.internal");
+        assert!(matches!(
+            verifier.verify_with_grace(&token, "store", tenant, "kv"),
+            Err(CapabilityError::Expired { .. })
+        ));
     }
 
     #[test]
@@ -1423,7 +1485,7 @@ mod tests {
         match result {
             Ok(cap) => {
                 assert!(!cap.grace_accepted, "valid token must not be grace_accepted");
-                assert_eq!(cap.node_id, "spiffe://deislet/node/n1");
+                assert_eq!(cap.node_id, NODE_SUBJECT);
             }
             Err(e) => panic!("valid token should pass: {e}"),
         }
@@ -1452,7 +1514,7 @@ mod tests {
         match result {
             Ok(cap) => {
                 assert!(cap.grace_accepted, "expired node token in degraded mode must be grace_accepted");
-                assert_eq!(cap.node_id, "spiffe://deislet/node/n1");
+                assert_eq!(cap.node_id, NODE_SUBJECT);
             }
             Err(e) => panic!("grace should accept recently-expired node token: {e}"),
         }
