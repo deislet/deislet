@@ -336,14 +336,19 @@ is not a statement about anything above.
 `.github/workflows/checks.yml` is written to run, on every push to `main` and
 every pull request: the three document checks (path constants, link targets
 and written-down counts), the witness tests below, `cargo fmt --check`,
-`cargo clippy -D warnings`, `cargo build --workspace`, the three test shards,
-and a full `start` → `verify` → `stop`. Until it grew those jobs it held the
+`cargo clippy -D warnings`, `cargo build --workspace`, every test of every
+workspace crate (`cargo nextest run --workspace`, plus the doc tests), and a
+full `start` → `verify` → `stop`. Until it grew those jobs it held the
 document-path check alone, and nothing automatic had ever compiled this
 workspace, run its tests, or run the verification the project's claims are
-quoted from. Status: the last green run is `33848760058`, 2026-09-04. Every
-run since then has failed within seconds — a GitHub billing problem, not a
-build failure — so changes landed after that date carry local evidence only.
-This paragraph is to be updated once CI is running again.
+quoted from. Status: the last green run is `33848760058`, 2026-09-04, on
+GitHub-hosted runners. Every run since then has failed within seconds — a
+GitHub billing problem, not a build failure — so changes landed after that
+date carry local evidence only. The workflow now targets a self-hosted runner
+on the build host instead
+([docs/operations/ci-runner.md](docs/operations/ci-runner.md)); until that
+runner is registered its runs wait in the queue, and this paragraph is to be
+updated with the first green run there.
 
 ```bash
 bash scripts/test-demo-witnesses.sh    # unit tests for verify itself; no demo needed
