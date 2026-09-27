@@ -31,7 +31,7 @@ use deis_wire::machine::{
     IssueCapabilityResponse, RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::{Request, Response, Status};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::api::catalog::CatalogState;
 use crate::api::catalog::{assignments, routing_table};
@@ -425,11 +425,14 @@ impl MachineChannel for MachineChannelService {
 
         // The node's own name, from the certificate, decides what it may
         // read - never anything the request says about itself.
-        let visible = assignments::deployments_visible_to(&self.state, &node_id)
-            .await
-            .map_err(|error| {
-                Status::internal(format!("could not list visible deployments: {error:?}"))
-            })?;
+        let visible = match assignments::deployments_visible_to(&self.state, &node_id).await {
+            Ok(visible) => visible,
+            Err(error) => {
+                let refusal =
+                    Status::internal(format!("could not list visible deployments: {error:?}"));
+                return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
+            }
+        };
 
         // Every entry is checked before anything is decrypted, and one bad
         // entry refuses the whole request: a partial answer would let a
@@ -459,6 +462,7 @@ impl MachineChannel for MachineChannelService {
         }
 
         let mut values: BTreeMap<String, String> = BTreeMap::new();
+        let mut accepted = Vec::with_capacity(wanted.len());
         for (entry, env_id, snapshot_id, revisions) in wanted {
             let fetched = match self
                 .state
@@ -486,29 +490,50 @@ impl MachineChannel for MachineChannelService {
             };
             // Revision ids and a count, never a value.
             let revision_list = revisions.iter().cloned().collect::<Vec<_>>().join(",");
-            self.audit
-                .record(secret_fetch_record(
-                    &proved,
-                    Some(&entry.deployment_id),
-                    AuditOutcome::Accepted,
-                    200,
-                    format!("revisions={revision_list} count={}", fetched.len()),
-                ))
-                .await;
-            debug!(
-                node = %node_id,
-                deployment_id = %entry.deployment_id,
-                count = fetched.len(),
-                "A node fetched secret values over the machine channel"
-            );
+            accepted.push(secret_fetch_record(
+                &proved,
+                Some(&entry.deployment_id),
+                AuditOutcome::Accepted,
+                200,
+                format!("revisions={revision_list} count={}", fetched.len()),
+            ));
             for (revision, value) in fetched {
                 values.insert(format!("{}\x00{revision}", entry.deployment_id), value);
             }
         }
 
-        let values_json = serde_json::to_string(&values).map_err(|error| {
-            Status::internal(format!("could not encode secret values: {error}"))
-        })?;
+        let values_json = match serde_json::to_string(&values) {
+            Ok(json) => json,
+            Err(error) => {
+                let refusal = Status::internal(format!("could not encode secret values: {error}"));
+                return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
+            }
+        };
+
+        // Fail closed: a value leaves this process only once the row saying
+        // it did is durable. A fetch the audit log cannot show is the one
+        // thing this row exists to rule out, so an audit table that cannot
+        // be written means no values, not values and a log line.
+        for record in accepted {
+            let deployment_id = record.target.clone();
+            if let Err(error) = self.audit.try_record(record).await {
+                error!(
+                    proved = %proved,
+                    deployment_id = deployment_id.as_deref().unwrap_or(""),
+                    error = %error,
+                    "Withheld secret values from a node because the audit row for the fetch could not be written"
+                );
+                return Err(Status::unavailable(
+                    "the audit record for this secret fetch could not be written, so no value \
+                     is handed over; retry once the control plane's database accepts writes",
+                ));
+            }
+            debug!(
+                node = %node_id,
+                deployment_id = deployment_id.as_deref().unwrap_or(""),
+                "A node fetched secret values over the machine channel"
+            );
+        }
         Ok(Response::new(FetchSecretValuesResponse { values_json }))
     }
 
@@ -1077,6 +1102,80 @@ mod tests {
                 "a value reached the log: {text}"
             );
         }
+    }
+
+    /// Run `sql` against the catalog's database, for a test that has to
+    /// break it.
+    async fn break_database(state: &CatalogState, sql: &'static str) {
+        state
+            .store
+            .database()
+            .with_connection(move |conn| {
+                conn.execute_batch(sql)?;
+                Ok::<(), crate::database::DatabaseError>(())
+            })
+            .await
+            .expect("the statement runs");
+    }
+
+    /// A value leaves only once its audit row is durable. With the audit
+    /// table refusing writes, the node gets no values at all.
+    #[tokio::test]
+    async fn no_secret_value_is_handed_over_without_its_audit_row() {
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+        break_database(
+            &h.state,
+            "CREATE TRIGGER refuse_audit BEFORE INSERT ON audit_log \
+             BEGIN SELECT RAISE(ABORT, 'audit is read-only'); END;",
+        )
+        .await;
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect_err("values were handed over with no audit row");
+        assert_eq!(refusal.code(), tonic::Code::Unavailable);
+        assert!(
+            !refusal.message().contains("first-value"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// A fetch the control plane could not serve is still a fetch someone
+    /// asked for, and is written down like a refusal.
+    #[tokio::test]
+    async fn an_internal_failure_is_written_to_the_audit_log() {
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+        break_database(
+            &h.state,
+            "ALTER TABLE deployment_plans RENAME TO deployment_plans_gone;",
+        )
+        .await;
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect_err("a broken catalog answered");
+        assert_eq!(refusal.code(), tonic::Code::Internal);
+
+        let lines = secret_fetch_lines(&h.state).await;
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0].status, 500);
+        assert_eq!(
+            lines[0].actor_account.as_deref(),
+            Some(node("runtime-test").to_string().as_str())
+        );
     }
 
     /// The node the answer is for comes from the certificate: claiming

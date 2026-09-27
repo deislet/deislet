@@ -382,6 +382,21 @@ pub struct AuditStore {
     db: Arc<Database>,
 }
 
+/// One line naming an audit event, for the service log when the row itself
+/// could not be written.
+fn describe(record: &AuditRecord) -> String {
+    format!(
+        "{} {} on {}/{} by {} -> {} ({})",
+        record.action,
+        record.method,
+        record.app_id.as_deref().unwrap_or("-"),
+        record.environment.as_deref().unwrap_or("-"),
+        record.actor_account.as_deref().unwrap_or("unknown"),
+        record.outcome.as_str(),
+        record.status
+    )
+}
+
 impl AuditStore {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
@@ -406,19 +421,26 @@ impl AuditStore {
     /// should copy the table out and truncate it at the file, which is the
     /// same level of access that could rewrite it anyway.
     pub async fn record(&self, record: AuditRecord) {
-        let description = format!(
-            "{} {} on {}/{} by {} -> {} ({})",
-            record.action,
-            record.method,
-            record.app_id.as_deref().unwrap_or("-"),
-            record.environment.as_deref().unwrap_or("-"),
-            record.actor_account.as_deref().unwrap_or("unknown"),
-            record.outcome.as_str(),
-            record.status
-        );
+        let description = describe(&record);
+        if let Err(e) = self.try_record(record).await {
+            error!(
+                error = %e,
+                event = %description,
+                "Could not write an audit record; the call it describes still happened, and this log line is now the only trace of it"
+            );
+        }
+    }
+
+    /// Append one line, and say whether it was written.
+    ///
+    /// For the calls whose audit row is a precondition rather than a
+    /// report: handing out a secret value is one. The caller decides what a
+    /// failure means - for a secret fetch it means the values are withheld,
+    /// because a fetch nobody can later find is exactly what the row exists
+    /// to rule out.
+    pub async fn try_record(&self, record: AuditRecord) -> Result<(), DatabaseError> {
         let at = now_secs();
-        let written = self
-            .db
+        self.db
             .with_connection(move |conn| {
                 conn.execute(
                     "INSERT INTO audit_log \
@@ -447,15 +469,7 @@ impl AuditStore {
                 )?;
                 Ok::<(), DatabaseError>(())
             })
-            .await;
-
-        if let Err(e) = written {
-            error!(
-                error = %e,
-                event = %description,
-                "Could not write an audit record; the call it describes still happened, and this log line is now the only trace of it"
-            );
-        }
+            .await
     }
 
     /// One page of the log, newest first: `(at DESC, id DESC)`, the wall
