@@ -466,6 +466,36 @@ mod tests {
     }
 
     #[test]
+    fn a_deployment_env_keeps_both_capabilities_apart() {
+        // deis-store and deis-queue each accept only their own audience, so
+        // the two tokens the control plane ships must both survive the wiring
+        // and stay in their own slots: losing the queue one leaves every send
+        // and every consumer poll refused.
+        let mut map = env(&[
+            ("DEIS_STORE_ENDPOINT", "http://store:8090"),
+            ("DEIS_QUEUE_ENDPOINT", "http://queue:8091"),
+            (STORAGE_TOKEN_KEY, "v1.store-capability"),
+            (QUEUE_TOKEN_KEY, "v1.queue-capability"),
+        ]);
+
+        wire_deployment_env(
+            &manifest(
+                r#"{
+                    "schema": 1,
+                    "app": "demo",
+                    "entry": "worker/index.js",
+                    "services": { "kv": true, "queue": true }
+                }"#,
+            ),
+            &mut map,
+        );
+
+        let wiring = ServiceWiring::take_from_env(&mut map);
+        assert_eq!(wiring.storage_token.as_deref(), Some("v1.store-capability"));
+        assert_eq!(wiring.queue_token.as_deref(), Some("v1.queue-capability"));
+    }
+
+    #[test]
     fn a_deployment_without_addresses_declares_services_but_binds_none() {
         let mut map = env(&[("LOG_LEVEL", "info")]);
         wire_deployment_env(

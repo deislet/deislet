@@ -1418,9 +1418,11 @@ pub fn wire_deployment_env(manifest: &deis_bundle::Manifest, env: &mut HashMap<S
         queue: non_empty(env.get(QUEUE_ENDPOINT_KEY).cloned()),
     };
     let storage_token = non_empty(env.get(STORAGE_TOKEN_KEY).cloned());
+    let queue_token = non_empty(env.get(QUEUE_TOKEN_KEY).cloned());
     strip_reserved_env(env);
     let mut wiring = ServiceWiring::from_manifest(manifest, endpoints);
     wiring.storage_token = storage_token;
+    wiring.queue_token = queue_token;
     wiring.write_to_env(env);
 }
 
@@ -1428,11 +1430,10 @@ pub fn wire_deployment_env(manifest: &deis_bundle::Manifest, env: &mut HashMap<S
 /// code never sends a message.
 ///
 /// Charged to the same tenant as the app's own client, and carrying the same
-/// capability token, so a preview polls its own queues and never leases a
-/// message production was meant to handle - and so a deis-queue with an
-/// `auth_secret` answers the poller instead of refusing it. Dropping the token
-/// here would leave an application whose own `queue.send` works while nothing
-/// is ever consumed.
+/// queue capability, so a preview polls its own queues and never leases a
+/// message production was meant to handle, and deis-queue answers the poller
+/// instead of refusing it. Dropping the token here would leave an application
+/// whose own `queue.send` works while nothing is ever consumed.
 pub(crate) fn consumer_queue_client(
     tenant: &str,
     endpoint: &str,
@@ -1441,6 +1442,9 @@ pub(crate) fn consumer_queue_client(
 ) -> Result<QueueClient> {
     let identity = StorageIdentity::new(tenant, token)
         .with_context(|| format!("building the queue consumer client for {tenant}"))?;
+    // Renewed like the app's own queue client: a poller outlives any one
+    // token, and one that stopped renewing would stop consuming.
+    crate::deployment::capability_renewer::register(tenant, "queue", identity.token_lock());
     QueueClient::connect_lazy(endpoint, &identity)?
         .with_consumer_generation(generation)
         .with_context(|| format!("building the queue consumer client for {tenant}"))

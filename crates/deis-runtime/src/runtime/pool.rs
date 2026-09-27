@@ -2441,13 +2441,13 @@ impl RuntimePool {
         };
 
         // Charged to the same tenant as the app's own queue client, and
-        // carrying the same capability token, so a preview leases only its own
-        // messages and a deis-queue that checks the token answers the poller
-        // instead of refusing it.
+        // carrying the same queue capability, so a preview leases only its
+        // own messages and deis-queue answers the poller instead of refusing
+        // it. Not the storage token: deis-queue accepts only its own audience.
         let client: Arc<dyn QueuePort> = match consumer_queue_client(
             storage_tenant,
             endpoint,
-            wiring.storage_token.as_deref(),
+            wiring.queue_token.as_deref(),
             generation,
         ) {
             Ok(client) => Arc::new(client),
