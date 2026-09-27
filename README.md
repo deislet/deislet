@@ -85,7 +85,7 @@ for two consecutive checks:
 | `context.env.KV` round-trips | through the declared logical binding into deis-store |
 | a storage call presenting no capability token is refused | deis-store answers Unauthenticated before touching any data |
 | the storage-token endpoint refuses a caller with no API key | 401 and nothing handed out; that token works directly against deis-store and does not expire, so it goes through the same door a deploy does |
-| `deis kv` reads what the application wrote | the CLI asks the control plane for this tenant's token, then talks to deis-store with it; it never sees `storage_auth_secret` |
+| `deis kv` reads what the application wrote | the CLI asks the control plane for this tenant's token, then talks to deis-store with it; it never holds the capability signing key |
 | three named `kv` bindings of one application never see each other | `context.env.KV`, `context.env.HOT` and `context.env.COLD` hold three different values for one key |
 | a binding name cannot be made to address another tenant | five hostile names are refused before anything touches disk, and a token for one tenant cannot name another's namespace |
 | `deis kv --binding` reads the namespace a binding names | and prints `demo.production@HOT` rather than the tenant alone |

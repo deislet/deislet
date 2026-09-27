@@ -274,7 +274,7 @@ API key 能不能从控制面领到那张令牌。
 | 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
 | | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
 | | 不带 API key 打 `GET /api/apps/:app/environments/:env/storage-token` | 401，什么也拿不到；同一发带上 key 才拿到租户名、deis-store 地址与令牌本身（令牌不打印）。这张令牌绕过控制面直接对 deis-store 生效、而且不过期，所以它和部署走同一道门——这是「成功了算失败」的第三项 |
-| | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾看不到 `storage_auth_secret`，它只拿到这一个租户的令牌 |
+| | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾碰不到控制面的能力签名密钥，它只拿到这一个租户的令牌 |
 | | `deis db query` 发一条数到二十亿的递归查询 | deis-store 在几秒内把它停下来，而不是跑到底；拒绝的话写在响应里（跟一个 SQL 拼写错一样），并且同时点出上限是多少、要改哪里。管的是这个租户的 SQL 能花多少，跟它能碰哪些数据是两件事 |
 | | 一个租户的 SQL 去读另一个租户的表、去点它的文件名 | 两样都够不到：库是一租户一个文件，schema 和路径在查询里都不可达 |
 | | 往一行里塞二十兆的单元格 | 在分配之前就被拒，回话点名 8388608 字节这条「任何单个字符串 / blob / 行」的上限，并指向 blob 服务——这个尺寸的载荷该走那里 |
