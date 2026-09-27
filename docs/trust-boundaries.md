@@ -322,10 +322,19 @@ knowing:
   (`MachineIdentity::announce_expiry` / `report_expiry`). The threshold is a
   fraction of the certificate's own lifetime - `warn` at four fifths spent,
   `error` at nineteen twentieths - rather than a number of days, because this
-  platform is handed both two-day certificates and multi-year ones, and a
+  platform is handed both four-day certificates and multi-year ones, and a
   fixed threshold would either say nothing useful on one or fire on every
   correct startup on the other. A warning that fires when nothing is wrong is
-  how an operator learns to skip the one that matters.
+  how an operator learns to skip the one that matters. One absolute rule sits
+  beside the fractions: under 48 hours left always warns, because a 24 hour
+  control-plane outage starting then could outlast the certificate.
+- **A certificate must be issued for at least 72 hours.** A machine rides out
+  a control-plane outage of up to 24 hours on what it already holds, and
+  nothing can renew its certificate while the control plane is down. A
+  certificate issued for less (`not_after - not_before < 72h`) is refused when
+  it is loaded (`IdentityError::LifetimeTooShort`, checked in
+  `crates/deis-identity/src/material.rs`) - at startup, and on a rotation,
+  where the material already in force stays in use.
 - A re-read that fails leaves the material already in force in use, and says
   so at `warn`. If it keeps failing until the current certificate expires,
   every connection on the machine channel starts failing at once.

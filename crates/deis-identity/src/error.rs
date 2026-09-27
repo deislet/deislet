@@ -52,6 +52,15 @@ pub enum IdentityError {
     #[error("a TLS configuration could not be built from this identity: {0}")]
     Tls(#[from] rustls::Error),
 
+    #[error(
+        "the certificate in {path} was issued for {lifetime_hours} hour(s), and a machine certificate has to be issued for at least {minimum_hours}: a control-plane outage is ridden out on what a machine already holds, and a certificate that cannot outlast one takes the machine off the channel in the middle of it"
+    )]
+    LifetimeTooShort {
+        path: PathBuf,
+        lifetime_hours: i64,
+        minimum_hours: i64,
+    },
+
     #[error("a certificate could not be parsed to find the name it carries: {0}")]
     UnparsableCertificate(String),
 

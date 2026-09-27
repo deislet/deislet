@@ -125,9 +125,37 @@ impl TestCa {
         self.sign(spiffe_id.as_str(), subject_alt_names)
     }
 
+    /// A certificate naming one machine, valid from a minute ago for
+    /// `lifetime`.
+    ///
+    /// Every other method here issues rcgen's default window, which runs for
+    /// centuries; this is for the tests about how long a certificate is.
+    pub fn issue_for(&self, spiffe_id: &SpiffeId, lifetime: std::time::Duration) -> Issued {
+        let not_before = time::OffsetDateTime::now_utc() - time::Duration::minutes(1);
+        let lifetime = time::Duration::try_from(lifetime).expect("a lifetime that fits");
+        self.sign_valid(
+            spiffe_id.as_str(),
+            vec![uri_san(spiffe_id.as_str())],
+            Some((not_before, not_before + lifetime)),
+        )
+    }
+
     fn sign(&self, holder: &str, subject_alt_names: Vec<SanType>) -> Issued {
+        self.sign_valid(holder, subject_alt_names, None)
+    }
+
+    fn sign_valid(
+        &self,
+        holder: &str,
+        subject_alt_names: Vec<SanType>,
+        window: Option<(time::OffsetDateTime, time::OffsetDateTime)>,
+    ) -> Issued {
         let key = KeyPair::generate().expect("a key pair");
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf parameters");
+        if let Some((not_before, not_after)) = window {
+            params.not_before = not_before;
+            params.not_after = not_after;
+        }
         params.subject_alt_names = subject_alt_names;
         // A subject of this leaf's own, distinct from the root's. rcgen would
         // otherwise stamp every certificate it makes - the authority included

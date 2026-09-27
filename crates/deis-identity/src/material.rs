@@ -26,7 +26,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 
 use crate::IdentityFiles;
-use crate::cert::{name_in_certificate, validity_of};
+use crate::cert::{MIN_CERTIFICATE_LIFETIME_SECS, name_in_certificate, validity_of};
 use crate::error::{FileRole, IdentityError};
 use crate::names::ServiceKind;
 use crate::spiffe::SpiffeId;
@@ -90,6 +90,16 @@ impl Material {
         // The same certificate, read twice for two different questions: who
         // this machine is, and how long it may go on saying so.
         let validity = validity_of(&chain[0])?;
+        // Refused here rather than warned about later, because a rotation to
+        // a certificate this short is exactly as dangerous as starting on
+        // one - and refusing it keeps the material already in force.
+        if validity.lifetime() < MIN_CERTIFICATE_LIFETIME_SECS {
+            return Err(IdentityError::LifetimeTooShort {
+                path: files.certificate.clone(),
+                lifetime_hours: validity.lifetime() / 3600,
+                minimum_hours: MIN_CERTIFICATE_LIFETIME_SECS / 3600,
+            });
+        }
 
         let peer_verifier =
             WebPkiClientVerifier::builder_with_provider(Arc::clone(&roots), Arc::clone(&provider))

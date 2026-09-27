@@ -10,3 +10,5 @@ description = "A certificate authority small enough to hand a test, for harnesse
 [dependencies]
 deis-identity = { path = "../deis-identity" }
 rcgen = "0.14"
+# Validity windows relative to now, for certificates of a chosen lifetime.
+time = "0.3"

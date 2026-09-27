@@ -115,7 +115,7 @@ Enrollment token 不是机器日常凭证，不能读取 assignment、bundle、r
 
 - 续期请求必须在 mTLS 下由当前 active principal 发起，同时以新私钥签署 CSR proof-of-possession。
 - 新证书保持同一 SPIFFE ID，记录 predecessor/successor 和新的 SPKI；旧、新证书只在有界 overlap 内同时有效。
-- 默认证书期限 30 分钟，production 最大值 24 小时。默认在已用三分之二寿命前续期，带抖动与退避；不能靠延长 leaf 寿命替代可靠续期和撤销。
+- 机器证书签发寿命不少于 72 小时（`deis_identity::MIN_CERTIFICATE_LIFETIME_SECS`）：节点在控制面失联期间最多靠已有材料运行 24 小时，其间证书无法续期，所以证书必须撑过这个窗口并留出事后续期的余量。更短的证书在加载时即被拒绝（启动与轮换都一样，轮换失败时保留正在使用的材料）；剩余不足 48 小时时每个检查周期都告警。默认在已用三分之二寿命前续期，带抖动与退避；不能靠延长 leaf 寿命替代可靠续期和撤销。
 - 已过期、suspended/revoked principal、旧 auth epoch、错误 kind/installation 或未经证明的新密钥不能续期。离线过期实例必须重新 enrollment，不能用过期证书自救。
 
 ### Registration

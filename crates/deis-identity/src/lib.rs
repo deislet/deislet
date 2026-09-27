@@ -71,7 +71,9 @@ use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, ServerConfig};
 use tracing::{error, info, warn};
 
-pub use crate::cert::name_in_certificate;
+pub use crate::cert::{
+    EXPIRY_WARNING_SECS, MIN_CERTIFICATE_LIFETIME_SECS, Validity, name_in_certificate,
+};
 pub use crate::dial::Dialler;
 pub use crate::error::{FileRole, IdentityError};
 pub use crate::names::ServiceKind;
@@ -262,7 +264,7 @@ impl MachineIdentity {
     ///
     /// # Why the threshold is a fraction and not a number of days
     ///
-    /// Deislet is handed both two-day certificates (its own demo) and
+    /// Deislet is handed both four-day certificates (its own demo) and
     /// multi-year ones. A week's notice is early on one and already too late
     /// on the other, and a fixed threshold would either say nothing useful or
     /// fire on every correct startup - which teaches an operator that this
@@ -307,11 +309,12 @@ impl MachineIdentity {
                  restart"
             );
         }
-        // T8: the control-plane disconnect grace period needs at least 72 h
-        // of certificate validity.  If the certificate drops below 48 h it
-        // cannot survive a full 24 h grace window plus the TLS handshake
-        // skew, so the operator must be warned on every report cycle.
-        if remaining > 0 && remaining < 172_800 {
+        // A machine rides out a control-plane outage of up to 24 hours on
+        // what it holds, and certificates are issued for at least 72 (see
+        // `cert::MIN_CERTIFICATE_LIFETIME_SECS`). Below 48 hours left, an
+        // outage starting now could outlast the certificate, so this warns
+        // on every report cycle whatever fraction of the life that is.
+        if remaining > 0 && remaining < crate::cert::EXPIRY_WARNING_SECS {
             warn!(
                 identity = %id,
                 certificate = %certificate,

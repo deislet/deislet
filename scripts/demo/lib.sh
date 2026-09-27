@@ -336,7 +336,7 @@ mint_ca() {
   local prefix=$1
   local subject=$2
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-    -keyout "${prefix}.key" -out "${prefix}.crt" -days 2 \
+    -keyout "${prefix}.key" -out "${prefix}.crt" -days 4 \
     -subj "/CN=${subject}" \
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
@@ -371,7 +371,7 @@ subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid
 EXT
   openssl x509 -req -in "${leaf}.csr" -CA "${ca}.crt" -CAkey "${ca}.key" \
-    -CAcreateserial -days 2 -extfile "${leaf}.ext" -out "${leaf}.crt" \
+    -CAcreateserial -days 4 -extfile "${leaf}.ext" -out "${leaf}.crt" \
     >/dev/null 2>&1
   rm -f "${leaf}.csr" "${leaf}.ext"
 }

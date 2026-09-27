@@ -59,6 +59,22 @@ pub fn name_in_certificate(der: &[u8]) -> Result<SpiffeId, IdentityError> {
     }
 }
 
+/// The shortest certificate a machine may be given, in seconds: 72 hours.
+///
+/// Set by the control-plane outage budget rather than by taste. A node keeps
+/// serving through an outage of up to 24 hours on what it already holds, and
+/// nothing can renew its certificate while the control plane is down - so a
+/// certificate has to outlast that window with room left over for the
+/// renewal that follows it, and for someone to notice the warning at
+/// [`EXPIRY_WARNING_SECS`] before it is too late. A certificate issued
+/// shorter than this is refused when it is loaded, not discovered to be too
+/// short in the middle of an outage.
+pub const MIN_CERTIFICATE_LIFETIME_SECS: i64 = 72 * 3600;
+
+/// Remaining lifetime below which every expiry report warns: 48 hours, the
+/// point past which a 24 hour outage could no longer be ridden out.
+pub const EXPIRY_WARNING_SECS: i64 = 48 * 3600;
+
 /// When a certificate starts and stops being valid, in seconds since the
 /// epoch.
 ///
@@ -95,6 +111,11 @@ impl Validity {
         }
         let elapsed = now - self.not_before;
         (elapsed as f64 / lifetime as f64).clamp(0.0, 1.0)
+    }
+
+    /// How long this certificate was issued for, in seconds.
+    pub fn lifetime(&self) -> i64 {
+        self.not_after - self.not_before
     }
 
     /// Seconds until this certificate stops being valid, negative once it has.
