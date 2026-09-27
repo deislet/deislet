@@ -25,8 +25,8 @@
 //! Machines are admitted on the machine channel by the certificate each one
 //! proves, which names one machine and is not part of this model:
 //! that channel hands out decrypted secrets and answers to machines, not to
-//! people, so it has no account and no scope. `storage_auth_secret` still
-//! signs the capability tokens that talk to deis-store. Three ways of being
+//! people, so it has no account and no scope. Capabilities for deis-store and
+//! deis-queue are signed by [`crate::capability_issuer`]. Three ways of being
 //! admitted, three channels, and this module is only about the third one -
 //! the people.
 

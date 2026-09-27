@@ -336,7 +336,7 @@ pub enum ApiError {
     /// control plane will not help, but the request itself was fine.
     ServiceUnavailable(String),
     /// This control plane is deliberately not set up to do what was asked -
-    /// a storage token with no `storage_auth_secret`, say.
+    /// a storage token with no `store_endpoint`, say.
     ///
     /// Deliberately 4xx and not [`Self::ServiceUnavailable`]: nothing here is
     /// unavailable or failing, and a 5xx tells every client and every proxy

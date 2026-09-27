@@ -2215,7 +2215,7 @@ impl Control {
     /// own checks*, and never hands out the key every tenant's token is
     /// derived from.
     ///
-    /// A control plane with no deis-store address or no `storage_auth_secret`
+    /// A control plane with no deis-store address
     /// answers 409 with a message naming the key to set, which the generic
     /// error path below prints as it stands: the caller is told what to fix
     /// rather than handed an empty token that fails later inside deis-store.

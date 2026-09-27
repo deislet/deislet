@@ -315,23 +315,12 @@ data_dir = "/var/lib/deis-control"
 # queue_endpoint = "http://127.0.0.1:8091"
 # telemetry_endpoint = "http://127.0.0.1:8092"
 
-# Shared secret the storage capability tokens are derived from.
-#
-# THIS MUST BE THE IDENTICAL STRING AS auth_secret ON BOTH deis-store AND
-# deis-queue. All three are one setting spelled in three files: set it here
-# and mint the wrong thing, or set it on the services and not here, and every
-# storage and queue call every application makes is refused with no hint why
-# in this file - the reason is on the *other* process's log line. Rotate it
-# by changing all three together.
-#
-# Leave it unset - the default - and no token is minted or shipped, which is
-# only safe while store_endpoint and queue_endpoint above point at services
-# that likewise have no auth_secret of their own and are bound to loopback.
-# The moment either service is configured with an auth_secret, every call
-# from every node is refused until this is set to match.
-#
-#   openssl rand -hex 32
-# storage_auth_secret = "put a long random string here"
+# There is no storage secret to configure. Calls to deis-store and deis-queue
+# carry Ed25519 capabilities this control plane signs with keys it keeps in
+# its own database, encrypted under secret_key_file above and rotated on
+# their own; the two services fetch the public keys from
+# /.well-known/deis/capability-jwks.json on this listener (their
+# capability_jwks_url setting).
 
 # Independent backend-migration administrator credentials. Each value must
 # match migration_admin_token on the corresponding service, contain at least

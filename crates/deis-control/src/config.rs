@@ -158,28 +158,6 @@ pub struct ControlConfig {
     /// identity across logs, metrics and traces.
     #[serde(default)]
     pub telemetry_endpoint: Option<String>,
-    /// Shared secret the storage capability tokens are derived from. It must
-    /// be the identical string that deis-store and deis-queue carry as their
-    /// own `auth_secret`.
-    ///
-    /// Unlike [`Self::store_endpoint`] this is a credential, so it is never
-    /// logged and never travels to a node as itself: the control plane mints
-    /// one token per tenant with
-    /// [`deis_wire::conventions::storage_token`] and ships only that. A token
-    /// authorises exactly the one tenant it was derived for, so a value that
-    /// leaks out of one application is useless against another's data.
-    ///
-    /// Unset - the single-box default - means no token is minted and none is
-    /// shipped. That is only safe while both storage services are bound to
-    /// loopback and have no `auth_secret` of their own; they refuse to start
-    /// on any other address without one. Setting it here while the services
-    /// have no secret is harmless, and setting it on the services while it is
-    /// unset here refuses every storage call every application makes.
-    ///
-    /// A blank or whitespace-only value counts as unset, so an empty string
-    /// in the file cannot become an HMAC key that happens to compute.
-    #[serde(default)]
-    pub storage_auth_secret: Option<String>,
     /// Independent administrator credential used only when Control calls the
     /// deis-store backend-migration service. It is never derived from, equal
     /// to, or sent in place of an application storage capability.
@@ -456,7 +434,6 @@ impl Default for ControlConfig {
             store_endpoint: None,
             queue_endpoint: None,
             telemetry_endpoint: None,
-            storage_auth_secret: None,
             store_migration_admin_token: None,
             queue_migration_admin_token: None,
             telemetry_migration_admin_token: None,
@@ -499,10 +476,6 @@ impl std::fmt::Debug for ControlConfig {
             .field("store_endpoint", &self.store_endpoint)
             .field("queue_endpoint", &self.queue_endpoint)
             .field("telemetry_endpoint", &self.telemetry_endpoint)
-            .field(
-                "storage_auth_secret",
-                &self.storage_auth_secret.as_ref().map(|_| "<redacted>"),
-            )
             .field(
                 "store_migration_admin_token",
                 &self
