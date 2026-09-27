@@ -2232,10 +2232,14 @@ dependencies = [
  "base64 0.22.1",
  "deis-wire",
  "ed25519-dalek",
+ "reqwest",
  "serde",
  "serde_jcs",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

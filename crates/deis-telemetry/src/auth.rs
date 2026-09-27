@@ -286,6 +286,13 @@ fn map_capability_error(e: CapabilityError) -> Status {
             tracing::warn!("refused a telemetry call whose capability claims are invalid");
             Status::invalid_argument(e.to_string())
         }
+        CapabilityError::UnknownKey { .. } => {
+            tracing::warn!(
+                "refused a telemetry call whose capability names a signing key this service does \
+                 not hold"
+            );
+            Status::unauthenticated(e.to_string())
+        }
     }
 }
 

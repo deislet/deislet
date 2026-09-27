@@ -19,6 +19,9 @@
 //! - The signature is a raw Ed25519 signature (64 bytes) over the
 //!   canonicalized claims bytes.
 //! - Both payload and signature use base64url without padding.
+//! - The claims name the signing key in `kid` (its RFC 7638 thumbprint, see
+//!   [`keys`]); a verifier holding several keys picks the one named, which
+//!   is what lets the control plane rotate its key without a flag day.
 //!
 //! # Token lifetime
 //!
@@ -33,6 +36,53 @@ use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub mod keys;
+#[cfg(feature = "jwks-fetch")]
+pub mod fetch;
+
+pub use keys::{Jwk, Jwks, JwksError, KeyRing, key_id};
+
+// ---- audiences and bindings -----------------------------------------------
+
+/// Audience of a capability for deis-store.
+pub const AUD_STORE: &str = "store";
+/// Audience of a capability for deis-queue.
+pub const AUD_QUEUE: &str = "queue";
+
+/// The bindings deis-store serves, one per service; each verifies its own.
+pub const STORE_BINDINGS: &[&str] = &["kv", "sql", "blob"];
+/// The one binding deis-queue serves.
+pub const QUEUE_BINDINGS: &[&str] = &["queue"];
+
+/// The bindings a capability for `aud` has to name so every service behind
+/// that audience accepts it, or `None` for an audience with no per-tenant
+/// bindings.
+pub fn bindings_for_audience(aud: &str) -> Option<&'static [&'static str]> {
+    match aud {
+        AUD_STORE => Some(STORE_BINDINGS),
+        AUD_QUEUE => Some(QUEUE_BINDINGS),
+        _ => None,
+    }
+}
+
+/// One resource per binding of `aud` for `tenant`: what a capability that
+/// may use every service of that audience for the tenant carries. Empty for
+/// an audience with no per-tenant bindings.
+///
+/// Every issuer builds its resource list here, so a token minted anywhere
+/// in the control plane names exactly the bindings the verifiers check.
+pub fn resources_for_audience(tenant: &str, aud: &str) -> Vec<CapabilityResource> {
+    bindings_for_audience(aud)
+        .unwrap_or_default()
+        .iter()
+        .map(|binding| CapabilityResource {
+            tenant: tenant.to_string(),
+            binding: (*binding).to_string(),
+            generation: None,
+        })
+        .collect()
+}
 
 // ---- wire format constants ------------------------------------------------
 
@@ -116,6 +166,12 @@ pub enum CapabilityError {
     /// The token is not yet valid (iat in the future beyond clock skew).
     #[error("capability not yet valid (iat: {iat}, now: {now})")]
     NotYetValid { iat: u64, now: u64 },
+
+    /// The token names a signing key this verifier does not hold: signed by
+    /// a key published after the verifier last refreshed, by a retired key,
+    /// or by nothing the control plane ever published.
+    #[error("capability signed by unknown key {kid:?}")]
+    UnknownKey { kid: String },
 }
 
 // ---- claims types ---------------------------------------------------------
@@ -163,6 +219,11 @@ pub struct CapabilityClaims {
     /// Audience: `store`, `queue`, or `telemetry`.
     pub aud: String,
 
+    /// The signing key's RFC 7638 thumbprint. Set by [`encode`] from the key
+    /// it signs with, so a caller never has to fill it in.
+    #[serde(default)]
+    pub kid: String,
+
     /// Issuer identity (SPIFFE ID of the control plane).
     pub iss: String,
 
@@ -199,6 +260,7 @@ impl CapabilityClaims {
         let now = now_secs();
         Self {
             aud: aud.into(),
+            kid: String::new(),
             iss: iss.into(),
             jti: uuid::Uuid::now_v7().to_string(),
             exp: now.saturating_add(lifetime.as_secs()),
@@ -245,23 +307,47 @@ impl CapabilityClaims {
 /// Encode a capability token from claims and a signing key.
 ///
 /// Returns the wire-format string: `v1.<base64url(payload)>.<base64url(sig)>`.
+/// The `kid` claim is overwritten with the thumbprint of `signing_key`.
 pub fn encode(claims: &CapabilityClaims, signing_key: &ed25519_dalek::SigningKey) -> String {
-    let payload = serialize_claims(claims);
+    let claims = CapabilityClaims {
+        kid: key_id(&signing_key.verifying_key()),
+        ..claims.clone()
+    };
+    let payload = serialize_claims(&claims);
     let signature = signing_key.sign(&payload);
     let payload_b64 = base64url(&payload);
     let sig_b64 = base64url(signature.to_bytes().as_ref());
     format!("{VERSION_PREFIX}{payload_b64}{TOKEN_SEPARATOR}{sig_b64}")
 }
 
-/// Decode and verify a capability token.
+/// Decode and verify a capability token signed by `verifying_key`.
 ///
 /// Returns the deserialized claims on success, or a [`CapabilityError`]
-/// describing why verification failed.
+/// describing why verification failed. A token whose `kid` names another key
+/// is refused with [`CapabilityError::UnknownKey`].
 pub fn decode(
     token: &str,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<CapabilityClaims, CapabilityError> {
+    decode_with(token, &KeyRing::from_keys([*verifying_key]))
+}
+
+/// Decode and verify a capability token against whichever key in `keys` its
+/// `kid` names.
+pub fn decode_with(token: &str, keys: &KeyRing) -> Result<CapabilityClaims, CapabilityError> {
     let (payload_bytes, sig_bytes) = parse_token(token)?;
+
+    // The kid is read before the signature is checked: it only selects the
+    // key, and the signature over these same bytes then proves it.
+    #[derive(Deserialize)]
+    struct KeyHint {
+        #[serde(default)]
+        kid: String,
+    }
+    let hint: KeyHint = serde_json::from_slice(&payload_bytes).map_err(|e| {
+        CapabilityError::InvalidClaims(format!("claims deserialization failed: {e}"))
+    })?;
+    let verifying_key = keys.lookup(&hint.kid)?;
 
     let signature = ed25519_dalek::Signature::from_slice(&sig_bytes)
         .map_err(|e| CapabilityError::ParseError(format!("invalid signature bytes: {e}")))?;
@@ -341,24 +427,44 @@ pub fn verify_for_request(
     revoked_jtis: Option<&[String]>,
 ) -> Result<VerifiedCapability, CapabilityError> {
     let claims = decode(token, verifying_key)?;
+    check_claims(
+        claims,
+        false,
+        expected_aud,
+        tenant,
+        binding,
+        min_auth_epoch.unwrap_or(0),
+        revoked_jtis.unwrap_or_default(),
+    )
+}
 
-    // Check expiry
-    if claims.is_expired() {
+/// Every check after the signature: expiry (skipped when `grace_accepted`),
+/// issue time, audience, auth epoch, revocation, and the tenant + binding.
+fn check_claims(
+    claims: CapabilityClaims,
+    grace_accepted: bool,
+    expected_aud: &str,
+    tenant: &str,
+    binding: &str,
+    min_auth_epoch: u64,
+    revoked_jtis: &[String],
+) -> Result<VerifiedCapability, CapabilityError> {
+    let now = now_secs();
+
+    if claims.is_expired() && !grace_accepted {
         return Err(CapabilityError::Expired {
             exp: claims.exp,
-            now: now_secs(),
+            now,
         });
     }
 
-    // Check iat not in the future
-    if claims.is_not_yet_valid() {
+    if !grace_accepted && claims.is_not_yet_valid() {
         return Err(CapabilityError::NotYetValid {
             iat: claims.iat,
-            now: now_secs(),
+            now,
         });
     }
 
-    // Check audience
     if claims.aud != expected_aud {
         return Err(CapabilityError::WrongAudience {
             expected: expected_aud.to_string(),
@@ -366,26 +472,19 @@ pub fn verify_for_request(
         });
     }
 
-    // Check auth epoch
-    if let Some(minimum) = min_auth_epoch {
-        if claims.auth_epoch < minimum {
-            return Err(CapabilityError::AuthEpochTooLow {
-                got: claims.auth_epoch,
-                minimum,
-            });
-        }
+    if claims.auth_epoch < min_auth_epoch {
+        return Err(CapabilityError::AuthEpochTooLow {
+            got: claims.auth_epoch,
+            minimum: min_auth_epoch,
+        });
     }
 
-    // Check revocation
-    if let Some(revoked) = revoked_jtis {
-        if revoked.iter().any(|jti| jti == &claims.jti) {
-            return Err(CapabilityError::Revoked {
-                jti: claims.jti.clone(),
-            });
-        }
+    if revoked_jtis.iter().any(|jti| *jti == claims.jti) {
+        return Err(CapabilityError::Revoked {
+            jti: claims.jti.clone(),
+        });
     }
 
-    // Check tenant + binding
     if !claims.authorizes_binding(tenant, binding) {
         if !claims.authorizes_tenant(tenant) {
             return Err(CapabilityError::TenantNotAuthorized {
@@ -399,10 +498,10 @@ pub fn verify_for_request(
     }
 
     Ok(VerifiedCapability {
-        node_id: claims.sub.clone(),
+        node_id: claims.sub,
         canonical_tenant_id: tenant.to_string(),
         binding: binding.to_string(),
-        grace_accepted: false,
+        grace_accepted,
         exp: claims.exp,
     })
 }
@@ -411,14 +510,16 @@ pub fn verify_for_request(
 
 /// A reusable verifier for capability tokens.
 ///
-/// Bundles the verifying key with the two revocation-state inputs
+/// Bundles the key ring with the two revocation-state inputs
 /// (`min_auth_epoch` and `revoked_jtis`) and the T8 degraded-mode state
 /// (`last_sync`, `grace_max_secs`) so a service can construct one
 /// verifier at startup and reuse it for every request.
 #[derive(Debug, Clone)]
 pub struct CapabilityVerifier {
-    /// The Ed25519 public key for verifying signatures.
-    verifying_key: ed25519_dalek::VerifyingKey,
+    /// The control plane's published keys, picked by the token's `kid`.
+    /// Shared with whatever refreshes it, so a new key is picked up without
+    /// touching the verifier.
+    keys: KeyRing,
     /// Minimum auth_epoch accepted (loaded from revocation feed).
     min_auth_epoch: u64,
     /// List of revoked JTIs (loaded from revocation feed).
@@ -438,12 +539,18 @@ pub struct CapabilityVerifier {
 }
 
 impl CapabilityVerifier {
-    /// Create a verifier with `min_auth_epoch = 0`, an empty revoked list,
-    /// and T8 defaults (grace period = 24 h, skew = 30 s,
-    /// pull interval = 30 s).
+    /// A verifier trusting exactly one key, with `min_auth_epoch = 0`, an
+    /// empty revoked list, and T8 defaults (grace period = 24 h,
+    /// skew = 30 s, pull interval = 30 s).
     pub fn new(verifying_key: ed25519_dalek::VerifyingKey) -> Self {
+        Self::with_key_ring(KeyRing::from_keys([verifying_key]))
+    }
+
+    /// A verifier trusting whatever `keys` holds at the time of each call,
+    /// with the same defaults as [`Self::new`].
+    pub fn with_key_ring(keys: KeyRing) -> Self {
         Self {
-            verifying_key,
+            keys,
             min_auth_epoch: 0,
             revoked_jtis: Vec::new(),
             last_sync: None,
@@ -452,6 +559,11 @@ impl CapabilityVerifier {
             pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
             grace_accepted_total: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The key ring this verifier checks signatures against.
+    pub fn key_ring(&self) -> &KeyRing {
+        &self.keys
     }
 
     /// Update the minimum accepted auth epoch.
@@ -528,14 +640,15 @@ impl CapabilityVerifier {
         tenant: &str,
         binding: &str,
     ) -> Result<VerifiedCapability, CapabilityError> {
-        verify_for_request(
-            token,
-            &self.verifying_key,
+        let claims = decode_with(token, &self.keys)?;
+        check_claims(
+            claims,
+            false,
             expected_aud,
             tenant,
             binding,
-            Some(self.min_auth_epoch),
-            Some(&self.revoked_jtis),
+            self.min_auth_epoch,
+            &self.revoked_jtis,
         )
     }
 
@@ -557,78 +670,27 @@ impl CapabilityVerifier {
         tenant: &str,
         binding: &str,
     ) -> Result<VerifiedCapability, CapabilityError> {
-        let claims = decode(token, &self.verifying_key)?;
+        let claims = decode_with(token, &self.keys)?;
         let now = now_secs();
-        let is_node = is_node_subject(&claims.sub);
         let grace_accepted = claims.is_expired()
-            && is_node
+            && is_node_subject(&claims.sub)
             && self.is_degraded()
             && self.grace_applies(&claims, now);
 
-        // Check expiry with grace.
-        if claims.is_expired() && !grace_accepted {
-            return Err(CapabilityError::Expired {
-                exp: claims.exp,
-                now,
-            });
-        }
-
-        // Iat must not be in the future (checked even in grace).
-        if !grace_accepted && claims.is_not_yet_valid() {
-            return Err(CapabilityError::NotYetValid {
-                iat: claims.iat,
-                now,
-            });
-        }
-
-        // Check audience.
-        if claims.aud != expected_aud {
-            return Err(CapabilityError::WrongAudience {
-                expected: expected_aud.to_string(),
-                got: claims.aud,
-            });
-        }
-
-        // Check auth epoch.
-        if claims.auth_epoch < self.min_auth_epoch {
-            return Err(CapabilityError::AuthEpochTooLow {
-                got: claims.auth_epoch,
-                minimum: self.min_auth_epoch,
-            });
-        }
-
-        // Check revocation.
-        if self.revoked_jtis.iter().any(|jti| *jti == claims.jti) {
-            return Err(CapabilityError::Revoked {
-                jti: claims.jti.clone(),
-            });
-        }
-
-        // Check tenant + binding.
-        if !claims.authorizes_binding(tenant, binding) {
-            if !claims.authorizes_tenant(tenant) {
-                return Err(CapabilityError::TenantNotAuthorized {
-                    tenant: tenant.to_string(),
-                });
-            }
-            return Err(CapabilityError::BindingNotAuthorized {
-                tenant: tenant.to_string(),
-                binding: binding.to_string(),
-            });
-        }
-
-        if grace_accepted {
-            self.grace_accepted_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        Ok(VerifiedCapability {
-            node_id: claims.sub.clone(),
-            canonical_tenant_id: tenant.to_string(),
-            binding: binding.to_string(),
+        let verified = check_claims(
+            claims,
             grace_accepted,
-            exp: claims.exp,
-        })
+            expected_aud,
+            tenant,
+            binding,
+            self.min_auth_epoch,
+            &self.revoked_jtis,
+        )?;
+
+        if verified.grace_accepted {
+            self.grace_accepted_total.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(verified)
     }
 
     /// Check whether the two grace-period conditions are satisfied.
@@ -724,7 +786,13 @@ mod tests {
         assert!(token.starts_with("v1."));
 
         let decoded = decode(&token, &verifying).unwrap();
-        assert_eq!(decoded, claims);
+        assert_eq!(
+            decoded,
+            CapabilityClaims {
+                kid: key_id(&verifying),
+                ..claims
+            }
+        );
     }
 
     #[test]
@@ -776,11 +844,103 @@ mod tests {
         let other_signing = SigningKey::from_bytes(&seed);
         let other_verifying = other_signing.verifying_key();
 
+        // The token names its own key, which this verifier does not hold.
         let result = decode(&token, &other_verifying);
         assert!(
-            matches!(result, Err(CapabilityError::BadSignature(_))),
-            "expected BadSignature, got {result:?}"
+            matches!(result, Err(CapabilityError::UnknownKey { .. })),
+            "expected UnknownKey, got {result:?}"
         );
+    }
+
+    /// A token that names a trusted key but was signed by another one is a
+    /// forgery, and the signature check is what catches it.
+    #[test]
+    fn a_kid_naming_a_trusted_key_does_not_excuse_a_foreign_signature() {
+        let (_, trusted) = make_keypair();
+        let forger = SigningKey::from_bytes(&[9u8; 32]);
+        let mut claims = make_claims("store");
+        claims.kid = key_id(&trusted);
+        // Signed by hand so `encode` cannot correct the kid.
+        let payload = serialize_claims(&claims);
+        let signature = forger.sign(&payload);
+        let token = format!(
+            "{VERSION_PREFIX}{}{TOKEN_SEPARATOR}{}",
+            base64url(&payload),
+            base64url(&signature.to_bytes())
+        );
+        assert!(matches!(
+            decode(&token, &trusted),
+            Err(CapabilityError::BadSignature(_))
+        ));
+    }
+
+    #[test]
+    fn encode_names_the_signing_key() {
+        let (signing, verifying) = make_keypair();
+        let token = encode(&make_claims("store"), &signing);
+        let claims = decode(&token, &verifying).unwrap();
+        assert_eq!(claims.kid, key_id(&verifying));
+    }
+
+    /// Rotation as a verifier sees it: tokens from the old and the new key
+    /// both verify while both are published, and the old key's tokens stop
+    /// the moment it is dropped from the ring.
+    #[test]
+    fn a_verifier_accepts_every_published_key_and_only_those() {
+        let old = SigningKey::from_bytes(&[1u8; 32]);
+        let new = SigningKey::from_bytes(&[2u8; 32]);
+        let ring = KeyRing::from_keys([old.verifying_key(), new.verifying_key()]);
+        let verifier = CapabilityVerifier::with_key_ring(ring.clone());
+        let tenant = "app.production";
+        let claims = CapabilityClaims::new(
+            AUD_STORE,
+            "issuer",
+            "subject",
+            1,
+            Duration::from_secs(900),
+            resources_for_audience(tenant, AUD_STORE),
+        );
+        let old_token = encode(&claims, &old);
+        let new_token = encode(&claims, &new);
+        assert!(verifier.verify(&old_token, AUD_STORE, tenant, "kv").is_ok());
+        assert!(verifier.verify(&new_token, AUD_STORE, tenant, "kv").is_ok());
+
+        ring.replace([new.verifying_key()]);
+        assert!(matches!(
+            verifier.verify(&old_token, AUD_STORE, tenant, "kv"),
+            Err(CapabilityError::UnknownKey { .. })
+        ));
+        assert!(verifier.verify(&new_token, AUD_STORE, tenant, "kv").is_ok());
+    }
+
+    /// What an issuer builds for an audience is exactly what each verifier
+    /// behind it checks.
+    #[test]
+    fn resources_for_an_audience_satisfy_every_service_behind_it() {
+        let (signing, verifying) = make_keypair();
+        let verifier = CapabilityVerifier::new(verifying);
+        let tenant = "app.production";
+        for (aud, bindings) in [(AUD_STORE, STORE_BINDINGS), (AUD_QUEUE, QUEUE_BINDINGS)] {
+            let claims = CapabilityClaims::new(
+                aud,
+                "issuer",
+                "subject",
+                1,
+                Duration::from_secs(900),
+                resources_for_audience(tenant, aud),
+            );
+            let token = encode(&claims, &signing);
+            for binding in bindings {
+                verifier
+                    .verify(&token, aud, tenant, binding)
+                    .unwrap_or_else(|e| panic!("{aud}/{binding}: {e}"));
+            }
+            assert!(matches!(
+                verifier.verify(&token, aud, "other.production", bindings[0]),
+                Err(CapabilityError::TenantNotAuthorized { .. })
+            ));
+        }
+        assert!(resources_for_audience(tenant, "telemetry").is_empty());
     }
 
     #[test]
@@ -1077,6 +1237,7 @@ mod tests {
         // Use manual construction to avoid auto-generated jti.
         let claims1 = CapabilityClaims {
             aud: "store".into(),
+            kid: String::new(),
             iss: "spiffe://deislet/control/main".into(),
             jti: "00000000-0000-7000-8000-000000000001".into(),
             exp: 1790478752,
@@ -1131,6 +1292,7 @@ mod tests {
         // Token with empty string tenant in resource should still parse
         let claims = CapabilityClaims {
             aud: "store".into(),
+            kid: String::new(),
             iss: "issuer".into(),
             sub: "subject".into(),
             jti: uuid::Uuid::now_v7().to_string(),
@@ -1167,6 +1329,7 @@ mod tests {
         let iat = exp.saturating_sub(900);
         let claims = CapabilityClaims {
             aud: "store".into(),
+            kid: String::new(),
             iss: "spiffe://deislet/control/main".into(),
             sub: "spiffe://deislet/node/n1".into(),
             jti: uuid::Uuid::now_v7().to_string(),
@@ -1194,6 +1357,7 @@ mod tests {
         let iat = exp.saturating_sub(900);
         let claims = CapabilityClaims {
             aud: "store".into(),
+            kid: String::new(),
             iss: "spiffe://deislet/control/main".into(),
             sub: "spiffe://deislet/human/alice".into(),
             jti: uuid::Uuid::now_v7().to_string(),

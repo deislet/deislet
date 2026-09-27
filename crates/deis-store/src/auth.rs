@@ -250,6 +250,14 @@ fn map_capability_error(e: CapabilityError) -> Status {
             tracing::warn!("refused a storage call whose capability claims are invalid");
             Status::invalid_argument(e.to_string())
         }
+        CapabilityError::UnknownKey { .. } => {
+            tracing::warn!(
+                "refused a storage call whose capability names a signing key this service does not \
+                 hold; a refresh of the control plane's keys has been requested, so a token from \
+                 a newly rotated key is accepted once it lands"
+            );
+            Status::unauthenticated(e.to_string())
+        }
     }
 }
 
