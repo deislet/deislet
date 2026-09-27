@@ -59,10 +59,40 @@ pub const AUD_STORE: &str = "store";
 /// Audience of a capability for deis-queue.
 pub const AUD_QUEUE: &str = "queue";
 
+/// Audience of a capability for deis-telemetry.
+pub const AUD_TELEMETRY: &str = "telemetry";
+
 /// The bindings deis-store serves, one per service; each verifies its own.
 pub const STORE_BINDINGS: &[&str] = &["kv", "sql", "blob"];
 /// The one binding deis-queue serves.
 pub const QUEUE_BINDINGS: &[&str] = &["queue"];
+
+/// The deis-telemetry binding that may push logs, traces and metric samples
+/// for its tenant. It reads nothing.
+pub const TELEMETRY_INGEST: &str = "ingest";
+/// The deis-telemetry binding that may query and follow its tenant's logs,
+/// traces and metric samples. It writes nothing.
+pub const TELEMETRY_READ: &str = "read";
+/// What a node's tenant resource for deis-telemetry names: a node ships, it
+/// never reads.
+pub const TELEMETRY_BINDINGS: &[&str] = &[TELEMETRY_INGEST];
+
+/// The tenant a deis-telemetry resource names when it is about the platform
+/// rather than about one application environment.
+///
+/// With [`TELEMETRY_INGEST`] it lets a node push its own, node-level records
+/// (the ones carrying no application); with [`TELEMETRY_READ`] it lets an
+/// operator read everything, every tenant's records and the platform's own.
+/// Never a real tenant: a tenant is always `<app>.<environment>`, and this
+/// has no `.`.
+pub const TELEMETRY_PLATFORM_TENANT: &str = "@platform";
+
+/// The longest a capability may be valid for, `exp - iat`, in seconds.
+///
+/// Every issuer mints 15-minute tokens (ADR-025); a verifier refuses anything
+/// that claims to last longer, so a token minted outside the control plane's
+/// rules - a year-long one, say - is refused however it was signed.
+pub const MAX_CAPABILITY_LIFETIME_SECS: u64 = 15 * 60;
 
 /// The bindings a capability for `aud` has to name so every service behind
 /// that audience accepts it, or `None` for an audience with no per-tenant
@@ -71,6 +101,7 @@ pub fn bindings_for_audience(aud: &str) -> Option<&'static [&'static str]> {
     match aud {
         AUD_STORE => Some(STORE_BINDINGS),
         AUD_QUEUE => Some(QUEUE_BINDINGS),
+        AUD_TELEMETRY => Some(TELEMETRY_BINDINGS),
         _ => None,
     }
 }
@@ -447,8 +478,8 @@ pub fn verify_for_request(
     )
 }
 
-/// Every check after the signature: expiry (skipped when `grace_accepted`),
-/// issue time, audience, auth epoch, revocation, and the tenant + binding.
+/// Every check after the signature: the ones in [`check_common`], then the
+/// tenant + binding.
 fn check_claims(
     claims: CapabilityClaims,
     grace_accepted: bool,
@@ -458,41 +489,13 @@ fn check_claims(
     min_auth_epoch: u64,
     revoked_jtis: &[String],
 ) -> Result<VerifiedCapability, CapabilityError> {
-    let now = now_secs();
-
-    if claims.is_expired() && !grace_accepted {
-        return Err(CapabilityError::Expired {
-            exp: claims.exp,
-            now,
-        });
-    }
-
-    if !grace_accepted && claims.is_not_yet_valid() {
-        return Err(CapabilityError::NotYetValid {
-            iat: claims.iat,
-            now,
-        });
-    }
-
-    if claims.aud != expected_aud {
-        return Err(CapabilityError::WrongAudience {
-            expected: expected_aud.to_string(),
-            got: claims.aud,
-        });
-    }
-
-    if claims.auth_epoch < min_auth_epoch {
-        return Err(CapabilityError::AuthEpochTooLow {
-            got: claims.auth_epoch,
-            minimum: min_auth_epoch,
-        });
-    }
-
-    if revoked_jtis.iter().any(|jti| *jti == claims.jti) {
-        return Err(CapabilityError::Revoked {
-            jti: claims.jti.clone(),
-        });
-    }
+    check_common(
+        &claims,
+        grace_accepted,
+        expected_aud,
+        min_auth_epoch,
+        revoked_jtis,
+    )?;
 
     if !claims.authorizes_binding(tenant, binding) {
         if !claims.authorizes_tenant(tenant) {
@@ -513,6 +516,87 @@ fn check_claims(
         grace_accepted,
         exp: claims.exp,
     })
+}
+
+/// Every check after the signature that does not look at the resources:
+/// lifetime, expiry (skipped when `grace_accepted`), issue time, audience,
+/// auth epoch and revocation.
+fn check_common(
+    claims: &CapabilityClaims,
+    grace_accepted: bool,
+    expected_aud: &str,
+    min_auth_epoch: u64,
+    revoked_jtis: &[String],
+) -> Result<(), CapabilityError> {
+    let now = now_secs();
+
+    let lifetime = claims.exp.saturating_sub(claims.iat);
+    if lifetime > MAX_CAPABILITY_LIFETIME_SECS {
+        return Err(CapabilityError::InvalidClaims(format!(
+            "lifetime {lifetime}s exceeds the maximum of {MAX_CAPABILITY_LIFETIME_SECS}s"
+        )));
+    }
+
+    if claims.is_expired() && !grace_accepted {
+        return Err(CapabilityError::Expired {
+            exp: claims.exp,
+            now,
+        });
+    }
+
+    if !grace_accepted && claims.is_not_yet_valid() {
+        return Err(CapabilityError::NotYetValid {
+            iat: claims.iat,
+            now,
+        });
+    }
+
+    if claims.aud != expected_aud {
+        return Err(CapabilityError::WrongAudience {
+            expected: expected_aud.to_string(),
+            got: claims.aud.clone(),
+        });
+    }
+
+    if claims.auth_epoch < min_auth_epoch {
+        return Err(CapabilityError::AuthEpochTooLow {
+            got: claims.auth_epoch,
+            minimum: min_auth_epoch,
+        });
+    }
+
+    if revoked_jtis.iter().any(|jti| *jti == claims.jti) {
+        return Err(CapabilityError::Revoked {
+            jti: claims.jti.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+/// A capability that passed every check but the resource one, handed back
+/// whole so a service whose calls are not about exactly one tenant can decide
+/// per record what the resources allow.
+#[derive(Debug, Clone)]
+pub struct VerifiedGrant {
+    /// The principal the capability was issued to.
+    pub sub: String,
+    /// Every (tenant, binding) pair it authorizes.
+    pub resources: Vec<CapabilityResource>,
+    /// `true` when accepted under T8 degraded-mode grace rules.
+    pub grace_accepted: bool,
+    /// Token expiry as Unix seconds.
+    pub exp: u64,
+}
+
+impl VerifiedGrant {
+    /// The tenants this grant names with `binding`.
+    pub fn tenants_with<'a>(&'a self, binding: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.resources
+            .iter()
+            .filter(move |r| r.binding == binding)
+            .map(|r| r.tenant.as_str())
+    }
 }
 
 // ---- verifier -------------------------------------------------------------
@@ -801,6 +885,46 @@ impl CapabilityVerifier {
         Ok(verified)
     }
 
+    /// Verify a token against an expected audience only, with the same T8
+    /// grace as [`Self::verify_with_grace`], and hand back its resources for
+    /// the caller to check.
+    ///
+    /// For a service whose one call can touch several tenants - a
+    /// deis-telemetry push carries every application on a node - and which
+    /// therefore cannot name the one tenant [`Self::verify_with_grace`]
+    /// needs. The caller must then refuse whatever the resources do not
+    /// name; an empty resource list authorizes nothing.
+    pub fn verify_grant_with_grace(
+        &self,
+        token: &str,
+        expected_aud: &str,
+    ) -> Result<VerifiedGrant, CapabilityError> {
+        let claims = decode_with(token, &self.keys)?;
+        let now = now_secs();
+        let grace_accepted = claims.is_expired()
+            && is_node_subject(&claims.sub, self.trust_domain.as_deref())
+            && self.is_degraded()
+            && self.grace_applies(&claims, now);
+
+        check_common(
+            &claims,
+            grace_accepted,
+            expected_aud,
+            self.min_auth_epoch,
+            &self.revoked_jtis,
+        )?;
+
+        if grace_accepted {
+            self.grace_accepted_total.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(VerifiedGrant {
+            sub: claims.sub,
+            resources: claims.resources,
+            grace_accepted,
+            exp: claims.exp,
+        })
+    }
+
     /// Check whether the two grace-period conditions are satisfied.
     fn grace_applies(&self, claims: &CapabilityClaims, now: u64) -> bool {
         let last_unix = match self.last_sync_unix() {
@@ -1039,7 +1163,11 @@ mod tests {
         let (signing, verifying) = make_keypair();
         let verifier = CapabilityVerifier::new(verifying);
         let tenant = "app.production";
-        for (aud, bindings) in [(AUD_STORE, STORE_BINDINGS), (AUD_QUEUE, QUEUE_BINDINGS)] {
+        for (aud, bindings) in [
+            (AUD_STORE, STORE_BINDINGS),
+            (AUD_QUEUE, QUEUE_BINDINGS),
+            (AUD_TELEMETRY, TELEMETRY_BINDINGS),
+        ] {
             let claims = CapabilityClaims::new(
                 aud,
                 "issuer",
@@ -1059,7 +1187,7 @@ mod tests {
                 Err(CapabilityError::TenantNotAuthorized { .. })
             ));
         }
-        assert!(resources_for_audience(tenant, "telemetry").is_empty());
+        assert!(resources_for_audience(tenant, "telemetry.read").is_empty());
     }
 
     #[test]
@@ -1108,6 +1236,82 @@ mod tests {
             result.is_ok(),
             "capability at the boundary should pass with clock skew tolerance: {result:?}"
         );
+    }
+
+    #[test]
+    fn a_lifetime_beyond_the_maximum_is_refused() {
+        let (signing, verifying) = make_keypair();
+        let mut claims = make_claims("store");
+        claims.exp = claims.iat + 365 * 24 * 3600;
+        let token = encode(&claims, &signing);
+        let verifier = CapabilityVerifier::new(verifying);
+
+        let result = verifier.verify(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        );
+        assert!(
+            matches!(result, Err(CapabilityError::InvalidClaims(ref m)) if m.contains("lifetime")),
+            "a year-long token must be refused, got {result:?}"
+        );
+        let grant = verifier.verify_grant_with_grace(&token, "store");
+        assert!(
+            matches!(grant, Err(CapabilityError::InvalidClaims(_))),
+            "the grant path applies the same ceiling, got {grant:?}"
+        );
+
+        // Exactly the ceiling is what every issuer mints, and passes.
+        claims.exp = claims.iat + MAX_CAPABILITY_LIFETIME_SECS;
+        let token = encode(&claims, &signing);
+        assert!(verifier.verify_grant_with_grace(&token, "store").is_ok());
+    }
+
+    #[test]
+    fn a_grant_carries_every_resource_and_checks_everything_else() {
+        let (signing, verifying) = make_keypair();
+        let claims = CapabilityClaims::new(
+            AUD_TELEMETRY,
+            "spiffe://deislet/control/main",
+            "spiffe://deis.internal/deislet/node/n1",
+            1,
+            Duration::from_secs(900),
+            vec![
+                CapabilityResource {
+                    tenant: "shop.production".into(),
+                    binding: TELEMETRY_INGEST.into(),
+                    generation: None,
+                },
+                CapabilityResource {
+                    tenant: TELEMETRY_PLATFORM_TENANT.into(),
+                    binding: TELEMETRY_INGEST.into(),
+                    generation: None,
+                },
+            ],
+        );
+        let token = encode(&claims, &signing);
+        let mut verifier = CapabilityVerifier::new(verifying);
+
+        let grant = verifier
+            .verify_grant_with_grace(&token, AUD_TELEMETRY)
+            .expect("a well-formed telemetry capability");
+        assert_eq!(grant.sub, "spiffe://deis.internal/deislet/node/n1");
+        assert_eq!(
+            grant.tenants_with(TELEMETRY_INGEST).collect::<Vec<_>>(),
+            ["shop.production", TELEMETRY_PLATFORM_TENANT]
+        );
+        assert_eq!(grant.tenants_with(TELEMETRY_READ).count(), 0);
+
+        assert!(matches!(
+            verifier.verify_grant_with_grace(&token, AUD_STORE),
+            Err(CapabilityError::WrongAudience { .. })
+        ));
+        verifier.set_revoked_jtis(vec![claims.jti.clone()]);
+        assert!(matches!(
+            verifier.verify_grant_with_grace(&token, AUD_TELEMETRY),
+            Err(CapabilityError::Revoked { .. })
+        ));
     }
 
     #[test]
