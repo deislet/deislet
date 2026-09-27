@@ -31,6 +31,7 @@ use base64::Engine;
 use deis_wire::CanonicalTenantId;
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ---- wire format constants ------------------------------------------------
@@ -432,6 +433,8 @@ pub struct CapabilityVerifier {
     skew_secs: u64,
     /// Revocation-list pull interval in seconds.
     pull_interval_secs: u64,
+    /// Total number of expired tokens accepted under T8 degraded-mode grace rules.
+    grace_accepted_total: Arc<AtomicU64>,
 }
 
 impl CapabilityVerifier {
@@ -447,6 +450,7 @@ impl CapabilityVerifier {
             grace_max_secs: DEFAULT_GRACE_PERIOD_SECS,
             skew_secs: DEFAULT_DEGRADED_SKEW_SECS,
             pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
+            grace_accepted_total: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -475,6 +479,18 @@ impl CapabilityVerifier {
     /// clock.
     pub fn record_sync(&mut self) {
         self.last_sync = Some(Instant::now());
+    }
+
+    /// Total number of expired tokens accepted under T8 degraded-mode grace
+    /// rules since this verifier was created.
+    pub fn grace_accepted_total(&self) -> u64 {
+        self.grace_accepted_total.load(Ordering::Relaxed)
+    }
+
+    /// Seconds since the last successful revocation-list pull, or `None` if a
+    /// pull has never completed.
+    pub fn degraded_since_seconds(&self) -> Option<u64> {
+        self.last_sync.map(|last| last.elapsed().as_secs())
     }
 
     /// Whether the verifier is in degraded mode.
@@ -599,6 +615,11 @@ impl CapabilityVerifier {
                 tenant: tenant.to_string(),
                 binding: binding.to_string(),
             });
+        }
+
+        if grace_accepted {
+            self.grace_accepted_total
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(VerifiedCapability {
@@ -1271,6 +1292,32 @@ mod tests {
             }
             Err(e) => panic!("grace should accept recently-expired node token: {e}"),
         }
+    }
+
+    #[test]
+    fn grace_accepted_counter_increments() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, -60);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(3600));
+        assert!(verifier.is_degraded());
+        assert_eq!(verifier.grace_accepted_total(), 0);
+
+        // First grace acceptance.
+        let _ = verifier.verify_with_grace(
+            &token, "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        ).unwrap();
+        assert_eq!(verifier.grace_accepted_total(), 1);
+
+        // Second grace acceptance — counter accumulates.
+        let _ = verifier.verify_with_grace(
+            &token, "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        ).unwrap();
+        assert_eq!(verifier.grace_accepted_total(), 2);
     }
 
     #[test]

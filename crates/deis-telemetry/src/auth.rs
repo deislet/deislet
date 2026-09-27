@@ -108,6 +108,24 @@ impl TelemetryAuth {
             .record_sync();
     }
 
+    /// Total number of expired tokens accepted under T8 degraded-mode grace
+    /// rules since this auth was created.
+    pub fn grace_accepted_total(&self) -> u64 {
+        self.verifier
+            .read()
+            .expect("lock poisoned")
+            .grace_accepted_total()
+    }
+
+    /// Seconds since the last successful revocation-list pull, or `None` if a
+    /// pull has never completed.
+    pub fn degraded_since_seconds(&self) -> Option<u64> {
+        self.verifier
+            .read()
+            .expect("lock poisoned")
+            .degraded_since_seconds()
+    }
+
     /// Whether this service is enforcing capability checks.
     pub fn is_enforcing(&self) -> bool {
         self.enforcing
