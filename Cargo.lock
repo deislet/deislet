@@ -2370,6 +2370,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
+ "deis-build-adapter-cloudflare",
  "deis-build-core",
  "deis-provider-driver",
  "deis-wire",
@@ -2383,9 +2384,9 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
- "url",
  "zeroize",
 ]
 
