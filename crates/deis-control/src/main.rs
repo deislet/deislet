@@ -154,7 +154,10 @@ fn load_capability_vault(
 ) -> anyhow::Result<Arc<deis_control::catalog::secrets::SecretCipher>> {
     let path = config.secret_key_file.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "secret_key_file is not set. The capability signing keys are stored encrypted under              that master key and this control plane will not start without it; generate one              with `openssl rand -hex 32 > <data_dir>/keys/master.key` and name it in the              configuration file"
+            "secret_key_file is not set. The capability signing keys are stored encrypted under the \
+             master key it names and this control plane will not start without it; generate one \
+             with `openssl rand -hex 32 > <data_dir>/keys/master.key` and name it in the \
+             configuration file"
         )
     })?;
     let cipher = deis_control::catalog::secrets::SecretCipher::load_from_file(path)
