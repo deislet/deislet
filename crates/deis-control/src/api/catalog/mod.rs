@@ -19,6 +19,7 @@
 pub mod apps;
 pub mod artifacts;
 pub mod assignments;
+pub mod capabilities;
 pub mod deployments;
 pub mod domains;
 pub mod environments;
@@ -230,6 +231,24 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
         .route(
             &at("/apps/:app_id/environments/:env/secrets/:name"),
             put(secrets::put_secret).delete(secrets::delete_secret),
+        )
+        // Taking capabilities back: one, a node's, a tenant's, or all of them
+        // by the auth epoch. See `capabilities` for what each reaches.
+        .route(
+            &at("/apps/:app_id/environments/:env/capability-revocations"),
+            post(capabilities::revoke_tenant_capabilities),
+        )
+        .route(
+            &at("/capabilities/auth-epoch"),
+            post(capabilities::bump_auth_epoch),
+        )
+        .route(
+            &at("/capabilities/revocations/nodes/:node_id"),
+            post(capabilities::revoke_node_capabilities),
+        )
+        .route(
+            &at("/capabilities/:jti"),
+            delete(capabilities::revoke_capability),
         )
         // Who may claim which hostname. Not under `/api/apps`, because a
         // hostname is not a name inside an application - it is the one

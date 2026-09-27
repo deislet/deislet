@@ -466,6 +466,21 @@
         ],
         "type": "object"
       },
+      "AuthEpoch": {
+        "description": "The auth epoch after a bump.",
+        "properties": {
+          "auth_epoch": {
+            "description": "Every capability issued under a lower epoch is refused by every\nverifier once it adopts the next revocation list.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "auth_epoch"
+        ],
+        "type": "object"
+      },
       "BackendAttemptState": {
         "enum": [
           "acquiring",
@@ -1299,6 +1314,22 @@
           "validation",
           "attestations",
           "signatures"
+        ],
+        "type": "object"
+      },
+      "CapabilityRevocation": {
+        "description": "What a revocation took back.",
+        "properties": {
+          "revoked": {
+            "description": "Every capability revoked by this call, by `jti`. Only capabilities\nthat could still be accepted somewhere are listed; one that expired\nlong ago needs no revoking.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "revoked"
         ],
         "type": "object"
       },
@@ -10052,6 +10083,60 @@
         ]
       }
     },
+    "/api/v1/apps/{app_id}/environments/{env_name}/capability-revocations": {
+      "post": {
+        "description": "Every unexpired capability that names this application environment,\nwhoever it was issued to - nodes, operators, the control plane itself.",
+        "operationId": "revokeTenantCapabilities",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityRevocation"
+                }
+              }
+            },
+            "description": "Every capability naming the tenant is revoked."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Revoke every capability for an environment's storage tenant.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
     "/api/v1/apps/{app_id}/environments/{env_name}/deployment": {
       "get": {
         "description": "The current version of an environment: the newest pointer row.",
@@ -12471,6 +12556,124 @@
             "$ref": "#/components/responses/Internal"
           }
         },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/capabilities/auth-epoch": {
+      "post": {
+        "description": "Bumps the auth epoch. Every capability issued before this call is refused\nby every verifier once it adopts the next revocation list, whoever holds\nit; nodes obtain new ones on their next renewal, and every other holder\nhas to ask again.",
+        "operationId": "bumpAuthEpoch",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthEpoch"
+                }
+              }
+            },
+            "description": "The new auth epoch."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Revoke every capability issued so far.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/capabilities/revocations/nodes/{node_id}": {
+      "post": {
+        "description": "Every unexpired capability issued to the node with this id. Answers 200\nwith an empty list when it holds none.",
+        "operationId": "revokeNodeCapabilities",
+        "parameters": [
+          {
+            "description": "The node's id, as its certificate names it.",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityRevocation"
+                }
+              }
+            },
+            "description": "Every capability the node held is revoked."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Revoke every capability a node holds.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/capabilities/{jti}": {
+      "delete": {
+        "description": "Answers 404 when no capability with this `jti` was issued here, or it\nexpired long enough ago that nothing can accept it any more.",
+        "operationId": "revokeCapability",
+        "parameters": [
+          {
+            "description": "The capability's `jti`.",
+            "in": "path",
+            "name": "jti",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityRevocation"
+                }
+              }
+            },
+            "description": "The capability is revoked; verifiers refuse it within one poll."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Revoke one capability.",
         "tags": [
           "product"
         ]

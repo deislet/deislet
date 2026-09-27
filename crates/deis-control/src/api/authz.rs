@@ -1204,6 +1204,49 @@ fn classify_canonical(
                 .changes_state()
         }
 
+        // Taking capabilities back is an administrator's, recorded every
+        // time: it is the withdrawal of a credential, and the epoch bump
+        // withdraws every one on the platform. `Every` even for the tenant
+        // form, for the same reason `token.revoke` is: a scoped credential
+        // must not be able to cut off what others hold.
+        [
+            "api",
+            "apps",
+            _app,
+            "environments",
+            _env,
+            "capability-revocations",
+        ] => Requirement::new(
+            "capability.revoke_tenant",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state(),
+        ["api", "capabilities", "auth-epoch"] => Requirement::new(
+            "capability.auth_epoch.bump",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state(),
+        ["api", "capabilities", "revocations", "nodes", node] => Requirement::new(
+            "capability.revoke_node",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(node)
+        .changes_state(),
+        ["api", "capabilities", jti] => Requirement::new(
+            "capability.revoke",
+            Verb::Admin,
+            Resource::Every,
+            Resource::Every,
+        )
+        .about(jti)
+        .changes_state(),
+
         // ---- accounts, tokens, the audit log ------------------------------
         ["api", "accounts"] if !writing => Requirement::new(
             "account.list",

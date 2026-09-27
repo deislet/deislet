@@ -20,7 +20,6 @@ pub mod pagination;
 pub mod paths;
 pub mod registration;
 pub mod restores;
-pub mod revocation;
 pub mod static_files;
 pub mod versioning;
 
@@ -218,13 +217,6 @@ pub async fn build_api_router(
         .route("/health", get(handle_health))
         .route("/deis.svg", get(static_files::serve_favicon))
         .route("/assets/*path", get(static_files::serve_assets))
-        .route(
-            "/capability/revocation-list",
-            get(revocation::revocation_list),
-        )
-        .with_state(revocation::RevocationState {
-            issuer: issuer.clone(),
-        })
         // Public keys, for store and queue, which have no machine identity
         // to fetch them over the machine channel with.
         .merge(

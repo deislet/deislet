@@ -73,8 +73,10 @@ demand a client certificate. Two sockets, and what is on them:
 
 **The control plane's machine listener** (`crates/deis-control/src/machine/listen.rs`)
 serves the gRPC service `deis.machine.MachineChannel` - `Register`,
-`Deregister`, `FetchAssignments`, `FetchRoutingTable` - the bundle download
-beside it over HTTP/1.1 (`versions::BUNDLE_ROUTE`), and the long-lived control
+`Deregister`, `FetchAssignments`, `FetchRoutingTable`, `FetchSecretValues`,
+`IssueCapability` - the bundle download beside it over HTTP/1.1
+(`versions::BUNDLE_ROUTE`), the capability JWKS, the signed capability
+revocation list (`/capability/revocation-list`), and the long-lived control
 channel `deis.control.ControlService/EstablishChannel`.
 
 **A node's management listener** (`crates/deis-runtime/src/dispatcher/machine.rs`)
@@ -86,7 +88,7 @@ connection, node and proxy certificates included.
 | A holder of | can do |
 |---|---|
 | the control plane's private key | Drive any node that has registered a name and a management address: `ApplyDeployment` (run a bundle of the caller's choosing under any tenant's identity, **with that environment's decrypted secrets carried in the same request**), `UnloadApp`, `GetStatus` (every tenant's applications and metrics on that node), `StartInspect`, `HealthCheck`, and the cron trigger `OnScheduled`. `PushConfig`, `UpdateApp` and `ExecuteCommand` exist on the wire and answer `unimplemented` (`crates/deis-runtime/src/management/service.rs`). This is the only way any node is dialled: `crates/deis-control/src/runtime_client/mod.rs` builds one channel, over mutual TLS, and a node that proved no name or reported no management address is not driven at all and says so. |
-| one node's private key | `Register` and `Deregister` **its own id only** - the id in the request is held against the id in the proved name and a mismatch is refused (`crates/deis-control/src/machine/service.rs`). `FetchAssignments` for its own id only, and that answer carries **every** environment's decrypted secrets, not that node's (see "What is not implemented"). `FetchRoutingTable`. The bundle download for any application and any version: the handler checks nothing about who is asking (`crates/deis-control/src/api/catalog/versions.rs`, `download_bundle`). And the control channel, for a place in the session list, heartbeats and whatever operator-issued command is addressed to the id it announced. |
+| one node's private key | `Register` and `Deregister` **its own id only** - the id in the request is held against the id in the proved name and a mismatch is refused (`crates/deis-control/src/machine/service.rs`). `FetchAssignments` for its own id only, and that answer carries **every** environment's decrypted secrets, not that node's (see "What is not implemented"). `FetchRoutingTable`. `IssueCapability` for store and queue capabilities naming only tenants of deployments assigned to that node - one resource outside them refuses the whole request, and the refusal is written to the audit log (`crates/deis-control/src/machine/issuance.rs`); every capability issued is recorded in the issuance table. The revocation list. The bundle download for any application and any version: the handler checks nothing about who is asking (`crates/deis-control/src/api/catalog/versions.rs`, `download_bundle`). And the control channel, for a place in the session list, heartbeats and whatever operator-issued command is addressed to the id it announced. |
 | one proxy's private key | `FetchRoutingTable`, and the control channel. Not `FetchAssignments`: a proxy name yields no node id, so the call is refused. The bundle download is not scoped either, so a proxy certificate reaches it too. |
 | an inspector session token, minted by `StartInspect` | A Chrome DevTools Protocol WebSocket **on the node's `management_listen`**, against a running isolate: full debugger access to a tenant's running code (`crates/deis-runtime/src/dispatcher/machine.rs`). The socket it used to live on - the data port - now admits only a proxy's certificate, so the token alone no longer reaches it: the caller proves the control plane's name first. |
 
@@ -337,11 +339,10 @@ knowing:
 **The values that are still shared.** Each is a file edit plus a restart of
 whoever reads it, and each has its own blast radius:
 
-1. `storage_auth_secret` must change on deis-control and on deis-store and
-   deis-queue together. Every capability token in flight is derived from it,
-   so all of them are invalidated at the same instant; a node holding an old
-   token is refused until the control plane hands it a new one with its next
-   deployment.
+1. Store and queue capabilities are not derived from a shared value any
+   more: each is signed by the control plane's issuer key, lives fifteen
+   minutes and is recorded in the issuance table. Withdrawing them is a call,
+   not a file edit - see "Taking capabilities back" below.
 2. deis-telemetry's `auth_secret` must change on the collector and in every
    node's `[logging] auth_secret` together. A node with the wrong value is not
    refused at startup: it serves requests normally and every push is rejected,
@@ -355,6 +356,59 @@ whoever reads it, and each has its own blast radius:
    design. Change one without touching the others.
 5. `secret_key_file` is not rotatable by editing a line: every secret in the
    database is encrypted under it.
+
+## Taking capabilities back
+
+Every capability the control plane signs - for a node through
+`IssueCapability`, for an operator through `.../storage-token`, for its own
+calls to deis-queue - is written to the issuance table
+(`capability_issuances`: `jti`, subject, node id, audience, `kid`, epoch,
+issue and expiry time, and every tenant and binding it grants) before it is
+handed out, and not handed out if it cannot be (`crates/deis-control/src/capability_ledger.rs`).
+An administrator can revoke from that record, and every call is in the audit
+log:
+
+| Call | Revokes |
+|---|---|
+| `DELETE /api/v1/capabilities/{jti}` (`capability.revoke`) | one capability |
+| `POST /api/v1/capabilities/revocations/nodes/{node_id}` (`capability.revoke_node`) | every unexpired capability issued to that node |
+| `POST /api/v1/apps/{app}/environments/{env}/capability-revocations` (`capability.revoke_tenant`) | every unexpired capability naming that tenant, whoever holds it |
+| `POST /api/v1/capabilities/auth-epoch` (`capability.auth_epoch.bump`) | every capability issued so far: the epoch floor rises |
+
+Verifiers learn of it from the revocation list: every revoked `jti` that
+could still be accepted, and the current auth epoch, **signed with the issuer
+key** in the capability wire format and served on the machine listener only.
+deis-store (for kv, sql and blob alike - one verifier behind all three),
+deis-queue and deis-telemetry poll it every 30 seconds, check the signature
+against the same JWKS capabilities are checked against, and refuse a list
+that is older than two minutes, from the future, or older than the one they
+last adopted - so a list edited on the way, or an old one replayed, changes
+nothing. A revocation is therefore in force within one poll.
+
+Two things a revocation does not do. It does not stop a node asking again:
+a node still in the fleet and still running the tenant is issued a new
+capability on its next renewal - to shut a machine out, remove it from the
+fleet and stop trusting its certificate. And it does not reach a verifier cut
+off from the control plane: in T8 degraded mode a verifier enforces the last
+list it adopted.
+
+**T8 degraded mode.** A verifier that has not adopted a list for two poll
+intervals is degraded. Only then, and only for a capability whose subject is
+a runtime node's SPIFFE name (`spiffe://<trust domain>/deislet/node/<id>`,
+parsed by `deis-identity`), does it accept an expired capability - and only
+if it was still valid (give or take 30 seconds) when the last list arrived,
+is at most 24 hours past its expiry, and is not revoked by that list. Human
+capabilities never get grace. Each verifier exports `deis_auth_degraded`,
+`deis_auth_degraded_since_seconds`, `deis_auth_grace_accepted_total` and
+`deis_auth_revocation_last_sync_seconds` - deis-telemetry on its `/metrics`,
+deis-store and deis-queue on `metrics_listen` when it is set.
+
+A verifier **restarted** while the control plane is unreachable has adopted
+no list and holds no keys (the JWKS is not persisted either), so it refuses
+every capability until the control plane is back: it reports itself degraded
+but has nothing to extend grace from. This is deliberate. Persisting the time
+of the last sync alone would let such a verifier accept expired capabilities
+without the revocations that came with that sync.
 
 **If a private key may have leaked**, rotating it is not enough on its own.
 Work out what the name on that certificate opened - the table under "What each
@@ -386,6 +440,16 @@ this release - no way to say that an application runs on some nodes and not
 others - so there is nothing for a filter to filter by. The bundle download is
 unscoped for the same reason: any machine that completes the handshake may
 download any version of any application.
+
+What a node can obtain on its own initiative is narrower than what it is
+handed. `FetchSecretValues` and `IssueCapability` both go through
+`deployments_visible_to` in the same file, the one function a placement model
+will narrow: today it admits every current assignment to a node that is in the
+fleet (registered with the name it proved, or configured) and nothing to one
+that is not, plus in-flight plans that name the node as a target. A node can
+therefore not mint a capability for a tenant nothing deployed, and a machine
+holding a certificate this fleet signed but not in the fleet gets no
+capability and no secret at all.
 
 So the shape of the risk changed and its size did not. A credential that named
 no machine became one that names exactly one and cannot be copied out of a

@@ -146,6 +146,11 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         crate::api::catalog::secrets::put_secret,
         crate::api::catalog::secrets::delete_secret,
         crate::api::catalog::storage::storage_token,
+        // Capability revocation.
+        crate::api::catalog::capabilities::revoke_capability,
+        crate::api::catalog::capabilities::revoke_node_capabilities,
+        crate::api::catalog::capabilities::revoke_tenant_capabilities,
+        crate::api::catalog::capabilities::bump_auth_epoch,
         // Hostname grants.
         crate::api::catalog::domains::list_grants,
         crate::api::catalog::domains::create_grant,
