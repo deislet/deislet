@@ -56,6 +56,7 @@ pub mod dial;
 mod error;
 mod material;
 pub mod names;
+pub mod service;
 mod spiffe;
 /// A certificate authority small enough to hand a test.
 ///
@@ -77,6 +78,7 @@ pub use crate::cert::{
 pub use crate::dial::Dialler;
 pub use crate::error::{FileRole, IdentityError};
 pub use crate::names::ServiceKind;
+pub use crate::service::{ServiceDialler, ServiceTrust, accept_tls};
 pub use crate::spiffe::{SpiffeId, SpiffeIdError, check_path_segment};
 
 use crate::material::Material;
@@ -114,7 +116,7 @@ impl Protocol {
     }
 
     /// The list rustls wants, in the caller's order of preference.
-    fn wire_names(protocols: &[Self]) -> Vec<Vec<u8>> {
+    pub(crate) fn wire_names(protocols: &[Self]) -> Vec<Vec<u8>> {
         protocols.iter().map(|p| p.wire_name().to_vec()).collect()
     }
 }
@@ -541,7 +543,7 @@ pub fn name_presented_by(
 /// Every configuration this crate builds is pinned to the provider that was in
 /// force when its material was loaded, so a provider installed later by another
 /// part of the process cannot silently change what a running listener accepts.
-fn default_provider() -> Arc<CryptoProvider> {
+pub(crate) fn default_provider() -> Arc<CryptoProvider> {
     if let Some(installed) = CryptoProvider::get_default() {
         return Arc::clone(installed);
     }

@@ -232,3 +232,92 @@ pub fn write_files(directory: &Path, name: &str, issued: &Issued, root_pem: &str
     std::fs::write(&files.trust_root, root_pem).expect("write trust root");
     files
 }
+
+/// One authority and a directory to write its certificates into: what a test
+/// of a data service - deis-store, deis-queue, deis-telemetry - needs to
+/// serve over TLS and dial it the way a real caller does.
+///
+/// The directory is removed when the fleet is dropped, so keep the fleet
+/// alive for as long as anything loaded from it is.
+pub struct TestFleet {
+    pub ca: TestCa,
+    pub trust_domain: String,
+    dir: tempfile::TempDir,
+}
+
+impl TestFleet {
+    pub fn new() -> Self {
+        let dir = tempfile::TempDir::new().expect("a directory for the test fleet");
+        let ca = TestCa::new();
+        std::fs::write(dir.path().join("ca.crt.pem"), &ca.root_pem).expect("write trust root");
+        Self {
+            ca,
+            trust_domain: "deis.test".to_string(),
+            dir,
+        }
+    }
+
+    /// The directory the fleet's files are written into.
+    pub fn dir(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// The fleet's trust root, on disk.
+    pub fn trust_root(&self) -> PathBuf {
+        self.dir.path().join("ca.crt.pem")
+    }
+
+    /// Issue `id` a certificate and write its three files, named after `name`.
+    pub fn files_for(&self, name: &str, id: &SpiffeId) -> WrittenFiles {
+        write_files(self.dir.path(), name, &self.ca.issue(id), &self.ca.root_pem)
+    }
+
+    /// Issue `id` a certificate and load it as a machine identity serving
+    /// `serves`.
+    pub fn identity(
+        &self,
+        name: &str,
+        id: &SpiffeId,
+        serves: &[deis_identity::Protocol],
+    ) -> std::sync::Arc<deis_identity::MachineIdentity> {
+        let files = self.files_for(name, id);
+        std::sync::Arc::new(
+            deis_identity::MachineIdentity::load(files.as_identity_files(), serves)
+                .expect("a test identity loads"),
+        )
+    }
+
+    /// The identity a data service of `kind` serves with: named
+    /// `spiffe://deis.test/deislet/<kind>/test`, speaking HTTP/2.
+    pub fn service_identity(
+        &self,
+        kind: deis_identity::ServiceKind,
+    ) -> std::sync::Arc<deis_identity::MachineIdentity> {
+        use deis_identity::{ServiceKind, names};
+        let (name, id) = match kind {
+            ServiceKind::Store => ("store", names::store(&self.trust_domain, "test")),
+            ServiceKind::Queue => ("queue", names::queue(&self.trust_domain, "test")),
+            ServiceKind::Telemetry => ("telemetry", names::telemetry(&self.trust_domain, "test")),
+            ServiceKind::Control => ("control", names::control(&self.trust_domain)),
+            ServiceKind::Node => ("node", names::node(&self.trust_domain, "test")),
+            ServiceKind::Proxy => ("proxy", names::proxy(&self.trust_domain, "test")),
+        };
+        self.identity(
+            name,
+            &id.expect("a well-formed test name"),
+            &[deis_identity::Protocol::Http2],
+        )
+    }
+
+    /// What a caller holding only this fleet's trust root trusts - a CLI.
+    pub fn service_trust(&self) -> deis_identity::ServiceTrust {
+        deis_identity::ServiceTrust::from_trust_root(&self.trust_root())
+            .expect("the test trust root loads")
+    }
+}
+
+impl Default for TestFleet {
+    fn default() -> Self {
+        Self::new()
+    }
+}

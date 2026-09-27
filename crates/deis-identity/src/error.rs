@@ -99,6 +99,15 @@ pub enum IdentityError {
     },
 
     #[error(
+        "this connection was made to {expected_kind} and the far end proved the name {presented}, which our trust root signed but which names {presented_kind}"
+    )]
+    WrongServiceKind {
+        presented: String,
+        presented_kind: String,
+        expected_kind: String,
+    },
+
+    #[error(
         "this connection carries no peer certificate, so there is no name to read; a listener built from this crate cannot produce such a connection"
     )]
     NoPeerCertificate,

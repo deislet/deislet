@@ -24,6 +24,9 @@
 //! spiffe://<trust domain>/deislet/control
 //! spiffe://<trust domain>/deislet/node/<node id>
 //! spiffe://<trust domain>/deislet/proxy/<proxy id>
+//! spiffe://<trust domain>/deislet/store/<store id>
+//! spiffe://<trust domain>/deislet/queue/<queue id>
+//! spiffe://<trust domain>/deislet/telemetry/<telemetry id>
 //! ```
 //!
 //! One control plane per trust domain, so it has no id of its own: a second
@@ -32,6 +35,12 @@
 //! by everywhere else - the one in an API path, in `deis status` and in a log
 //! line - so that "which machine is this certificate for" needs no lookup
 //! table to answer.
+//!
+//! The three data services carry an id as well, although a small installation
+//! runs one of each: an id is what lets a second store be told apart from the
+//! first in a log line, and the role - not the id - is what a client checks
+//! when it dials one (see [`crate::ServiceDialler`]). A queue's certificate
+//! therefore cannot answer for a store, whatever address it is reached at.
 //!
 //! # What the ids may hold
 //!
@@ -53,6 +62,9 @@ const PREFIX: &str = "deislet";
 const CONTROL: &str = "control";
 const NODE: &str = "node";
 const PROXY: &str = "proxy";
+const STORE: &str = "store";
+const QUEUE: &str = "queue";
+const TELEMETRY: &str = "telemetry";
 
 /// What kind of process a name belongs to.
 ///
@@ -64,6 +76,12 @@ pub enum ServiceKind {
     Control,
     Node,
     Proxy,
+    /// deis-store: KV, SQL and blob.
+    Store,
+    /// deis-queue.
+    Queue,
+    /// deis-telemetry.
+    Telemetry,
 }
 
 /// The control plane of `trust_domain`.
@@ -93,9 +111,35 @@ pub fn proxy(trust_domain: &str, proxy_id: &str) -> Result<SpiffeId, SpiffeIdErr
     ))
 }
 
+/// The deis-store instance known as `store_id`.
+///
+/// The id is checked as one path segment, as in [`node`].
+pub fn store(trust_domain: &str, store_id: &str) -> Result<SpiffeId, SpiffeIdError> {
+    with_id(trust_domain, STORE, store_id)
+}
+
+/// The deis-queue instance known as `queue_id`.
+///
+/// The id is checked as one path segment, as in [`node`].
+pub fn queue(trust_domain: &str, queue_id: &str) -> Result<SpiffeId, SpiffeIdError> {
+    with_id(trust_domain, QUEUE, queue_id)
+}
+
+/// The deis-telemetry instance known as `telemetry_id`.
+///
+/// The id is checked as one path segment, as in [`node`].
+pub fn telemetry(trust_domain: &str, telemetry_id: &str) -> Result<SpiffeId, SpiffeIdError> {
+    with_id(trust_domain, TELEMETRY, telemetry_id)
+}
+
+fn with_id(trust_domain: &str, role: &str, id: &str) -> Result<SpiffeId, SpiffeIdError> {
+    check_path_segment(id)?;
+    SpiffeId::parse(&format!("spiffe://{trust_domain}/{PREFIX}/{role}/{id}"))
+}
+
 /// What `id` names, or `None` if it is not a name this fleet issues.
 ///
-/// A name from our own trust domain that does not fit any of the three shapes
+/// A name from our own trust domain that does not fit any of the shapes
 /// is `None` and not a guess. A certificate our root signed into a shape
 /// nobody serves is a mistake somewhere, and the safe reading of a mistake is
 /// "I do not know what this is".
@@ -104,6 +148,9 @@ pub fn service_kind(id: &SpiffeId) -> Option<ServiceKind> {
         [CONTROL] => Some(ServiceKind::Control),
         [NODE, _] => Some(ServiceKind::Node),
         [PROXY, _] => Some(ServiceKind::Proxy),
+        [STORE, _] => Some(ServiceKind::Store),
+        [QUEUE, _] => Some(ServiceKind::Queue),
+        [TELEMETRY, _] => Some(ServiceKind::Telemetry),
         _ => None,
     }
 }
@@ -202,9 +249,30 @@ mod tests {
     }
 
     #[test]
+    fn the_data_services_are_named_by_role_and_id() {
+        for (name, kind) in [
+            (store("deis.internal", "s1").unwrap(), ServiceKind::Store),
+            (queue("deis.internal", "q1").unwrap(), ServiceKind::Queue),
+            (
+                telemetry("deis.internal", "t1").unwrap(),
+                ServiceKind::Telemetry,
+            ),
+        ] {
+            assert_eq!(service_kind(&name), Some(kind), "{name}");
+            assert_eq!(node_id_of(&name), None);
+        }
+        assert_eq!(
+            store("deis.internal", "s1").unwrap().as_str(),
+            "spiffe://deis.internal/deislet/store/s1"
+        );
+        assert!(queue("deis.internal", "../control").is_err());
+    }
+
+    #[test]
     fn a_name_this_fleet_does_not_issue_is_not_guessed_at() {
         for text in [
-            "spiffe://deis.internal/deislet/store/01",
+            "spiffe://deis.internal/deislet/store",
+            "spiffe://deis.internal/deislet/store/01/extra",
             "spiffe://deis.internal/node/07",
             "spiffe://deis.internal/deislet",
             "spiffe://deis.internal/deislet/control/extra",

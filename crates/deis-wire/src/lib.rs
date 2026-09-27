@@ -18,6 +18,7 @@ pub mod error;
 pub mod logging;
 pub mod models;
 pub mod operation;
+pub mod served;
 
 pub mod pb {
     tonic::include_proto!("deis.control");
