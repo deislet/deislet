@@ -188,7 +188,30 @@ pub async fn serve(
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
     let auth = QueueAuth::new(keys);
-    crate::auth::start_revocation_poller(auth.clone(), config.revocation_list_url.clone());
+    deis_capability::fetch::poll_revocations_over_http(
+        auth.verifier().clone(),
+        "queue",
+        &config.revocation_list_url,
+    );
+    if let Some(listen) = config.metrics_listen.as_deref() {
+        let metrics = TcpListener::bind(listen)
+            .await
+            .with_context(|| format!("cannot bind the metrics listener on {listen}"))?;
+        tracing::info!(
+            address = %metrics.local_addr().context("metrics listener has no address")?,
+            "Serving the capability verifier's metrics at /metrics"
+        );
+        let verifier = auth.verifier().clone();
+        deis_capability::exposition::serve_metrics(
+            metrics,
+            std::sync::Arc::new(move || {
+                verifier
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .render_metrics("queue")
+            }),
+        );
+    }
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => Some(
             MigrationAuth::new(token)

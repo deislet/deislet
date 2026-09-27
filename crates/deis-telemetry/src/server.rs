@@ -253,7 +253,11 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
     // present a valid Ed25519-signed capability token. There is no anonymous
     // or loopback bypass.
     let auth = TelemetryAuth::new(verifying_key, enforcing);
-    crate::auth::start_revocation_poller(auth.clone(), config.revocation_list_url.clone());
+    deis_capability::fetch::poll_revocations_over_http(
+        auth.verifier().clone(),
+        "telemetry",
+        &config.revocation_list_url,
+    );
     // Read off before the interceptor copies are handed to the tasks, so the
     // startup line below can say which regime is in force.
     let enforcing = auth.is_enforcing();
@@ -339,7 +343,8 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
             store.clone(),
             Arc::clone(&stats),
             config.metrics_export_window_secs,
-        ),
+        )
+        .with_verifier(auth.verifier().clone()),
         auth,
     );
     let metrics_shutdown = subscribe(&shutdown);

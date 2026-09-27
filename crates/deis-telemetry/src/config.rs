@@ -34,9 +34,14 @@ pub struct Config {
     /// capability tokens.
     #[serde(default)]
     pub capability_public_key: Option<String>,
-    /// The control-plane URL for the T8 revocation-list endpoint.
+    /// Where the control plane serves its signed revocation list.
     ///
-    /// Defaults to `http://127.0.0.1:8100`.
+    /// Polled at `{revocation_list_url}/capability/revocation-list` every 30
+    /// seconds; a list is adopted only if its signature verifies against the
+    /// capability verifying key and it is fresh. Only a loopback `http://`
+    /// address is polled here; anything else is refused at startup and the
+    /// service stays degraded. Its state is exported on `/metrics` as
+    /// `deis_auth_*`.
     #[serde(default = "default_revocation_list_url")]
     pub revocation_list_url: String,
     /// Independent bearer credential for the backend migration management

@@ -195,10 +195,36 @@ pub async fn serve(
     keys: deis_capability::KeyRing,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
-    let auth_kv = StorageAuth::new(keys.clone(), "kv");
-    let auth_sql = StorageAuth::new(keys.clone(), "sql");
-    let auth_blob = StorageAuth::new(keys, "blob");
-    crate::auth::start_revocation_poller(auth_kv.clone(), config.revocation_list_url.clone());
+    // One verifier behind all three guards, so the revocation list and the
+    // degraded-mode clock the poller feeds are the ones every binding checks.
+    let verifier = deis_capability::CapabilityVerifier::with_key_ring(keys).shared();
+    let auth_kv = StorageAuth::new(verifier.clone(), "kv");
+    let auth_sql = StorageAuth::new(verifier.clone(), "sql");
+    let auth_blob = StorageAuth::new(verifier.clone(), "blob");
+    deis_capability::fetch::poll_revocations_over_http(
+        verifier.clone(),
+        "store",
+        &config.revocation_list_url,
+    );
+    if let Some(listen) = config.metrics_listen.as_deref() {
+        let metrics = TcpListener::bind(listen)
+            .await
+            .with_context(|| format!("cannot bind the metrics listener on {listen}"))?;
+        tracing::info!(
+            address = %metrics.local_addr().context("metrics listener has no address")?,
+            "Serving the capability verifier's metrics at /metrics"
+        );
+        let verifier = verifier.clone();
+        deis_capability::exposition::serve_metrics(
+            metrics,
+            std::sync::Arc::new(move || {
+                verifier
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .render_metrics("store")
+            }),
+        );
+    }
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => Some(
             MigrationAuth::new(token)

@@ -35,11 +35,20 @@ pub struct Config {
     /// port.
     #[serde(default = "default_capability_jwks_url")]
     pub capability_jwks_url: String,
-    /// The control-plane URL for the T8 revocation-list endpoint.
+    /// Where the control plane serves its signed revocation list.
     ///
-    /// Defaults to `http://127.0.0.1:8100`.
+    /// Polled at `{revocation_list_url}/capability/revocation-list` every 30
+    /// seconds; the list's signature is checked against the same keys
+    /// capabilities are verified with before its revoked `jti`s and minimum
+    /// `auth_epoch` are enforced and the T8 degraded-mode clock is reset.
+    /// Only a loopback `http://` address is polled here; anything else is
+    /// refused at startup and the service stays degraded.
     #[serde(default = "default_revocation_list_url")]
     pub revocation_list_url: String,
+    /// Where to serve the capability verifier's Prometheus metrics at
+    /// `/metrics`. Not served when absent.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
     /// Independent credential for migration inventory and writer fencing.
     /// If absent, the management gRPC service does not exist; there is no
     /// loopback bypass and this must not reuse the application data secret.
@@ -184,6 +193,7 @@ impl Default for Config {
             listen: default_listen(),
             capability_jwks_url: default_capability_jwks_url(),
             revocation_list_url: default_revocation_list_url(),
+            metrics_listen: None,
             migration_admin_token: None,
             data_dir: default_data_dir(),
             connections: default_connections(),

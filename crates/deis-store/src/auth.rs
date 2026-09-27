@@ -23,7 +23,7 @@
 //! probe that needs a tenant credential is a probe the control plane cannot
 //! make.
 
-use deis_capability::{CapabilityError, CapabilityVerifier, KeyRing, VerifiedCapability};
+use deis_capability::{CapabilityError, SharedVerifier, VerifiedCapability};
 use deis_wire::conventions::TENANT_HEADER;
 use tonic::{Request, Status};
 
@@ -35,74 +35,35 @@ const BEARER_PREFIX: &str = "bearer ";
 
 /// What the process checks on every storage call.
 ///
-/// Cheap to clone: the verifier is behind an `Arc` so one instance guards
-/// all three services. Uses a `std::sync::Mutex` (not `tokio::sync::RwLock`)
-/// because [`tonic::service::Interceptor`] is a synchronous trait and
-/// `block_on` panics when called from within a tokio runtime context.
+/// Cheap to clone. One [`deis_capability::CapabilityVerifier`] is shared by
+/// all three services - it holds the key ring, the revocation list and the
+/// T8 degraded-mode clock, and the revocation poller feeds that one copy - so
+/// a revoked `jti` or a raised epoch is refused by kv, sql and blob alike. A
+/// `std::sync::Mutex` (not `tokio::sync::RwLock`) because
+/// [`tonic::service::Interceptor`] is a synchronous trait and `block_on`
+/// panics when called from within a tokio runtime context.
 ///
 /// Each service (KvStore, Database, BlobStore) gets its own `StorageAuth`
 /// with the binding baked in at construction time, so the interceptor does
 /// not need to inspect the request URI to decide which store is targeted.
 #[derive(Clone)]
 pub struct StorageAuth {
-    verifier: std::sync::Arc<std::sync::Mutex<CapabilityVerifier>>,
+    verifier: SharedVerifier,
     /// The binding this guard enforces: `"kv"`, `"sql"`, or `"blob"`.
     binding: &'static str,
 }
 
 impl StorageAuth {
-    /// Build a new interceptor over the control plane's key ring and the
-    /// binding this service guards (`"kv"`, `"sql"`, or `"blob"`).
-    pub fn new(keys: KeyRing, binding: &'static str) -> Self {
-        Self {
-            verifier: std::sync::Arc::new(std::sync::Mutex::new(
-                CapabilityVerifier::with_key_ring(keys),
-            )),
-            binding,
-        }
+    /// A guard for `binding` (`"kv"`, `"sql"`, or `"blob"`) over the
+    /// process's shared verifier.
+    pub fn new(verifier: SharedVerifier, binding: &'static str) -> Self {
+        Self { verifier, binding }
     }
 
-    /// Update the minimum accepted auth epoch.
-    pub fn set_min_auth_epoch(&self, epoch: u64) {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .set_min_auth_epoch(epoch);
-    }
-
-    /// Replace the revoked JTI list.
-    pub fn set_revoked_jtis(&self, jtis: Vec<String>) {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .set_revoked_jtis(jtis);
-    }
-
-    /// Record a successful revocation-list pull, resetting the T8
-    /// degraded-mode clock.
-    pub fn record_sync(&self) {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .record_sync();
-    }
-
-    /// Total number of expired tokens accepted under T8 degraded-mode grace
-    /// rules since this auth was created.
-    pub fn grace_accepted_total(&self) -> u64 {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .grace_accepted_total()
-    }
-
-    /// Seconds since the last successful revocation-list pull, or `None` if a
-    /// pull has never completed.
-    pub fn degraded_since_seconds(&self) -> Option<u64> {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .degraded_since_seconds()
+    /// The verifier this guard checks against, shared with the other guards
+    /// and with the revocation poller.
+    pub fn verifier(&self) -> &SharedVerifier {
+        &self.verifier
     }
 
     /// Whether this service is enforcing capability checks. Always true:
@@ -263,59 +224,6 @@ fn map_capability_error(e: CapabilityError) -> Status {
     }
 }
 
-/// The JSON body returned by `GET /capability/revocation-list`.
-#[derive(Debug, serde::Deserialize)]
-struct RevocationListResponse {
-    auth_epoch: u64,
-    revoked_jtis: Vec<String>,
-}
-
-/// Start a background task that polls the control plane's revocation-list
-/// endpoint every 30 seconds, feeding the current `auth_epoch` and revoked
-/// JTIs into the verifier.  A successful poll calls [`StorageAuth::record_sync`]
-/// which resets the T8 degraded-mode clock.
-///
-/// The task is spawned on the tokio runtime and runs until the process exits.
-/// Failures are logged at `warn` level and do not crash the process.
-pub fn start_revocation_poller(auth: StorageAuth, revocation_list_url: String) {
-    let url = format!("{revocation_list_url}/capability/revocation-list");
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        // First tick fires immediately; skip it so the interval is consistent.
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            match client.get(&url).send().await {
-                Ok(response) => match response.json::<RevocationListResponse>().await {
-                    Ok(body) => {
-                        auth.set_min_auth_epoch(body.auth_epoch);
-                        auth.set_revoked_jtis(body.revoked_jtis);
-                        auth.record_sync();
-                        tracing::debug!(
-                            auth_epoch = body.auth_epoch,
-                            "Refreshed revocation list from control plane"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to parse revocation-list response; will retry"
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        url = %url,
-                        "Failed to reach control-plane revocation-list endpoint; will retry"
-                    );
-                }
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,13 +240,69 @@ mod tests {
     #[test]
     fn binding_is_baked_in_at_construction() {
         let (_, vk) = test_key();
-        let keys = KeyRing::from_keys([vk]);
-        let kv_auth = StorageAuth::new(keys.clone(), "kv");
-        let sql_auth = StorageAuth::new(keys.clone(), "sql");
-        let blob_auth = StorageAuth::new(keys, "blob");
+        let verifier = deis_capability::CapabilityVerifier::new(vk).shared();
+        let kv_auth = StorageAuth::new(verifier.clone(), "kv");
+        let sql_auth = StorageAuth::new(verifier.clone(), "sql");
+        let blob_auth = StorageAuth::new(verifier, "blob");
         assert_eq!(kv_auth.binding, "kv");
         assert_eq!(sql_auth.binding, "sql");
         assert_eq!(blob_auth.binding, "blob");
+    }
+
+    /// The three services share one verifier, so a revocation list adopted
+    /// once is enforced by kv, sql and blob alike - not only by kv, which is
+    /// the one the poller used to be wired to.
+    #[test]
+    fn a_revocation_reaches_every_binding() {
+        use deis_capability::{
+            AUD_STORE, CapabilityClaims, RevocationList, encode, resources_for_audience,
+            revocation,
+        };
+        let (signing, vk) = test_key();
+        let verifier = deis_capability::CapabilityVerifier::new(vk).shared();
+        let guards: Vec<StorageAuth> = ["kv", "sql", "blob"]
+            .into_iter()
+            .map(|binding| StorageAuth::new(verifier.clone(), binding))
+            .collect();
+        let claims = CapabilityClaims::new(
+            AUD_STORE,
+            "iss",
+            "spiffe://deis.internal/deislet/node/n1",
+            1,
+            std::time::Duration::from_secs(900),
+            resources_for_audience("app.production", AUD_STORE),
+        );
+        let token = encode(&claims, &signing);
+        let request = |token: &str| {
+            let mut request = Request::new(());
+            request.metadata_mut().insert(
+                AUTHORIZATION_HEADER,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+            request
+                .metadata_mut()
+                .insert(TENANT_HEADER, "app.production".parse().unwrap());
+            request
+        };
+        for mut guard in guards.clone() {
+            tonic::service::Interceptor::call(&mut guard, request(&token)).unwrap();
+        }
+
+        let signed = revocation::sign(
+            &RevocationList::new("iss", 1, vec![claims.jti.clone()]),
+            &signing,
+        );
+        let list = revocation::verify(
+            &signed,
+            verifier.lock().unwrap().key_ring(),
+        )
+        .unwrap();
+        verifier.lock().unwrap().apply_revocation_list(list).unwrap();
+        for mut guard in guards {
+            let refusal =
+                tonic::service::Interceptor::call(&mut guard, request(&token)).unwrap_err();
+            assert_eq!(refusal.code(), tonic::Code::PermissionDenied, "{}", guard.binding);
+        }
     }
 
     #[test]

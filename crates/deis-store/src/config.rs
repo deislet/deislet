@@ -58,16 +58,24 @@ pub struct Config {
     /// port.
     #[serde(default = "default_capability_jwks_url")]
     pub capability_jwks_url: String,
-    /// The control-plane URL for the T8 revocation-list endpoint.
+    /// Where the control plane serves its signed revocation list.
     ///
     /// The store polls `{revocation_list_url}/capability/revocation-list`
-    /// every 30 seconds.  A successful poll feeds `auth_epoch` into the
-    /// verifier and resets the degraded-mode clock.
-    ///
-    /// Defaults to `http://127.0.0.1:8100` (the control plane's human API
-    /// listener on the default port).
+    /// every 30 seconds, checks the list's signature against the same keys
+    /// capabilities are verified with, and adopts it: the revoked `jti`s and
+    /// the minimum `auth_epoch` are enforced by kv, sql and blob alike, and
+    /// the T8 degraded-mode clock is reset. The list is served on the control
+    /// plane's machine listener; only a loopback `http://` address is polled
+    /// here, and anything else is refused at startup with the service left
+    /// degraded (no grace, no revocation beyond what tokens carry).
     #[serde(default = "default_revocation_list_url")]
     pub revocation_list_url: String,
+    /// Where to serve the capability verifier's Prometheus metrics
+    /// (`deis_auth_degraded`, `deis_auth_degraded_since_seconds`,
+    /// `deis_auth_grace_accepted_total`, `deis_auth_revocation_last_sync_seconds`)
+    /// at `/metrics`. Not served when absent.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
     /// Independent credential for backend migration inventory and writer
     /// fencing. When absent, the management service is not registered at
     /// all, including on loopback.
@@ -243,6 +251,7 @@ impl Default for Config {
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
             capability_jwks_url: default_capability_jwks_url(),
             revocation_list_url: default_revocation_list_url(),
+            metrics_listen: None,
             migration_admin_token: None,
             snapshot_dir: None,
             snapshot_interval_secs: default_snapshot_interval_secs(),

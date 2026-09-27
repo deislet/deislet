@@ -32,6 +32,9 @@ pub struct MetricsState {
     stats: Arc<ServiceStats>,
     /// How far back to look for the latest sample of each series.
     window_secs: u64,
+    /// The capability verifier whose T8 state (`deis_auth_*`) is exported
+    /// beside this process's own counters.
+    verifier: Option<deis_capability::SharedVerifier>,
 }
 
 impl MetricsState {
@@ -40,7 +43,14 @@ impl MetricsState {
             store,
             stats,
             window_secs,
+            verifier: None,
         }
+    }
+
+    /// Export `verifier`'s degraded-mode and grace metrics on every scrape.
+    pub fn with_verifier(mut self, verifier: deis_capability::SharedVerifier) -> Self {
+        self.verifier = Some(verifier);
+        self
     }
 }
 
@@ -126,9 +136,14 @@ async fn scrape(State(state): State<MetricsState>) -> impl IntoResponse {
         window_secs = state.window_secs,
         "serving a Prometheus scrape"
     );
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, CONTENT_TYPE)],
-        prom::render(&samples, &state.stats),
-    )
+    let mut body = prom::render(&samples, &state.stats);
+    if let Some(verifier) = &state.verifier {
+        body.push_str(
+            &verifier
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .render_metrics("telemetry"),
+        );
+    }
+    (StatusCode::OK, [(header::CONTENT_TYPE, CONTENT_TYPE)], body)
 }
