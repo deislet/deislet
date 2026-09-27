@@ -76,6 +76,15 @@ impl StorageAuth {
             .set_revoked_jtis(jtis);
     }
 
+    /// Record a successful revocation-list pull, resetting the T8
+    /// degraded-mode clock.
+    pub fn record_sync(&self) {
+        self.verifier
+            .lock()
+            .expect("lock poisoned")
+            .record_sync();
+    }
+
     /// Whether this service is enforcing capability checks. Always true:
     /// there is no anonymous or loopback bypass.
     pub fn is_enforcing(&self) -> bool {
