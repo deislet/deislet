@@ -39,9 +39,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod keys;
 #[cfg(feature = "jwks-fetch")]
+pub mod exposition;
+#[cfg(feature = "jwks-fetch")]
 pub mod fetch;
+pub mod revocation;
 
 pub use keys::{Jwk, Jwks, JwksError, KeyRing, key_id};
+pub use revocation::{RevocationList, RevocationListError, SignedRevocationList};
+
+/// One verifier shared by every guard of a process, so the revocation poller
+/// feeds all of them at once. A `std` mutex because the guards run inside
+/// synchronous tonic interceptors.
+pub type SharedVerifier = Arc<std::sync::Mutex<CapabilityVerifier>>;
 
 // ---- audiences and bindings -----------------------------------------------
 
@@ -539,6 +548,12 @@ pub struct CapabilityVerifier {
     /// The trust domain a node subject must be in to get T8 grace, when the
     /// verifier knows its own; `None` accepts a node of any trust domain.
     trust_domain: Option<String>,
+    /// `issued_at` of the last revocation list accepted, so an older one -
+    /// a replay - is refused.
+    last_list_issued_at: u64,
+    /// When this verifier was made: a verifier that has never synced has
+    /// been degraded since then.
+    created_at: Instant,
 }
 
 impl CapabilityVerifier {
@@ -562,7 +577,90 @@ impl CapabilityVerifier {
             pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
             grace_accepted_total: Arc::new(AtomicU64::new(0)),
             trust_domain: None,
+            last_list_issued_at: 0,
+            created_at: Instant::now(),
         }
+    }
+
+    /// Wrap this verifier for sharing between guards and the poller.
+    pub fn shared(self) -> SharedVerifier {
+        Arc::new(std::sync::Mutex::new(self))
+    }
+
+    /// Adopt a verified revocation list (see [`revocation::verify`]).
+    ///
+    /// Refuses a list that is stale - older than
+    /// [`revocation::MAX_LIST_AGE_SECS`], from the future, or older than the
+    /// last one accepted - and leaves everything as it was, including the
+    /// degraded-mode clock: a replayed list must not make a verifier cut off
+    /// from the control plane look in sync. The epoch floor only ever rises.
+    pub fn apply_revocation_list(
+        &mut self,
+        list: RevocationList,
+    ) -> Result<(), RevocationListError> {
+        revocation::check_fresh(&list, now_secs(), self.last_list_issued_at)?;
+        self.min_auth_epoch = self.min_auth_epoch.max(list.auth_epoch);
+        self.revoked_jtis = list.revoked_jtis;
+        self.last_list_issued_at = list.issued_at;
+        self.record_sync();
+        Ok(())
+    }
+
+    /// The minimum auth epoch currently enforced.
+    pub fn min_auth_epoch(&self) -> u64 {
+        self.min_auth_epoch
+    }
+
+    /// When degraded mode began, as Unix seconds, or `None` when not
+    /// degraded. A verifier that has never synced has been degraded since it
+    /// was made.
+    pub fn degraded_since_unix(&self) -> Option<u64> {
+        if !self.is_degraded() {
+            return None;
+        }
+        let began = match self.last_sync {
+            Some(last) => last + Duration::from_secs(self.pull_interval_secs * DEGRADED_PULL_INTERVAL_FACTOR),
+            None => self.created_at,
+        };
+        Some(now_secs().saturating_sub(began.elapsed().as_secs()))
+    }
+
+    /// The T8 metrics in Prometheus text form, labelled with `service`, for
+    /// the process's own metrics endpoint.
+    pub fn render_metrics(&self, service: &str) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(768);
+        let label = format!("{{service=\"{service}\"}}");
+        let mut family = |name: &str, kind: &str, help: &str, value: u64| {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} {kind}");
+            let _ = writeln!(out, "{name}{label} {value}");
+        };
+        family(
+            "deis_auth_degraded",
+            "gauge",
+            "1 while this verifier has not fetched the control plane's revocation list for two poll intervals (T8 degraded mode)",
+            u64::from(self.is_degraded()),
+        );
+        family(
+            "deis_auth_degraded_since_seconds",
+            "gauge",
+            "Unix time degraded mode began, 0 when not degraded",
+            self.degraded_since_unix().unwrap_or(0),
+        );
+        family(
+            "deis_auth_grace_accepted_total",
+            "counter",
+            "Expired node capabilities accepted under T8 degraded-mode grace",
+            self.grace_accepted_total(),
+        );
+        family(
+            "deis_auth_revocation_last_sync_seconds",
+            "gauge",
+            "Unix time of the last revocation list accepted, 0 if none yet",
+            self.last_sync_unix().unwrap_or(0),
+        );
+        out
     }
 
     /// The key ring this verifier checks signatures against.
@@ -1626,6 +1724,99 @@ mod tests {
             matches!(result, Err(CapabilityError::Expired { .. })),
             "token past grace window must be refused"
         );
+    }
+
+    fn signed_list(signing: &SigningKey, epoch: u64, jtis: Vec<String>) -> RevocationList {
+        let signed = revocation::sign(&RevocationList::new("iss", epoch, jtis), signing);
+        revocation::verify(&signed, &KeyRing::from_keys([signing.verifying_key()])).unwrap()
+    }
+
+    const TENANT: &str =
+        "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002";
+
+    /// A jti on the list is refused from the moment the list is adopted -
+    /// in normal mode and under T8 grace alike.
+    #[test]
+    fn a_jti_on_an_adopted_list_is_refused_even_under_grace() {
+        let (signing, verifying) = make_keypair();
+        let claims = make_claims("store");
+        let token = encode(&claims, &signing);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        assert!(verifier.verify_with_grace(&token, "store", TENANT, "kv").is_ok());
+
+        verifier
+            .apply_revocation_list(signed_list(&signing, 1, vec![claims.jti.clone()]))
+            .unwrap();
+        assert!(matches!(
+            verifier.verify_with_grace(&token, "store", TENANT, "kv"),
+            Err(CapabilityError::Revoked { .. })
+        ));
+
+        let expired = make_node_token(&signing, -60);
+        let expired_jti = decode(&expired, &signing.verifying_key()).unwrap().jti;
+        verifier
+            .apply_revocation_list(signed_list(&signing, 1, vec![expired_jti]))
+            .unwrap();
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(30));
+        verifier.set_pull_interval_secs(10);
+        assert!(verifier.is_degraded());
+        assert!(matches!(
+            verifier.verify_with_grace(&expired, "store", TENANT, "kv"),
+            Err(CapabilityError::Revoked { .. })
+        ));
+    }
+
+    /// Mass revocation: a list carrying a higher epoch refuses every token
+    /// minted under a lower one, and a later list cannot lower it again.
+    #[test]
+    fn an_epoch_bump_refuses_older_tokens_and_never_goes_back() {
+        let (signing, verifying) = make_keypair();
+        let old = encode(&make_claims("store"), &signing);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.apply_revocation_list(signed_list(&signing, 2, vec![])).unwrap();
+        assert!(matches!(
+            verifier.verify_with_grace(&old, "store", TENANT, "kv"),
+            Err(CapabilityError::AuthEpochTooLow { got: 1, minimum: 2 })
+        ));
+        verifier.apply_revocation_list(signed_list(&signing, 1, vec![])).unwrap();
+        assert_eq!(verifier.min_auth_epoch(), 2);
+    }
+
+    /// A replayed list is refused and does not count as a sync, so it can
+    /// neither hide newer revocations nor mask an outage.
+    #[test]
+    fn a_stale_list_changes_nothing_and_does_not_count_as_a_sync() {
+        let (signing, verifying) = make_keypair();
+        let mut verifier = CapabilityVerifier::new(verifying);
+        let mut old = signed_list(&signing, 1, vec![]);
+        old.issued_at -= revocation::MAX_LIST_AGE_SECS + 10;
+        assert!(matches!(
+            verifier.apply_revocation_list(old),
+            Err(RevocationListError::Stale(_))
+        ));
+        assert!(verifier.last_sync.is_none());
+
+        let fresh = signed_list(&signing, 1, vec!["x".into()]);
+        let mut earlier = fresh.clone();
+        earlier.issued_at -= 5;
+        earlier.revoked_jtis.clear();
+        verifier.apply_revocation_list(fresh).unwrap();
+        assert!(verifier.apply_revocation_list(earlier).is_err());
+        assert_eq!(verifier.revoked_jtis, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn the_metrics_say_whether_the_verifier_is_degraded() {
+        let (signing, verifying) = make_keypair();
+        let mut verifier = CapabilityVerifier::new(verifying);
+        let text = verifier.render_metrics("store");
+        assert!(text.contains("deis_auth_degraded{service=\"store\"} 1"), "{text}");
+        assert!(text.contains("# TYPE deis_auth_grace_accepted_total counter"));
+        verifier.apply_revocation_list(signed_list(&signing, 1, vec![])).unwrap();
+        let text = verifier.render_metrics("store");
+        assert!(text.contains("deis_auth_degraded{service=\"store\"} 0"), "{text}");
+        assert!(text.contains("deis_auth_degraded_since_seconds{service=\"store\"} 0"));
+        assert!(text.contains("deis_auth_grace_accepted_total{service=\"store\"} 0"));
     }
 
     #[test]
