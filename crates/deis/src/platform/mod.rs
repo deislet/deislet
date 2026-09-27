@@ -711,6 +711,10 @@ pub struct StorageCredentials {
     pub store_endpoint: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+    /// The deis-queue capability for the same tenant. deis-queue accepts
+    /// only its own audience, so the store token is refused there.
+    #[serde(default)]
+    pub queue_token: Option<String>,
 }
 
 /// What this credential can see of the runtime fleet.

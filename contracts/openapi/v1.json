@@ -7503,23 +7503,28 @@
       "StorageTokenResponse": {
         "description": "What a caller needs in order to act as one tenant of deis-store.\n\nEvery field is always present: an answer carrying an empty token would be\none the caller cannot use, so that case is a refusal rather than a field\nleft blank.",
         "properties": {
+          "queue_token": {
+            "description": "The Ed25519 capability token for deis-queue, for the same header on\ncalls to deis-queue. A separate token because deis-queue accepts only\nits own audience.",
+            "type": "string"
+          },
           "store_endpoint": {
             "description": "Where deis-store listens, as configured on this control plane.",
             "type": "string"
           },
           "tenant": {
-            "description": "The `<app>.<environment>` pair the token authorises, which the caller\nmust send back in `x-deis-tenant` on every storage call. Included so\na caller never has to rebuild it, and so the one this control plane\nsigned is visible to anyone debugging a refused call.",
+            "description": "The `<app>.<environment>` pair the token authorises. Included so\na caller never has to rebuild it, and so the tenant this control\nplane signed is visible to anyone debugging a refused call.",
             "type": "string"
           },
           "token": {
-            "description": "The capability token, for `x-deis-storage-token`.",
+            "description": "The Ed25519 capability token for deis-store (kv, sql and blob), for\nthe `Authorization: Bearer` header.",
             "type": "string"
           }
         },
         "required": [
           "tenant",
           "store_endpoint",
-          "token"
+          "token",
+          "queue_token"
         ],
         "type": "object"
       },

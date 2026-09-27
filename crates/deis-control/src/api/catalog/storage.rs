@@ -25,7 +25,7 @@
 //! Every mint is recorded in the audit log whatever its outcome, because what
 //! it hands back is a credential; see [`crate::api::authz`].
 
-use deis_capability::CapabilityResource;
+use deis_capability::{AUD_QUEUE, AUD_STORE, resources_for_audience};
 
 use std::net::SocketAddr;
 
@@ -55,8 +55,13 @@ pub struct StorageTokenResponse {
     pub tenant: String,
     /// Where deis-store listens, as configured on this control plane.
     pub store_endpoint: String,
-    /// The Ed25519 capability token, for the `Authorization: Bearer` header.
+    /// The Ed25519 capability token for deis-store (kv, sql and blob), for
+    /// the `Authorization: Bearer` header.
     pub token: String,
+    /// The Ed25519 capability token for deis-queue, for the same header on
+    /// calls to deis-queue. A separate token because deis-queue accepts only
+    /// its own audience.
+    pub queue_token: String,
 }
 
 /// Mint a storage credential for an environment.
@@ -116,23 +121,19 @@ pub async fn storage_token(
     );
     let token = state
         .issuer
-        .issue(
-            "store",
-            &subject,
-            vec![CapabilityResource {
-                tenant: tenant.clone(),
-                binding: String::new(),
-                generation: None,
-            }],
-        )
+        .issue(AUD_STORE, &subject, resources_for_audience(&tenant, AUD_STORE))
+        .await;
+    let queue_token = state
+        .issuer
+        .issue(AUD_QUEUE, &subject, resources_for_audience(&tenant, AUD_QUEUE))
         .await;
 
     // The mint is also a row in the audit log, written by the gate that let
     // this call through (action `storage_token.mint`, recorded whatever the
     // outcome). This line is here as well because it is the one an operator
     // finds while reading the control plane's log for something else, and
-    // what was handed out - a credential that talks to deis-store directly
-    // and does not expire - is worth meeting twice.
+    // what was handed out - credentials that talk to deis-store and
+    // deis-queue directly - is worth meeting twice.
     info!(
         app_id = %app_id,
         environment = %env.name,
@@ -140,13 +141,14 @@ pub async fn storage_token(
         %caller,
         subject = %subject,
         store_endpoint = %store_endpoint,
-        "Minted a storage capability token; the caller can now read and write this tenant's kv, database and blob data directly against deis-store"
+        "Minted storage and queue capability tokens; for their 15 minutes the caller can read and write this tenant's kv, database and blob data directly against deis-store, and its queues against deis-queue"
     );
 
     Ok(Json(StorageTokenResponse {
         tenant,
         store_endpoint,
         token,
+        queue_token,
     }))
 }
 
@@ -209,6 +211,23 @@ mod tests {
         );
         // Human tokens expire in 15 minutes
         assert!(!claims.is_expired(), "freshly minted token must not be expired");
+
+        // And each is accepted by the verifiers it is for: every store
+        // service, and the queue.
+        let verifier = deis_capability::CapabilityVerifier::new(verifying_key);
+        for binding in deis_capability::STORE_BINDINGS {
+            verifier
+                .verify(token, "store", "demo.production", binding)
+                .unwrap_or_else(|e| panic!("store/{binding}: {e}"));
+        }
+        verifier
+            .verify(
+                body["queue_token"].as_str().unwrap(),
+                "queue",
+                "demo.production",
+                "queue",
+            )
+            .expect("the queue token is accepted by deis-queue");
     }
 
     /// A token minted for the wrong environment authorises a different

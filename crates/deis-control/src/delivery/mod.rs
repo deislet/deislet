@@ -48,7 +48,7 @@ use crate::catalog::{
     SecretsBackend, Version, declared_compatibility, declared_limits,
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
-use deis_capability::CapabilityResource;
+use deis_capability::resources_for_audience;
 
 /// How the control plane names itself, once for each audience that is given
 /// an absolute URL.
@@ -266,24 +266,20 @@ impl StorageWiring {
         self
     }
 
-    /// The capability token for one tenant, or `None` on a platform with no
-    /// issuer configured.
+    /// The capability this control plane presents to deis-queue for one
+    /// tenant, or `None` on a platform with no issuer configured.
     ///
     /// The tenant is the whole `<app>.<environment>` pair, the same string
-    /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: the storage
-    /// services verify the capability signature, so a token minted for
-    /// anything else would be refused on every call.
-    pub fn token_for(&self, app_id: &str, environment: &str) -> Option<String> {
+    /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: deis-queue
+    /// checks the token names that tenant, the `queue` audience and the
+    /// `queue` binding, so a token minted for anything else is refused.
+    pub fn queue_token_for(&self, app_id: &str, environment: &str) -> Option<String> {
         let issuer = self.issuer.as_ref()?;
         let tenant = deis_wire::conventions::tenant_id(app_id, environment);
         let token = futures::executor::block_on(issuer.issue(
-            AUD_STORE,
+            AUD_QUEUE,
             &format!("spiffe://deislet/control/{app_id}"),
-            vec![CapabilityResource {
-                tenant,
-                binding: String::new(),
-                generation: None,
-            }],
+            resources_for_audience(&tenant, AUD_QUEUE),
         ));
         Some(token)
     }
@@ -326,11 +322,6 @@ impl StorageWiring {
 
         if let Some(issuer) = &self.issuer {
             let tenant = deis_wire::conventions::tenant_id(app_id, environment);
-            let resources = vec![CapabilityResource {
-                tenant,
-                binding: String::new(),
-                generation: None,
-            }];
             let subject = format!("spiffe://deislet/control/{app_id}");
 
             // Use futures::executor::block_on: CapabilityIssuer::issue is
@@ -338,20 +329,24 @@ impl StorageWiring {
             // futures::block_on is safe to call inside a tokio runtime
             // unlike tokio Handle::block_on.
 
-            // Store capability: authorises the unnamed namespace for KV/SQL/blob.
+            // Store capability: every store binding (kv, sql, blob) of the
+            // tenant, since each store service verifies its own.
             let store_token = futures::executor::block_on(issuer.issue(
                 AUD_STORE,
                 &subject,
-                resources.clone(),
+                resources_for_audience(&tenant, AUD_STORE),
             ));
             env.insert(
                 deis_wire::conventions::STORAGE_TOKEN_ENV.to_string(),
                 store_token,
             );
 
-            // Queue capability: same tenant, but aud = "queue" so the queue
-            // service accepts it.
-            let queue_token = futures::executor::block_on(issuer.issue(AUD_QUEUE, &subject, resources));
+            // Queue capability: same tenant, `queue` audience and binding.
+            let queue_token = futures::executor::block_on(issuer.issue(
+                AUD_QUEUE,
+                &subject,
+                resources_for_audience(&tenant, AUD_QUEUE),
+            ));
             env.insert(
                 deis_wire::conventions::QUEUE_TOKEN_ENV.to_string(),
                 queue_token,
@@ -415,14 +410,7 @@ impl StorageWiring {
                 anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
             })?,
         );
-        if let Some(token) = self.token_for(app_id, environment) {
-            request.metadata_mut().insert(
-                deis_wire::conventions::STORAGE_TOKEN_HEADER,
-                token.parse().map_err(|error| {
-                    anyhow::anyhow!("queue capability is not valid gRPC metadata: {error}")
-                })?,
-            );
-        }
+        self.stamp_queue_capability(&mut request, app_id, environment)?;
         Ok(QueueClient::new(channel)
             .prepare_consumer_generation(request)
             .await?
@@ -506,10 +494,21 @@ impl StorageWiring {
                 anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
             })?,
         );
-        if let Some(token) = self.token_for(app_id, environment) {
+        self.stamp_queue_capability(request, app_id, environment)
+    }
+
+    /// Put this control plane's queue capability in `Authorization: Bearer`,
+    /// the one header deis-queue reads it from.
+    fn stamp_queue_capability<T>(
+        &self,
+        request: &mut tonic::Request<T>,
+        app_id: &str,
+        environment: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(token) = self.queue_token_for(app_id, environment) {
             request.metadata_mut().insert(
-                deis_wire::conventions::STORAGE_TOKEN_HEADER,
-                token.parse().map_err(|error| {
+                "authorization",
+                format!("Bearer {token}").parse().map_err(|error| {
                     anyhow::anyhow!("queue capability is not valid gRPC metadata: {error}")
                 })?,
             );
@@ -2779,6 +2778,61 @@ mod tests {
                 .contains_key(deis_wire::conventions::QUEUE_TOKEN_ENV),
             "DEIS_QUEUE_TOKEN must be present for preview environments too"
         );
+    }
+
+    /// What the issuer mints is what the verifiers accept: the store token
+    /// passes every store service's binding check and the queue token the
+    /// queue's - the pairing the review found broken, with an empty binding
+    /// that no verifier matched.
+    #[tokio::test]
+    async fn the_tokens_a_deployment_carries_pass_the_verifiers_they_are_for() {
+        use deis_capability::{CapabilityVerifier, STORE_BINDINGS};
+        let wiring = authenticated_wiring();
+        let issuer = wiring.issuer.clone().unwrap();
+        let verifier = CapabilityVerifier::new(issuer.verifying_key().await);
+        let tenant = deis_wire::conventions::tenant_id("demo", "production");
+
+        let mut env = BTreeMap::new();
+        wiring.write_into("demo", "production", &mut env);
+        let store_token = &env[deis_wire::conventions::STORAGE_TOKEN_ENV];
+        let queue_token = &env[deis_wire::conventions::QUEUE_TOKEN_ENV];
+        for binding in STORE_BINDINGS {
+            verifier
+                .verify(store_token, AUD_STORE, &tenant, binding)
+                .unwrap_or_else(|e| panic!("store/{binding}: {e}"));
+        }
+        verifier
+            .verify(queue_token, AUD_QUEUE, &tenant, "queue")
+            .expect("the queue token is for the queue");
+        assert!(verifier.verify(store_token, AUD_QUEUE, &tenant, "queue").is_err());
+    }
+
+    /// The control plane's own queue calls carry a queue-audience token in
+    /// `Authorization: Bearer`, which is where deis-queue reads it.
+    #[tokio::test]
+    async fn a_queue_call_from_control_carries_a_queue_capability_as_a_bearer() {
+        let wiring = authenticated_wiring();
+        let issuer = wiring.issuer.clone().unwrap();
+        let mut request = tonic::Request::new(());
+        wiring
+            .stamp_queue_capability(&mut request, "demo", "production")
+            .unwrap();
+        assert!(
+            request
+                .metadata()
+                .get(deis_wire::conventions::STORAGE_TOKEN_HEADER)
+                .is_none()
+        );
+        let header = request.metadata().get("authorization").unwrap().to_str().unwrap();
+        let token = header.strip_prefix("Bearer ").expect("a bearer credential");
+        deis_capability::CapabilityVerifier::new(issuer.verifying_key().await)
+            .verify(
+                token,
+                AUD_QUEUE,
+                &deis_wire::conventions::tenant_id("demo", "production"),
+                "queue",
+            )
+            .expect("deis-queue accepts it");
     }
 
     #[tokio::test]

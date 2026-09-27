@@ -12,12 +12,12 @@
 //!
 //! # Identity on the wire
 //!
-//! The same two headers `deis kv` stamps - `x-deis-tenant` and the capability
-//! token in `x-deis-storage-token` - because deis-queue checks the token the
-//! same way deis-store does, against the same shared secret and derived from
-//! the tenant the call itself claims (see `deis-queue/src/auth.rs`). So the
-//! credential this CLI already fetches for storage is the one that works
-//! here, and there is no second secret to manage.
+//! `x-deis-tenant` and the capability in `Authorization: Bearer`, the same
+//! shape `deis kv` uses. The capability is a separate one, though: deis-queue
+//! accepts only tokens minted for the `queue` audience and binding (see
+//! `deis-queue/src/auth.rs`), and the control plane's storage-token route
+//! hands one out beside the store token, so there is still no second call or
+//! secret to manage.
 //!
 //! There is no binding: a binding names a namespace inside one tenant's
 //! *storage*, and deis-queue has no such dimension - one tenant has one set
