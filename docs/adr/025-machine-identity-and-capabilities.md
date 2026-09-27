@@ -98,6 +98,10 @@ trust_bundle = "/etc/deislet/pki/control-roots.pem"
 - 不信任反向代理注入的 principal header。TLS 可以在受控 sidecar 终止，但 sidecar 与服务间必须使用经过认证的 Unix socket 或再次 mTLS，并把已验证身份放入不可由普通客户端到达的协议字段。
 - bundle、assignment、routing、registration/renewal 和 Control-to-node management 均迁到 machine listener。公开应用 route 永不挂载这些路径。
 - runtime、proxy、store、queue 与 telemetry 的 management listener 与应用 data listener 分离。ADR-023/024 的迁移和恢复管理员调用使用各自 principal 与 operation capability，不再依赖长期静态管理员 bearer token。runtime 的应用 data listener 同样只接受互证 TLS：caller 必须持有本 installation 签发的 proxy 角色证书（URI SAN `deislet/proxy/...`），否则握手即断，无任何明文回落（2026-09 落地：`deis_runtime::dispatcher::DataPlaneAcceptor`，验收见 `crates/deis-runtime/tests/management_auth_test.rs` 与 `crates/deis-proxy/tests/upstream_mtls_test.rs`）。
+- store、queue 与 telemetry 持有各自的机器身份：`spiffe://<trust domain>/deislet/store/<id>`、`.../queue/<id>`、`.../telemetry/<id>`，由同一 installation CA 签发，配置在各自的 `[machine_identity]`；证书若命名其他角色则拒绝启动（2026-09 落地：`deis_identity::names`、`deis_capability::ServiceIdentityConfig`）。同一身份用于两处：
+  - 三者的 gRPC listener 只提供 TLS，出示自身证书（`deis_identity::accept_tls`），不存在明文 listener，bearer capability 不会以明文出现在网络上。listener 不要求客户端证书（人类 CLI 没有机器身份），调用权限仍由每次调用携带的 capability 决定。所有调用方按「角色」校验服务端：证书必须链到 fleet trust root，且命名所要访问的服务种类（`VerifyServerIsOfKind`），同一 CA 签给 queue 的证书不能冒充 store。runtime 与 Control 用自身机器身份的 trust root 与 trust domain 校验，CLI 用 `DEIS_SERVICES_CA` 或 `[services] ca` 指定的 root。
+  - capability JWKS 只挂在 Control 的 machine listener 上，human listener 不再提供；三者以 mTLS 拉取（`deis_capability::ControlClient`），出示自身证书，并要求对端证明同一 trust domain 的 Control 名称。`control_endpoint` 必须是 `https://`，非 loopback 的 `http://` 在启动时即被拒绝。
+  - 尚未实现：capability 与调用方证书的 `cnf` 绑定（本节的 TLS 只防止传输中被读取或被交给错误的机器，不防止被复制的 capability 在有效期内重放）；telemetry 的 Prometheus 端口仍为明文 HTTP。
 - Production 缺少独立 listener、client trust、server identity 或认证 Unix socket 时只进入 diagnostic/not-ready。Dev 可以由本地 ephemeral CA 自动配置，但仍经过相同 principal 与授权代码路径。
 
 ## Enrollment、证书续期与 Registration

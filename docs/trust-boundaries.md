@@ -76,15 +76,51 @@ demand a client certificate. Two sockets, and what is on them:
 serves the gRPC service `deis.machine.MachineChannel` - `Register`,
 `Deregister`, `FetchAssignments`, `FetchRoutingTable`, `FetchSecretValues`,
 `IssueCapability` - the bundle download beside it over HTTP/1.1
-(`versions::BUNDLE_ROUTE`), the capability JWKS, the signed capability
-revocation list (`/capability/revocation-list`), and the long-lived control
-channel `deis.control.ControlService/EstablishChannel`.
+(`versions::BUNDLE_ROUTE`), the long-lived control channel
+`deis.control.ControlService/EstablishChannel`, the signed capability
+revocation list (`/capability/revocation-list`), and the capability verifying
+keys as a JWKS document (`/.well-known/deis/capability-jwks.json`). The keys
+are public, but whoever answers for that document decides which capabilities
+deis-store, deis-queue and deis-telemetry honour, so it is served here and
+nowhere else: the human listener has neither it nor the revocation list.
 
 **A node's management listener** (`crates/deis-runtime/src/dispatcher/machine.rs`)
 serves `deis.management.RuntimeManagement` and `deis.trigger.Trigger`, and
 admits exactly one name: the control plane this node was configured to expect.
 Every other certificate this fleet has ever signed is refused at the
 connection, node and proxy certificates included.
+
+**The data services** - deis-store, deis-queue and deis-telemetry - each hold a
+machine identity of their own under `[machine_identity]`:
+`spiffe://<trust domain>/deislet/store/<id>`, `.../queue/<id>` and
+`.../telemetry/<id>`, issued by the same authority as every other machine
+(`crates/deis-identity/src/names.rs`). A service refuses to start with a
+certificate naming any other kind of machine. The identity is used twice:
+
+* their gRPC listeners speak TLS only, presenting that certificate
+  (`deis_identity::accept_tls`, `crates/deis-identity/src/service.rs`). There is
+  no plaintext listener, so the bearer capability every call carries is never
+  readable on the wire. The listener asks the caller for no certificate - a
+  person's `deis kv` holds none - and what the caller may do is decided by the
+  capability, per call. Every caller checks the far end by role: the
+  certificate must chain to the fleet's trust root and name the kind of
+  service it meant to reach (`VerifyServerIsOfKind`), so a queue's certificate,
+  signed by the same authority, does not answer for a store, and a machine that
+  merely holds a store's address gets a refused handshake instead of the
+  capability. Runtime nodes and the control plane check against their own
+  machine identity's root and trust domain; the CLI checks against the root
+  named by `DEIS_SERVICES_CA` or `[services] ca`.
+* they read the JWKS from the control plane's machine listener under mutual
+  TLS, proving that certificate and requiring the control plane's name in the
+  same trust domain (`deis_capability::ControlClient`). `control_endpoint` must
+  be `https://`; plain `http://` is refused at startup unless it names a
+  loopback address, where nothing on the network sits between the two
+  processes.
+
+Binding a capability to the caller's certificate (`cnf`) is not implemented,
+so a capability copied off a node still works from anywhere that can reach the
+service until it expires; the TLS above only keeps it from being read in
+transit or handed to the wrong machine.
 
 | A holder of | can do |
 |---|---|
@@ -288,8 +324,8 @@ network - not by the absence of a published address:
 | Node `[machine_identity] management_listen` | The one machine this node's `[machine_identity]` names as its control plane, and nobody else this fleet has ever signed a certificate for - every other proved name is refused at the connection. |
 | Control plane's human listener (`bind_addr`, `port`) | The operators' network. Never the internet. It serves the dashboard and the API - every caller presents a token, and there is no anonymous path - plus a control channel that admits nobody. |
 | Control plane's `[machine]` listener | Machines holding a certificate this fleet signed. This is where the assignment list, the routing table and the bundle store live, so it must never be the internet either - the certificate demand is the authentication, not the containment. |
-| deis-store and deis-queue gRPC ports | Runtime nodes, the control plane and the operators' network only. Each binds loopback by default and refuses to start bound anywhere else with no `auth_secret`; the optional migration service shares the listener under its own independent token. |
-| deis-telemetry's gRPC port and its Prometheus port | The same set. Every call on either presents a control-signed capability, and neither has a mode without that check, so binding them beyond loopback is not a hole in itself; keeping them off the internet is still the containment. |
+| deis-store and deis-queue gRPC ports (TLS only) | Runtime nodes, the control plane and the operators' network only. Each binds loopback by default; every call carries a capability whatever the address, and a plaintext caller gets no answer. The optional migration service shares the listener under its own independent token. |
+| deis-telemetry's gRPC port (TLS only) and its Prometheus port | The same set, and both count: one serves logs and traces, the other every application's metric series. Every call on either presents a control-signed capability, and neither has a mode without that check. The Prometheus port is still plain HTTP, so the bearer a scraper sends is readable on the way: keep it on loopback or a network only the scraper reaches. |
 | deis-proxy's listeners | The internet. This is the only one that belongs there. |
 
 A `[machine_identity]` private key is a credential like any other, whatever
@@ -314,7 +350,7 @@ Everything below is therefore the operator's to enforce:
 | Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchSecretValues` still answers for every environment's secrets. Issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. |
 | Every node's configuration | `0600`, owned by the node's service user. It holds no shared credential - its telemetry capability is issued by the control plane at run time - but the file names the path of this node's private key and the one control plane this node obeys - which is what decides who may deploy to it. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same contents, same reasoning, on the one host that faces the internet. |
-| deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. deis-store and deis-queue hold the application-data `auth_secret`; all three hold the independent `migration_admin_token`, whose possession can freeze and inventory any tenant in that backend. Never reuse one value for both domains. deis-telemetry's configuration holds no application credential at all. |
+| deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. They hold the independent `migration_admin_token` - possession of it can freeze and inventory any tenant in that backend - and name the service's `[machine_identity]` files. The private key is `0600` like every other machine's: whoever holds a store's key can answer for a store and collect the capabilities sent to it. |
 | `.demo/` written by `scripts/demo.sh` | The demo writes every configuration it generates, `state.env`, `secret.key` and every private key it mints as `0600`; `scripts/test-demo-witnesses.sh` holds it to that statically. Five of those files carry a credential value - `state.env`, `secret.key` and the store, queue and control-plane configurations - and the node's and the proxy's carry a path to a key file instead. It is still a workstation tool: it puts every process under one user, so the mode separates the demo from other accounts on the host and nothing else. Do not copy a `.demo/` configuration into a real deployment. |
 
 ## Rotating the credential
