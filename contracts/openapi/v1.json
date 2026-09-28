@@ -7588,6 +7588,27 @@
         ],
         "type": "object"
       },
+      "TelemetryTokenResponse": {
+        "description": "A read credential for deis-telemetry.",
+        "properties": {
+          "tenants": {
+            "description": "The `<app>.<environment>` tenants the token reads, or `@platform` for\na token that reads everything.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token": {
+            "description": "The capability, for the `Authorization: Bearer` header on calls to\ndeis-telemetry. Valid for 15 minutes; it may query and follow, and\nmay not push.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenants",
+          "token"
+        ],
+        "type": "object"
+      },
       "TokenOrigin": {
         "description": "Where a credential came from.",
         "enum": [
@@ -9139,6 +9160,36 @@
           }
         },
         "summary": "GET /api/platform/sessions/{node_id}/heartbeats - the recorded heartbeat\nhistory, newest first, in the unified list envelope. The node need not\nhold a channel open now: its history is what it left behind.",
+        "tags": [
+          "platform"
+        ]
+      }
+    },
+    "/api/platform/telemetry-token": {
+      "get": {
+        "operationId": "getPlatformTelemetryToken",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryTokenResponse"
+                }
+              }
+            },
+            "description": "A credential that reads every tenant's telemetry and the nodes' own."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Mint a telemetry read credential for the whole platform.",
         "tags": [
           "platform"
         ]
@@ -11127,6 +11178,103 @@
           }
         },
         "summary": "Mint a storage credential for an environment.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/telemetry-token": {
+      "get": {
+        "operationId": "getEnvironmentTelemetryToken",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryTokenResponse"
+                }
+              }
+            },
+            "description": "A credential that reads this environment's telemetry."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Mint a telemetry read credential for one environment.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/telemetry-token": {
+      "get": {
+        "operationId": "getAppTelemetryToken",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryTokenResponse"
+                }
+              }
+            },
+            "description": "A credential that reads the telemetry of every environment of the application."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Mint a telemetry read credential for every environment of an application.",
         "tags": [
           "product"
         ]

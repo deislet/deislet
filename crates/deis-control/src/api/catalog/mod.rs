@@ -28,6 +28,7 @@ pub mod routes;
 pub mod routing_table;
 pub mod secrets;
 pub mod storage;
+pub mod telemetry;
 pub mod versions;
 
 use std::sync::Arc;
@@ -228,6 +229,16 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
             &at("/apps/:app_id/environments/:env/storage-token"),
             get(storage::storage_token),
         )
+        // The read credential for deis-telemetry, at the breadth the path
+        // names; see `telemetry` for what each one needs.
+        .route(
+            &at("/apps/:app_id/environments/:env/telemetry-token"),
+            get(telemetry::environment_telemetry_token),
+        )
+        .route(
+            &at("/apps/:app_id/telemetry-token"),
+            get(telemetry::app_telemetry_token),
+        )
         .route(
             &at("/apps/:app_id/environments/:env/secrets/:name"),
             put(secrets::put_secret).delete(secrets::delete_secret),
@@ -355,6 +366,10 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
 pub fn platform_router(prefix: &str, state: CatalogState) -> Router {
     Router::new()
         .route(&format!("{prefix}/routes"), get(routes::list_all_routes))
+        .route(
+            &format!("{prefix}/telemetry-token"),
+            get(telemetry::platform_telemetry_token),
+        )
         .with_state(state)
 }
 

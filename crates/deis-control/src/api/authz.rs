@@ -333,7 +333,8 @@ impl Resource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditWhen {
     /// Every time, whatever the outcome. Every state-changing call, plus the
-    /// storage-token mint, which is a read that hands back a credential.
+    /// storage-token and telemetry-token mints, reads that hand back a
+    /// credential.
     Always,
     /// Only when it was refused. A successful read is not an event; a refused
     /// one is somebody finding out what they cannot reach.
@@ -1246,6 +1247,21 @@ fn classify_canonical(
         )
         .about(jti)
         .changes_state(),
+        // A read credential for deis-telemetry. Reading telemetry is
+        // looking, so the verb is `read`, over exactly the breadth the token
+        // will read; recorded every time all the same, because what comes
+        // back is a credential that reads without passing through here again.
+        ["api", "apps", app, "environments", env, "telemetry-token"] => {
+            Requirement::new("telemetry_token.mint", Verb::Read, named(app), named(env))
+                .changes_state()
+        }
+        ["api", "apps", app, "telemetry-token"] => Requirement::new(
+            "telemetry_token.mint",
+            Verb::Read,
+            named(app),
+            Resource::Every,
+        )
+        .changes_state(),
 
         // ---- accounts, tokens, the audit log ------------------------------
         ["api", "accounts"] if !writing => Requirement::new(
@@ -1333,6 +1349,16 @@ fn classify_canonical(
             Resource::Every,
             Resource::Every,
         )
+        .operator(),
+        // Reads every tenant's telemetry and the nodes' own, so it needs a
+        // credential that may look at everything.
+        ["api", "telemetry-token"] => Requirement::new(
+            "telemetry_token.mint_platform",
+            Verb::Read,
+            Resource::Every,
+            Resource::Every,
+        )
+        .changes_state()
         .operator(),
         ["api", "sessions", ..] => {
             Requirement::new("session.read", Verb::Read, Resource::Every, Resource::Every)
@@ -2191,6 +2217,24 @@ mod tests {
                 "storage_token.mint",
                 Verb::Storage,
             ),
+            (
+                "GET",
+                "/api/apps/demo/environments/production/telemetry-token",
+                "telemetry_token.mint",
+                Verb::Read,
+            ),
+            (
+                "GET",
+                "/api/apps/demo/telemetry-token",
+                "telemetry_token.mint",
+                Verb::Read,
+            ),
+            (
+                "GET",
+                "/api/telemetry-token",
+                "telemetry_token.mint_platform",
+                Verb::Read,
+            ),
             ("GET", "/api/routes", "route.list_all", Verb::Read),
             ("GET", "/api/sessions", "session.read", Verb::Read),
             (
@@ -2544,6 +2588,7 @@ mod tests {
         "node.list",
         "node.status",
         "node.app.unload",
+        "telemetry_token.mint_platform",
     ];
 
     /// The table above is written by hand and can only be as complete as
@@ -3320,6 +3365,48 @@ mod tests {
                 .is_none(),
             "the authorization gate must never parse signed release material"
         );
+    }
+
+    /// A telemetry read credential reaches no further than the reader's own
+    /// scope: one environment's reader mints for that environment, and
+    /// neither for the whole application nor for the platform. Every mint is
+    /// recorded, like the storage-token mint.
+    #[test]
+    fn a_telemetry_token_is_minted_only_within_the_readers_scope() {
+        let reader = Principal {
+            kind: crate::identity::PrincipalKind::Account,
+            account: Some("dev".to_string()),
+            role: Some(crate::identity::Role::Viewer),
+            credential_id: Some("0011223344556677".to_string()),
+            authority: crate::identity::Authority::Scoped(
+                crate::identity::Scope::parse_list("read:myapp/preview").unwrap(),
+            ),
+        };
+        let permitted = |path: &str| {
+            let requirement = requirement("GET", path);
+            assert_eq!(
+                requirement.audit,
+                AuditWhen::Always,
+                "{path} must be audited"
+            );
+            let demand = Demand {
+                verb: requirement.verb,
+                app: requirement.app.selector(),
+                environment: requirement.environment.selector(),
+            };
+            reader.permits(&demand).is_ok()
+        };
+        assert!(permitted(
+            "/api/apps/myapp/environments/preview/telemetry-token"
+        ));
+        for path in [
+            "/api/apps/myapp/environments/production/telemetry-token",
+            "/api/apps/myapp/telemetry-token",
+            "/api/apps/otherapp/environments/preview/telemetry-token",
+            "/api/telemetry-token",
+        ] {
+            assert!(!permitted(path), "{path} was allowed to read:myapp/preview");
+        }
     }
 
     /// The CI credential from the specification, walked through the exact

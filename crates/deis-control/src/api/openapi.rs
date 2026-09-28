@@ -151,6 +151,8 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         crate::api::catalog::capabilities::revoke_node_capabilities,
         crate::api::catalog::capabilities::revoke_tenant_capabilities,
         crate::api::catalog::capabilities::bump_auth_epoch,
+        crate::api::catalog::telemetry::environment_telemetry_token,
+        crate::api::catalog::telemetry::app_telemetry_token,
         // Hostname grants.
         crate::api::catalog::domains::list_grants,
         crate::api::catalog::domains::create_grant,
@@ -226,6 +228,8 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         crate::api::apps::unload_app,
         // Platform: the global route table.
         crate::api::catalog::routes::list_all_routes,
+        // Platform: the platform-wide telemetry read credential.
+        crate::api::catalog::telemetry::platform_telemetry_token,
     ),
     components(
         schemas(
@@ -2093,6 +2097,7 @@ mod tests {
         ("SecretChangeResponse", "secret"),
         ("MintResponse", "secret"),
         ("StorageTokenResponse", "token"),
+        ("TelemetryTokenResponse", "token"),
         ("ControlListPage_SecretMeta", "items"),
         // A count of secrets removed with an application.
         ("DeletedApp", "secrets"),
