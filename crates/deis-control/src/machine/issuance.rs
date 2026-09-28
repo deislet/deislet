@@ -14,7 +14,11 @@
 //!   that node - the one place placement will narrow;
 //! - the binding is one that audience defines;
 //! - a generation, if the resource names one, is that deployment's routing
-//!   generation.
+//!   generation;
+//! - for deis-telemetry, the binding is `ingest` only: a node pushes the
+//!   records of what it runs and never reads anyone's. It may also always
+//!   ask for `ingest` on the reserved `@platform` tenant, which covers its
+//!   own node-level records and nothing of any application.
 //!
 //! One resource outside that refuses the whole request, and the refusal is
 //! written to the audit log with the name the node proved. This is what
@@ -24,7 +28,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use deis_capability::{CapabilityResource, bindings_for_audience};
+use deis_capability::{
+    AUD_TELEMETRY, CapabilityResource, TELEMETRY_INGEST, TELEMETRY_PLATFORM_TENANT,
+    bindings_for_audience,
+};
 
 use crate::api::catalog::assignments::VisibleDeployment;
 
@@ -61,6 +68,19 @@ pub(crate) fn authorize(
     }
     let tenants = tenants_of(visible);
     for resource in resources {
+        if audience == AUD_TELEMETRY && resource.binding != TELEMETRY_INGEST {
+            return Err(format!(
+                "binding {:?} of the {audience} audience is not one a node may be issued; \
+                 a node pushes telemetry and reads none",
+                resource.binding
+            ));
+        }
+        if audience == AUD_TELEMETRY
+            && resource.tenant == TELEMETRY_PLATFORM_TENANT
+            && resource.generation.is_none()
+        {
+            continue;
+        }
         let Some(generations) = tenants.get(resource.tenant.as_str()) else {
             return Err(format!(
                 "tenant {:?} is not deployed to node {node_id}",
@@ -89,7 +109,7 @@ pub(crate) fn authorize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deis_capability::{AUD_QUEUE, AUD_STORE, resources_for_audience};
+    use deis_capability::{AUD_QUEUE, AUD_STORE, TELEMETRY_READ, resources_for_audience};
 
     fn visible() -> BTreeMap<String, VisibleDeployment> {
         BTreeMap::from([(
@@ -137,6 +157,41 @@ mod tests {
             .is_err()
         );
         assert!(authorize("n", AUD_STORE, &[], &visible()).is_err());
+    }
+
+    fn ingest(tenant: &str) -> CapabilityResource {
+        CapabilityResource {
+            tenant: tenant.to_string(),
+            binding: TELEMETRY_INGEST.to_string(),
+            generation: None,
+        }
+    }
+
+    #[test]
+    fn a_node_may_push_telemetry_for_what_it_runs_and_its_own_records() {
+        authorize(
+            "n",
+            AUD_TELEMETRY,
+            &[ingest("a.production"), ingest(TELEMETRY_PLATFORM_TENANT)],
+            &visible(),
+        )
+        .unwrap();
+        // Its own records need no deployment at all.
+        authorize("n", AUD_TELEMETRY, &[ingest(TELEMETRY_PLATFORM_TENANT)], &BTreeMap::new())
+            .unwrap();
+        assert!(authorize("n", AUD_TELEMETRY, &[ingest("b.production")], &visible()).is_err());
+    }
+
+    #[test]
+    fn a_node_may_never_read_telemetry() {
+        for tenant in ["a.production", TELEMETRY_PLATFORM_TENANT] {
+            let read = CapabilityResource {
+                binding: TELEMETRY_READ.to_string(),
+                ..ingest(tenant)
+            };
+            let refusal = authorize("n", AUD_TELEMETRY, &[read], &visible()).unwrap_err();
+            assert!(refusal.contains("reads none"), "{refusal}");
+        }
     }
 
     #[test]
