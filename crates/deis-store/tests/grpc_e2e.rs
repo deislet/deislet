@@ -9,8 +9,8 @@
 //!
 //! Every call carries a capability naming one canonical tenant, which is
 //! what deis-runtime sends; nothing in the request names the tenant. The
-//! tests name tenants by label - `app-one.production`, `app-two.production`
-//! - and derive the canonical id from it (`CanonicalTenantId::derived_from_label`),
+//! tests name tenants by label (`app-one.production`, `app-two.production`)
+//! and derive the canonical id from it (`CanonicalTenantId::derived_from_label`),
 //! and one test pairs `app-one.production` with `app-one.preview` to check
 //! that two environments of the *same* application are also two namespaces.
 

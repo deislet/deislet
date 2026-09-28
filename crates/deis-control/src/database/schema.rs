@@ -551,7 +551,8 @@ mod tests {
             .unwrap();
         assert_eq!(installation_organization, organization_id);
         assert_eq!(revision, 1);
-        for id in [&organization_id] {
+        {
+            let id = &organization_id;
             assert!(
                 CanonicalId::from_str(id).is_ok(),
                 "seed id {id} is not a canonical UUIDv7"

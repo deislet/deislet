@@ -512,10 +512,21 @@ pub fn verify_for_request(
         expected_aud,
         tenant,
         binding,
-        min_auth_epoch.unwrap_or(0),
-        revoked_jtis.unwrap_or_default(),
-        &[],
+        Revoked {
+            min_auth_epoch: min_auth_epoch.unwrap_or(0),
+            jtis: revoked_jtis.unwrap_or_default(),
+            nodes: &[],
+        },
     )
+}
+
+/// What a verifier has learned from the revocation list: the lowest auth
+/// epoch still honoured, and the revoked token ids and nodes.
+#[derive(Clone, Copy)]
+struct Revoked<'a> {
+    min_auth_epoch: u64,
+    jtis: &'a [String],
+    nodes: &'a [String],
 }
 
 /// Every check after the signature: the ones in [`check_common`], then the
@@ -526,18 +537,9 @@ fn check_claims(
     expected_aud: &str,
     tenant: &str,
     binding: &str,
-    min_auth_epoch: u64,
-    revoked_jtis: &[String],
-    revoked_nodes: &[String],
+    revoked: Revoked<'_>,
 ) -> Result<VerifiedCapability, CapabilityError> {
-    check_common(
-        &claims,
-        grace_accepted,
-        expected_aud,
-        min_auth_epoch,
-        revoked_jtis,
-        revoked_nodes,
-    )?;
+    check_common(&claims, grace_accepted, expected_aud, revoked)?;
 
     if !claims.authorizes_binding(tenant, binding) {
         if !claims.authorizes_tenant(tenant) {
@@ -567,10 +569,13 @@ fn check_common(
     claims: &CapabilityClaims,
     grace_accepted: bool,
     expected_aud: &str,
-    min_auth_epoch: u64,
-    revoked_jtis: &[String],
-    revoked_nodes: &[String],
+    revoked: Revoked<'_>,
 ) -> Result<(), CapabilityError> {
+    let Revoked {
+        min_auth_epoch,
+        jtis: revoked_jtis,
+        nodes: revoked_nodes,
+    } = revoked;
     let now = now_secs();
 
     let lifetime = claims.exp.saturating_sub(claims.iat);
@@ -608,7 +613,7 @@ fn check_common(
         });
     }
 
-    if revoked_jtis.iter().any(|jti| *jti == claims.jti) {
+    if revoked_jtis.contains(&claims.jti) {
         return Err(CapabilityError::Revoked {
             jti: claims.jti.clone(),
         });
@@ -949,16 +954,7 @@ impl CapabilityVerifier {
     ) -> Result<VerifiedCapability, CapabilityError> {
         self.require_list()?;
         let claims = decode_with(token, &self.keys)?;
-        check_claims(
-            claims,
-            false,
-            expected_aud,
-            tenant,
-            binding,
-            self.min_auth_epoch,
-            &self.revoked_jtis,
-            &self.revoked_nodes,
-        )
+        check_claims(claims, false, expected_aud, tenant, binding, self.revoked())
     }
 
     /// Verify with T8 degraded-mode grace period.
@@ -995,9 +991,7 @@ impl CapabilityVerifier {
             expected_aud,
             tenant,
             binding,
-            self.min_auth_epoch,
-            &self.revoked_jtis,
-            &self.revoked_nodes,
+            self.revoked(),
         )?;
 
         if verified.grace_accepted {
@@ -1028,14 +1022,7 @@ impl CapabilityVerifier {
             && self.is_degraded()
             && self.grace_applies(&claims, now);
 
-        check_common(
-            &claims,
-            grace_accepted,
-            expected_aud,
-            self.min_auth_epoch,
-            &self.revoked_jtis,
-            &self.revoked_nodes,
-        )?;
+        check_common(&claims, grace_accepted, expected_aud, self.revoked())?;
 
         if grace_accepted {
             self.count_grace(claims.resources.iter().map(|r| r.tenant.as_str()));
@@ -1078,6 +1065,14 @@ impl CapabilityVerifier {
                 binding: binding.to_string(),
                 named: tenants.len(),
             }),
+        }
+    }
+
+    fn revoked(&self) -> Revoked<'_> {
+        Revoked {
+            min_auth_epoch: self.min_auth_epoch,
+            jtis: &self.revoked_jtis,
+            nodes: &self.revoked_nodes,
         }
     }
 

@@ -980,7 +980,7 @@ impl std::fmt::Debug for StorageIdentity {
                     .read()
                     .unwrap()
                     .as_ref()
-                    .map_or(false, |t| !t.is_empty())
+                    .is_some_and(|t| !t.is_empty())
                 {
                     "<present>"
                 } else {
@@ -1104,7 +1104,7 @@ impl StorageIdentity {
             .read()
             .unwrap()
             .as_ref()
-            .map_or(false, |t| !t.is_empty())
+            .is_some_and(|t| !t.is_empty())
     }
 
     /// Returns the shared lock behind this identity's token so a background
