@@ -42,7 +42,9 @@
 >   操作，按该环境最近一次 provider 部署的期望状态执行 driver 的 `delete`：删掉 Worker、保留数据；
 >   只有请求里 `purgeData` 写明本环境名（`--purge-data <环境名>`）时，才把清除许可
 >   `DEIS_PROVIDER_PURGE_DATA` 交给 driver，连同 KV/D1/R2/队列一起删除。
-> - **未做：** D1 迁移（ADR-008 T5-3）。
+> - **不在本期范围：** D1 迁移（ADR-008 T5-3）。要等 Edge Canon 标准先定下应用声明迁移的格式；
+>   在此之前 driver 只创建空的 D1 数据库、从不改动其 schema，建表由应用自己（例如首次使用时幂等执行）
+>   或运维用 `wrangler d1 execute` 对 driver 创建的带命名空间的数据库完成。
 >
 > 相应地，本文表格里 Deislet 侧的若干数值上限已按共享标准收敛到与 Cloudflare 一致：KV key 512B、
 > metadata 1 KiB、TTL ≥ 60 秒、list 单页 1000；SQL 单值 2,000,000 字节、单条语句 100,000 字节；

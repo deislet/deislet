@@ -18,7 +18,7 @@ preflight, plan, prepare, upload, verify, activate and observe.
 | Against a real Cloudflare account | **not yet verified**; run [`scripts/cloudflare-smoke.sh`](../../scripts/cloudflare-smoke.sh) |
 | Environment secrets and deployment-time config values handed from the control plane to the driver | implemented, covered by `cloudflare_e2e.rs` against the fake `wrangler`: the config value fills its `[vars]` placeholder, the bound secret reaches `wrangler versions upload` on stdin and never argv, a rotated secret reaches the next deployment, and a delivery the audit log cannot record does not happen (see [Secrets and config](#secrets-and-config)) |
 | Undeploying through the control plane | implemented, covered by `cloudflare_e2e.rs` against the fake `wrangler`: `deis undeploy --target cloudflare` (`POST /api/v1/apps/{app}/environments/{env}/provider-undeployments`) removes the Worker and keeps the data; with `--purge-data <environment>` the environment's KV, D1, R2 and queue resources are destroyed too, and a consent naming another environment is refused (see [Undeploying](#undeploying)) |
-| D1 migrations before activate (ADR-008 T5-3) | not done |
+| D1 migrations before activate (ADR-008 T5-3) | out of scope until the Edge Canon standard defines how an application declares its migrations; D1 databases are created empty (see [D1 migrations](#d1-migrations)) |
 
 Until the smoke script has passed against a real account, treat Cloudflare
 deployment as implemented but unverified.
@@ -203,6 +203,15 @@ undeploy --purge-data <environment>`); the name must be the environment in
 the request path, so a consent written for one environment can never be
 applied to another. The consent is recorded on the workflow (`purgeData`)
 and handed to the driver for that workflow's steps only.
+
+## D1 migrations
+
+Applying D1 migrations before `activate` (ADR-008 T5-3) is out of scope
+until the Edge Canon standard defines how an application declares its
+migrations. The driver creates each declared D1 database empty and never
+changes its schema; an application that needs tables creates them itself
+(for example, idempotently on first use) or an operator applies them with
+`wrangler d1 execute` against the namespaced database the driver created.
 
 ## Verifying against a real account
 

@@ -195,7 +195,7 @@ proposal 落地前属于「未实现」，编译期报 `EC_BINDING_TARGET_UNIMPL
 | SQL | 交互式事务：deislet 有 `transaction()`，D1 只有原子 `batch()` | (c) 向 Edge Canon 提议标准 SQL 仅含 `prepare/bind/first/all/run/batch`；proposal 通过前编译到 Cloudflare 的应用使用 `transaction()` 报 `EC_BINDING_TARGET_UNIMPLEMENTED` | 已实现编译期拒绝；proposal 草稿见 `standards/proposals/0002-shared-limits-and-interactive-transactions.zh.md` |
 | SQL | 单值上限：deislet 8 MiB → D1 约 2,000,000 字节（developers.cloudflare.com/d1/platform/limits，核对 2026-09-25） | (a) 标准取两者较小值 | 已收紧：`TENANT_MAX_VALUE_BYTES = 2_000_000`；2,000,000 可写、2,000,001 报 `TooLarge` |
 | SQL | 单条 SQL 长度：deislet 64 KiB → D1 约 100 KB（同上核对日期） | (a) 标准取两者较大值（本项 deislet 放宽到交集外沿） | 已调整：`TENANT_MAX_SQL_BYTES = 100_000` |
-| SQL | schema 迁移：deislet 应用自执行 DDL，D1 有 migrations 目录 | (b) driver 在 activate 之前执行应用声明的迁移；标准规定迁移声明格式 | T5-3（driver）范围 |
+| SQL | schema 迁移：deislet 应用自执行 DDL，D1 有 migrations 目录 | (b) driver 在 activate 之前执行应用声明的迁移；标准规定迁移声明格式 | T5-3（driver）范围；标准尚未定义迁移声明格式，在此之前不做，driver 只创建空库（见 `docs/operations/cloudflare.md`「D1 migrations」） |
 | Blob | 元数据/大对象/httpMetadata 差异 | (a) 标准 etag 只保证「内容变化 ⇒ etag 变化」；customMetadata/完整 httpMetadata 暂不进标准 | 未进入本轮；需要时走 proposal 后由 deislet 补齐 |
 | Queue | 投递语义：双方均为 at-least-once | 一致 | conformance 覆盖 |
 | Queue | 重试次数：deislet 默认 5 → Cloudflare `max_retries` 默认 3 | (b) 标准要求显式声明 `maxRetries`，默认 3 | 已实现：`.config.json` 消费者可声明 `maxRetries`，binding plan 总是写出显式值（缺省 3）；deis-queue 默认改为 3，双端同数 |
