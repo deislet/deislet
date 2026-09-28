@@ -313,8 +313,8 @@ sidecar 的 payload 是恰好 N+1 的 RFC 8785 canonical 新根，DSSE PAE 必�
 
 Control 通过与根文件相同的安全文件读取边界加载可选 rotation envelope；根与轮换在同一 SQLite 事务中持久化。
 `provider_driver_trust_root_rotations` 保存前后版本、canonical envelope 摘要和双方实际签名者，记录不可修改、不可删除。
-为避免上一已发布切片的 pre-root-role v1 在升级时失效，兼容解析只对既有历史保留其原 canonical identity，并把旧
-release role 阈值作为旧 root role；它不能用于全新 bootstrap，下一次双阈值轮换写入显式 root role 后即退出兼容路径。
+没有 pre-root-role v1 或缺少 transparency policy 的根文档需要兼容（平台没有存量安装）：配置文件与数据库历史中的根
+一律按严格形状解析，缺少显式 `root` 角色或 transparency policy 的根在任何路径上都被拒绝。
 共享契约新增 rotation envelope schema、canonical N+1 正例与 payload type/signature/role 阈值反例；Rust fixture 测试会
 执行真实 Ed25519 双阈值验证，而不把 Python 结构检查冒充密码学证据。该设计遵循 TUF 对连续 intermediate root、旧/新
 root threshold 及只在更新结束检查最终 trusted root expiry 的要求。
@@ -325,7 +325,7 @@ provider driver 平台适用测试、Control provider 专项、legacy migration 
 误判 Cargo stderr 的事实，不能用后续绿灯改写。runner 只在操作系统明确报告进程尚未创建的 `WouldBlock`、
 `Interrupted` 或 Unix `ETXTBSY` 上做有界启动重试，仍受原调用 deadline 约束；其他错误立即失败，因而不会以重试
 重复 provider side effect。该证据同时覆盖显式 root role、旧/新根双阈值、过期旧根恢复、最终新根有效期、不可变轮换
-记录，以及 pre-root-role v1 历史根重启和一次性迁移。
+记录。（当时还覆盖 pre-root-role v1 历史根的兼容解析，该路径已删除。）
 
 ## 发行透明度与离线证明
 

@@ -85,27 +85,12 @@ pub struct DriverReleaseTrustRoot {
     pub keys: Vec<DriverReleaseSigningKey>,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-struct LegacyDriverReleaseTrustRoot {
-    #[serde(rename = "$schema")]
-    schema: Option<String>,
-    schema_version: u32,
-    root_version: u64,
-    expires_at: DateTime<Utc>,
-    provider_driver_release: DriverReleaseSigningRole,
-    keys: Vec<DriverReleaseSigningKey>,
-}
-
 #[derive(Clone, Debug)]
 pub struct ValidatedDriverReleaseTrustRoot {
     root: DriverReleaseTrustRoot,
     verifying_keys: BTreeMap<String, VerifyingKey>,
     canonical_json: Vec<u8>,
     canonical_sha256: Sha256Digest,
-    legacy_implicit_root_role: bool,
-    legacy_missing_transparency_policy: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -227,62 +212,17 @@ impl ValidatedDriverReleaseTrustRoot {
         Self::new(root)
     }
 
-    /// Reads the pre-root-role v1 shape only for an already deployed trust
-    /// history. New bootstrap and every rotation payload remain strict.
-    pub fn load_file_compatible(
-        path: impl AsRef<Path>,
-    ) -> Result<Self, DriverReleaseAuthorizationError> {
-        let bytes = read_secure_trust_metadata_file(path.as_ref())?;
-        Self::parse_json_compatible(&bytes)
-    }
-
-    pub fn parse_json_compatible(bytes: &[u8]) -> Result<Self, DriverReleaseAuthorizationError> {
-        if let Ok(root) = serde_json::from_slice::<DriverReleaseTrustRoot>(bytes) {
-            let canonical_json =
-                serde_jcs::to_vec(&root).map_err(DriverReleaseAuthorizationError::Json)?;
-            if root.provider_driver_transparency.is_some() {
-                return Self::from_root_and_canonical(root, canonical_json, false, false);
-            }
-            return Self::from_root_and_canonical(root, canonical_json, false, true);
-        }
-        let legacy: LegacyDriverReleaseTrustRoot =
-            serde_json::from_slice(bytes).map_err(DriverReleaseAuthorizationError::Json)?;
-        let canonical_json =
-            serde_jcs::to_vec(&legacy).map_err(DriverReleaseAuthorizationError::Json)?;
-        let root_role = DriverReleaseRootRole {
-            key_ids: legacy.provider_driver_release.key_ids.clone(),
-            threshold: legacy.provider_driver_release.threshold,
-        };
-        Self::from_root_and_canonical(
-            DriverReleaseTrustRoot {
-                schema: legacy.schema,
-                schema_version: legacy.schema_version,
-                root_version: legacy.root_version,
-                expires_at: legacy.expires_at,
-                root: root_role,
-                provider_driver_release: legacy.provider_driver_release,
-                provider_driver_transparency: None,
-                keys: legacy.keys,
-            },
-            canonical_json,
-            true,
-            true,
-        )
-    }
-
     pub fn new(root: DriverReleaseTrustRoot) -> Result<Self, DriverReleaseAuthorizationError> {
         let canonical_json =
             serde_jcs::to_vec(&root).map_err(DriverReleaseAuthorizationError::Json)?;
-        Self::from_root_and_canonical(root, canonical_json, false, false)
+        Self::from_root_and_canonical(root, canonical_json)
     }
 
     fn from_root_and_canonical(
         root: DriverReleaseTrustRoot,
         canonical_json: Vec<u8>,
-        legacy_implicit_root_role: bool,
-        legacy_missing_transparency_policy: bool,
     ) -> Result<Self, DriverReleaseAuthorizationError> {
-        validate_trust_root(&root, !legacy_missing_transparency_policy)?;
+        validate_trust_root(&root)?;
         let mut verifying_keys = BTreeMap::new();
         for key in &root.keys {
             let bytes = decode_canonical_base64(&key.public_key)?;
@@ -303,8 +243,6 @@ impl ValidatedDriverReleaseTrustRoot {
             verifying_keys,
             canonical_sha256: sha256(&canonical_json),
             canonical_json,
-            legacy_implicit_root_role,
-            legacy_missing_transparency_policy,
         })
     }
 
@@ -320,16 +258,6 @@ impl ValidatedDriverReleaseTrustRoot {
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, DriverReleaseAuthorizationError> {
         Ok(self.canonical_json.clone())
-    }
-
-    #[must_use]
-    pub const fn uses_legacy_implicit_root_role(&self) -> bool {
-        self.legacy_implicit_root_role
-    }
-
-    #[must_use]
-    pub const fn uses_legacy_missing_transparency_policy(&self) -> bool {
-        self.legacy_missing_transparency_policy
     }
 
     #[must_use]
@@ -627,10 +555,7 @@ impl ValidatedDriverReleaseAuthorization {
     }
 }
 
-fn validate_trust_root(
-    root: &DriverReleaseTrustRoot,
-    require_transparency_policy: bool,
-) -> Result<(), DriverReleaseAuthorizationError> {
+fn validate_trust_root(root: &DriverReleaseTrustRoot) -> Result<(), DriverReleaseAuthorizationError> {
     require(
         root.schema
             .as_deref()
@@ -751,7 +676,6 @@ fn validate_trust_root(
             )?;
             crate::release_transparency::validate_transparency_policy(policy, &root.keys)
         }
-        None if !require_transparency_policy => Ok(()),
         None => Err(DriverReleaseAuthorizationError::Invalid(
             "provider driver release trust root requires a transparency policy",
         )),
@@ -1347,33 +1271,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("exactly one version")
-        );
-    }
-
-    #[test]
-    fn legacy_root_shape_preserves_its_identity_only_in_compatible_mode() {
-        let now = Utc::now();
-        let (root, _authorization, _release, _manifest) = signed_fixture(now);
-        let mut legacy: serde_json::Value = serde_json::to_value(root.get()).unwrap();
-        legacy.as_object_mut().unwrap().remove("root");
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("providerDriverTransparency");
-        let canonical_legacy = serde_jcs::to_vec(&legacy).unwrap();
-
-        assert!(ValidatedDriverReleaseTrustRoot::parse_json(&canonical_legacy).is_err());
-        let compatible =
-            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&canonical_legacy).unwrap();
-        assert!(compatible.uses_legacy_implicit_root_role());
-        assert_eq!(compatible.canonical_json().unwrap(), canonical_legacy);
-        assert_eq!(
-            compatible.get().root.key_ids,
-            compatible.get().provider_driver_release.key_ids
-        );
-        assert_eq!(
-            compatible.get().root.threshold,
-            compatible.get().provider_driver_release.threshold
         );
     }
 

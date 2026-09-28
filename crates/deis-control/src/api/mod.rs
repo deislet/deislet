@@ -654,7 +654,7 @@ async fn build_catalog_state(
     ) {
         (Some(root), Some(trust_root_path), trust_root_rotation_path) => {
             let trust_metadata =
-                deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file_compatible(
+                deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file(
                     trust_root_path,
                 )
                 .and_then(|trust_root| {
@@ -674,60 +674,46 @@ async fn build_catalog_state(
                     .await
                     {
                         Ok(registry) => {
-                            if registry
-                                .trust_root()
-                                .uses_legacy_missing_transparency_policy()
-                            {
-                                warn!(
-                                    installation_root = %registry.installation_root().display(),
-                                    host = %registry.host(),
-                                    trust_root_version = registry.trust_root().get().root_version,
-                                    trust_root_sha256 = %registry.trust_root().canonical_sha256(),
-                                    "Legacy provider driver trust root was loaded for recovery and rotation only; external provider execution remains disabled until a transparently governed root is active"
-                                );
-                                None
-                            } else {
-                                info!(
-                                    installation_root = %registry.installation_root().display(),
-                                    host = %registry.host(),
-                                    trust_root_version = registry.trust_root().get().root_version,
-                                    trust_root_sha256 = %registry.trust_root().canonical_sha256(),
-                                    "Signed and transparent provider driver release registry is enabled"
-                                );
-                                let work_root = config.data_dir.join("provider-work");
-                                let workspaces = deis_provider_driver::DriverWorkspaceRoot::new(
-                                    &work_root,
-                                    Arc::new(crate::catalog::CatalogPayloadSource::new(
-                                        Arc::clone(&provider_payloads),
+                            info!(
+                                installation_root = %registry.installation_root().display(),
+                                host = %registry.host(),
+                                trust_root_version = registry.trust_root().get().root_version,
+                                trust_root_sha256 = %registry.trust_root().canonical_sha256(),
+                                "Signed and transparent provider driver release registry is enabled"
+                            );
+                            let work_root = config.data_dir.join("provider-work");
+                            let workspaces = deis_provider_driver::DriverWorkspaceRoot::new(
+                                &work_root,
+                                Arc::new(crate::catalog::CatalogPayloadSource::new(
+                                    Arc::clone(&provider_payloads),
+                                )),
+                            )
+                            .map_err(|error| {
+                                crate::catalog::CatalogError::BundleStorage(format!(
+                                    "provider driver workspace root {} is not usable: {error}",
+                                    work_root.display()
+                                ))
+                            });
+                            match workspaces.and_then(|workspaces| {
+                                crate::catalog::ProviderDriverDispatcher::new(
+                                    registry,
+                                    Arc::clone(&provider_credentials),
+                                    Arc::new(crate::catalog::CatalogOperationInputs::new(
+                                        store.as_ref().clone(),
+                                        Arc::clone(&secrets),
+                                        Arc::new(AuditStore::new(store.database())),
                                     )),
+                                    workspaces,
+                                    crate::catalog::provider_driver_release::driver_process_config(),
                                 )
-                                .map_err(|error| {
-                                    crate::catalog::CatalogError::BundleStorage(format!(
-                                        "provider driver workspace root {} is not usable: {error}",
-                                        work_root.display()
-                                    ))
-                                });
-                                match workspaces.and_then(|workspaces| {
-                                    crate::catalog::ProviderDriverDispatcher::new(
-                                        registry,
-                                        Arc::clone(&provider_credentials),
-                                        Arc::new(crate::catalog::CatalogOperationInputs::new(
-                                            store.as_ref().clone(),
-                                            Arc::clone(&secrets),
-                                            Arc::new(AuditStore::new(store.database())),
-                                        )),
-                                        workspaces,
-                                        crate::catalog::provider_driver_release::driver_process_config(),
-                                    )
-                                }) {
-                                    Ok(dispatcher) => Some(Arc::new(dispatcher)),
-                                    Err(error) => {
-                                        error!(
-                                            error = %error,
-                                            "Provider driver dispatcher is unusable; external provider execution is disabled"
-                                        );
-                                        None
-                                    }
+                            }) {
+                                Ok(dispatcher) => Some(Arc::new(dispatcher)),
+                                Err(error) => {
+                                    error!(
+                                        error = %error,
+                                        "Provider driver dispatcher is unusable; external provider execution is disabled"
+                                    );
+                                    None
                                 }
                             }
                         }

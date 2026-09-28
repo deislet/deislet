@@ -233,13 +233,6 @@ impl ProviderDriverReleaseRegistry {
                                 "provider driver trust root bootstrap cannot use an unverifiable rotation envelope",
                             ));
                         }
-                        if trust_root.uses_legacy_implicit_root_role()
-                            || trust_root.uses_legacy_missing_transparency_policy()
-                        {
-                            return Err(CatalogError::conflict(
-                                "provider driver trust root bootstrap requires an explicit root role and transparency policy",
-                            ));
-                        }
                         insert_trust_root(
                             &transaction,
                             root_version,
@@ -281,7 +274,7 @@ impl ProviderDriverReleaseRegistry {
                                 "provider driver trust root versions must advance exactly once",
                             ));
                         }
-                        let previous_root = ValidatedDriverReleaseTrustRoot::parse_json_compatible(
+                        let previous_root = ValidatedDriverReleaseTrustRoot::parse_json(
                             highest_json.as_bytes(),
                         )
                         .map_err(|error| {
@@ -914,7 +907,7 @@ fn validate_trust_root_transition(
     let mut permanently_revoked_key_ids = BTreeSet::new();
 
     for root_json in historical_root_json {
-        let root = ValidatedDriverReleaseTrustRoot::parse_json_compatible(root_json.as_bytes())
+        let root = ValidatedDriverReleaseTrustRoot::parse_json(root_json.as_bytes())
             .map_err(|error| {
                 CatalogError::invalid(format!(
                     "invalid durable provider driver trust root: {error}"
@@ -2685,196 +2678,6 @@ pub(crate) mod tests {
                 .contains("canonical authorization envelope")
         );
         assert_eq!(fs::read_dir(&fixture.install_root).unwrap().count(), 0);
-    }
-
-    #[tokio::test]
-    async fn legacy_root_history_can_restart_and_rotate_but_cannot_bootstrap() {
-        let fixture = Fixture::new();
-        let mut legacy_value = serde_json::to_value(fixture.trust_root.get()).unwrap();
-        legacy_value.as_object_mut().unwrap().remove("root");
-        legacy_value
-            .as_object_mut()
-            .unwrap()
-            .remove("providerDriverTransparency");
-        let legacy_json = serde_jcs::to_vec(&legacy_value).unwrap();
-        let legacy_root =
-            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&legacy_json).unwrap();
-        assert!(legacy_root.uses_legacy_implicit_root_role());
-
-        let bootstrap_database = Arc::new(
-            Database::init(fixture.temporary.path().join("legacy-bootstrap.sqlite"))
-                .await
-                .unwrap(),
-        );
-        let bootstrap_error = ProviderDriverReleaseRegistry::new(
-            CatalogStore::new(bootstrap_database),
-            &fixture.install_root,
-            legacy_root.clone(),
-            None,
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(bootstrap_error.to_string().contains("explicit root role"));
-
-        let database = Arc::new(
-            Database::init(fixture.temporary.path().join("legacy-upgrade.sqlite"))
-                .await
-                .unwrap(),
-        );
-        let root_version = i64::try_from(legacy_root.get().root_version).unwrap();
-        let root_digest = legacy_root.canonical_sha256().to_string();
-        let root_json = String::from_utf8(legacy_root.canonical_json().unwrap()).unwrap();
-        let expires_at = legacy_root.get().expires_at.timestamp();
-        database
-            .with_connection(move |connection| {
-                connection.execute(
-                    "INSERT INTO provider_driver_trust_roots
-                       (root_version, root_sha256, root_json, expires_at,
-                        first_seen_at, last_seen_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![root_version, root_digest, root_json, expires_at, now_secs()],
-                )?;
-                Ok::<(), crate::database::DatabaseError>(())
-            })
-            .await
-            .unwrap();
-        let store = CatalogStore::new(Arc::clone(&database));
-        ProviderDriverReleaseRegistry::new(store.clone(), &fixture.install_root, legacy_root, None)
-            .await
-            .unwrap();
-
-        let mut next_root = fixture.trust_root.get().clone();
-        next_root.root_version = 2;
-        next_root.expires_at += TimeDelta::days(30);
-        let rotation = signed_root_rotation_with_seeds(next_root.clone(), &[29, 23]);
-        ProviderDriverReleaseRegistry::new(
-            store,
-            &fixture.install_root,
-            ValidatedDriverReleaseTrustRoot::new(next_root).unwrap(),
-            Some(rotation),
-        )
-        .await
-        .unwrap();
-        let versions: (i64, i64) = database
-            .with_connection(|connection| {
-                Ok::<(i64, i64), crate::database::DatabaseError>((
-                    connection.query_row(
-                        "SELECT count(*) FROM provider_driver_trust_roots",
-                        [],
-                        |row| row.get(0),
-                    )?,
-                    connection.query_row(
-                        "SELECT count(*) FROM provider_driver_trust_root_rotations",
-                        [],
-                        |row| row.get(0),
-                    )?,
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!(versions, (2, 1));
-    }
-
-    #[tokio::test]
-    async fn pre_transparency_explicit_root_can_only_restart_and_rotate() {
-        let fixture = Fixture::new();
-        let mut legacy_value = serde_json::to_value(fixture.trust_root.get()).unwrap();
-        legacy_value
-            .as_object_mut()
-            .unwrap()
-            .remove("providerDriverTransparency");
-        let legacy_json = serde_jcs::to_vec(&legacy_value).unwrap();
-        assert!(ValidatedDriverReleaseTrustRoot::parse_json(&legacy_json).is_err());
-        let legacy_root =
-            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&legacy_json).unwrap();
-        assert!(!legacy_root.uses_legacy_implicit_root_role());
-        assert!(legacy_root.uses_legacy_missing_transparency_policy());
-        assert_eq!(legacy_root.canonical_json().unwrap(), legacy_json);
-
-        let bootstrap_database = Arc::new(
-            Database::init(
-                fixture
-                    .temporary
-                    .path()
-                    .join("pre-transparency-bootstrap.sqlite"),
-            )
-            .await
-            .unwrap(),
-        );
-        let bootstrap_error = ProviderDriverReleaseRegistry::new(
-            CatalogStore::new(bootstrap_database),
-            &fixture.install_root,
-            legacy_root.clone(),
-            None,
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(bootstrap_error.to_string().contains("transparency policy"));
-
-        let database = Arc::new(
-            Database::init(
-                fixture
-                    .temporary
-                    .path()
-                    .join("pre-transparency-upgrade.sqlite"),
-            )
-            .await
-            .unwrap(),
-        );
-        let root_version = i64::try_from(legacy_root.get().root_version).unwrap();
-        let root_digest = legacy_root.canonical_sha256().to_string();
-        let root_json = String::from_utf8(legacy_root.canonical_json().unwrap()).unwrap();
-        let expires_at = legacy_root.get().expires_at.timestamp();
-        database
-            .with_connection(move |connection| {
-                connection.execute(
-                    "INSERT INTO provider_driver_trust_roots
-                       (root_version, root_sha256, root_json, expires_at,
-                        first_seen_at, last_seen_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![root_version, root_digest, root_json, expires_at, now_secs()],
-                )?;
-                Ok::<(), crate::database::DatabaseError>(())
-            })
-            .await
-            .unwrap();
-        let store = CatalogStore::new(Arc::clone(&database));
-        ProviderDriverReleaseRegistry::new(store.clone(), &fixture.install_root, legacy_root, None)
-            .await
-            .unwrap();
-
-        let mut next_root = fixture.trust_root.get().clone();
-        next_root.root_version = 2;
-        next_root.expires_at += TimeDelta::days(30);
-        let rotation = signed_root_rotation(next_root.clone());
-        ProviderDriverReleaseRegistry::new(
-            store,
-            &fixture.install_root,
-            ValidatedDriverReleaseTrustRoot::new(next_root).unwrap(),
-            Some(rotation),
-        )
-        .await
-        .unwrap();
-        let counts: (i64, i64) = database
-            .with_connection(|connection| {
-                Ok::<(i64, i64), crate::database::DatabaseError>((
-                    connection.query_row(
-                        "SELECT count(*) FROM provider_driver_trust_roots",
-                        [],
-                        |row| row.get(0),
-                    )?,
-                    connection.query_row(
-                        "SELECT count(*) FROM provider_driver_trust_root_rotations",
-                        [],
-                        |row| row.get(0),
-                    )?,
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!(counts, (2, 1));
     }
 
     #[test]
