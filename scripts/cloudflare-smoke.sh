@@ -7,9 +7,13 @@
 # queue (producer and consumer), a secret and a cron trigger; drives the
 # Cloudflare provider driver through the same deploy steps the control plane
 # runs (preflight, plan, prepare, upload, verify, activate, observe), with the
-# same process envelope and private per-operation work directory; requests the
-# deployed Worker and checks every binding answers; then deletes the Worker,
-# purges the run's resources and checks nothing named for the run is left.
+# same process envelope and private per-operation work directory; checks
+# through the Cloudflare API that the first upload created the Worker without
+# publishing it (no workers.dev route, no schedule) and that activate applied
+# the cron schedule and the queue consumer; requests the deployed Worker and
+# checks every binding, the queue and the cron answer; then deletes the
+# Worker, purges the run's resources and checks nothing named for the run is
+# left.
 #
 # The environment is throwaway: its id is minted per run, and the driver
 # namespaces every Cloudflare resource by application and environment id, so
@@ -333,19 +337,44 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The Worker is named by the scope (the driver's naming, mirrored above).
+WORKER="$SCOPE"
+JOBS_QUEUE="$SCOPE-q-jobs"
+
+schedules() {
+  cf_api "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER/schedules" \
+    | python3 -c 'import json,sys; [print(s["cron"]) for s in json.load(sys.stdin)["result"].get("schedules", [])]'
+}
+
+workers_dev_enabled() {
+  cf_api "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$WORKER/subdomain" \
+    | python3 -c 'import json,sys; print("yes" if json.load(sys.stdin)["result"].get("enabled") else "no")'
+}
+
 say "deploying through the driver"
-for step in preflight plan prepare upload verify activate observe; do
+for step in preflight plan prepare upload; do
   run_step "$step" yes || fail "$step failed"
 done
 
-WORKER="$(python3 - "$LAST_RECEIPT" "$SCOPE" <<'PY'
-import json, sys
-outcome = json.load(open(sys.argv[1]))
-ids = (outcome.get("receipt") or {}).get("providerResourceIds", {})
-names = [v for k, v in ids.items() if "worker" in k and isinstance(v, str)]
-print(names[0] if names else sys.argv[2])
-PY
-)"
+# A first upload creates the Worker with an unpublished placeholder, then
+# uploads the real version without deploying it.
+[ "$(workers_dev_enabled)" = no ] || fail "the Worker is on workers.dev before activate"
+[ -z "$(schedules)" ] || fail "a cron schedule was applied before activate"
+echo "  after upload: the Worker exists, is not on workers.dev and has no schedule"
+
+for step in verify activate observe; do
+  run_step "$step" yes || fail "$step failed"
+done
+
+# Activate applies what Cloudflare keeps per Worker: the schedule, the queue
+# consumer and the workers.dev route.
+[ "$(schedules)" = "* * * * *" ] || fail "activate did not apply the cron schedule (got: $(schedules | tr '\n' ' '))"
+[ "$(workers_dev_enabled)" = yes ] || fail "activate did not enable workers.dev"
+JOBS_QUEUE_ID="$(cf_api "/accounts/$CLOUDFLARE_ACCOUNT_ID/queues" | python3 -c 'import json,sys; [print(q["queue_id"]) for q in json.load(sys.stdin)["result"] if q["queue_name"] == sys.argv[1]]' "$JOBS_QUEUE")"
+[ -n "$JOBS_QUEUE_ID" ] || fail "queue $JOBS_QUEUE does not exist"
+cf_api "/accounts/$CLOUDFLARE_ACCOUNT_ID/queues/$JOBS_QUEUE_ID/consumers" | grep -qF "\"$WORKER\"" \
+  || fail "activate did not attach $WORKER as the consumer of $JOBS_QUEUE"
+echo "  after activate: schedule, queue consumer and workers.dev are applied"
 SUBDOMAIN="$(cf_api "/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain" | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["subdomain"])')"
 URL="https://$WORKER.$SUBDOMAIN.workers.dev"
 echo "worker $WORKER at $URL"
