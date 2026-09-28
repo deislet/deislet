@@ -47,6 +47,7 @@ pub mod provider_deployment_reconciler;
 pub mod provider_driver_operation;
 pub mod provider_driver_release;
 pub mod provider_lifecycle;
+pub mod provider_payload;
 pub mod provider_target_grant;
 pub mod secrets;
 pub mod store;
@@ -109,6 +110,7 @@ pub use provider_lifecycle::{
     PROVIDER_TARGET_IN_USE, ProviderLifecycleAuditEvent, ProviderLifecycleCascadeEntry,
     ProviderLifecycleMutationContext, ProviderLifecycleResourceKind,
 };
+pub use provider_payload::{CatalogPayloadSource, ProviderPayloadStore, StoredProviderPayload};
 pub use provider_target_grant::{
     ProviderTargetGrant, ProviderTargetGrantAuditEvent, ProviderTargetGrantHistoryFilter,
     ProviderTargetGrantMutationContext, ProviderTargetGrantRevocationReason,

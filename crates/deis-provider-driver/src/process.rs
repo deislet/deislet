@@ -12,6 +12,9 @@ use crate::{
     DriverReleaseComponentRole, InstalledDriverRelease, InstalledReleaseExecutable,
     PinnedCommandRunner, ProviderCredentialBroker, ProviderDriver, SecretInjection, SecretString,
     SideEffect, SideEffectPolicy, ValidatedProviderDriverManifest,
+    workspace::{
+        DriverArtifactError, DriverArtifactErrorKind, DriverWorkspace, DriverWorkspaceRoot,
+    },
 };
 
 pub const DRIVER_PROCESS_PROTOCOL_V1: &str = "edge-canon-provider-driver-v1";
@@ -24,20 +27,25 @@ pub struct DriverProcessRequest {
     pub schema_version: u32,
     pub protocol: String,
     pub request: crate::DriverRequest,
+    /// Where this process finds its artifact and keeps its files. Not part
+    /// of the durable request: the same request may run in a different
+    /// workspace on every attempt. See [`crate::DriverWorkspace`].
+    pub workspace: DriverWorkspace,
 }
 
 impl DriverProcessRequest {
     #[must_use]
-    pub fn new(request: crate::DriverRequest) -> Self {
+    pub fn new(request: crate::DriverRequest, workspace: DriverWorkspace) -> Self {
         Self {
             message_type: "request".to_owned(),
             schema_version: 1,
             protocol: DRIVER_PROCESS_PROTOCOL_V1.to_owned(),
             request,
+            workspace,
         }
     }
 
-    pub fn validate(self) -> Result<crate::DriverRequest, DriverContractError> {
+    pub fn validate(self) -> Result<(crate::DriverRequest, DriverWorkspace), DriverContractError> {
         if self.message_type != "request"
             || self.schema_version != 1
             || self.protocol != DRIVER_PROCESS_PROTOCOL_V1
@@ -46,7 +54,8 @@ impl DriverProcessRequest {
                 "driver process request does not use the exact v1 protocol",
             ));
         }
-        Ok(self.request)
+        self.workspace.validate_for(&self.request)?;
+        Ok((self.request, self.workspace))
     }
 }
 
@@ -176,6 +185,7 @@ pub struct ExecutableProviderDriver {
     installed: InstalledDriverRelease,
     executable: InstalledReleaseExecutable,
     credential_broker: Arc<dyn ProviderCredentialBroker>,
+    workspaces: DriverWorkspaceRoot,
     config: ExecutableProviderDriverConfig,
     runner: PinnedCommandRunner,
 }
@@ -185,6 +195,7 @@ impl ExecutableProviderDriver {
         manifest: ValidatedProviderDriverManifest,
         installed: InstalledDriverRelease,
         credential_broker: Arc<dyn ProviderCredentialBroker>,
+        workspaces: DriverWorkspaceRoot,
         config: ExecutableProviderDriverConfig,
     ) -> Result<Self, DriverContractError> {
         let config = config.validate()?;
@@ -224,6 +235,7 @@ impl ExecutableProviderDriver {
             installed,
             executable,
             credential_broker,
+            workspaces,
             config,
             runner: PinnedCommandRunner,
         })
@@ -277,7 +289,15 @@ impl ProviderDriver for ExecutableProviderDriver {
         context: &DriverExecutionContext<'_>,
     ) -> Result<DriverReceipt, DriverError> {
         let request = context.request();
-        let process_request = DriverProcessRequest::new(request.clone());
+        // Opened before the credential lease: a payload that cannot be
+        // materialized or verified must not cost a lease or start a process.
+        // Dropping it at the end of this call removes the operation directory.
+        let workspace = self
+            .workspaces
+            .open(request)
+            .await
+            .map_err(|error| workspace_error(request, &error))?;
+        let process_request = DriverProcessRequest::new(request.clone(), workspace.get().clone());
         let request_json = serde_jcs::to_vec(&process_request).map_err(|_| {
             driver_error(
                 request,
@@ -297,9 +317,14 @@ impl ProviderDriver for ExecutableProviderDriver {
         ]);
         let process_policy = side_effect_policy(request.operation);
         let mut invocation =
-            CommandInvocation::new(&self.installed.root, arguments, process_policy);
+            CommandInvocation::new(&workspace.get().directory, arguments, process_policy);
         invocation
             .stdin(request_json)
+            .and_then(|invocation| invocation.environment("PATH", crate::DRIVER_PROCESS_PATH))
+            .and_then(|invocation| invocation.environment("HOME", self.workspaces.home()))
+            .and_then(|invocation| {
+                invocation.environment("TMPDIR", workspace.get().directory.clone())
+            })
             .and_then(|invocation| invocation.timeout(self.config.process_timeout))
             .and_then(|invocation| {
                 invocation.output_limits(self.config.max_stdout_bytes, self.config.max_stderr_bytes)
@@ -371,6 +396,8 @@ impl ProviderDriver for ExecutableProviderDriver {
             .run(&self.executable.executable, &invocation)
             .await;
         drop(invocation);
+        // The process has exited; nothing it was given outlives it.
+        drop(workspace);
         let process_result = output
             .map_err(|error| command_error(request, &error))
             .and_then(|output| {
@@ -452,6 +479,39 @@ fn side_effect_policy(operation: DriverOperation) -> SideEffectPolicy {
         | DriverOperation::Delete
         | DriverOperation::Cleanup => SideEffectPolicy::MayChangeProvider,
     }
+}
+
+fn workspace_error(request: &crate::DriverRequest, error: &DriverArtifactError) -> DriverError {
+    let (category, code, retryable) = match error.kind {
+        DriverArtifactErrorKind::NotFound => (
+            DriverErrorCategory::Configuration,
+            "DRIVER_ARTIFACT_NOT_FOUND",
+            false,
+        ),
+        DriverArtifactErrorKind::Integrity => (
+            DriverErrorCategory::DriverIntegrity,
+            "DRIVER_ARTIFACT_INTEGRITY",
+            false,
+        ),
+        DriverArtifactErrorKind::Unavailable => (
+            DriverErrorCategory::Internal,
+            "DRIVER_WORKSPACE_UNAVAILABLE",
+            true,
+        ),
+    };
+    driver_error(
+        request,
+        category,
+        code,
+        &error.message,
+        retryable,
+        SideEffect::None,
+        if retryable {
+            DriverNextAction::Retry
+        } else {
+            DriverNextAction::None
+        },
+    )
 }
 
 fn broker_error(request: &crate::DriverRequest, error: &CredentialBrokerError) -> DriverError {
@@ -610,6 +670,69 @@ mod tests {
         }
     }
 
+    fn plain_process_request(request: crate::DriverRequest) -> DriverProcessRequest {
+        let directory = std::path::PathBuf::from(format!(
+            "/var/lib/deis-control/provider-work/operations/{}-{}",
+            request.operation_id,
+            CanonicalId::new_v7()
+        ));
+        let state_directory = std::path::PathBuf::from(format!(
+            "/var/lib/deis-control/provider-work/state/{}/{}",
+            request.target.provider_target_id, request.environment_id
+        ));
+        let artifact_directory = request
+            .artifact
+            .as_ref()
+            .map(|artifact| directory.join(artifact.provider_payload_sha256.as_str()));
+        DriverProcessRequest::new(
+            request,
+            DriverWorkspace {
+                directory,
+                artifact_directory,
+                state_directory,
+            },
+        )
+    }
+
+    #[test]
+    fn a_workspace_must_agree_with_its_request() {
+        let mut with_artifact = request(DriverOperation::Upload);
+        with_artifact.artifact = Some(crate::ArtifactVersionRef {
+            artifact_version_id: CanonicalId::new_v7(),
+            canonical_artifact_sha256: "c".repeat(64).parse().unwrap(),
+            provider_payload_sha256: "d".repeat(64).parse().unwrap(),
+        });
+        let good = plain_process_request(with_artifact.clone());
+        assert!(good.clone().validate().is_ok());
+
+        let mut missing = good.clone();
+        missing.workspace.artifact_directory = None;
+        assert!(missing.validate().is_err());
+
+        let mut elsewhere = good.clone();
+        elsewhere.workspace.artifact_directory = Some("/tmp/payload".into());
+        assert!(elsewhere.validate().is_err());
+
+        let mut relative = good.clone();
+        relative.workspace.directory = "operations/1".into();
+        assert!(relative.validate().is_err());
+
+        let mut state_inside = good.clone();
+        state_inside.workspace.state_directory = good.workspace.directory.join("state");
+        assert!(state_inside.validate().is_err());
+
+        let mut unexpected = plain_process_request(request(DriverOperation::Preflight));
+        unexpected.workspace.artifact_directory = Some(unexpected.workspace.directory.join("x"));
+        assert!(unexpected.validate().is_err());
+
+        let mut without_workspace = serde_json::to_value(&good).unwrap();
+        without_workspace
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace");
+        assert!(serde_json::from_value::<DriverProcessRequest>(without_workspace).is_err());
+    }
+
     #[test]
     fn outcome_envelope_is_explicit_and_round_trips() {
         let request = request(DriverOperation::Preflight);
@@ -661,7 +784,7 @@ mod tests {
     fn rollback_target_is_present_only_when_set_and_round_trips_the_fixture() {
         // A request without a target serializes exactly as the original v1
         // envelope did, so drivers that reject unknown members keep parsing.
-        let plain = DriverProcessRequest::new(request(DriverOperation::Observe));
+        let plain = plain_process_request(request(DriverOperation::Observe));
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json["request"].get("rollbackTarget").is_none(), "{json}");
         assert_eq!(
@@ -700,7 +823,7 @@ mod tests {
     fn a_reconcile_request_names_what_it_took_over_and_round_trips_the_fixture() {
         // Operations dispatched directly serialize exactly as the original v1
         // envelope did, so drivers that reject unknown members keep parsing.
-        let plain = DriverProcessRequest::new(request(DriverOperation::Observe));
+        let plain = plain_process_request(request(DriverOperation::Observe));
         let json = serde_json::to_value(&plain).unwrap();
         assert!(json["request"].get("reconciles").is_none(), "{json}");
 
@@ -758,18 +881,130 @@ mod tests {
         );
     }
 
+    /// A provider payload published the way the Control's store publishes
+    /// one, and a source that copies it into a workspace.
+    #[cfg(unix)]
+    struct PayloadFixture {
+        _store: tempfile::TempDir,
+        root: std::path::PathBuf,
+        sha256: Sha256Digest,
+    }
+
+    #[cfg(unix)]
+    impl PayloadFixture {
+        fn new(files: &[(&str, &[u8])]) -> Self {
+            let source = tempfile::tempdir().unwrap();
+            for (path, content) in files {
+                let path = source.path().join(path);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, content).unwrap();
+            }
+            let store = tempfile::tempdir().unwrap();
+            let summary =
+                deis_artifact::provider_derivation::publish_payload(store.path(), source.path())
+                    .unwrap();
+            Self {
+                root: summary.root,
+                sha256: summary.payload_root_sha256.parse().unwrap(),
+                _store: store,
+            }
+        }
+
+        fn artifact(&self) -> crate::ArtifactVersionRef {
+            crate::ArtifactVersionRef {
+                artifact_version_id: CanonicalId::new_v7(),
+                canonical_artifact_sha256: "c".repeat(64).parse().unwrap(),
+                provider_payload_sha256: self.sha256.clone(),
+            }
+        }
+    }
+
+    /// Copies one directory into every workspace, optionally adding a file
+    /// the payload does not contain.
+    #[cfg(unix)]
+    struct CopySource {
+        from: std::path::PathBuf,
+        tamper: bool,
+        calls: AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl crate::DriverArtifactSource for CopySource {
+        async fn materialize(
+            &self,
+            _application_id: CanonicalId,
+            _artifact: &crate::ArtifactVersionRef,
+            destination: &Path,
+        ) -> Result<(), DriverArtifactError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            for entry in walk(&self.from) {
+                let relative = entry.strip_prefix(&self.from).unwrap();
+                let target = destination.join(relative);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                fs::copy(&entry, &target).unwrap();
+            }
+            if self.tamper {
+                fs::write(destination.join("extra.js"), b"injected").unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn walk(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(walk(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    #[cfg(unix)]
+    fn install(fixture: &ProcessFixture) -> InstalledDriverRelease {
+        DriverReleaseInstaller::new(&fixture.install_root)
+            .unwrap()
+            .install(
+                &fixture.release,
+                &fixture.manifest,
+                HostOperatingSystem::current().unwrap(),
+                &fixture.archive,
+            )
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn quick_config() -> ExecutableProviderDriverConfig {
+        ExecutableProviderDriverConfig {
+            credential_lease_duration: Duration::from_secs(10),
+            process_timeout: Duration::from_secs(5),
+            ..ExecutableProviderDriverConfig::default()
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn installed_process_receives_the_exact_request_and_an_operation_scoped_credential() {
-        let request = request(DriverOperation::Preflight);
+        let payload = PayloadFixture::new(&[
+            ("wrangler.toml", b"name = \"demo\"\n"),
+            ("binding-plan.json", b"{\"bindings\":[]}"),
+            ("worker/index.js", b"export default {}"),
+        ]);
+        let mut request = request(DriverOperation::Upload);
+        request.artifact = Some(payload.artifact());
         let expected_receipt = DriverReceipt {
             schema_version: 1,
             operation_id: request.operation_id,
             operation: request.operation,
             desired_state_digest: request.desired_state_digest.clone(),
             state: DriverStepState::Succeeded,
-            deployment_state: Some(DeploymentState::Planned),
-            side_effect: SideEffect::None,
+            deployment_state: Some(DeploymentState::Uploaded),
+            side_effect: SideEffect::Confirmed,
             provider_request_id: Some("process-request-1".to_owned()),
             provider_version_id: None,
             provider_deployment_id: None,
@@ -778,16 +1013,19 @@ mod tests {
             next_action: DriverNextAction::None,
             diagnostic: None,
         };
-        let input = String::from_utf8(
-            serde_jcs::to_vec(&DriverProcessRequest::new(request.clone())).unwrap(),
-        )
-        .unwrap();
+        let request_json = String::from_utf8(serde_jcs::to_vec(&request).unwrap()).unwrap();
         let output = String::from_utf8(
             serde_jcs::to_vec(&DriverProcessOutcome::succeeded(expected_receipt.clone())).unwrap(),
         )
         .unwrap();
-        assert!(!input.contains('\''));
+        assert!(!request_json.contains('\''));
         assert!(!output.contains('\''));
+        let workspace_root = tempfile::tempdir().unwrap();
+        let operations = workspace_root.path().join("operations");
+        // The script proves, from inside the process: the durable request is
+        // embedded byte for byte; its cwd is the private operation directory
+        // the envelope names; the verified payload sits at the digest beneath
+        // it; and the state directory exists outside it.
         let script = format!(
             "#!/bin/sh\nset -eu\n\
              test \"$1\" = execute\n\
@@ -795,41 +1033,139 @@ mod tests {
              test \"$3\" = {DRIVER_PROCESS_PROTOCOL_V1}\n\
              test \"${{{DRIVER_PROCESS_CREDENTIAL_ENV}}}\" = process-secret\n\
              input=$(/bin/cat)\n\
-             test \"$input\" = '{input}'\n\
-             printf '%s' '{output}'\n"
+             case \"$input\" in *'\"request\":{request_json}'*) ;; *) exit 11 ;; esac\n\
+             here=$(pwd)\n\
+             case \"$here\" in {operations}/{operation}-*) ;; *) exit 12 ;; esac\n\
+             case \"$input\" in *\"\\\"directory\\\":\\\"$here\\\"\"*) ;; *) exit 13 ;; esac\n\
+             test -n \"$(/usr/bin/find \"$here\" -maxdepth 0 -perm 700)\" || exit 14\n\
+             test -f \"$here/{sha}/wrangler.toml\" || exit 15\n\
+             test -f \"$here/{sha}/worker/index.js\" || exit 16\n\
+             test -d {state} || exit 17\n\
+             test \"$HOME\" = {home} || exit 18\n\
+             test \"$TMPDIR\" = \"$here\" || exit 19\n\
+             test \"$PATH\" = {path} || exit 20\n\
+             printf '%s' '{output}'\n",
+            operations = operations.display(),
+            operation = request.operation_id,
+            sha = payload.sha256.as_str(),
+            home = workspace_root.path().join("home").display(),
+            path = crate::DRIVER_PROCESS_PATH,
+            state = workspace_root
+                .path()
+                .join("state")
+                .join(request.target.provider_target_id.to_string())
+                .join(request.environment_id.to_string())
+                .display(),
         );
         let fixture = ProcessFixture::new(script.into_bytes());
-        let installed = DriverReleaseInstaller::new(&fixture.install_root)
-            .unwrap()
-            .install(
-                &fixture.release,
-                &fixture.manifest,
-                HostOperatingSystem::current().unwrap(),
-                &fixture.archive,
-            )
-            .unwrap();
+        let installed = install(&fixture);
         let broker = Arc::new(TestBroker::default());
         let broker_trait: Arc<dyn ProviderCredentialBroker> = broker.clone();
+        let source = Arc::new(CopySource {
+            from: payload.root.clone(),
+            tamper: false,
+            calls: AtomicUsize::new(0),
+        });
+        let workspaces = DriverWorkspaceRoot::new(workspace_root.path(), source.clone()).unwrap();
         let driver = ExecutableProviderDriver::new(
             fixture.manifest.clone(),
             installed,
             broker_trait,
-            ExecutableProviderDriverConfig {
-                credential_lease_duration: Duration::from_secs(10),
-                process_timeout: Duration::from_secs(5),
-                ..ExecutableProviderDriverConfig::default()
-            },
+            workspaces,
+            quick_config(),
         )
         .unwrap();
         let context = DriverExecutionContext::new(&request, CanonicalId::new_v7(), 1);
         let receipt = driver.execute(&context).await.unwrap();
         assert_eq!(receipt, expected_receipt);
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
         assert_eq!(broker.acquired.load(Ordering::SeqCst), 1);
         assert_eq!(
             broker.released.lock().unwrap().as_slice(),
             [CredentialLeaseDisposition::Succeeded]
         );
+        assert_eq!(
+            fs::read_dir(&operations).unwrap().count(),
+            0,
+            "the operation directory is removed once the process has exited"
+        );
         make_writable_for_cleanup(fixture.temporary.path());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_payload_that_differs_from_its_digest_never_reaches_a_process() {
+        let payload = PayloadFixture::new(&[("wrangler.toml", b"name = \"demo\"\n")]);
+        let mut request = request(DriverOperation::Upload);
+        request.artifact = Some(payload.artifact());
+        // A driver that would record having been started.
+        let workspace_root = tempfile::tempdir().unwrap();
+        let marker = workspace_root.path().join("started");
+        let fixture = ProcessFixture::new(
+            format!("#!/bin/sh\n/usr/bin/touch {}\nexit 1\n", marker.display()).into_bytes(),
+        );
+        let installed = install(&fixture);
+        let broker = Arc::new(TestBroker::default());
+        let broker_trait: Arc<dyn ProviderCredentialBroker> = broker.clone();
+        let source = Arc::new(CopySource {
+            from: payload.root.clone(),
+            tamper: true,
+            calls: AtomicUsize::new(0),
+        });
+        let workspaces = DriverWorkspaceRoot::new(workspace_root.path(), source).unwrap();
+        let driver = ExecutableProviderDriver::new(
+            fixture.manifest.clone(),
+            installed,
+            broker_trait,
+            workspaces,
+            quick_config(),
+        )
+        .unwrap();
+        let context = DriverExecutionContext::new(&request, CanonicalId::new_v7(), 1);
+        let error = driver.execute(&context).await.unwrap_err();
+        assert_eq!(error.code, "DRIVER_ARTIFACT_INTEGRITY");
+        assert_eq!(error.category, DriverErrorCategory::DriverIntegrity);
+        assert_eq!(error.side_effect, SideEffect::None);
+        assert!(!error.retryable);
+        assert!(!marker.exists(), "the driver process was never started");
+        assert_eq!(
+            broker.acquired.load(Ordering::SeqCst),
+            0,
+            "no credential lease is taken for a payload that failed verification"
+        );
+        assert_eq!(
+            fs::read_dir(workspace_root.path().join("operations"))
+                .unwrap()
+                .count(),
+            0
+        );
+        make_writable_for_cleanup(fixture.temporary.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_root_is_private_and_sweeps_stale_operation_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("provider-work");
+        let stale = root.join("operations").join("left-behind");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("wrangler.toml"), b"x").unwrap();
+        let source = Arc::new(CopySource {
+            from: temporary.path().to_path_buf(),
+            tamper: false,
+            calls: AtomicUsize::new(0),
+        });
+        DriverWorkspaceRoot::new(&root, source).unwrap();
+        assert!(!stale.exists());
+        for directory in [&root, &root.join("operations"), &root.join("state")] {
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{}",
+                directory.display()
+            );
+        }
     }
 
     #[cfg(unix)]

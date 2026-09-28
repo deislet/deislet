@@ -9,22 +9,23 @@
 //! | `EDGE_CANON_PROVIDER_SECRETS` | optional JSON object `{NAME: "value"}`, sent to wrangler on stdin only |
 //! | `DEIS_CLOUDFLARE_PURGE_DATA` | the environment id whose KV/D1/R2/queue resources `delete`/`cleanup` may destroy; anything else destroys nothing |
 //! | `DEIS_PROVIDER_TOOLS_DIR` | toolchain cache (default `$HOME/.deis/tools`) |
-//! | `DEIS_PROVIDER_STATE_DIR` | journals and wrangler's private home (default `$HOME/.deis/provider-state`) |
 //! | `DEIS_PROVIDER_NODE` | absolute path of the Node.js executable (default: `node` on `PATH`) |
 //!
-//! The artifact directory is the process's working directory.
+//! The artifact directory and the state directory (journals, wrangler's
+//! private home) come from the envelope's
+//! [`deis_provider_driver::DriverWorkspace`], never from the environment.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use deis_provider_driver::DriverWorkspace;
 use zeroize::Zeroize;
 
 pub const CONFIG_ENV: &str = "EDGE_CANON_PROVIDER_CONFIG";
 pub const SECRETS_ENV: &str = "EDGE_CANON_PROVIDER_SECRETS";
 pub const PURGE_ENV: &str = "DEIS_CLOUDFLARE_PURGE_DATA";
 pub const TOOLS_DIR_ENV: &str = "DEIS_PROVIDER_TOOLS_DIR";
-pub const STATE_DIR_ENV: &str = "DEIS_PROVIDER_STATE_DIR";
 pub const NODE_ENV: &str = "DEIS_PROVIDER_NODE";
 
 /// Secret values for the Worker. `Debug` never prints a value, and values
@@ -102,7 +103,7 @@ pub struct DriverEnvironment {
 }
 
 impl DriverEnvironment {
-    pub fn from_process() -> Result<Self, String> {
+    pub fn from_process(workspace: &DriverWorkspace) -> Result<Self, String> {
         let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
         let home = var("HOME").map(PathBuf::from);
         let under_home = |suffix: &str, explicit: &str| -> Result<PathBuf, String> {
@@ -114,8 +115,7 @@ impl DriverEnvironment {
                     .ok_or_else(|| format!("neither {explicit} nor HOME is set")),
             }
         };
-        let artifact_dir = std::env::current_dir()
-            .map_err(|error| format!("reading the working directory: {error}"))?;
+        let artifact_dir = crate::protocol::artifact_work_dir(workspace);
         let config = match std::env::var(CONFIG_ENV) {
             Ok(json) if !json.is_empty() => parse_string_map(CONFIG_ENV, &json)?,
             _ => BTreeMap::new(),
@@ -131,7 +131,7 @@ impl DriverEnvironment {
         Ok(Self {
             artifact_dir,
             tools_dir: under_home("tools", TOOLS_DIR_ENV)?,
-            state_dir: under_home("provider-state", STATE_DIR_ENV)?,
+            state_dir: workspace.state_directory.clone(),
             node: var(NODE_ENV).map(PathBuf::from),
             search_path: var("PATH"),
             config,

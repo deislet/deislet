@@ -2347,6 +2347,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
+ "deis-artifact",
  "deis-wire",
  "ed25519-dalek",
  "hex",

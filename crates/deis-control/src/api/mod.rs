@@ -567,6 +567,9 @@ async fn build_catalog_state(
 ) -> catalog::CatalogState {
     let bundles = BundleStore::new(config.bundle_dir());
     let artifacts = ArtifactStore::beside_bundles(bundles.root());
+    let provider_payloads = Arc::new(crate::catalog::ProviderPayloadStore::beside_bundles(
+        bundles.root(),
+    ));
     // Both paths, because they differ exactly when `bundle_dir` is relative -
     // and then the resolved one is the whole answer to "where did my versions
     // go?" after this process is next started somewhere else.
@@ -588,6 +591,13 @@ async fn build_catalog_state(
             artifact_dir = %artifacts.root().display(),
             error = %e,
             "Canonical artifact directory is not usable; canonical uploads and lineage-bound deploys will fail until it is writable"
+        );
+    }
+    if let Err(e) = provider_payloads.ensure_root() {
+        error!(
+            payload_dir = %provider_payloads.root().display(),
+            error = %e,
+            "Provider payload directory is not usable; Cloudflare payload uploads and provider deployments will fail until it is writable"
         );
     }
 
@@ -714,11 +724,27 @@ async fn build_catalog_state(
                                     trust_root_sha256 = %registry.trust_root().canonical_sha256(),
                                     "Signed and transparent provider driver release registry is enabled"
                                 );
-                                match crate::catalog::ProviderDriverDispatcher::new(
-                                    registry,
-                                    Arc::clone(&provider_credentials),
-                                    deis_provider_driver::ExecutableProviderDriverConfig::default(),
-                                ) {
+                                let work_root = config.data_dir.join("provider-work");
+                                let workspaces = deis_provider_driver::DriverWorkspaceRoot::new(
+                                    &work_root,
+                                    Arc::new(crate::catalog::CatalogPayloadSource::new(
+                                        Arc::clone(&provider_payloads),
+                                    )),
+                                )
+                                .map_err(|error| {
+                                    crate::catalog::CatalogError::BundleStorage(format!(
+                                        "provider driver workspace root {} is not usable: {error}",
+                                        work_root.display()
+                                    ))
+                                });
+                                match workspaces.and_then(|workspaces| {
+                                    crate::catalog::ProviderDriverDispatcher::new(
+                                        registry,
+                                        Arc::clone(&provider_credentials),
+                                        workspaces,
+                                        deis_provider_driver::ExecutableProviderDriverConfig::default(),
+                                    )
+                                }) {
                                     Ok(dispatcher) => Some(Arc::new(dispatcher)),
                                     Err(error) => {
                                         error!(
@@ -768,6 +794,7 @@ async fn build_catalog_state(
         store: Arc::clone(&store),
         bundles: Arc::new(bundles),
         artifacts: Arc::new(artifacts),
+        provider_payloads,
         secrets: Arc::clone(&secrets),
         provider_credentials,
         provider_driver_dispatcher,

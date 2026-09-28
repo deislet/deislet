@@ -12,7 +12,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use deis_provider_driver::{
-    DriverInstallationError, DriverReleaseInstaller, ExecutableProviderDriver,
+    DriverInstallationError, DriverReleaseInstaller, DriverWorkspaceRoot, ExecutableProviderDriver,
     ExecutableProviderDriverConfig, HostOperatingSystem, InstalledDriverRelease,
     ProviderCredentialBroker, Sha256Digest, ValidatedDriverReleaseAuthorization,
     ValidatedDriverReleaseTransparencyProof, ValidatedDriverReleaseTrustRoot,
@@ -86,6 +86,8 @@ pub struct ProviderDriverReleaseRegistry {
 pub struct ProviderDriverDispatcher {
     registry: ProviderDriverReleaseRegistry,
     credential_broker: Arc<dyn ProviderCredentialBroker>,
+    /// Where every driver process gets its verified payload and state.
+    workspaces: DriverWorkspaceRoot,
     process_config: ExecutableProviderDriverConfig,
 }
 
@@ -1023,6 +1025,7 @@ impl ProviderDriverDispatcher {
     pub fn new(
         registry: ProviderDriverReleaseRegistry,
         credential_vault: Arc<CatalogProviderCredentialVault>,
+        workspaces: DriverWorkspaceRoot,
         process_config: ExecutableProviderDriverConfig,
     ) -> CatalogResult<Self> {
         if !credential_vault.belongs_to(&registry.store) {
@@ -1037,6 +1040,7 @@ impl ProviderDriverDispatcher {
         Ok(Self {
             registry,
             credential_broker,
+            workspaces,
             process_config,
         })
     }
@@ -1057,12 +1061,14 @@ impl ProviderDriverDispatcher {
     ) -> CatalogResult<ExecutableProviderDriver> {
         let resolved = self.registry.resolve_for_target(target_id).await?;
         let credential_broker = Arc::clone(&self.credential_broker);
+        let workspaces = self.workspaces.clone();
         let process_config = self.process_config;
         tokio::task::spawn_blocking(move || {
             ExecutableProviderDriver::new(
                 resolved.manifest,
                 resolved.installed,
                 credential_broker,
+                workspaces,
                 process_config,
             )
         })
@@ -3201,6 +3207,7 @@ pub(crate) mod tests {
         let dispatcher = ProviderDriverDispatcher::new(
             registry.clone(),
             Arc::clone(&vault),
+            crate::catalog::provider_payload::test_workspaces(),
             ExecutableProviderDriverConfig::default(),
         )
         .unwrap();

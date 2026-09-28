@@ -38,11 +38,11 @@ use axum::{
     routing::{delete, get, post, put},
 };
 
+use crate::capability_issuer::CapabilityIssuer;
 use crate::catalog::{
     ArtifactStore, BundleStore, CatalogProviderCredentialVault, CatalogStore,
-    ProviderDriverDispatcher, SecretsBackend,
+    ProviderDriverDispatcher, ProviderPayloadStore, SecretsBackend,
 };
-use crate::capability_issuer::CapabilityIssuer;
 use crate::delivery::{DeploymentDeliverer, StorageWiring};
 use crate::runtime_client::RuntimeNodeManager;
 use crate::session::SessionManager;
@@ -61,6 +61,9 @@ pub struct CatalogState {
     /// separate namespace beneath the bundle root; provider payloads never
     /// become canonical merely by being uploaded here.
     pub artifacts: Arc<ArtifactStore>,
+    /// Payloads an external provider driver deploys (Cloudflare), stored
+    /// beside canonical artifacts and copied into driver workspaces.
+    pub provider_payloads: Arc<ProviderPayloadStore>,
     pub secrets: Arc<SecretsBackend>,
     /// Encrypts provider-management credentials and authorizes their
     /// operation-scoped driver leases against the same catalog database.
@@ -139,6 +142,12 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
             &at("/apps/:app_id/artifacts/:artifact_id/versions"),
             post(versions::upload_version_with_lineage)
                 .layer(DefaultBodyLimit::max(versions::MAX_PROVIDER_ENVELOPE_BYTES)),
+        )
+        .route(
+            &at("/apps/:app_id/artifacts/:artifact_id/provider-payloads"),
+            post(artifacts::upload_provider_payload).layer(DefaultBodyLimit::max(
+                crate::catalog::provider_payload::MAX_PROVIDER_PAYLOAD_ENVELOPE_BYTES,
+            )),
         )
         .route(
             &at("/apps/:app_id/versions"),
@@ -554,11 +563,9 @@ pub(crate) mod tests {
             ..Default::default()
         });
         if with_issuer {
-            wiring.with_issuer(
-                crate::capability_issuer::CapabilityIssuer::for_test(
-                    "spiffe://deislet/control/test",
-                ),
-            )
+            wiring.with_issuer(crate::capability_issuer::CapabilityIssuer::for_test(
+                "spiffe://deislet/control/test",
+            ))
         } else {
             wiring
         }
@@ -728,6 +735,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
             artifacts: Arc::new(ArtifactStore::beside_bundles(bundle_dir.path())),
+            provider_payloads: Arc::new(ProviderPayloadStore::beside_bundles(bundle_dir.path())),
             secrets: Arc::clone(&secrets),
             provider_credentials,
             provider_driver_dispatcher: None,
@@ -2363,5 +2371,107 @@ pub(crate) mod tests {
         assert_eq!(deleted["removed"]["provider_derivations"], 1);
         assert_eq!(deleted["artifact_directories_removed"], 1);
         assert!(!std::path::Path::new(&artifact_path).exists());
+    }
+
+    #[tokio::test]
+    async fn a_cloudflare_payload_is_stored_for_its_canonical_parent_and_removed_with_the_app() {
+        let h = harness(true).await;
+        let router = &h.router;
+        let (_, app) = json(
+            router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
+        let source = tempfile::tempdir().unwrap();
+        let canonical = crate::catalog::artifact::tests::source_artifact(source.path());
+        let (status, artifact_response) = call(
+            router,
+            "POST",
+            &format!(
+                "/api/apps/demo/artifacts?sha256={}",
+                canonical.artifact_sha256
+            ),
+            Body::from(crate::catalog::artifact::tests::transport(&canonical.root)),
+            "application/zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{artifact_response}");
+        let artifact_id = artifact_response["artifact"]["artifactId"]
+            .as_str()
+            .unwrap();
+
+        let payload = tempfile::tempdir().unwrap();
+        std::fs::write(payload.path().join("wrangler.toml"), "name = \"demo\"\n").unwrap();
+        std::fs::write(payload.path().join("index.js"), "export default {}").unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let published =
+            deis_artifact::provider_derivation::publish_payload(store.path(), payload.path())
+                .unwrap();
+        let records = tempfile::tempdir().unwrap();
+        let derivation = deis_artifact::provider_derivation::publish(
+            records.path(),
+            &published.root,
+            "cloudflare",
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            &canonical.artifact_sha256,
+            &canonical.content_root_sha256,
+        )
+        .unwrap();
+        let mut envelope = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::FileOptions::default();
+        envelope
+            .start_file(".deislet/provider-derivation.json", options)
+            .unwrap();
+        envelope
+            .write_all(&std::fs::read(&derivation.manifest_path).unwrap())
+            .unwrap();
+        for name in ["wrangler.toml", "index.js"] {
+            envelope
+                .start_file(format!("payload/{name}"), options)
+                .unwrap();
+            envelope
+                .write_all(&std::fs::read(payload.path().join(name)).unwrap())
+                .unwrap();
+        }
+        let envelope = envelope.finish().unwrap().into_inner();
+        let uri = format!("/api/apps/demo/artifacts/{artifact_id}/provider-payloads");
+        let (status, stored) = call(
+            router,
+            "POST",
+            &uri,
+            Body::from(envelope.clone()),
+            "application/vnd.deislet.provider-envelope.v1+zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{stored}");
+        assert_eq!(stored["provider"], "cloudflare");
+        assert_eq!(stored["payloadRootSha256"], published.payload_root_sha256);
+        assert_eq!(stored["manifestSha256"], derivation.manifest_sha256);
+        assert_eq!(stored["created"], true);
+        let application_id: deis_wire::CanonicalId =
+            app["canonical_id"].as_str().unwrap().parse().unwrap();
+        let stored_path = h
+            .state
+            .provider_payloads
+            .path_for(application_id, &published.payload_root_sha256);
+        assert!(stored_path.join("wrangler.toml").is_file());
+
+        let (status, replay) = call(
+            router,
+            "POST",
+            &uri,
+            Body::from(envelope),
+            "application/vnd.deislet.provider-envelope.v1+zip",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["created"], false);
+
+        let (status, deleted) = json(router, "DELETE", "/api/apps/demo", Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{deleted}");
+        assert_eq!(deleted["removed"]["provider_derivations"], 1);
+        assert!(!stored_path.exists());
     }
 }

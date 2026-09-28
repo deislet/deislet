@@ -37,5 +37,10 @@
         "worker-script": "checkout-api-production"
       }
     }
+  },
+  "workspace": {
+    "directory": "/var/lib/deis-control/provider-work/operations/018f7f32-7c42-7a1b-8c2d-4e5f60718299-018f7f32-7c42-7a1b-8c2d-4e5f607182ff",
+    "artifactDirectory": "/var/lib/deis-control/provider-work/operations/018f7f32-7c42-7a1b-8c2d-4e5f60718299-018f7f32-7c42-7a1b-8c2d-4e5f607182ff/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "stateDirectory": "/var/lib/deis-control/provider-work/state/018f7f32-7c42-7a1b-8c2d-4e5f60718296/018f7f32-7c42-7a1b-8c2d-4e5f60718295"
   }
 }

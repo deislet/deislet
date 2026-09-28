@@ -998,6 +998,99 @@ impl CatalogStore {
         .await
     }
 
+    /// Record a driver-deployed provider derivation (see
+    /// [`super::provider_payload`]) beside its canonical parent.
+    ///
+    /// Idempotent on the derivation's identity: recording the same evidence
+    /// again answers the existing row with `false`, while the same identity
+    /// bound to any other evidence is a conflict.
+    pub async fn record_provider_derivation(
+        &self,
+        app_id: &str,
+        artifact_id: CanonicalId,
+        derivation: ProviderDerivationSpec,
+    ) -> CatalogResult<(ProviderDerivation, bool)> {
+        let app_id = app_id.to_string();
+        self.with_conn(move |conn| {
+            load_app(conn, &app_id)?;
+            let tx = conn.unchecked_transaction()?;
+            let artifact = tx
+                .query_row(
+                    &format!(
+                        "SELECT {CANONICAL_ARTIFACT_COLUMNS} FROM canonical_artifacts \
+                         WHERE app_id = ?1 AND id = ?2"
+                    ),
+                    params![app_id, artifact_id.to_string()],
+                    map_canonical_artifact,
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    CatalogError::not_found(format!(
+                        "canonical artifact {artifact_id} of app {app_id}"
+                    ))
+                })?;
+            if !super::provider_payload::DRIVER_DEPLOYED_PROVIDERS
+                .contains(&derivation.provider.as_str())
+                || derivation.standard_version != artifact.standard_version
+            {
+                return Err(CatalogError::invalid(
+                    "provider derivation target or standard differs from its canonical parent",
+                ));
+            }
+            let existing: Option<ProviderDerivation> = tx
+                .query_row(
+                    &format!(
+                        "SELECT {PROVIDER_DERIVATION_COLUMNS} FROM provider_derivations \
+                         WHERE manifest_sha256 = ?1"
+                    ),
+                    params![derivation.manifest_sha256],
+                    map_provider_derivation,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing.artifact_id != artifact_id
+                    || existing.provider != derivation.provider
+                    || existing.standard_version != derivation.standard_version
+                    || existing.payload_root_sha256 != derivation.payload_root_sha256
+                    || existing.manifest != derivation.manifest
+                {
+                    return Err(CatalogError::Conflict(
+                        "provider derivation identity is already bound to different evidence"
+                            .into(),
+                    ));
+                }
+                return Ok((existing, false));
+            }
+            let record = ProviderDerivation {
+                manifest_sha256: derivation.manifest_sha256,
+                artifact_id,
+                provider: derivation.provider,
+                standard_version: derivation.standard_version,
+                payload_root_sha256: derivation.payload_root_sha256,
+                manifest: derivation.manifest,
+                created_at: now_secs(),
+            };
+            tx.execute(
+                &format!(
+                    "INSERT INTO provider_derivations ({PROVIDER_DERIVATION_COLUMNS}) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+                ),
+                params![
+                    record.manifest_sha256,
+                    artifact_id.to_string(),
+                    record.provider,
+                    record.standard_version,
+                    record.payload_root_sha256,
+                    record.manifest,
+                    record.created_at,
+                ],
+            )?;
+            tx.commit()?;
+            Ok((record, true))
+        })
+        .await
+    }
+
     async fn create_version_record(
         &self,
         app_id: &str,

@@ -3,13 +3,20 @@
 //! The binary reads a [`deis_provider_driver::DriverProcessRequest`] envelope
 //! from stdin (one operation per invocation), dispatches it to wrangler,
 //! and writes back a [`deis_provider_driver::DriverProcessOutcome`].
+//!
+//! The envelope's [`deis_provider_driver::DriverWorkspace`] says where the
+//! build output is: wrangler runs in `artifactDirectory`, the payload the
+//! Control verified against `providerPayloadSha256`, and the deployment
+//! journal is kept in `stateDirectory`. The driver never reads its own
+//! working directory or install directory for application files.
 
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use deis_provider_driver::{
     DriverError, DriverErrorCategory, DriverNextAction, DriverProcessOutcome, DriverProcessRequest,
-    SideEffect,
+    DriverWorkspace, SideEffect,
 };
 use deis_wire::CanonicalId;
 use tracing::{error, info};
@@ -73,8 +80,8 @@ pub async fn execute_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let request = match process_request.validate() {
-        Ok(r) => r,
+    let (request, workspace) = match process_request.validate() {
+        Ok(validated) => validated,
         Err(_) => {
             let outcome = DriverProcessOutcome::failed(DriverError {
                 operation_id: CanonicalId::new_v7(),
@@ -82,7 +89,7 @@ pub async fn execute_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
                 desired_state_digest: zero_digest(),
                 category: DriverErrorCategory::DriverIntegrity,
                 code: "PROTOCOL_MISMATCH".to_owned(),
-                message: "driver process request does not use the exact v1 protocol".to_owned(),
+                message: "driver process request does not use the exact v1 protocol or its workspace disagrees with the request".to_owned(),
                 retryable: false,
                 side_effect: SideEffect::None,
                 next_action: DriverNextAction::None,
@@ -93,7 +100,7 @@ pub async fn execute_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    match tokio::time::timeout(PROCESS_TIMEOUT, execute_request(request)).await {
+    match tokio::time::timeout(PROCESS_TIMEOUT, execute_request(request, workspace)).await {
         Ok(result) => result,
         Err(_) => {
             let outcome = DriverProcessOutcome::failed(DriverError {
@@ -116,20 +123,24 @@ pub async fn execute_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn execute_request(
     request: deis_provider_driver::DriverRequest,
+    workspace: DriverWorkspace,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let outcome = run_request(&request).await;
+    let outcome = run_request(&request, &workspace).await;
     print_outcome(&outcome)?;
     Ok(())
 }
 
 /// Resolve the driver's inputs, install/verify the toolchain, and run one
 /// operation.
-async fn run_request(request: &deis_provider_driver::DriverRequest) -> DriverProcessOutcome {
+async fn run_request(
+    request: &deis_provider_driver::DriverRequest,
+    workspace: &DriverWorkspace,
+) -> DriverProcessOutcome {
     let credential = match load_credential(request) {
         Ok(credential) => credential,
         Err(outcome) => return *outcome,
     };
-    let environment = match DriverEnvironment::from_process() {
+    let environment = match DriverEnvironment::from_process(workspace) {
         Ok(environment) => environment,
         Err(message) => {
             return setup_failure(
@@ -267,6 +278,16 @@ fn load_credential(
         .map_err(|error| failure("CREDENTIAL_PARSE_FAILED", error.to_string()));
     zeroize::Zeroize::zeroize(&mut value);
     credential
+}
+
+/// The directory wrangler runs in and reads the build output from: the
+/// verified payload the Control materialized for this operation, or the
+/// operation's scratch directory when it has no artifact.
+pub fn artifact_work_dir(workspace: &DriverWorkspace) -> PathBuf {
+    workspace
+        .artifact_directory
+        .clone()
+        .unwrap_or_else(|| workspace.directory.clone())
 }
 
 fn print_outcome(outcome: &DriverProcessOutcome) -> Result<(), Box<dyn std::error::Error>> {

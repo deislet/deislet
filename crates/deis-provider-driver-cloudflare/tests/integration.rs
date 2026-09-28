@@ -13,9 +13,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use deis_provider_driver::{
-    DeploymentState, DriverErrorCategory, DriverNextAction, DriverOperation, DriverReceipt,
-    DriverReconcileContext, DriverRequest, DriverRollbackTarget, ProviderNeutralPlan,
-    ProviderTargetRef, SideEffect,
+    DeploymentState, DriverErrorCategory, DriverNextAction, DriverOperation, DriverProcessRequest,
+    DriverReceipt, DriverReconcileContext, DriverRequest, DriverRollbackTarget, DriverWorkspace,
+    ProviderNeutralPlan, ProviderTargetRef, SideEffect,
 };
 use deis_provider_driver_cloudflare::commands::{OperationContext, Timeouts, execute_operation};
 use deis_provider_driver_cloudflare::credentials::CloudflareCredential;
@@ -690,4 +690,59 @@ async fn failures_clear_once_the_provider_recovers() {
     harness.fail_with(DriverOperation::Preflight).await;
     harness.clear_failure("whoami");
     harness.run(DriverOperation::Preflight).await;
+}
+
+// ── process envelope and workspace ─────────────────────────────────────────
+
+#[test]
+fn protocol_envelope_round_trips_with_its_workspace() {
+    let harness = Harness::new();
+    let request = harness.request(DriverOperation::Preflight, DIGEST_A);
+    let workspace = DriverWorkspace {
+        directory: "/srv/provider-work/operations/op-1".into(),
+        artifact_directory: None,
+        state_directory: "/srv/provider-work/state/target/env".into(),
+    };
+    let process_request = DriverProcessRequest::new(request, workspace.clone());
+    let json = serde_jcs::to_string(&process_request).unwrap();
+    let parsed: DriverProcessRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.message_type, "request");
+    assert_eq!(parsed.schema_version, 1);
+    assert_eq!(
+        parsed.protocol,
+        deis_provider_driver::DRIVER_PROCESS_PROTOCOL_V1
+    );
+    let (validated, parsed_workspace) = parsed.validate().unwrap();
+    assert_eq!(validated.operation, DriverOperation::Preflight);
+    assert_eq!(parsed_workspace, workspace);
+    // Without an artifact wrangler runs in the scratch directory.
+    assert_eq!(
+        deis_provider_driver_cloudflare::protocol::artifact_work_dir(&parsed_workspace),
+        workspace.directory
+    );
+}
+
+#[test]
+fn wrangler_runs_in_the_materialized_artifact_directory() {
+    let harness = Harness::new();
+    let mut request = harness.request(DriverOperation::Upload, DIGEST_A);
+    let payload: deis_provider_driver::Sha256Digest = "d".repeat(64).parse().unwrap();
+    request.artifact = Some(deis_provider_driver::ArtifactVersionRef {
+        artifact_version_id: CanonicalId::new_v7(),
+        canonical_artifact_sha256: "c".repeat(64).parse().unwrap(),
+        provider_payload_sha256: payload.clone(),
+    });
+    let directory = PathBuf::from("/srv/provider-work/operations/op-2");
+    let workspace = DriverWorkspace {
+        artifact_directory: Some(directory.join(payload.as_str())),
+        directory: directory.clone(),
+        state_directory: "/srv/provider-work/state/target/env".into(),
+    };
+    let (_, workspace) = DriverProcessRequest::new(request, workspace)
+        .validate()
+        .unwrap();
+    assert_eq!(
+        deis_provider_driver_cloudflare::protocol::artifact_work_dir(&workspace),
+        directory.join(payload.as_str())
+    );
 }
