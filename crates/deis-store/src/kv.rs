@@ -1181,7 +1181,6 @@ mod tests {
     #[tokio::test]
     async fn metadata_over_a_kibibyte_is_refused_and_a_kibibyte_is_kept() {
         let (_dir, svc) = service().await;
-        let a = tenant("app-one.production");
 
         let request = as_tenant(
             "app-one.production",
