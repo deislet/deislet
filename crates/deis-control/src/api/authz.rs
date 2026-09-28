@@ -2628,7 +2628,7 @@ mod tests {
         assert!(seen > 100, "only {seen} documented operations were checked");
     }
 
-    /// `/api/v1/apps/{app_name}/versions/{version_id}` with every `{...}`
+    /// `/api/v1/apps/{app_id}/versions/{version_id}` with every `{...}`
     /// replaced by a canonical id, which every route that parses a segment
     /// accepts and no route in the table reads.
     fn fill_path_parameters(path: &str) -> String {

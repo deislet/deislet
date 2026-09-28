@@ -1721,10 +1721,10 @@ pub async fn provider_target_grant_history_audit(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants",
     operation_id = "grantProviderTarget",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
     request_body = GrantProviderTargetRequest,
     responses(
         (status = 201, description = "The grant was recorded.", body = ProviderTargetGrant, headers(("Location" = String, description = "The new resource."), ("ETag" = String, description = "The resource revision, for `If-Match`."))),
@@ -1737,18 +1737,15 @@ pub async fn provider_target_grant_history_audit(
 )]
 pub async fn grant_provider_target(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name)): Path<(String, String)>,
+    Path((app_id, env_name)): Path<(String, String)>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     paths: ApiPaths,
     Json(request): Json<GrantProviderTargetRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderTargetGrant>)> {
     let idempotency_key = required_header(&headers, IDEMPOTENCY_KEY)?;
-    let app = state.store.get_app(&app_name).await?;
-    let environment = state
-        .store
-        .get_environment(&app_name, &environment_name)
-        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    let environment = state.store.get_environment(&app_id, &env_name).await?;
     // Canonical ids, not names: a name deleted and recreated must not let an
     // old key replay a grant onto the new application.
     let replay = idempotent_request(
@@ -1769,7 +1766,7 @@ pub async fn grant_provider_target(
         StatusCode::CREATED,
         |grant: &ProviderTargetGrant| {
             paths.absolute(&format!(
-                "/apps/{app_name}/environments/{environment_name}/provider-target-grants/{}",
+                "/apps/{app_id}/environments/{env_name}/provider-target-grants/{}",
                 grant.grant_id
             ))
         },
@@ -1791,10 +1788,10 @@ pub async fn grant_provider_target(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants",
     operation_id = "listProviderTargetGrants",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ProviderTargetGrantListQuery),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ProviderTargetGrantListQuery),
     responses(
         (status = 200, description = "One page of the environment's grants.", body = ControlListPage<ProviderTargetGrant>),
         (status = 400, response = openapi::BadRequest),
@@ -1805,14 +1802,11 @@ pub async fn grant_provider_target(
 )]
 pub async fn list_provider_target_grants(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name)): Path<(String, String)>,
+    Path((app_id, env_name)): Path<(String, String)>,
     Query(query): Query<ProviderTargetGrantListQuery>,
 ) -> ApiResult<(HeaderMap, Json<ControlListPage<ProviderTargetGrant>>)> {
-    let app = state.store.get_app(&app_name).await?;
-    let environment = state
-        .store
-        .get_environment(&app_name, &environment_name)
-        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    let environment = state.store.get_environment(&app_id, &env_name).await?;
     let status = query.status_filter()?;
     let status_name = status.as_str();
     let collection = "provider-target-grants";
@@ -1853,10 +1847,10 @@ pub async fn list_provider_target_grants(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants/{grant_id}",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants/{grant_id}",
     operation_id = "getProviderTargetGrant",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7.")),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7.")),
     responses(
         (status = 200, description = "The grant.", body = ProviderTargetGrant, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
         (status = 400, response = openapi::BadRequest),
@@ -1867,21 +1861,20 @@ pub async fn list_provider_target_grants(
 )]
 pub async fn get_provider_target_grant(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
+    Path((app_id, env_name, grant_id)): Path<(String, String, String)>,
 ) -> ApiResult<(HeaderMap, Json<ProviderTargetGrant>)> {
     let grant_id = parse_id(&grant_id, "provider target grant")?;
-    let grant =
-        provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
+    let grant = provider_target_grant_in_scope(&state, &app_id, &env_name, grant_id).await?;
     let headers = resource_headers("", grant.revision)?;
     Ok((headers, Json(grant)))
 }
 
 #[utoipa::path(
     delete,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants/{grant_id}",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants/{grant_id}",
     operation_id = "revokeProviderTargetGrant",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer."), ("If-Match" = String, Header, description = "The revision the caller expects, from `ETag`.")),
     responses(
         (status = 200, description = "The grant, now revoked.", body = ProviderTargetGrant, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
         (status = 400, response = openapi::BadRequest),
@@ -1895,12 +1888,12 @@ pub async fn get_provider_target_grant(
 )]
 pub async fn revoke_provider_target_grant(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
+    Path((app_id, env_name, grant_id)): Path<(String, String, String)>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProviderTargetGrant>)> {
     let grant_id = parse_id(&grant_id, "provider target grant")?;
-    provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
+    provider_target_grant_in_scope(&state, &app_id, &env_name, grant_id).await?;
     let expected_revision = required_if_match(&headers)?;
     let replay = idempotent_request(
         &state.secrets,
@@ -1928,10 +1921,10 @@ pub async fn revoke_provider_target_grant(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants/{grant_id}/audit",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants/{grant_id}/audit",
     operation_id = "listProviderTargetGrantAudit",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7."), ListQuery),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("grant_id" = String, Path, description = "The grant's UUIDv7."), ListQuery),
     responses(
         (status = 200, description = "One page of grant events, newest first.", body = ControlListPage<ProviderTargetGrantAuditEvent>),
         (status = 400, response = openapi::BadRequest),
@@ -1942,15 +1935,14 @@ pub async fn revoke_provider_target_grant(
 )]
 pub async fn provider_target_grant_audit(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name, grant_id)): Path<(String, String, String)>,
+    Path((app_id, env_name, grant_id)): Path<(String, String, String)>,
     Query(query): Query<ListQuery>,
 ) -> ApiResult<(
     HeaderMap,
     Json<ControlListPage<ProviderTargetGrantAuditEvent>>,
 )> {
     let grant_id = parse_id(&grant_id, "provider target grant")?;
-    let grant =
-        provider_target_grant_in_scope(&state, &app_name, &environment_name, grant_id).await?;
+    let grant = provider_target_grant_in_scope(&state, &app_id, &env_name, grant_id).await?;
     let collection = "provider-target-grant-audit";
     let binding = format!(
         "scope=application:{}/environment:{}/grant:{};filter=all;sort=grant-revision-asc,event-id-asc-v1",
@@ -1983,15 +1975,12 @@ pub async fn provider_target_grant_audit(
 
 async fn provider_target_grant_in_scope(
     state: &CatalogState,
-    app_name: &str,
-    environment_name: &str,
+    app_id: &str,
+    env_name: &str,
     grant_id: CanonicalId,
 ) -> ApiResult<ProviderTargetGrant> {
-    let app = state.store.get_app(app_name).await?;
-    let environment = state
-        .store
-        .get_environment(app_name, environment_name)
-        .await?;
+    let app = state.store.get_app(app_id).await?;
+    let environment = state.store.get_environment(app_id, env_name).await?;
     // One answer for both ways this fails. A grant id that does not exist
     // and one that belongs to another application or environment have to
     // read identically, or a credential scoped to a single environment
@@ -2007,7 +1996,7 @@ async fn provider_target_grant_in_scope(
         })
         .ok_or_else(|| {
             ApiError::NotFound(format!(
-                "provider target grant {grant_id} not found for {app_name}/{environment_name}"
+                "provider target grant {grant_id} not found for {app_id}/{env_name}"
             ))
         })?;
     Ok(grant)
@@ -2015,10 +2004,10 @@ async fn provider_target_grant_in_scope(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments",
     operation_id = "beginProviderDeployment",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same answer.")),
     request_body = BeginProviderDeploymentRequest,
     responses(
         (status = 202, description = "The deployment was recorded and will be driven; poll `Location`.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
@@ -2033,21 +2022,18 @@ async fn provider_target_grant_in_scope(
 )]
 pub async fn begin_provider_deployment(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name)): Path<(String, String)>,
+    Path((app_id, env_name)): Path<(String, String)>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     paths: ApiPaths,
     Json(request): Json<BeginProviderDeploymentRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
-    let app = state.store.get_app(&app_name).await?;
-    let environment = state
-        .store
-        .get_environment(&app_name, &environment_name)
-        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    let environment = state.store.get_environment(&app_id, &env_name).await?;
     let context = operation_context(
         &headers,
         &principal,
-        &format!("/api/apps/{app_name}/environments/{environment_name}/provider-deployments"),
+        &format!("/api/apps/{app_id}/environments/{env_name}/provider-deployments"),
     )?;
     let operation = state
         .store
@@ -2062,16 +2048,16 @@ pub async fn begin_provider_deployment(
             context,
         )
         .await?;
-    let headers = operation_headers(paths, &operation, &app_name, &environment_name)?;
+    let headers = operation_headers(paths, &operation, &app_id, &env_name)?;
     Ok((StatusCode::ACCEPTED, headers, Json(operation)))
 }
 
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments",
     operation_id = "listProviderDeployments",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ListQuery),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ListQuery),
     responses(
         (status = 200, description = "One page of provider deployments, newest first.", body = ControlListPage<ProviderDeploymentWorkflow>),
         (status = 400, response = openapi::BadRequest),
@@ -2082,14 +2068,11 @@ pub async fn begin_provider_deployment(
 )]
 pub async fn list_provider_deployments(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name)): Path<(String, String)>,
+    Path((app_id, env_name)): Path<(String, String)>,
     Query(query): Query<ListQuery>,
 ) -> ApiResult<(HeaderMap, Json<ControlListPage<ProviderDeploymentWorkflow>>)> {
-    let app = state.store.get_app(&app_name).await?;
-    let environment = state
-        .store
-        .get_environment(&app_name, &environment_name)
-        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    let environment = state.store.get_environment(&app_id, &env_name).await?;
     let collection = "provider-deployments";
     let binding = format!(
         "scope=application:{}/environment:{};filter=all;sort=created-at-desc,operation-id-desc-v1",
@@ -2126,10 +2109,10 @@ pub async fn list_provider_deployments(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments/{operation_id}",
     operation_id = "getProviderDeployment",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The deployment operation's UUIDv7.")),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The deployment operation's UUIDv7.")),
     responses(
         (status = 200, description = "The workflow and its operation.", body = ProviderDeploymentWorkflow, headers(("ETag" = String, description = "The resource revision, for `If-Match`."))),
         (status = 400, response = openapi::BadRequest),
@@ -2140,14 +2123,11 @@ pub async fn list_provider_deployments(
 )]
 pub async fn get_provider_deployment(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name, operation_id)): Path<(String, String, String)>,
+    Path((app_id, env_name, operation_id)): Path<(String, String, String)>,
     paths: ApiPaths,
 ) -> ApiResult<(HeaderMap, Json<ProviderDeploymentWorkflow>)> {
-    let app = state.store.get_app(&app_name).await?;
-    let environment = state
-        .store
-        .get_environment(&app_name, &environment_name)
-        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    let environment = state.store.get_environment(&app_id, &env_name).await?;
     let operation_id = parse_id(&operation_id, "provider deployment operation")?;
     // The same single answer as the grant read above: an operation id from
     // another environment must be indistinguishable from one that was never
@@ -2163,19 +2143,19 @@ pub async fn get_provider_deployment(
         })
         .ok_or_else(|| {
             ApiError::NotFound(format!(
-                "provider deployment operation {operation_id} not found for {app_name}/{environment_name}"
+                "provider deployment operation {operation_id} not found for {app_id}/{env_name}"
             ))
         })?;
-    let headers = operation_headers(paths, &workflow.operation, &app_name, &environment_name)?;
+    let headers = operation_headers(paths, &workflow.operation, &app_id, &env_name)?;
     Ok((headers, Json(workflow)))
 }
 
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/cancel",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments/{operation_id}/cancel",
     operation_id = "cancelProviderDeployment",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The deployment or rollback operation's UUIDv7."), ("Idempotency-Key" = Option<String>, Header, description = "Optional. A replay of the same key by the same principal returns the same operation."), ("If-Match" = String, Header, description = "The operation revision the caller expects.")),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The deployment or rollback operation's UUIDv7."), ("Idempotency-Key" = Option<String>, Header, description = "Optional. A replay of the same key by the same principal returns the same operation."), ("If-Match" = String, Header, description = "The operation revision the caller expects.")),
     responses(
         (status = 202, description = "Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback. A request that could withhold nothing is refused with `409` `operation-not-cancellable`: the operation is already terminal or cancelling, or it is on its last step and the provider is already holding that call, in which case the deployment finishes and a rollback is the way back.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the operation."))),
         (status = 400, response = openapi::BadRequest),
@@ -2190,28 +2170,25 @@ pub async fn get_provider_deployment(
 )]
 pub async fn cancel_provider_deployment(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name, operation_id)): Path<(String, String, String)>,
+    Path((app_id, env_name, operation_id)): Path<(String, String, String)>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     paths: ApiPaths,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
-    let app = state.store.get_app(&app_name).await?;
-    let environment = state
-        .store
-        .get_environment(&app_name, &environment_name)
-        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    let environment = state.store.get_environment(&app_id, &env_name).await?;
     let operation_id = parse_id(&operation_id, "provider deployment operation")?;
     let expected_revision = required_if_match(&headers)?;
     let route = format!(
-        "/api/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/cancel"
+        "/api/apps/{app_id}/environments/{env_name}/provider-deployments/{operation_id}/cancel"
     );
     // The generic `POST /operations/{id}/cancel` stops a provider workflow
     // through the same helper, so the two routes cannot drift apart.
     let scope = OperationScopeNames {
         application_id: app.canonical_id,
         environment_id: environment.canonical_id,
-        application_name: app_name,
-        environment_name,
+        application_name: app_id,
+        environment_name: env_name,
     };
     cancel_provider_workflow(
         &state.store,
@@ -2230,10 +2207,10 @@ pub async fn cancel_provider_deployment(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/rollback",
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments/{operation_id}/rollback",
     operation_id = "rollbackProviderDeployment",
     tag = "product",
-    params(("app_name" = String, Path, description = "The application's id."), ("environment_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The succeeded deployment operation to roll back to."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation.")),
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("operation_id" = String, Path, description = "The succeeded deployment operation to roll back to."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation.")),
     responses(
         (status = 202, description = "A new `rollback` operation was recorded and will be driven; poll `Location`. Its workflow names the deployment in `rolledBackFromOperationId`, runs the driver's `rollback` against that deployment's exact desired state and then `observe`s the result.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the new operation."))),
         (status = 400, response = openapi::BadRequest),
@@ -2246,22 +2223,19 @@ pub async fn cancel_provider_deployment(
 )]
 pub async fn rollback_provider_deployment(
     State(state): State<CatalogState>,
-    Path((app_name, environment_name, operation_id)): Path<(String, String, String)>,
+    Path((app_id, env_name, operation_id)): Path<(String, String, String)>,
     Extension(principal): Extension<Principal>,
     headers: HeaderMap,
     paths: ApiPaths,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
-    let app = state.store.get_app(&app_name).await?;
-    let environment = state
-        .store
-        .get_environment(&app_name, &environment_name)
-        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    let environment = state.store.get_environment(&app_id, &env_name).await?;
     let operation_id = parse_id(&operation_id, "provider deployment operation")?;
     let context = operation_context(
         &headers,
         &principal,
         &format!(
-            "/api/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/rollback"
+            "/api/apps/{app_id}/environments/{env_name}/provider-deployments/{operation_id}/rollback"
         ),
     )?;
     let operation = state
@@ -2275,7 +2249,7 @@ pub async fn rollback_provider_deployment(
             context,
         )
         .await?;
-    let headers = operation_headers(paths, &operation, &app_name, &environment_name)?;
+    let headers = operation_headers(paths, &operation, &app_id, &env_name)?;
     Ok((StatusCode::ACCEPTED, headers, Json(operation)))
 }
 
@@ -2579,12 +2553,12 @@ pub(in crate::api) fn keyed_operation_context(
 pub(in crate::api) fn operation_headers(
     paths: ApiPaths,
     operation: &ProductOperation,
-    app_name: &str,
-    environment_name: &str,
+    app_id: &str,
+    env_name: &str,
 ) -> ApiResult<HeaderMap> {
     let mut headers = resource_headers(
         &paths.absolute(&format!(
-            "/apps/{app_name}/environments/{environment_name}/provider-deployments/{}",
+            "/apps/{app_id}/environments/{env_name}/provider-deployments/{}",
             operation.operation_id
         )),
         operation.revision,

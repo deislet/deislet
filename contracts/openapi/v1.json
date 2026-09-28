@@ -7454,7 +7454,7 @@
         "type": "apiKey"
       },
       "bearerToken": {
-        "description": "`Authorization: Bearer <token>` with an API token minted by `POST /api/v1/accounts/{name}/tokens`; on a fresh install, log in with `deis login --bootstrap` using the bootstrap.token file the control plane wrote to its data directory.",
+        "description": "`Authorization: Bearer <token>` with an API token minted by `POST /api/v1/accounts/{account}/tokens`; on a fresh install, log in with `deis login --bootstrap` using the bootstrap.token file the control plane wrote to its data directory.",
         "scheme": "bearer",
         "type": "http"
       }
@@ -8554,7 +8554,7 @@
         ]
       }
     },
-    "/api/platform/runtime/{node}/apps/{app_id}": {
+    "/api/platform/runtime/{node_id}/apps/{app_id}": {
       "delete": {
         "description": "This is a node-local operation and changes nothing in the catalog, which\nis why it is **refused** while the catalog still deploys the application:\na node reconciles against `GET /api/nodes/{id}/assignments` on its own\ntimer, that list is built from the catalog and names the same application,\nand the node loads it straight back. The endpoint used to send the unload\nanyway and answer `200 {\"success\": true}`, so an operator was told the\napplication was off a node while the node was already putting it back -\nand there was nothing in the answer, or anywhere else, to say so. An\noperation that reports success and then reverses itself is worse than one\nthat refuses, because the refusal is the only version of it an operator\ncan act on.\n\nWhat it is still for: an application the catalog no longer names but a node\nis still running - a node that was unreachable when the application was\ndeleted, or one that has drifted. That case is the one where the unload\nsticks, because the next assignment list will not contain it either.",
         "operationId": "unloadRuntimeApp",
@@ -8562,7 +8562,7 @@
           {
             "description": "The node's id in the fleet.",
             "in": "path",
-            "name": "node",
+            "name": "node_id",
             "required": true,
             "schema": {
               "type": "string"
@@ -8644,20 +8644,20 @@
             "description": "The catalog could not be read, so nothing was sent."
           }
         },
-        "summary": "DELETE /api/platform/runtime/{node}/apps/{app_id}[?environment=NAME] -\nunload an app.",
+        "summary": "DELETE /api/platform/runtime/{node_id}/apps/{app_id}[?environment=NAME] -\nunload an app.",
         "tags": [
           "platform"
         ]
       }
     },
-    "/api/platform/runtime/{node}/status": {
+    "/api/platform/runtime/{node_id}/status": {
       "get": {
         "operationId": "getRuntimeNodeStatus",
         "parameters": [
           {
             "description": "The node's id in the fleet.",
             "in": "path",
-            "name": "node",
+            "name": "node_id",
             "required": true,
             "schema": {
               "type": "string"
@@ -8703,7 +8703,7 @@
             "$ref": "#/components/responses/BadGateway"
           }
         },
-        "summary": "GET /api/platform/runtime/{node}/status - live status straight from the\nnode.",
+        "summary": "GET /api/platform/runtime/{node_id}/status - live status straight from the\nnode.",
         "tags": [
           "platform"
         ]
@@ -8980,6 +8980,108 @@
         ]
       }
     },
+    "/api/v1/accounts/{account}": {
+      "get": {
+        "operationId": "getAccount",
+        "parameters": [
+          {
+            "description": "The account's name.",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Account"
+                }
+              }
+            },
+            "description": "The account."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Read one account.",
+        "tags": [
+          "product"
+        ]
+      },
+      "patch": {
+        "operationId": "updateAccount",
+        "parameters": [
+          {
+            "description": "The account's name.",
+            "in": "path",
+            "name": "account",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAccountRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Account"
+                }
+              }
+            },
+            "description": "The account after the change."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Change an account's role, or disable it.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
     "/api/v1/accounts/{account}/tokens": {
       "post": {
         "operationId": "createToken",
@@ -9035,108 +9137,6 @@
           }
         },
         "summary": "Mint a token for an account.",
-        "tags": [
-          "product"
-        ]
-      }
-    },
-    "/api/v1/accounts/{name}": {
-      "get": {
-        "operationId": "getAccount",
-        "parameters": [
-          {
-            "description": "The account's name.",
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Account"
-                }
-              }
-            },
-            "description": "The account."
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "summary": "Read one account.",
-        "tags": [
-          "product"
-        ]
-      },
-      "patch": {
-        "operationId": "updateAccount",
-        "parameters": [
-          {
-            "description": "The account's name.",
-            "in": "path",
-            "name": "name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/UpdateAccountRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Account"
-                }
-              }
-            },
-            "description": "The account after the change."
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "415": {
-            "$ref": "#/components/responses/UnsupportedMediaType"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "summary": "Change an account's role, or disable it.",
         "tags": [
           "product"
         ]
@@ -10239,6 +10239,863 @@
         ]
       }
     },
+    "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments": {
+      "get": {
+        "operationId": "listProviderDeployments",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, `1..=1000`; absent means 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The `page.nextCursor` of the previous answer. Opaque, bound to the\ncollection and the filters it was issued for, and refused with 400\n`cursor-invalid` anywhere else.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlListPage_ProviderDeploymentWorkflow"
+                }
+              }
+            },
+            "description": "One page of provider deployments, newest first."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      },
+      "post": {
+        "operationId": "beginProviderDeployment",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required. Replays of the same key return the same answer.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BeginProviderDeploymentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductOperation"
+                }
+              }
+            },
+            "description": "The deployment was recorded and will be driven; poll `Location`.",
+            "headers": {
+              "Location": {
+                "description": "Where to poll the operation.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments/{operation_id}": {
+      "get": {
+        "operationId": "getProviderDeployment",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The deployment operation's UUIDv7.",
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderDeploymentWorkflow"
+                }
+              }
+            },
+            "description": "The workflow and its operation.",
+            "headers": {
+              "ETag": {
+                "description": "The resource revision, for `If-Match`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments/{operation_id}/cancel": {
+      "post": {
+        "operationId": "cancelProviderDeployment",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The deployment or rollback operation's UUIDv7.",
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Optional. A replay of the same key by the same principal returns the same operation.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "The operation revision the caller expects.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductOperation"
+                }
+              }
+            },
+            "description": "Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback. A request that could withhold nothing is refused with `409` `operation-not-cancellable`: the operation is already terminal or cancelling, or it is on its last step and the provider is already holding that call, in which case the deployment finishes and a rollback is the way back.",
+            "headers": {
+              "Location": {
+                "description": "Where to poll the operation.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/provider-deployments/{operation_id}/rollback": {
+      "post": {
+        "operationId": "rollbackProviderDeployment",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The succeeded deployment operation to roll back to.",
+            "in": "path",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required. Replays of the same key return the same operation.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductOperation"
+                }
+              }
+            },
+            "description": "A new `rollback` operation was recorded and will be driven; poll `Location`. Its workflow names the deployment in `rolledBackFromOperationId`, runs the driver's `rollback` against that deployment's exact desired state and then `observe`s the result.",
+            "headers": {
+              "Location": {
+                "description": "Where to poll the new operation.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants": {
+      "get": {
+        "operationId": "listProviderTargetGrants",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, `1..=1000`; absent means 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The `page.nextCursor` of the previous answer. Opaque, bound to the\ncollection and the filters it was issued for, and refused with 400\n`cursor-invalid` anywhere else.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`active` (the default), `revoked` or `all`.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlListPage_ProviderTargetGrant"
+                }
+              }
+            },
+            "description": "One page of the environment's grants."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      },
+      "post": {
+        "operationId": "grantProviderTarget",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required. Replays of the same key return the same answer.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantProviderTargetRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderTargetGrant"
+                }
+              }
+            },
+            "description": "The grant was recorded.",
+            "headers": {
+              "ETag": {
+                "description": "The resource revision, for `If-Match`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Location": {
+                "description": "The new resource.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants/{grant_id}": {
+      "delete": {
+        "operationId": "revokeProviderTargetGrant",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grant's UUIDv7.",
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required. Replays of the same key return the same answer.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The revision the caller expects, from `ETag`.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderTargetGrant"
+                }
+              }
+            },
+            "description": "The grant, now revoked.",
+            "headers": {
+              "ETag": {
+                "description": "The resource revision, for `If-Match`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "428": {
+            "$ref": "#/components/responses/PreconditionRequired"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      },
+      "get": {
+        "operationId": "getProviderTargetGrant",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grant's UUIDv7.",
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderTargetGrant"
+                }
+              }
+            },
+            "description": "The grant.",
+            "headers": {
+              "ETag": {
+                "description": "The resource revision, for `If-Match`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants/{grant_id}/audit": {
+      "get": {
+        "operationId": "listProviderTargetGrantAudit",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grant's UUIDv7.",
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, `1..=1000`; absent means 100.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The `page.nextCursor` of the previous answer. Opaque, bound to the\ncollection and the filters it was issued for, and refused with 400\n`cursor-invalid` anywhere else.",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlListPage_ProviderTargetGrantAuditEvent"
+                }
+              }
+            },
+            "description": "One page of grant events, newest first."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      }
+    },
     "/api/v1/apps/{app_id}/environments/{env_name}/rollback": {
       "post": {
         "description": "Coordinate a new immutable deployment aimed at an older version and its\nhistorical binding snapshot. The current pointer is changed only after\nthe same strict prepare barrier used by a forward deployment, so rollback\nremains reversible and never silently rebinds secrets by name.",
@@ -11243,863 +12100,6 @@
           }
         },
         "summary": "Read one version.",
-        "tags": [
-          "product"
-        ]
-      }
-    },
-    "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments": {
-      "get": {
-        "operationId": "listProviderDeployments",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Page size, `1..=1000`; absent means 100.",
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "maximum": 1000,
-              "minimum": 1,
-              "type": "integer"
-            }
-          },
-          {
-            "description": "The `page.nextCursor` of the previous answer. Opaque, bound to the\ncollection and the filters it was issued for, and refused with 400\n`cursor-invalid` anywhere else.",
-            "in": "query",
-            "name": "cursor",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ControlListPage_ProviderDeploymentWorkflow"
-                }
-              }
-            },
-            "description": "One page of provider deployments, newest first."
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      },
-      "post": {
-        "operationId": "beginProviderDeployment",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Required. Replays of the same key return the same answer.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BeginProviderDeploymentRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProductOperation"
-                }
-              }
-            },
-            "description": "The deployment was recorded and will be driven; poll `Location`.",
-            "headers": {
-              "Location": {
-                "description": "Where to poll the operation.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "409": {
-            "$ref": "#/components/responses/Conflict"
-          },
-          "415": {
-            "$ref": "#/components/responses/UnsupportedMediaType"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          },
-          "503": {
-            "$ref": "#/components/responses/ServiceUnavailable"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      }
-    },
-    "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}": {
-      "get": {
-        "operationId": "getProviderDeployment",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The deployment operation's UUIDv7.",
-            "in": "path",
-            "name": "operation_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProviderDeploymentWorkflow"
-                }
-              }
-            },
-            "description": "The workflow and its operation.",
-            "headers": {
-              "ETag": {
-                "description": "The resource revision, for `If-Match`.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      }
-    },
-    "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/cancel": {
-      "post": {
-        "operationId": "cancelProviderDeployment",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The deployment or rollback operation's UUIDv7.",
-            "in": "path",
-            "name": "operation_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Optional. A replay of the same key by the same principal returns the same operation.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": false,
-            "schema": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          {
-            "description": "The operation revision the caller expects.",
-            "in": "header",
-            "name": "If-Match",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProductOperation"
-                }
-              }
-            },
-            "description": "Cancellation was requested; poll `Location`. The operation is `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). Steps that already activated are not undone; that is a rollback. A request that could withhold nothing is refused with `409` `operation-not-cancellable`: the operation is already terminal or cancelling, or it is on its last step and the provider is already holding that call, in which case the deployment finishes and a rollback is the way back.",
-            "headers": {
-              "Location": {
-                "description": "Where to poll the operation.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "409": {
-            "$ref": "#/components/responses/Conflict"
-          },
-          "412": {
-            "$ref": "#/components/responses/PreconditionFailed"
-          },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          },
-          "503": {
-            "$ref": "#/components/responses/ServiceUnavailable"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      }
-    },
-    "/api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments/{operation_id}/rollback": {
-      "post": {
-        "operationId": "rollbackProviderDeployment",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The succeeded deployment operation to roll back to.",
-            "in": "path",
-            "name": "operation_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Required. Replays of the same key return the same operation.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProductOperation"
-                }
-              }
-            },
-            "description": "A new `rollback` operation was recorded and will be driven; poll `Location`. Its workflow names the deployment in `rolledBackFromOperationId`, runs the driver's `rollback` against that deployment's exact desired state and then `observe`s the result.",
-            "headers": {
-              "Location": {
-                "description": "Where to poll the new operation.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "409": {
-            "$ref": "#/components/responses/Conflict"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          },
-          "503": {
-            "$ref": "#/components/responses/ServiceUnavailable"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      }
-    },
-    "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants": {
-      "get": {
-        "operationId": "listProviderTargetGrants",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Page size, `1..=1000`; absent means 100.",
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "maximum": 1000,
-              "minimum": 1,
-              "type": "integer"
-            }
-          },
-          {
-            "description": "The `page.nextCursor` of the previous answer. Opaque, bound to the\ncollection and the filters it was issued for, and refused with 400\n`cursor-invalid` anywhere else.",
-            "in": "query",
-            "name": "cursor",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "`active` (the default), `revoked` or `all`.",
-            "in": "query",
-            "name": "status",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ControlListPage_ProviderTargetGrant"
-                }
-              }
-            },
-            "description": "One page of the environment's grants."
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      },
-      "post": {
-        "operationId": "grantProviderTarget",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Required. Replays of the same key return the same answer.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/GrantProviderTargetRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProviderTargetGrant"
-                }
-              }
-            },
-            "description": "The grant was recorded.",
-            "headers": {
-              "ETag": {
-                "description": "The resource revision, for `If-Match`.",
-                "schema": {
-                  "type": "string"
-                }
-              },
-              "Location": {
-                "description": "The new resource.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "409": {
-            "$ref": "#/components/responses/Conflict"
-          },
-          "415": {
-            "$ref": "#/components/responses/UnsupportedMediaType"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      }
-    },
-    "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants/{grant_id}": {
-      "delete": {
-        "operationId": "revokeProviderTargetGrant",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The grant's UUIDv7.",
-            "in": "path",
-            "name": "grant_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Required. Replays of the same key return the same answer.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The revision the caller expects, from `ETag`.",
-            "in": "header",
-            "name": "If-Match",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProviderTargetGrant"
-                }
-              }
-            },
-            "description": "The grant, now revoked.",
-            "headers": {
-              "ETag": {
-                "description": "The resource revision, for `If-Match`.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "409": {
-            "$ref": "#/components/responses/Conflict"
-          },
-          "412": {
-            "$ref": "#/components/responses/PreconditionFailed"
-          },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      },
-      "get": {
-        "operationId": "getProviderTargetGrant",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The grant's UUIDv7.",
-            "in": "path",
-            "name": "grant_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProviderTargetGrant"
-                }
-              }
-            },
-            "description": "The grant.",
-            "headers": {
-              "ETag": {
-                "description": "The resource revision, for `If-Match`.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      }
-    },
-    "/api/v1/apps/{app_name}/environments/{environment_name}/provider-target-grants/{grant_id}/audit": {
-      "get": {
-        "operationId": "listProviderTargetGrantAudit",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "app_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The environment's name.",
-            "in": "path",
-            "name": "environment_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "The grant's UUIDv7.",
-            "in": "path",
-            "name": "grant_id",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Page size, `1..=1000`; absent means 100.",
-            "in": "query",
-            "name": "limit",
-            "required": false,
-            "schema": {
-              "maximum": 1000,
-              "minimum": 1,
-              "type": "integer"
-            }
-          },
-          {
-            "description": "The `page.nextCursor` of the previous answer. Opaque, bound to the\ncollection and the filters it was issued for, and refused with 400\n`cursor-invalid` anywhere else.",
-            "in": "query",
-            "name": "cursor",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ControlListPage_ProviderTargetGrantAuditEvent"
-                }
-              }
-            },
-            "description": "One page of grant events, newest first."
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
         "tags": [
           "product"
         ]

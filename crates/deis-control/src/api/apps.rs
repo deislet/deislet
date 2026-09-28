@@ -154,14 +154,14 @@ pub struct NodeStatusResponse {
     pub resource_usage: Option<ResourceUsageView>,
 }
 
-/// GET /api/platform/runtime/{node}/status - live status straight from the
+/// GET /api/platform/runtime/{node_id}/status - live status straight from the
 /// node.
 #[utoipa::path(
     get,
-    path = "/api/platform/runtime/{node}/status",
+    path = "/api/platform/runtime/{node_id}/status",
     operation_id = "getRuntimeNodeStatus",
     tag = "platform",
-    params(("node" = String, Path, description = "The node's id in the fleet."), StatusParams),
+    params(("node_id" = String, Path, description = "The node's id in the fleet."), StatusParams),
     responses(
         (status = 200, description = "What the node reported.", body = NodeStatusResponse),
         (status = 404, response = openapi::NotFound),
@@ -269,7 +269,7 @@ pub struct UnloadRefused {
     pub assignment_refresh_seconds: Option<u64>,
 }
 
-/// DELETE /api/platform/runtime/{node}/apps/{app_id}[?environment=NAME] -
+/// DELETE /api/platform/runtime/{node_id}/apps/{app_id}[?environment=NAME] -
 /// unload an app.
 ///
 /// This is a node-local operation and changes nothing in the catalog, which
@@ -290,11 +290,11 @@ pub struct UnloadRefused {
 /// sticks, because the next assignment list will not contain it either.
 #[utoipa::path(
     delete,
-    path = "/api/platform/runtime/{node}/apps/{app_id}",
+    path = "/api/platform/runtime/{node_id}/apps/{app_id}",
     operation_id = "unloadRuntimeApp",
     tag = "platform",
     params(
-        ("node" = String, Path, description = "The node's id in the fleet."),
+        ("node_id" = String, Path, description = "The node's id in the fleet."),
         ("app_id" = String, Path, description = "The application's id."),
         UnloadParams,
     ),

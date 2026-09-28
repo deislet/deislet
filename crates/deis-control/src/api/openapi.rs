@@ -434,7 +434,7 @@ impl Modify for Security {
                     .scheme(HttpAuthScheme::Bearer)
                     .description(Some(
                         "`Authorization: Bearer <token>` with an API token minted by \
-                         `POST /api/v1/accounts/{name}/tokens`; on a fresh install, log in with \
+                         `POST /api/v1/accounts/{account}/tokens`; on a fresh install, log in with \
                          `deis login --bootstrap` using the bootstrap.token file the control \
                          plane wrote to its data directory.",
                     ))
