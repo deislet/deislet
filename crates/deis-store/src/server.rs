@@ -248,6 +248,8 @@ pub async fn serve(
     )
     .context("cannot reach the control plane's machine channel as configured")?;
     if let Some(listen) = config.metrics_listen.as_deref() {
+        deis_capability::exposition::require_loopback("metrics_listen", listen)
+            .map_err(anyhow::Error::msg)?;
         let metrics = TcpListener::bind(listen)
             .await
             .with_context(|| format!("cannot bind the metrics listener on {listen}"))?;

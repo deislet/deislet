@@ -73,7 +73,8 @@ pub struct Config {
     /// Where to serve the capability verifier's Prometheus metrics
     /// (`deis_auth_degraded`, `deis_auth_degraded_since_seconds`,
     /// `deis_auth_grace_accepted_total`, `deis_auth_revocation_last_sync_seconds`)
-    /// at `/metrics`. Not served when absent.
+    /// at `/metrics`. Not served when absent. Plaintext HTTP, so only a
+    /// loopback IP address is accepted; anything else refuses to start.
     #[serde(default)]
     pub metrics_listen: Option<String>,
     /// Independent credential for backend migration inventory and writer

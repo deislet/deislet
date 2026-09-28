@@ -31,6 +31,10 @@ pub struct Config {
     /// Address the Prometheus text endpoint binds to. It is a separate port
     /// from `listen` so a scraper can be pointed at it without being given
     /// access to the ingest and query RPCs.
+    ///
+    /// Plaintext HTTP, so it must be a loopback IP address: anything else is
+    /// refused at startup. A scrape carries a read capability for every
+    /// tenant, which must not cross a network in the clear.
     #[serde(default = "default_metrics_listen")]
     pub metrics_listen: String,
     /// Directory holding the SQLite database and any on-disk payloads.
@@ -243,6 +247,8 @@ impl Config {
         if self.query_default_limit == 0 || self.query_max_limit == 0 {
             anyhow::bail!("query_default_limit and query_max_limit must be at least 1");
         }
+        deis_capability::exposition::require_loopback("metrics_listen", &self.metrics_listen)
+            .map_err(anyhow::Error::msg)?;
         if self.query_default_limit > self.query_max_limit {
             anyhow::bail!(
                 "query_default_limit ({}) must not exceed query_max_limit ({})",
@@ -274,7 +280,7 @@ mod tests {
         let config: Config = toml::from_str(
             r#"
             listen = "0.0.0.0:9000"
-            metrics_listen = "0.0.0.0:9001"
+            metrics_listen = "127.0.0.1:9001"
             data_dir = "/var/lib/deis-telemetry"
             log_retention_days = 3
             tail_capacity = 16
@@ -282,12 +288,27 @@ mod tests {
         )
         .expect("config must parse");
         assert_eq!(config.listen, "0.0.0.0:9000");
-        assert_eq!(config.metrics_listen, "0.0.0.0:9001");
+        assert_eq!(config.metrics_listen, "127.0.0.1:9001");
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/deis-telemetry"));
         assert_eq!(config.log_retention_days, 3);
         assert_eq!(config.tail_capacity, 16);
         // Untouched fields keep their defaults.
         assert_eq!(config.query_default_limit, 100);
+        config
+            .validate()
+            .expect("a TLS listener may face the network");
+    }
+
+    /// The Prometheus port is plaintext and a scrape carries a read
+    /// capability for every tenant, so it is refused off loopback.
+    #[test]
+    fn a_metrics_listener_off_loopback_is_refused() {
+        for listen in ["0.0.0.0:9001", "192.168.1.10:9001", "localhost:9001"] {
+            let config: Config =
+                toml::from_str(&format!("metrics_listen = {listen:?}")).expect("config must parse");
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("metrics_listen"), "{error}");
+        }
     }
 
     #[test]

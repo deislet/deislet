@@ -44,7 +44,8 @@ pub struct Config {
     #[serde(default)]
     pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
     /// Where to serve the capability verifier's Prometheus metrics at
-    /// `/metrics`. Not served when absent.
+    /// `/metrics`. Not served when absent. Plaintext HTTP, so only a loopback
+    /// IP address is accepted; anything else refuses to start.
     #[serde(default)]
     pub metrics_listen: Option<String>,
     /// Independent credential for migration inventory and writer fencing.

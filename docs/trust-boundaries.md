@@ -331,7 +331,8 @@ network - not by the absence of a published address:
 | Control plane's human listener (`bind_addr`, `port`) | The operators' network. Never the internet. It serves the dashboard and the API - every caller presents a token, and there is no anonymous path - plus a control channel that admits nobody. |
 | Control plane's `[machine]` listener | Machines holding a certificate this fleet signed. This is where the assignment list, the routing table and the bundle store live, so it must never be the internet either - the certificate demand is the authentication, not the containment. |
 | deis-store and deis-queue gRPC ports (TLS only) | Runtime nodes, the control plane and the operators' network only. Each binds loopback by default; every call carries a capability whatever the address, and a plaintext caller gets no answer. The optional migration service shares the listener under its own independent token. |
-| deis-telemetry's gRPC port (TLS only) and its Prometheus port | The same set, and both count: one serves logs and traces, the other every application's metric series. Every call on either presents a control-signed capability, and neither has a mode without that check. The Prometheus port is still plain HTTP, so the bearer a scraper sends is readable on the way: keep it on loopback or a network only the scraper reaches. |
+| deis-telemetry's gRPC port (TLS only) | The same set: it serves logs and traces. Every call presents a control-signed capability, and there is no mode without that check. |
+| Every Prometheus port: deis-telemetry's `metrics_listen`, and deis-store's and deis-queue's when set | This host only. They speak plain HTTP, so each service refuses to start unless the address is a loopback IP literal (`deis_capability::exposition::require_loopback`); scrape from the host or through a tunnel. deis-telemetry's also demands a platform-wide read capability on every scrape - the one bearer that reads every tenant's telemetry, which is why it never crosses a network in the clear. |
 | deis-proxy's listeners | The internet. This is the only one that belongs there. |
 
 A `[machine_identity]` private key is a credential like any other, whatever
@@ -488,7 +489,8 @@ is at most 24 hours past its expiry, and is not revoked by that list. Human
 capabilities never get grace. Each verifier exports `deis_auth_degraded`,
 `deis_auth_degraded_since_seconds`, `deis_auth_grace_accepted_total` and
 `deis_auth_revocation_last_sync_seconds` - deis-telemetry on its `/metrics`,
-deis-store and deis-queue on `metrics_listen` when it is set.
+deis-store and deis-queue on `metrics_listen` when it is set (loopback
+only, like every Prometheus port here).
 
 A verifier **restarted** while the control plane is unreachable has adopted
 no list and holds no keys (the JWKS is not persisted either), so it refuses

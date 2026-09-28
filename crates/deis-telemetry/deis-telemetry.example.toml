@@ -13,8 +13,9 @@
 # configured and uses that independent credential.
 #
 # Every call on either port - push, query, follow, scrape - must carry a
-# capability deis-control signed; there is no mode without that check, so these
-# may be bound beyond loopback. The health service is exempt: it names no
+# capability deis-control signed; there is no mode without that check. This
+# port speaks TLS only, with [machine_identity]'s certificate, so it may be
+# bound beyond loopback. The health service is exempt: it names no
 # application and reads no data. See src/auth.rs for what each capability may
 # touch.
 listen = "127.0.0.1:8092"
@@ -23,7 +24,9 @@ listen = "127.0.0.1:8092"
 # scraper can read the exported numbers without reaching the ingest and
 # query RPCs. It serves every application's series at once, so it accepts
 # only a platform-wide read capability (GET /api/platform/telemetry-token on
-# deis-control, which needs read:*/*).
+# deis-control, which needs read:*/*). It is plaintext HTTP, so it must be a
+# loopback IP address - anything else refuses to start. Scrape it from this
+# host, or through a tunnel.
 metrics_listen = "127.0.0.1:8093"
 
 # Independent bearer credential for the optional BackendMigration management

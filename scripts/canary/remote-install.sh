@@ -465,11 +465,13 @@ EOF
   # deis-telemetry holds no secret either: every call and every scrape carries
   # a capability the control plane signed - a node's ingest capability, or a
   # reader's, minted per command by the CLI - checked against the keys it
-  # fetches from the control plane's JWKS. It always enforces, so it listens
-  # on the LAN like store and queue.
+  # fetches from the control plane's JWKS. It always enforces, and its gRPC
+  # port is TLS, so that one listens on the LAN like store and queue. The
+  # Prometheus port is plaintext and stays on loopback (deis-telemetry refuses
+  # anything else); scrape it through an SSH tunnel.
   cat >/etc/deis/telemetry.toml <<EOF
 listen = "0.0.0.0:${TELEMETRY_PORT}"
-metrics_listen = "0.0.0.0:${TELEMETRY_METRICS_PORT}"
+metrics_listen = "127.0.0.1:${TELEMETRY_METRICS_PORT}"
 data_dir = "/var/lib/deis/telemetry"
 log_retention_days = 7
 metric_retention_days = 30
@@ -748,7 +750,7 @@ print_status() {
   log "  preview     http://<env>--<app>.${ZONE}/  (production: http://<app>.${ZONE}/)"
   log "  store gRPC  ${LAN_IP}:${STORE_PORT}"
   log "  queue gRPC  ${LAN_IP}:${QUEUE_PORT}"
-  log "  telemetry   ${LAN_IP}:${TELEMETRY_PORT}  (metrics ${LAN_IP}:${TELEMETRY_METRICS_PORT}; a control-signed capability is required)"
+  log "  telemetry   ${LAN_IP}:${TELEMETRY_PORT}  (metrics 127.0.0.1:${TELEMETRY_METRICS_PORT} on that host; a control-signed capability is required)"
   log "credentials:  /etc/deis/operator.env (minted through the bootstrap token;"
   log "              a fresh database that has not been logged in yet keeps its token at /var/lib/deis/control/bootstrap.token)"
   if [[ -f /var/lib/deis/RELEASE ]]; then
