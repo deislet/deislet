@@ -291,6 +291,11 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     // no anonymous mode, no loopback bypass and no setting that turns this
     // off.
     let auth = TelemetryAuth::new(keys);
+    // T8 grace only for nodes of this installation's trust domain.
+    auth.verifier()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_trust_domain(identity.id().trust_domain());
     deis_capability::fetch::poll_revocations(auth.verifier().clone(), "telemetry", control);
 
     let (shutdown, _) = watch::channel(false);

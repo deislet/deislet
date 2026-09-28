@@ -250,12 +250,19 @@ pub fn poll_revocations(
 /// Without a table nothing is polled and the refusal is logged: the verifier
 /// then reports itself degraded and grants no T8 grace. Only a test serves
 /// that way; every binary refuses to start without the table.
+///
+/// T8 grace is limited to nodes of `identity`'s own trust domain: a node
+/// name from another installation is never a node of this one.
 pub fn poll_revocations_for_service(
     verifier: crate::SharedVerifier,
     service: &'static str,
     table: Option<&crate::ServiceIdentityConfig>,
     identity: Arc<deis_identity::MachineIdentity>,
 ) -> Result<(), crate::ControlClientError> {
+    verifier
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_trust_domain(identity.id().trust_domain());
     match table {
         Some(table) => {
             poll_revocations(verifier, service, table.control_client(identity)?);
