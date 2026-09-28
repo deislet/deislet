@@ -2225,12 +2225,11 @@ impl Control {
     /// Served by `deis-control`'s
     /// `api::catalog::storage::storage_token`, behind the same API-key
     /// middleware as the deploy route and gated on the same application and
-    /// environment having to exist. The token is minted there rather than
-    /// this CLI being handed the shared `auth_secret`, which is the whole
-    /// point of a capability token: a leaked CLI credential still only ever
-    /// proves the holder may deploy and inspect *through the control plane's
-    /// own checks*, and never hands out the key every tenant's token is
-    /// derived from.
+    /// environment having to exist. The token is signed there, for 15
+    /// minutes, and recorded in the issuance table: a leaked CLI credential
+    /// still only ever proves the holder may deploy and inspect *through the
+    /// control plane's own checks*, and never hands out the key capabilities
+    /// are signed with.
     ///
     /// A control plane with no deis-store address
     /// answers 409 with a message naming the key to set, which the generic

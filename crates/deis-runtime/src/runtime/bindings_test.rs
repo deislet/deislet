@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn a_storage_call_carries_the_tenant_and_the_proof_together() {
         // Both headers or neither: a call with the tenant alone is refused by
-        // a service that has an auth_secret, and a token without the tenant
+        // every data service, and a token without the tenant
         // names no namespace at all.
         let identity = StorageIdentity::new("demo.production", Some("a-minted-token"))
             .expect("a legal tenant and a sendable token");
@@ -743,7 +743,7 @@ mod tests {
         let error = kv
             .set("k".to_string(), b"v".to_vec())
             .await
-            .expect_err("a store with an auth_secret must not serve an unproven call");
+            .expect_err("a store must not serve an unproven call");
         assert_eq!(
             error
                 .downcast_ref::<tonic::Status>()

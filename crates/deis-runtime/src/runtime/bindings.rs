@@ -1001,9 +1001,9 @@ impl StorageIdentity {
         self.tenant.as_str()
     }
 
-    /// Whether this node was handed a credential for the tenant. False is
-    /// normal on a single-box install and fatal against a service that has an
-    /// `auth_secret`, so it is worth a log field wherever a client is built.
+    /// Whether this node holds a capability for the tenant yet. False until
+    /// the first `IssueCapability` answer lands, and every call made before
+    /// then is refused, so it is worth a log field wherever a client is built.
     pub fn is_proven(&self) -> bool {
         self.token.read().unwrap().as_ref().map_or(false, |t| !t.is_empty())
     }

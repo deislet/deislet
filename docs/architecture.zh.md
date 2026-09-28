@@ -568,34 +568,28 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 `x-deis-tenant` 的**形状**（两段合法部分，不含 `.` `/` `\`）。这一节说的是**身份**
 ——凭什么相信提出这个租户的调用方真的有权代表它。
 
-做法是能力令牌：调用方在 `x-deis-storage-token` 头里带一个
-`base64(HMAC-SHA256(auth_secret, tenant))`（`deis_wire::conventions::storage_token`
-/ `storage_token_matches`）。deis-store 与 deis-queue 各自配一份 `auth_secret`，
-控制面配同一份 `storage_auth_secret`——三处必须是同一个字符串，改一处就要三处一起
-改，改完之前旧令牌全部失效。部署消息里不带任何令牌：节点经机器通道用自己的证书身份调用
-`IssueCapability`，为自己运行的租户申领 15 分钟的 capability（注册时立即申领，剩余
-5 分钟时续签，见 `crates/deis-runtime/src/deployment/capability_renewer.rs`）；节点侧
-每一次 KV / SQL / Blob / Queue 调用都把它带上（`crates/deis-store/src/auth.rs`、
-`deis-queue` 的对应实现），应用代码摸不到它。
+做法是能力令牌：调用方在 `Authorization: Bearer` 头里带一个控制面用 Ed25519 签发的
+capability（`deis_capability`），写明 audience（`store` / `queue`）、若干
+（tenant, binding）对、15 分钟的有效期和 `jti`。deis-store 与 deis-queue 不持有任何
+共享值：它们用自己的机器身份（`[machine_identity]`）经 mTLS 从控制面的 machine
+channel 拉取 JWKS 公钥与签名的吊销名单，按 `kid` 验签。部署消息里不带任何令牌：节点经
+机器通道用自己的证书身份调用 `IssueCapability`，只能为分配给自己的租户申领（注册时
+立即申领，剩余 5 分钟时续签，见
+`crates/deis-runtime/src/deployment/capability_renewer.rs`）；节点侧每一次 KV / SQL /
+Blob / Queue 调用都把它带上（`crates/deis-store/src/auth.rs`、`deis-queue` 的对应
+实现），应用代码摸不到它。
 
-验证的顺序刻意是「先看调用方声称的租户，再用这个租户算出期望的令牌，最后才比较」，
-而不是反过来拿令牌去查它对应哪个租户——这样一份从某个应用那里泄漏出去的令牌，换到
-别的租户身上立刻算不出正确答案，包括同一个应用的另一个环境。令牌不过期、也不是
-会话；轮换 `auth_secret` 是唯一的失效手段，一轮换全部令牌同时作废。
+验证的顺序刻意是「先看调用方声称的租户，再看令牌是否为这个租户、这个 binding 签发」，
+而不是反过来拿令牌去决定租户——一份从某个应用那里泄漏出去的令牌，换到别的租户身上
+立刻被拒，包括同一个应用的另一个环境。令牌 15 分钟过期，可按 `jti`、节点、租户单独
+吊销，也可递增 `auth_epoch` 批量作废（见 `docs/trust-boundaries.md` 的「Taking
+capabilities back」）。
 
-**未配置 `auth_secret` 时到底发生什么，两种情况刻意不同**：
+没有不鉴权的模式，也没有回环地址的例外：不论绑定在哪个地址，每次调用都要带能力令牌，
+gRPC 监听只说 TLS。启动时缺 `[machine_identity]` 直接拒绝启动。这和控制面的节点通道
+是同一个形状：a7ba508 起那条通道只认证书，`node_preshared_keys` 这个字段已删除。
 
-- **回环地址 + 未配置**：照旧工作，也就是曾经唯一的机制——相信调用方声称的租户，
-  唯一的收敛手段是网络层，端口够不到就调不了。不是静默的：启动时打一条 `warn`，
-  把「现在保护数据的只有这一层」原样写出来。这是单机自用的默认状态，受支持。
-- **非回环地址 + 未配置**：**拒绝启动**，不是打 warn 放行。未配置不能悄悄等于
-  「不设防也照样监听公网」——一旦真的绑定到别处，曾经顶替鉴权的那层收敛就不存在了。
-  这一条曾经和控制面的节点通道是同一个形状：预共享密钥列表一旦为空，那条通道直接
-  关闭，而不是打开。a7ba508 起两者已统一——这条通道只认证书；
-  `node_preshared_keys` 这个字段已删除，`[machine_identity]` 本身就是 entry 条件，
-  没配的直接拒绝启动。
-
-配了 `auth_secret` 却没带令牌、令牌对不上租户、或者干脆没带 `x-deis-tenant`，三种
+没带令牌、令牌对不上租户或 binding、或者干脆没带 `x-deis-tenant`，三种
 情况都在拿到任何数据**之前**被拒——tonic 拦截器挡在每个 handler 前面
 （`crates/deis-store/src/server.rs` 的 `guarded`），新增第四个服务也不可能漏掉这一层。
 拒绝一律以 `warn` 记日志，带上声称的租户，可追查。健康检查端点刻意例外：它不回答
@@ -1137,11 +1131,9 @@ UTF-8**，没有换成 deno_web 那一套。这是有意收窄，理由写在 `r
 ### 出网这一格
 
 `fetch` 装上的同一批还做了出网策略，因为这两件事分不开：能打出去的处理函数，第一
-个能打到的就是本机的 deis-store，而单机默认安装下 deis-store 相信别人给它的
-`x-deis-tenant` 头（§6 的授权一节说了配了 `auth_secret` 之后不再是这样，但那是运维
-要主动打开的，不是默认状态）。也就是说，一个没有策略的 `fetch` 等于把每个应用的
-数据都摊开——即便配了令牌，应用代码本身也拿不到自己那个租户的令牌
-（`bindings.rs` 在它看到 `context.env` 之前就把令牌取走了），但一个不受限的
+个能打到的就是本机的 deis-store。deis-store 如今每次调用都要控制面签发的 capability
+（§6 的授权一节），应用代码本身也拿不到自己那个租户的令牌
+（令牌由节点自己经机器通道申领，从不进入 `context.env`），但一个不受限的
 `fetch` 仍然是一条应用本不该有的、直连节点内部服务的路。
 
 **默认拒绝、按例外放行。** 公网通；环回、私有段、链路本地（含云元数据
@@ -1283,8 +1275,8 @@ Workers AI 在项目配置里根本没有可声明的地方，所以编译器检
   （`websocket_through_proxy_test.rs`、`websocket_bridging_test.rs`），不再是「未
   验证」。
 - **deis-store / deis-queue 有了调用方鉴权**：这张矩阵本身没有一格是「鉴权」，但
-  §6「授权」一节此前写的「无条件相信调用方声称的租户」已经不是全貌——配置
-  `auth_secret` 后每次调用都要带能力令牌，见该节。
+  §6「授权」一节此前写的「无条件相信调用方声称的租户」已经不是全貌——每次调用
+  都要带控制面签发的 capability，见该节。
 - **维持 ❌**：BroadcastChannel、`addEventListener`、`Deno` / `__bootstrap`——理由
   不变。
 

@@ -3,7 +3,7 @@
 //! Talks to deis-queue, which partitions messages by tenant -- one
 //! application in one environment: the tenant travels in the `x-deis-tenant`
 //! metadata header, and the capability token that proves this node may act as
-//! it in `x-deis-storage-token` (both stamped by [`StorageIdentity`]), not in
+//! it in `Authorization: Bearer` (both stamped by [`StorageIdentity`]), not in
 //! the proto messages, so one client
 //! speaks for exactly one environment of one application and a preview never
 //! consumes production's messages. A call without the header is refused with

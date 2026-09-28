@@ -3,7 +3,7 @@
 //! Talks to deis-store, which partitions data by tenant -- one application in
 //! one environment. The tenant travels in the `x-deis-tenant` metadata header
 //! and the capability token that proves this node may act as it travels in
-//! `x-deis-storage-token` (both stamped by [`StorageIdentity`]), not in the
+//! `Authorization: Bearer` (both stamped by [`StorageIdentity`]), not in the
 //! proto messages, so one client speaks for exactly one environment of one
 //! application and a preview cannot read or overwrite what production
 //! stored.
@@ -761,10 +761,10 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_requires_a_token_refuses_a_client_without_one_and_serves_one_with_it() {
         // The whole delivery path in one test, over a real socket: the store
-        // holds the shared secret, the control plane would mint this token
-        // from it, and the client stamps it beside the tenant it claims.
-        // Asserting on the header alone would not catch the two halves
-        // computing different values.
+        // trusts the control plane's signing key, the control plane would sign
+        // this capability with it, and the client stamps it beside the tenant
+        // it claims. Asserting on the header alone would not catch the two
+        // halves disagreeing.
         let store = Store::start().await;
         let tenant = "demo.production";
         let token = store.capability_token_for(tenant);
@@ -773,7 +773,7 @@ mod tests {
         let error = unproven
             .set("k".to_string(), b"v".to_vec())
             .await
-            .expect_err("a store with an auth_secret must not serve an unproven call");
+            .expect_err("a store must not serve an unproven call");
         assert_eq!(
             refusal(&error),
             tonic::Code::Unauthenticated,
@@ -804,10 +804,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_token_minted_for_another_tenant_is_refused() {
-        // What makes a leaked token harmless elsewhere: the store recomputes
-        // the expected value from the tenant the call itself claims, so
-        // presenting production's token while naming the preview proves
-        // nothing.
+        // What makes a leaked token harmless elsewhere: the store checks the
+        // capability names the tenant the call itself claims, so presenting
+        // production's token while naming the preview proves nothing.
         let store = Store::start().await;
         let production_token = store.capability_token_for("demo.production");
 
@@ -817,26 +816,6 @@ mod tests {
             .await
             .expect_err("one environment's token must not authorise another's namespace");
         assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
-    }
-
-    #[tokio::test]
-    async fn a_store_without_a_secret_serves_a_client_that_carries_a_token_anyway() {
-        // Why the node stamps the token unconditionally instead of behind a
-        // flag: a control plane that mints tokens and a store that does not
-        // check them is a legal intermediate state during a rollout, and it
-        // must keep working.
-        let store = Store::start().await;
-        let token = store.capability_token_for("demo.production");
-
-        let client = store.binding("demo.production", Some(&token));
-        client
-            .set("k".to_string(), b"v".to_vec())
-            .await
-            .expect("a store with no auth_secret ignores the token it was handed");
-        assert_eq!(
-            client.get("k".to_string()).await.expect("read back"),
-            Some(b"v".to_vec())
-        );
     }
 
     #[tokio::test]

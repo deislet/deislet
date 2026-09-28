@@ -3,8 +3,8 @@
 A durable queue with lease-based consumption: `Send` and `SendBatch`, `Pull`
 under a lease, `Ack`, `Nack` with a delay, and a dead-letter table with the
 reason a message was given up on. Nodes poll it; it never pushes. Every call
-is scoped by the `x-deis-tenant` header and, once an `auth_secret` is set, by
-a capability token for that tenant. The crate docs in `src/lib.rs` describe
+is scoped by the `x-deis-tenant` header and proved by an Ed25519 capability
+the control plane signed for that tenant; the listener speaks TLS only. The crate docs in `src/lib.rs` describe
 the design; `proto/queue.proto` is the contract.
 
 When `migration_admin_token` is configured, the process also exposes the

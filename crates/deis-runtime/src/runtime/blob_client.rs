@@ -8,7 +8,7 @@
 //!
 //! The tenant travels out of band in the `x-deis-tenant` metadata header, and
 //! the capability token proving this node may act as it in
-//! `x-deis-storage-token` (see [`StorageIdentity`]): one
+//! `Authorization: Bearer` (see [`StorageIdentity`]): one
 //! application in one environment (see [`Tenant`]). deis-store refuses any
 //! request that arrives without it, so a client is bound to exactly one
 //! environment of one application for its whole life, and a preview cannot

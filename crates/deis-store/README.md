@@ -2,8 +2,8 @@
 
 KV, per-tenant SQL and content-addressed blobs, as three gRPC services in one
 process on SQLite and the local disk. Every call is scoped by the
-`x-deis-tenant` header and, once an `auth_secret` is set, by a capability
-token minted for that tenant. The crate docs in `src/lib.rs` describe the
+`x-deis-tenant` header and proved by an Ed25519 capability the control plane
+signed for that tenant; the listener speaks TLS only. The crate docs in `src/lib.rs` describe the
 layout; `proto/storage.proto` and `proto/blob.proto` are the contracts.
 
 When `migration_admin_token` is configured, the process also exposes the

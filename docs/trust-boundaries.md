@@ -19,12 +19,14 @@ configuration file any more - every caller presents a token, resolved against
 a hash in the control plane's database, and a control plane with no credential
 at all mints a one-time bootstrap token written to a file only its own host can
 read. Telemetry moved too: deis-telemetry holds no secret and accepts only
-capabilities the control plane signed (see "Telemetry" below). What did not
-change: `storage_auth_secret` and the matching `auth_secret` on deis-store and
-deis-queue are still values copied between files, and whoever holds one holds
-everything it opens. A reader who concludes that everything
-moved to certificates will protect the wrong files, which is why this document
-says which is which before it says anything else.
+capabilities the control plane signed (see "Telemetry" below), and so do
+deis-store and deis-queue: each serves TLS with its own certificate and
+verifies short-lived capabilities against keys it reads from the control
+plane, with no value shared between files. What did not change: the
+migration admin tokens and the control plane's master key are still values
+held in files, and whoever holds one holds everything it opens. A reader who
+concludes that everything moved to certificates will protect the wrong files,
+which is why this document says which is which before it says anything else.
 
 ## How a process proves who it is
 
@@ -179,8 +181,7 @@ one file.
 
 | Value | Held by | What holding it is worth |
 |---|---|---|
-| `storage_auth_secret` on deis-control, the identical `auth_secret` on deis-store and deis-queue | three processes, one value | The control plane mints `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant and writes it into that tenant's deployment; the backend recomputes the expected token from the tenant the call itself claims (`crates/deis-store/src/auth.rs`, `crates/deis-control/src/delivery/mod.rs`). The secret mints a token for **any** tenant, so holding it is holding every tenant's data in both backends. A token does not expire; the only lever is changing the secret, which invalidates every token at once. |
-| `store_migration_admin_token`, `queue_migration_admin_token`, `telemetry_migration_admin_token` | deis-control and the backend it names | Freeze and inventory any tenant in that backend. Each is independent of the others and must not equal that backend's `auth_secret` - deis-store refuses to start its management service if it does (`crates/deis-store/src/server.rs`). |
+| `store_migration_admin_token`, `queue_migration_admin_token`, `telemetry_migration_admin_token` | deis-control and the backend it names | Freeze and inventory any tenant in that backend. Each is independent of the others and of every other credential. |
 | the master key in `secret_key_file` | deis-control alone | Not shared between machines, but one key for every tenant: every environment's secrets in the database are encrypted with it (`crates/deis-control/src/catalog/secrets.rs`). The encrypted rows are worth nothing without it and everything with it. |
 
 ## Telemetry
@@ -344,7 +345,7 @@ Everything below is therefore the operator's to enforce:
 
 | File | Required |
 |---|---|
-| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `storage_auth_secret`, `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`, and names the `[machine]` identity files. The three migration values must be different from each other and from every other credential. |
+| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`, and names the `[machine]` identity files. The three migration values must be different from each other and from every other credential. |
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
 | The control plane's `<data_dir>/bootstrap.token` | `0600`, written by the control plane itself on a first start and deleted the moment the bootstrap token is used. Until then it is an operator credential - it exists to create the first owner account and nothing else - so treat it like one and do not let it out of the host. It is not part of a backup of the data directory: it is short-lived by design, and backing one up means carrying an unused way in. |
 | Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchSecretValues` still answers for every environment's secrets. Issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. |
