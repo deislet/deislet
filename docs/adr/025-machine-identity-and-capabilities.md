@@ -205,7 +205,7 @@ Capability 默认 5 分钟、最长 15 分钟，不使用长期 refresh token。
 - **吊销名单**：只在 machine listener 上提供（`/capability/revocation-list`），内容是未过期（含 120 秒余量，覆盖 T8 的 `exp ≥ last_sync − skew` 边界）的吊销 `jti`、全部被吊销的节点与当前 `auth_epoch`，**用签发密钥签名**（与 capability 同一 `v1.<payload>.<sig>` 格式，payload 带 `typ = "deis-revocation-list"`，二者互不可冒充）。store、queue、telemetry 用各自的 `[machine_identity]` 经 mTLS 从 machine channel 拉取（与拉 JWKS 同一个 `ControlClient`、同一个 `control_endpoint`，http 只允许 loopback），每 30 秒一次；校验方用同一 JWKS 验签，拒绝早于两分钟、来自未来或早于上一份的名单（防重放），epoch 只升不降。store 的 kv/sql/blob 共用一个校验器，同一份名单三者一起生效。
 - **T8 节点判定**：宽限只给 subject 为节点 SPIFFE 名（`spiffe://<trust domain>/deislet/node/<id>`，由 `deis-identity` 解析）的 capability，且 trust domain 必须与校验方自身 machine identity 的一致（store、queue、telemetry 启动时设置）。
 - **重启语义**：校验方在 control 不可达时重启，没有 last sync，也没有公钥（JWKS 不落盘），因此拒绝一切 capability，指标报告 degraded。不持久化 last sync：单独持久化它会让宽限期接受在那次同步里已被吊销的 capability。
-- **指标**：`deis_auth_degraded`、`deis_auth_degraded_since_seconds`、`deis_auth_grace_accepted_total`、`deis_auth_revocation_last_sync_seconds`，label `service`。
+- **指标**：`deis_auth_degraded`、`deis_auth_degraded_since_seconds`、`deis_auth_grace_accepted_total`、`deis_auth_revocation_last_sync_seconds`，label `service`；`deis_auth_grace_accepted_total` 另带 `tenant`（被宽限接受的 capability 所指的租户）。
 
 ## Dual 到 Strict 的滚动顺序
 

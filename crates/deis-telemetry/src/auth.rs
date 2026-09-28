@@ -407,6 +407,13 @@ fn map_capability_error(e: CapabilityError) -> Status {
             tracing::warn!("refused a telemetry call whose capability claims are invalid");
             Status::unauthenticated(e.to_string())
         }
+        CapabilityError::NoRevocationList => {
+            tracing::warn!(
+                "refused a telemetry call because this service has not adopted the control plane's \
+                 revocation list yet; it answers once the first list arrives"
+            );
+            Status::unavailable(e.to_string())
+        }
         CapabilityError::UnknownKey { .. } => {
             tracing::warn!(
                 "refused a telemetry call whose capability names a signing key this service does \
@@ -448,8 +455,15 @@ mod tests {
         encode(&claims, &key())
     }
 
+    /// A guard whose verifier has adopted a revocation list naming nothing.
     fn auth() -> TelemetryAuth {
-        TelemetryAuth::new(KeyRing::from_keys([key().verifying_key()]))
+        let auth = TelemetryAuth::new(KeyRing::from_keys([key().verifying_key()]));
+        auth.verifier()
+            .lock()
+            .unwrap()
+            .apply_revocation_list(deis_capability::RevocationList::new("iss", 0, vec![]))
+            .unwrap();
+        auth
     }
 
     fn call(token: Option<&str>) -> Result<Grant, Status> {
@@ -466,6 +480,23 @@ mod tests {
 
     fn tenant(name: &str) -> Owner {
         Owner::Tenant(name.to_string())
+    }
+
+    /// Until the first revocation list is adopted, a sound capability is
+    /// refused as UNAVAILABLE: the service cannot yet tell whether it, or
+    /// the node holding it, was revoked.
+    #[test]
+    fn nothing_is_accepted_before_the_first_revocation_list() {
+        let mut fresh = TelemetryAuth::new(KeyRing::from_keys([key().verifying_key()]));
+        let mut request = Request::new(());
+        request.metadata_mut().insert(
+            AUTHORIZATION_HEADER,
+            format!("Bearer {}", token(&[("shop.production", TELEMETRY_INGEST)]))
+                .parse()
+                .unwrap(),
+        );
+        let status = tonic::service::Interceptor::call(&mut fresh, request).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     #[test]

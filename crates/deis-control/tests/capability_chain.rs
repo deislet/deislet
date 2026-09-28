@@ -292,7 +292,7 @@ impl Service {
         let (identity, control) =
             deis_store::server::machine_identity(&config).expect("the store's identity loads");
         let keys = KeyRing::new();
-        spawn_refresher(keys.clone(), control, quick_refresh());
+        spawn_refresher(keys.clone(), control.clone(), quick_refresh());
         let (shutdown, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             deis_store::server::serve(
@@ -302,6 +302,7 @@ impl Service {
                     let _ = rx.await;
                 },
                 keys,
+                control,
                 identity,
             )
             .await
@@ -333,7 +334,7 @@ impl Service {
         let (identity, control) =
             deis_queue::server::machine_identity(&config).expect("the queue's identity loads");
         let keys = KeyRing::new();
-        spawn_refresher(keys.clone(), control, quick_refresh());
+        spawn_refresher(keys.clone(), control.clone(), quick_refresh());
         let (shutdown, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             deis_queue::server::serve(
@@ -343,6 +344,7 @@ impl Service {
                     let _ = rx.await;
                 },
                 keys,
+                control,
                 identity,
             )
             .await

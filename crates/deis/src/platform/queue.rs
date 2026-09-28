@@ -472,6 +472,7 @@ mod tests {
         // this CLI configured to trust the authority that issued it.
         let fleet = crate::platform::service_tls::test_fleet();
         let identity = fleet.service_identity(deis_identity::ServiceKind::Queue);
+        let control = deis_capability::testing::FakeControl::start(signing_key.clone()).client();
         let server = tokio::spawn(async move {
             deis_queue::server::serve(
                 config,
@@ -480,6 +481,7 @@ mod tests {
                     let _ = stopped.await;
                 },
                 deis_capability::KeyRing::from_keys([verifying_key]),
+                control,
                 identity,
             )
             .await

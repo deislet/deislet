@@ -212,6 +212,13 @@ fn map_capability_error(e: CapabilityError) -> Status {
             tracing::warn!("refused a storage call whose capability claims are invalid");
             Status::invalid_argument(e.to_string())
         }
+        CapabilityError::NoRevocationList => {
+            tracing::warn!(
+                "refused a storage call because this service has not adopted the control plane's \
+                 revocation list yet; it answers once the first list arrives"
+            );
+            Status::unavailable(e.to_string())
+        }
         CapabilityError::UnknownKey { .. } => {
             tracing::warn!(
                 "refused a storage call whose capability names a signing key this service does not \
@@ -283,6 +290,18 @@ mod tests {
             );
             request
         };
+        // Before any list is adopted every binding refuses, and says the
+        // service is not ready rather than that the caller is wrong.
+        for mut guard in guards.clone() {
+            let refused = tonic::service::Interceptor::call(&mut guard, request(&token))
+                .expect_err("nothing is accepted before the first revocation list");
+            assert_eq!(refused.code(), tonic::Code::Unavailable);
+        }
+        verifier
+            .lock()
+            .unwrap()
+            .apply_revocation_list(RevocationList::new("iss", 1, vec![]))
+            .unwrap();
         for mut guard in guards.clone() {
             let admitted = tonic::service::Interceptor::call(&mut guard, request(&token)).unwrap();
             assert_eq!(

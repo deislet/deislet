@@ -379,6 +379,11 @@ mod tests {
             let (shutdown, rx) = oneshot::channel();
             let identity = crate::runtime::test_store::fleet()
                 .service_identity(deis_identity::ServiceKind::Store);
+            // The store polls its revocation list from a stand-in control
+            // plane signing with the same key, and accepts nothing until it
+            // has one.
+            let control =
+                deis_capability::testing::FakeControl::start(signing_key.clone()).client();
             tokio::spawn(async move {
                 server::serve(
                     config,
@@ -387,6 +392,7 @@ mod tests {
                         let _ = rx.await;
                     },
                     deis_capability::KeyRing::from_keys([verifying_key]),
+                    control,
                     identity,
                 )
                 .await

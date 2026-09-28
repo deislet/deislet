@@ -543,7 +543,17 @@ mod tests {
             certificate: files.certificate,
             private_key: files.private_key,
             trust_root: files.trust_root,
-            control_endpoint: "http://127.0.0.1:1".to_string(),
+            // A stand-in control plane serving revocation lists signed with
+            // the control key; the collector refuses everything until it has
+            // adopted one.
+            control_endpoint: {
+                static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+                    std::sync::OnceLock::new();
+                CONTROL
+                    .get_or_init(|| deis_capability::testing::FakeControl::start(control_key()))
+                    .url()
+                    .to_string()
+            },
             identity_reload_seconds: 60,
         }
     }

@@ -34,7 +34,7 @@ use base64::Engine;
 use deis_wire::CanonicalTenantId;
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod keys;
@@ -45,6 +45,9 @@ pub mod exposition;
 #[cfg(feature = "jwks-fetch")]
 pub mod fetch;
 pub mod revocation;
+/// Test support: a stand-in control plane serving signed revocation lists.
+#[cfg(feature = "jwks-fetch")]
+pub mod testing;
 
 #[cfg(feature = "jwks-fetch")]
 pub use control::{ControlClient, ControlClientConfig, ControlClientError, ServiceIdentityConfig};
@@ -235,6 +238,17 @@ pub enum CapabilityError {
     /// or by nothing the control plane ever published.
     #[error("capability signed by unknown key {kid:?}")]
     UnknownKey { kid: String },
+
+    /// This verifier has not adopted a signed revocation list yet, so it
+    /// cannot tell whether the token - or the node holding it - was revoked.
+    /// Every capability is refused until the first list arrives: a verifier
+    /// that started while the control plane was unreachable must not honour
+    /// a token the control plane revoked before it started.
+    #[error(
+        "no revocation list has been adopted yet, so no capability can be checked against one; \
+         this service accepts capabilities once it has fetched the control plane's list"
+    )]
+    NoRevocationList,
 }
 
 // ---- claims types ---------------------------------------------------------
@@ -681,8 +695,9 @@ pub struct CapabilityVerifier {
     skew_secs: u64,
     /// Revocation-list pull interval in seconds.
     pull_interval_secs: u64,
-    /// Total number of expired tokens accepted under T8 degraded-mode grace rules.
-    grace_accepted_total: Arc<AtomicU64>,
+    /// Expired tokens accepted under T8 degraded-mode grace rules, per
+    /// tenant the accepted token named.
+    grace_accepted: Arc<std::sync::Mutex<std::collections::BTreeMap<String, u64>>>,
     /// The trust domain a node subject must be in to get T8 grace, when the
     /// verifier knows its own; `None` accepts a node of any trust domain.
     trust_domain: Option<String>,
@@ -714,7 +729,7 @@ impl CapabilityVerifier {
             grace_max_secs: DEFAULT_GRACE_PERIOD_SECS,
             skew_secs: DEFAULT_DEGRADED_SKEW_SECS,
             pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
-            grace_accepted_total: Arc::new(AtomicU64::new(0)),
+            grace_accepted: Arc::default(),
             trust_domain: None,
             last_list_issued_at: 0,
             created_at: Instant::now(),
@@ -789,19 +804,30 @@ impl CapabilityVerifier {
             self.degraded_since_unix().unwrap_or(0),
         );
         family(
-            "deis_auth_grace_accepted_total",
-            "counter",
-            "Expired node capabilities accepted under T8 degraded-mode grace",
-            self.grace_accepted_total(),
-        );
-        family(
             "deis_auth_revocation_last_sync_seconds",
             "gauge",
             "Unix time of the last revocation list accepted, 0 if none yet",
             self.last_sync_unix().unwrap_or(0),
         );
+        // One series per tenant: which tenants' traffic is riding on grace
+        // is the question an operator asks while the control plane is down.
+        let name = "deis_auth_grace_accepted_total";
+        let _ = writeln!(
+            out,
+            "# HELP {name} Expired node capabilities accepted under T8 degraded-mode grace, by the tenant they named"
+        );
+        let _ = writeln!(out, "# TYPE {name} counter");
+        for (tenant, count) in self.grace_accepted_by_tenant() {
+            let _ = writeln!(
+                out,
+                "{name}{{service=\"{}\",tenant=\"{}\"}} {count}",
+                label_value(service),
+                label_value(&tenant)
+            );
+        }
         out
     }
+
 
     /// The key ring this verifier checks signatures against.
     pub fn key_ring(&self) -> &KeyRing {
@@ -809,16 +835,19 @@ impl CapabilityVerifier {
     }
 
     /// Update the minimum accepted auth epoch.
+    #[cfg(test)]
     pub fn set_min_auth_epoch(&mut self, epoch: u64) {
         self.min_auth_epoch = epoch;
     }
 
     /// Replace the revoked JTI list.
+    #[cfg(test)]
     pub fn set_revoked_jtis(&mut self, jtis: Vec<String>) {
         self.revoked_jtis = jtis;
     }
 
     /// Replace the list of nodes revoked as principals.
+    #[cfg(test)]
     pub fn set_revoked_nodes(&mut self, nodes: Vec<String>) {
         self.revoked_nodes = nodes;
     }
@@ -840,15 +869,36 @@ impl CapabilityVerifier {
     }
 
     /// Record a successful revocation-list pull, resetting the degraded-mode
-    /// clock.
-    pub fn record_sync(&mut self) {
+    /// clock. Only [`Self::apply_revocation_list`] may say a list arrived.
+    fn record_sync(&mut self) {
         self.last_sync = Some(Instant::now());
     }
 
     /// Total number of expired tokens accepted under T8 degraded-mode grace
     /// rules since this verifier was created.
     pub fn grace_accepted_total(&self) -> u64 {
-        self.grace_accepted_total.load(Ordering::Relaxed)
+        self.grace_accepted_by_tenant().into_iter().map(|(_, n)| n).sum()
+    }
+
+    /// The same, per tenant the accepted tokens named, ordered by tenant.
+    pub fn grace_accepted_by_tenant(&self) -> Vec<(String, u64)> {
+        self.grace_accepted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(tenant, n)| (tenant.clone(), *n))
+            .collect()
+    }
+
+    /// Count one grace acceptance against each of `tenants`.
+    fn count_grace<'a>(&self, tenants: impl IntoIterator<Item = &'a str>) {
+        let mut counts = self.grace_accepted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = std::collections::BTreeSet::new();
+        for tenant in tenants {
+            if seen.insert(tenant) {
+                *counts.entry(tenant.to_string()).or_insert(0) += 1;
+            }
+        }
     }
 
     /// Seconds since the last successful revocation-list pull, or `None` if a
@@ -892,6 +942,7 @@ impl CapabilityVerifier {
         tenant: &str,
         binding: &str,
     ) -> Result<VerifiedCapability, CapabilityError> {
+        self.require_list()?;
         let claims = decode_with(token, &self.keys)?;
         check_claims(
             claims,
@@ -925,6 +976,7 @@ impl CapabilityVerifier {
         tenant: &str,
         binding: &str,
     ) -> Result<VerifiedCapability, CapabilityError> {
+        self.require_list()?;
         let claims = decode_with(token, &self.keys)?;
         let now = now_secs();
         let grace_accepted = claims.is_expired()
@@ -944,7 +996,7 @@ impl CapabilityVerifier {
         )?;
 
         if verified.grace_accepted {
-            self.grace_accepted_total.fetch_add(1, Ordering::Relaxed);
+            self.count_grace([tenant]);
         }
         Ok(verified)
     }
@@ -963,6 +1015,7 @@ impl CapabilityVerifier {
         token: &str,
         expected_aud: &str,
     ) -> Result<VerifiedGrant, CapabilityError> {
+        self.require_list()?;
         let claims = decode_with(token, &self.keys)?;
         let now = now_secs();
         let grace_accepted = claims.is_expired()
@@ -980,7 +1033,7 @@ impl CapabilityVerifier {
         )?;
 
         if grace_accepted {
-            self.grace_accepted_total.fetch_add(1, Ordering::Relaxed);
+            self.count_grace(claims.resources.iter().map(|r| r.tenant.as_str()));
         }
         Ok(VerifiedGrant {
             sub: claims.sub,
@@ -1023,6 +1076,15 @@ impl CapabilityVerifier {
         }
     }
 
+    /// Refuse everything until a signed revocation list has been adopted:
+    /// before that, "not revoked" is only "not known to be revoked".
+    fn require_list(&self) -> Result<(), CapabilityError> {
+        match self.last_sync {
+            Some(_) => Ok(()),
+            None => Err(CapabilityError::NoRevocationList),
+        }
+    }
+
     /// Check whether the two grace-period conditions are satisfied.
     fn grace_applies(&self, claims: &CapabilityClaims, now: u64) -> bool {
         let last_unix = match self.last_sync_unix() {
@@ -1058,6 +1120,15 @@ fn is_node_subject(sub: &str, trust_domain: Option<&str>) -> bool {
         return false;
     }
     deis_identity::names::service_kind(&id) == Some(deis_identity::ServiceKind::Node)
+}
+
+/// `value` escaped for a Prometheus label: backslash, double quote and line
+/// feed are the three characters the text format gives meaning to.
+fn label_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// JCS-canonicalize the claims to deterministic bytes for signing.
@@ -1099,6 +1170,15 @@ mod tests {
         let signing = SigningKey::from_bytes(&seed);
         let verifying = signing.verifying_key();
         (signing, verifying)
+    }
+
+    /// `verifier` once it has adopted a revocation list naming nothing, as
+    /// every verifier must before it accepts anything.
+    fn listed(mut verifier: CapabilityVerifier) -> CapabilityVerifier {
+        verifier
+            .apply_revocation_list(RevocationList::new("iss", 0, vec![]))
+            .unwrap();
+        verifier
     }
 
     fn make_claims(aud: &str) -> CapabilityClaims {
@@ -1231,7 +1311,7 @@ mod tests {
         let old = SigningKey::from_bytes(&[1u8; 32]);
         let new = SigningKey::from_bytes(&[2u8; 32]);
         let ring = KeyRing::from_keys([old.verifying_key(), new.verifying_key()]);
-        let verifier = CapabilityVerifier::with_key_ring(ring.clone());
+        let verifier = listed(CapabilityVerifier::with_key_ring(ring.clone()));
         let tenant = "app.production";
         let claims = CapabilityClaims::new(
             AUD_STORE,
@@ -1259,7 +1339,7 @@ mod tests {
     #[test]
     fn resources_for_an_audience_satisfy_every_service_behind_it() {
         let (signing, verifying) = make_keypair();
-        let verifier = CapabilityVerifier::new(verifying);
+        let verifier = listed(CapabilityVerifier::new(verifying));
         let tenant = "app.production";
         for (aud, bindings) in [
             (AUD_STORE, STORE_BINDINGS),
@@ -1342,7 +1422,7 @@ mod tests {
         let mut claims = make_claims("store");
         claims.exp = claims.iat + 365 * 24 * 3600;
         let token = encode(&claims, &signing);
-        let verifier = CapabilityVerifier::new(verifying);
+        let verifier = listed(CapabilityVerifier::new(verifying));
 
         let result = verifier.verify(
             &token,
@@ -1389,7 +1469,7 @@ mod tests {
             ],
         );
         let token = encode(&claims, &signing);
-        let mut verifier = CapabilityVerifier::new(verifying);
+        let mut verifier = listed(CapabilityVerifier::new(verifying));
 
         let grant = verifier
             .verify_grant_with_grace(&token, AUD_TELEMETRY)
@@ -1872,7 +1952,7 @@ mod tests {
     #[test]
     fn the_tenant_of_a_call_is_the_one_the_capability_names() {
         let (signing, verifying) = make_keypair();
-        let verifier = CapabilityVerifier::new(verifying);
+        let verifier = listed(CapabilityVerifier::new(verifying));
         let tenant = CanonicalTenantId::derived_from_label("shop.production").to_string();
         let other = CanonicalTenantId::derived_from_label("shop.preview").to_string();
 
@@ -2089,6 +2169,13 @@ mod tests {
         let claims = make_claims("store");
         let token = encode(&claims, &signing);
         let mut verifier = CapabilityVerifier::new(verifying);
+        assert!(matches!(
+            verifier.verify_with_grace(&token, "store", TENANT, "kv"),
+            Err(CapabilityError::NoRevocationList)
+        ));
+        verifier
+            .apply_revocation_list(signed_list(&signing, 1, vec![]))
+            .unwrap();
         assert!(verifier.verify_with_grace(&token, "store", TENANT, "kv").is_ok());
 
         verifier
@@ -2209,7 +2296,33 @@ mod tests {
         let text = verifier.render_metrics("store");
         assert!(text.contains("deis_auth_degraded{service=\"store\"} 0"), "{text}");
         assert!(text.contains("deis_auth_degraded_since_seconds{service=\"store\"} 0"));
-        assert!(text.contains("deis_auth_grace_accepted_total{service=\"store\"} 0"));
+        assert!(
+            !text.contains("deis_auth_grace_accepted_total{"),
+            "no series before any grace acceptance: {text}"
+        );
+    }
+
+    /// Each grace acceptance is counted against the tenant it served, so an
+    /// operator can see whose traffic rides on grace while the control plane
+    /// is unreachable.
+    #[test]
+    fn grace_acceptances_are_counted_per_tenant() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, -60);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(3600));
+        let tenant =
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002";
+        verifier.verify_with_grace(&token, "store", tenant, "kv").unwrap();
+        verifier.verify_with_grace(&token, "store", tenant, "kv").unwrap();
+        let text = verifier.render_metrics("store");
+        assert!(
+            text.contains(&format!(
+                "deis_auth_grace_accepted_total{{service=\"store\",tenant=\"{tenant}\"}} 2"
+            )),
+            "{text}"
+        );
+        assert_eq!(verifier.grace_accepted_total(), 2);
     }
 
     #[test]

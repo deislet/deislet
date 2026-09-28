@@ -71,6 +71,14 @@ fn canonical(label: &str) -> String {
     CanonicalTenantId::derived_from_label(label).to_string()
 }
 
+/// The control plane these servers poll their revocation list from: a list
+/// signed with the key the tests sign capabilities with.
+fn fake_control() -> &'static deis_capability::testing::FakeControl {
+    static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+        std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| deis_capability::testing::FakeControl::start(test_signing_key()))
+}
+
 /// Mint a capability token for `tenant` with audience `"queue"` and binding
 /// `"queue"`.
 fn queue_capability(signing_key: &ed25519_dalek::SigningKey, tenant: &str) -> String {
@@ -135,6 +143,7 @@ impl Harness {
                     let _ = rx.await;
                 },
                 keys,
+                fake_control().client(),
                 identity,
             )
             .await
@@ -1629,6 +1638,7 @@ async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
         public,
         async {},
         keys,
+        fake_control().client(),
         fleet.service_identity(ServiceKind::Queue),
     )
     .await;

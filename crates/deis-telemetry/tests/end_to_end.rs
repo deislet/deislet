@@ -61,7 +61,7 @@ fn test_identity() -> Option<deis_capability::ServiceIdentityConfig> {
         certificate: files.certificate,
         private_key: files.private_key,
         trust_root: files.trust_root,
-        control_endpoint: "http://127.0.0.1:1".to_string(),
+        control_endpoint: support::control_endpoint(),
         identity_reload_seconds: 60,
     })
 }

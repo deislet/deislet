@@ -622,6 +622,14 @@ pub(crate) mod tests {
             deis_queue::auth::QueueAuth::new(deis_capability::KeyRing::from_keys([issuer
                 .verifying_key()
                 .await]));
+        // deis-queue refuses every capability until it has adopted a
+        // revocation list; this one is empty.
+        queue_auth
+            .verifier()
+            .lock()
+            .unwrap()
+            .apply_revocation_list(deis_capability::RevocationList::new("iss", 0, vec![]))
+            .unwrap();
         // Served over TLS with a queue's certificate, as deis-queue is: the
         // control plane's own calls refuse anything else.
         let fleet = deis_identity_test_pki::TestFleet::new();

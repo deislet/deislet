@@ -77,6 +77,14 @@ fn make_raw_store_token(resources: &[(&str, &str)]) -> String {
     encode(&claims, &test_signing_key())
 }
 
+/// The control plane these servers poll their revocation list from: a list
+/// signed with the key the tests sign capabilities with.
+fn fake_control() -> &'static deis_capability::testing::FakeControl {
+    static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+        std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| deis_capability::testing::FakeControl::start(test_signing_key()))
+}
+
 fn make_store_token(tenant: &str, binding: &str) -> String {
     let tenant = canonical(tenant);
     let claims = CapabilityClaims::new(
@@ -181,6 +189,7 @@ impl Harness {
                     let _ = rx.await;
                 },
                 keys,
+                fake_control().client(),
                 identity,
             )
             .await
@@ -1645,6 +1654,7 @@ async fn a_public_bind_still_works_when_authenticated() {
         public,
         async {},
         keys,
+        fake_control().client(),
         fleet.service_identity(ServiceKind::Store),
     )
     .await;

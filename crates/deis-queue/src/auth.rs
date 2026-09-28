@@ -190,6 +190,13 @@ fn map_capability_error(e: CapabilityError) -> Status {
             tracing::warn!("refused a queue call whose capability claims are invalid");
             Status::invalid_argument(e.to_string())
         }
+        CapabilityError::NoRevocationList => {
+            tracing::warn!(
+                "refused a queue call because this service has not adopted the control plane's \
+                 revocation list yet; it answers once the first list arrives"
+            );
+            Status::unavailable(e.to_string())
+        }
         CapabilityError::UnknownKey { .. } => {
             tracing::warn!(
                 "refused a queue call whose capability names a signing key this service does not \

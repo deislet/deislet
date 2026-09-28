@@ -66,8 +66,8 @@ async fn main() -> Result<()> {
         None | Some(Command::Serve) => {
             let (identity, control) = server::machine_identity(&config)?;
             let listener = server::bind(&config).await?;
-            let keys = capability_keys(control);
-            server::serve(config, listener, server::shutdown_signal(), keys, identity).await
+            let keys = capability_keys(control.clone());
+            server::serve(config, listener, server::shutdown_signal(), keys, control, identity).await
         }
         Some(Command::Snapshot { out }) => {
             let manifest = snapshot::take(&config.data_dir, &out).with_context(|| {

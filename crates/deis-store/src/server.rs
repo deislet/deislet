@@ -213,12 +213,16 @@ fn report_interrupt(result: std::io::Result<()>) {
 /// can learn the port before the server starts accepting. `keys` is the
 /// control plane's key ring; whoever keeps it current (the binary starts a
 /// JWKS refresher, tests fill it by hand) shares it with every guard here.
+/// `control` reaches the control plane's machine channel, where the
+/// revocation list is polled from; until the first list is adopted every
+/// capability is refused.
 /// `identity` is the certificate every connection is served with.
 pub async fn serve(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
     keys: deis_capability::KeyRing,
+    control: deis_capability::ControlClient,
     identity: Arc<deis_identity::MachineIdentity>,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
@@ -228,13 +232,13 @@ pub async fn serve(
     let auth_kv = StorageAuth::new(verifier.clone(), "kv");
     let auth_sql = StorageAuth::new(verifier.clone(), "sql");
     let auth_blob = StorageAuth::new(verifier.clone(), "blob");
-    deis_capability::fetch::poll_revocations_for_service(
+    deis_capability::fetch::poll_revocations(
         verifier.clone(),
         "store",
-        config.machine_identity.as_ref(),
-        Arc::clone(&identity),
+        control,
+        identity.id().trust_domain(),
     )
-    .context("cannot reach the control plane's machine channel as configured")?;
+    .await;
     if let Some(listen) = config.metrics_listen.as_deref() {
         deis_capability::exposition::require_loopback("metrics_listen", listen)
             .map_err(anyhow::Error::msg)?;

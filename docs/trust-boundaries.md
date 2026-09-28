@@ -507,10 +507,17 @@ if it was still valid (give or take 30 seconds) when the last list arrived,
 is at most 24 hours past its expiry, and neither it nor its node is revoked
 by that list. Human
 capabilities never get grace. Each verifier exports `deis_auth_degraded`,
-`deis_auth_degraded_since_seconds`, `deis_auth_grace_accepted_total` and
+`deis_auth_degraded_since_seconds`, `deis_auth_grace_accepted_total` (per
+`tenant` the accepted capability named) and
 `deis_auth_revocation_last_sync_seconds` - deis-telemetry on its `/metrics`,
 deis-store and deis-queue on `metrics_listen` when it is set (loopback
 only, like every Prometheus port here).
+
+A verifier refuses every capability - UNAVAILABLE, not a verdict on the
+caller - until it has adopted its first signed revocation list: before that,
+"not revoked" would only mean "not known to be revoked". It makes its first
+attempt before it starts serving, so beside a reachable control plane this
+costs nothing.
 
 A verifier **restarted** while the control plane is unreachable has adopted
 no list and holds no keys (the JWKS is not persisted either), so it refuses

@@ -2722,7 +2722,11 @@ mod tests {
             .unwrap();
         let header = request.metadata().get("authorization").unwrap().to_str().unwrap();
         let token = header.strip_prefix("Bearer ").expect("a bearer credential");
-        deis_capability::CapabilityVerifier::new(issuer.verifying_key().await)
+        let mut verifier = deis_capability::CapabilityVerifier::new(issuer.verifying_key().await);
+        verifier
+            .apply_revocation_list(deis_capability::RevocationList::new("iss", 0, vec![]))
+            .unwrap();
+        verifier
             .verify(
                 token,
                 AUD_QUEUE,

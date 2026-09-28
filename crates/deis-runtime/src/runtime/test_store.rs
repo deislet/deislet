@@ -72,6 +72,9 @@ impl TestStore {
         let addr = listener.local_addr().expect("local addr");
         let (shutdown, rx) = oneshot::channel();
         let identity = fleet().service_identity(deis_identity::ServiceKind::Store);
+        // The store polls its revocation list from a stand-in control plane
+        // signing with the same key, and accepts nothing until it has one.
+        let control = deis_capability::testing::FakeControl::start(signing_key.clone()).client();
         tokio::spawn(async move {
             deis_store::server::serve(
                 config,
@@ -80,6 +83,7 @@ impl TestStore {
                     let _ = rx.await;
                 },
                 deis_capability::KeyRing::from_keys([verifying_key]),
+                control,
                 identity,
             )
             .await

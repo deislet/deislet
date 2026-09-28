@@ -33,6 +33,18 @@ pub fn keys() -> KeyRing {
     KeyRing::from_keys([signing_key().verifying_key()])
 }
 
+/// Where a service under test polls its revocation list from: a stand-in
+/// control plane signing lists with the key above. Shared by every test in
+/// the binary, so it runs on threads of its own.
+pub fn control_endpoint() -> String {
+    static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+        std::sync::OnceLock::new();
+    CONTROL
+        .get_or_init(|| deis_capability::testing::FakeControl::start(signing_key()))
+        .url()
+        .to_string()
+}
+
 /// A telemetry capability for `resources`, signed by the control plane.
 pub fn token(resources: &[(&str, &str)]) -> String {
     token_as(

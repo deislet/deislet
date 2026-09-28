@@ -225,7 +225,10 @@ mod tests {
 
         // And each is accepted by the verifiers it is for: every store
         // service, and the queue.
-        let verifier = deis_capability::CapabilityVerifier::new(verifying_key);
+        let mut verifier = deis_capability::CapabilityVerifier::new(verifying_key);
+        verifier
+            .apply_revocation_list(deis_capability::RevocationList::new("iss", 0, vec![]))
+            .unwrap();
         for binding in deis_capability::STORE_BINDINGS {
             verifier
                 .verify(token, "store", &tenant, binding)

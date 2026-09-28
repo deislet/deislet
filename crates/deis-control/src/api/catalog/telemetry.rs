@@ -217,7 +217,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["tenants"], serde_json::json!(["demo.production"]));
 
-        let verifier = CapabilityVerifier::new(h.state.issuer.verifying_key().await);
+        let mut verifier = CapabilityVerifier::new(h.state.issuer.verifying_key().await);
+        verifier
+            .apply_revocation_list(deis_capability::RevocationList::new("iss", 0, vec![]))
+            .unwrap();
         let token = body["token"].as_str().unwrap();
         let grant = verifier
             .verify_grant_with_grace(token, AUD_TELEMETRY)

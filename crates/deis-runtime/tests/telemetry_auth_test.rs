@@ -34,6 +34,13 @@ fn control_key() -> SigningKey {
     SigningKey::from_bytes(&[0x24; 32])
 }
 
+/// The control plane the collector polls its revocation list from.
+fn fake_control() -> &'static deis_capability::testing::FakeControl {
+    static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+        std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| deis_capability::testing::FakeControl::start(control_key()))
+}
+
 /// What the control plane would issue this node for `tenants`.
 fn issued_for(tenants: &[&str]) -> String {
     let claims = CapabilityClaims::new(
@@ -78,7 +85,7 @@ fn collector_identity() -> Option<deis_capability::ServiceIdentityConfig> {
         certificate: files.certificate,
         private_key: files.private_key,
         trust_root: files.trust_root,
-        control_endpoint: "http://127.0.0.1:1".to_string(),
+        control_endpoint: fake_control().url().to_string(),
         identity_reload_seconds: 60,
     })
 }
