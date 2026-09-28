@@ -2,14 +2,12 @@
 //!
 //! # Why an outbound call needs a policy at all
 //!
-//! Until `fetch` existed in an isolate, deis-store's only protection was that
-//! nothing but this process could reach it: it trusts the `x-deis-tenant`
-//! header it is given and listens on loopback. The moment an application can
-//! open an outbound HTTP connection, that stops being protection. A handler
-//! could `POST http://127.0.0.1:8090` with any tenant header it liked and read
-//! or delete another application's keys, rows and blobs. The same reasoning
-//! covers deis-queue, deis-control (which holds every node's credentials and
-//! every application's secrets) and deis-telemetry.
+//! deis-store, deis-queue, deis-control (which holds every node's credentials
+//! and every application's secrets) and deis-telemetry are internal services
+//! this node talks to on the application's behalf. The moment an application
+//! can open an outbound HTTP connection, a handler could probe them directly;
+//! the tenant of a storage call is fixed by the capability it carries, but an
+//! internal service is still not something an application should reach.
 //!
 //! So an outbound destination is **denied by default and allowed by
 //! exception**, which is also the model an edge platform is expected to have:

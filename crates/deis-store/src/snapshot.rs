@@ -704,7 +704,7 @@ mod tests {
     use tokio_stream::Stream;
 
     fn tenant(name: &str) -> TenantId {
-        TenantId::parse(name).unwrap()
+        TenantId::for_label(name)
     }
 
     fn limits() -> BlobLimits {
@@ -789,7 +789,7 @@ mod tests {
         assert!(
             manifest
                 .databases
-                .contains(&"db/app-one.production.sqlite".to_string()),
+                .contains(&format!("db/{}.sqlite", tenant("app-one.production"))),
             "a tenant's SQL database must be in the snapshot: {:?}",
             manifest.databases
         );
@@ -855,14 +855,14 @@ mod tests {
     /// per-namespace SQL files out of `db/`, and `copy_content_of`, which
     /// turns the `tenant` column of `blob.sqlite` back into a content path.
     ///
-    /// The restore is reopened through the ordinary services, so this also
-    /// witnesses that the startup scan in [`crate::legacy`] accepts a
-    /// directory a restore just wrote.
+    /// The restore is reopened through the ordinary services, and the
+    /// namespace is decoded from its on-disk key the way a scan does.
     #[tokio::test]
     async fn a_named_binding_survives_a_snapshot_and_a_restore() {
         let source = TempDir::new().unwrap();
-        let media = TenantId::of_binding("app-one.production", Some("MEDIA")).unwrap();
-        assert_eq!(media.as_str(), "app-one.production@MEDIA");
+        let media = TenantId::for_label("app-one.production@MEDIA");
+        assert!(media.as_str().ends_with("@MEDIA"));
+        assert_eq!(TenantId::parse_persisted(media.as_str()).unwrap(), media);
         let plain = tenant("app-one.production");
 
         let kv = KvService::open(source.path(), 4).await.unwrap();
@@ -896,7 +896,7 @@ mod tests {
         assert!(
             manifest
                 .databases
-                .contains(&"db/app-one.production@MEDIA.sqlite".to_string()),
+                .contains(&format!("db/{media}.sqlite")),
             "the binding's SQL database must be in the snapshot: {:?}",
             manifest.databases
         );
@@ -933,86 +933,6 @@ mod tests {
         );
     }
 
-    /// Copy will create canonical physical keys before live requests are
-    /// allowed to address them. Snapshot and restore must therefore preserve
-    /// those keys while the writer fence still keeps them internal; otherwise
-    /// the first backup taken during migration would silently omit the target
-    /// generation or restore it into an unusable data directory.
-    #[tokio::test]
-    async fn a_canonical_migration_target_survives_snapshot_and_restore() {
-        let application = "018f2518-7e38-7f80-8000-000000000001".parse().unwrap();
-        let environment = "018f2518-7e38-7f80-8000-000000000002".parse().unwrap();
-        let binding = "018f2518-7e38-7f80-8000-000000000003".parse().unwrap();
-        let logical = deis_wire::CanonicalTenantId::new(application, environment);
-        let target = TenantId::from_canonical(logical, Some(binding));
-        let expected_key = target.as_str().to_string();
-
-        let source = TempDir::new().unwrap();
-        let kv = KvService::open(source.path(), 4).await.unwrap();
-        kv.set(&target, "k", b"canonical kv".to_vec(), None, None)
-            .await
-            .unwrap();
-        let db = crate::database::DatabaseService::open(source.path(), 2).unwrap();
-        db.exec_statement(&target, "CREATE TABLE t(v TEXT)", &[])
-            .await
-            .unwrap();
-        db.exec_statement(&target, "INSERT INTO t VALUES('canonical sql')", &[])
-            .await
-            .unwrap();
-        let blob = BlobService::open(source.path(), 4, limits()).await.unwrap();
-        blob.store_object(
-            &target,
-            "object",
-            None,
-            None,
-            chunks(vec![b"canonical blob".to_vec()]),
-        )
-        .await
-        .unwrap();
-
-        let held = TempDir::new().unwrap();
-        let snapshot = held.path().join("snapshot");
-        let manifest = take(source.path(), &snapshot).unwrap();
-        assert!(
-            manifest
-                .databases
-                .contains(&format!("db/{expected_key}.sqlite"))
-        );
-        assert_eq!(manifest.objects, 1);
-
-        let target_dir = TempDir::new().unwrap();
-        let restored = target_dir.path().join("data");
-        restore(&snapshot, &restored).unwrap();
-
-        // Decode the key from durable state rather than retaining the
-        // in-memory constructor: this is the exact route a later inventory or
-        // recovery process takes.
-        let decoded = TenantId::parse_persisted(&expected_key).unwrap();
-        assert_eq!(decoded, target);
-        let kv = KvService::open(&restored, 4).await.unwrap();
-        assert_eq!(
-            kv.get(&decoded, "k").await.unwrap().unwrap().value,
-            b"canonical kv"
-        );
-        let db = crate::database::DatabaseService::open(&restored, 2).unwrap();
-        assert_eq!(
-            db.fetch_rows(&decoded, "SELECT v FROM t", &[])
-                .await
-                .unwrap()
-                .rows,
-            serde_json::json!([{ "v": "canonical sql" }])
-        );
-        let blob = BlobService::open(&restored, 4, limits()).await.unwrap();
-        assert_eq!(
-            blob.get_all(&decoded, "object").await.unwrap().unwrap(),
-            b"canonical blob"
-        );
-    }
-
-    /// The race a live snapshot actually has: an object is deleted after its
-    /// metadata was copied but before its bytes were. The snapshot must not
-    /// keep a row pointing at bytes it does not carry, because that restores
-    /// into a key whose every read fails.
     #[tokio::test]
     async fn content_deleted_mid_snapshot_is_dropped_rather_than_left_dangling() {
         let source = populated().await;

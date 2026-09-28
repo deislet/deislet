@@ -60,31 +60,16 @@
 //! queue.sqlite    messages and dead letters, both partitioned by tenant
 //! ```
 //!
-//! # A data directory from before this change is not readable
+//! # Trust model: the capability names the tenant
 //!
-//! Rows used to be keyed by a bare application id in an `app_id` column. That
-//! column no longer exists and nothing looks for it, so an old `queue.sqlite`
-//! holds messages that would never be delivered again. There is no migration,
-//! and there will not be one: this is a development platform with no deployed
-//! data, and inventing an environment for an old message would be inventing
-//! where to deliver it.
-//!
-//! What there is instead is a refusal: the service checks at startup and will
-//! not serve over a database in the old shape, because the alternative is a
-//! queue that looks healthy while every pull answers "nothing ready". See
-//! [`legacy`].
-//!
-//! # Trust model: a tenant is claimed in a header and proved with a token
-//!
-//! Every request names its tenant in the `x-deis-tenant` header. On its own
-//! that is a claim: the header says which queues the caller wants, not that
-//! the caller is entitled to them. What goes with the claim is a capability
-//! in `Authorization: Bearer`, signed by deis-control with Ed25519 for the
-//! `queue` audience, naming the tenant and the `queue` binding, and valid for
-//! 15 minutes. It is checked against the keys this service reads from the
-//! control plane's machine channel under its own machine identity, and
-//! against the signed revocation list read the same way, so a token that
-//! leaked out of one application reaches nothing in another. See [`auth`].
+//! Every call carries a capability in `Authorization: Bearer`, signed by
+//! deis-control with Ed25519 for the `queue` audience, naming one canonical
+//! tenant and the `queue` binding, and valid for 15 minutes. It is checked
+//! against the keys this service reads from the control plane's machine
+//! channel under its own machine identity, and against the signed revocation
+//! list read the same way. The tenant a call acts for is the one the
+//! capability names; nothing in the request names it, so a token that leaked
+//! out of one application reaches nothing in another. See [`auth`].
 //!
 //! There is no mode without the check and no loopback exception: whatever
 //! the address, every call carries a capability, and the listener speaks TLS
@@ -101,7 +86,6 @@ pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 pub mod auth;
 pub mod config;
 pub mod error;
-pub mod legacy;
 pub mod proto;
 pub mod queue;
 pub mod server;

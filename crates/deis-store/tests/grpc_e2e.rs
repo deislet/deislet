@@ -7,9 +7,10 @@
 //! actually registered on the server, and that a caller refuses a server the
 //! fleet's authority did not sign for as a store.
 //!
-//! Every call stamps `x-deis-tenant` with an `<app>.<environment>` value,
-//! which is what deis-runtime has to send. The tests below use
-//! `app-one.production` and `app-two.production` as two unrelated tenants,
+//! Every call carries a capability naming one canonical tenant, which is
+//! what deis-runtime sends; nothing in the request names the tenant. The
+//! tests name tenants by label - `app-one.production`, `app-two.production`
+//! - and derive the canonical id from it (`CanonicalTenantId::derived_from_label`),
 //! and one test pairs `app-one.production` with `app-one.preview` to check
 //! that two environments of the *same* application are also two namespaces.
 
@@ -25,9 +26,10 @@ use deis_store::proto::storage::{
     PrepareRequest, QueryPreparedRequest, QueryRequest, SetRequest,
     database_client::DatabaseClient, kv_store_client::KvStoreClient,
 };
-use deis_store::tenant::{BINDING_HEADER, TENANT_HEADER};
+use deis_store::tenant::BINDING_HEADER;
 use deis_store::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
+use deis_wire::CanonicalTenantId;
+use deis_wire::conventions::tenant_id;
 use ed25519_dalek::SigningKey;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -44,7 +46,39 @@ fn test_signing_key() -> SigningKey {
     SigningKey::from_bytes(&seed)
 }
 
+/// The canonical tenant a test label stands for.
+fn canonical(label: &str) -> String {
+    CanonicalTenantId::derived_from_label(label).to_string()
+}
+
+/// The on-disk key of a test tenant's unnamed namespace.
+fn key_of(label: &str) -> String {
+    deis_wire::DeisletCanonicalTenantKey::new(CanonicalTenantId::derived_from_label(label))
+        .to_string()
+}
+
+/// A store capability naming exactly these raw (tenant, binding) pairs.
+fn make_raw_store_token(resources: &[(&str, &str)]) -> String {
+    let claims = CapabilityClaims::new(
+        "store",
+        "spiffe://deislet/control/main",
+        "spiffe://deislet/node/test-node",
+        1,
+        Duration::from_secs(TOKEN_LIFETIME_SECS),
+        resources
+            .iter()
+            .map(|(tenant, binding)| CapabilityResource {
+                tenant: (*tenant).to_string(),
+                binding: (*binding).to_string(),
+                generation: None,
+            })
+            .collect(),
+    );
+    encode(&claims, &test_signing_key())
+}
+
 fn make_store_token(tenant: &str, binding: &str) -> String {
+    let tenant = canonical(tenant);
     let claims = CapabilityClaims::new(
         "store",
         "spiffe://deislet/control/main",
@@ -63,6 +97,7 @@ fn make_store_token(tenant: &str, binding: &str) -> String {
 /// Create a token that authorises all three storage bindings for one tenant.
 /// This lets any test call KvStore, Database or BlobStore with the same token.
 fn make_store_token_all_bindings(tenant: &str) -> String {
+    let tenant = canonical(tenant);
     let claims = CapabilityClaims::new(
         "store",
         "spiffe://deislet/control/main",
@@ -204,12 +239,9 @@ impl Drop for Harness {
     }
 }
 
-/// Stamp the tenant and a capability token the way deis-runtime will.
+/// Carry a capability for the tenant, the way deis-runtime does.
 fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     request.metadata_mut().insert(
         AUTHORIZATION,
         format!("Bearer {}", make_store_token_all_bindings(tenant))
@@ -219,19 +251,13 @@ fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     request
 }
 
-/// Stamp the tenant header WITHOUT a capability token. Only use this
-/// in tests that deliberately check that calls without tokens are refused.
-fn as_tenant_no_token<T>(tenant: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
-    request
+/// A call WITHOUT a capability token. Only use this in tests that
+/// deliberately check that calls without tokens are refused.
+fn as_tenant_no_token<T>(_tenant: &str, message: T) -> Request<T> {
+    Request::new(message)
 }
 
-/// Stamp the tenant *and* the binding, the way deis-runtime does for a
-
-/// Stamp the tenant, binding, and capability token.
+/// Carry a capability for the tenant and select a binding inside it.
 fn as_binding<T>(tenant: &str, binding: &str, message: T) -> Request<T> {
     let mut request = as_tenant(tenant, message);
     request
@@ -239,18 +265,22 @@ fn as_binding<T>(tenant: &str, binding: &str, message: T) -> Request<T> {
         .insert(BINDING_HEADER, binding.parse().unwrap());
     request
 }
-/// authorising `binding`, the way deis-runtime will have to.
-///
-/// The two tenants are separate arguments on purpose: presenting a token
-/// minted for one tenant on a call that claims another is exactly the attack
-/// the derivation is meant to defeat, and it has to be expressible here.
+
+/// Carry a capability for `token_tenant` authorising only `binding`. A
+/// `claimed` tenant other than `token_tenant` is stamped in the retired
+/// `x-deis-tenant` header, which the service must ignore.
 fn as_tenant_with_token<T>(
-    tenant: &str,
+    claimed: &str,
     token_tenant: &str,
     binding: &str,
     message: T,
 ) -> Request<T> {
-    let mut request = as_tenant(tenant, message);
+    let mut request = Request::new(message);
+    if claimed != token_tenant {
+        request
+            .metadata_mut()
+            .insert("x-deis-tenant", canonical(claimed).parse().unwrap());
+    }
     request.metadata_mut().insert(
         AUTHORIZATION,
         format!("Bearer {}", make_store_token(token_tenant, binding))
@@ -538,29 +568,31 @@ async fn a_request_without_a_usable_tenant_is_refused() {
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
-    for bad in [
-        // Would escape the data directory.
-        "../../etc",
-        // A bare application id: what every caller sent before the tenant
-        // contract. It names no environment, so it names no tenant.
-        "app-one",
-        // Neither too many parts nor an empty one is a tenant.
-        "a.b.c",
-        "app-one.",
+    // A capability whose tenant is not a canonical id, or that names no
+    // tenant or two for the binding, says nothing about whose data the call
+    // is about; the request has nothing that could say it instead.
+    let other = canonical("app-two.production");
+    let mine = canonical("app-one.production");
+    for (what, token) in [
+        ("../../etc", make_raw_store_token(&[("../../etc", "kv")])),
+        ("a name label", make_raw_store_token(&[("app-one.production", "kv")])),
+        ("no tenant for kv", make_raw_store_token(&[(mine.as_str(), "sql")])),
+        (
+            "two tenants",
+            make_raw_store_token(&[(mine.as_str(), "kv"), (other.as_str(), "kv")]),
+        ),
     ] {
-        let status = kv
-            .get(as_tenant(
-                bad,
-                GetRequest {
-                    key: "greeting".to_string(),
-                },
-            ))
-            .await
-            .unwrap_err();
+        let mut request = Request::new(GetRequest {
+            key: "greeting".to_string(),
+        });
+        request
+            .metadata_mut()
+            .insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        let status = kv.get(request).await.unwrap_err();
         assert_eq!(
             status.code(),
             tonic::Code::PermissionDenied,
-            "{bad} should be refused"
+            "{what} should be refused"
         );
     }
 }
@@ -1376,23 +1408,6 @@ async fn two_environments_of_one_application_share_nothing() {
     }
 }
 
-/// The application header is not the storage tenant. A caller that stamps
-/// only `x-deis-app-id` - which is what every caller did before this change -
-/// is refused rather than served production's data.
-#[tokio::test]
-async fn the_application_header_alone_does_not_identify_a_tenant() {
-    let harness = Harness::start().await;
-    let mut kv = harness.kv().await;
-    let mut request = Request::new(GetRequest {
-        key: "anything".to_string(),
-    });
-    request
-        .metadata_mut()
-        .insert(APP_ID_HEADER, "app-one".parse().unwrap());
-    let status = kv.get(request).await.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::Unauthenticated);
-}
-
 // ---- the capability token, over a real server -------------------------
 //
 // The checks below go through the same interceptor a deployed process runs,
@@ -1508,23 +1523,31 @@ async fn every_service_refuses_a_call_that_carries_no_token() {
 }
 
 #[tokio::test]
-async fn a_token_minted_for_another_tenant_opens_nothing() {
-    // The reason the token is derived from the tenant rather than issued as
-    // one fleet-wide bearer credential: a token that leaked out of one
-    // application must be useless against another, and against another
-    // environment of its own.
+async fn a_tenant_named_in_the_request_opens_nothing() {
+    // The tenant is the one the capability names. A caller holding a token
+    // for its own tenant that also names another one in a header - the
+    // retired `x-deis-tenant` - is served its own data, never the other's.
     let harness = Harness::start_authenticated().await;
     let mine = tenant_id("app-one", "production");
-
-    for claimed in [
+    let mut kv = harness.kv().await;
+    for owner in [
         tenant_id("app-two", "production"),
         tenant_id("app-one", "preview"),
     ] {
-        let status = harness
-            .kv()
-            .await
+        kv.set(as_tenant(
+            &owner,
+            SetRequest {
+                key: "greeting".to_string(),
+                value: owner.as_bytes().to_vec(),
+                ttl_seconds: None,
+                metadata: None,
+            },
+        ))
+        .await
+        .unwrap();
+        let got = kv
             .get(as_tenant_with_token(
-                &claimed,
+                &owner,
                 &mine,
                 "kv",
                 GetRequest {
@@ -1532,12 +1555,9 @@ async fn a_token_minted_for_another_tenant_opens_nothing() {
                 },
             ))
             .await
-            .unwrap_err();
-        assert_eq!(
-            status.code(),
-            tonic::Code::PermissionDenied,
-            "a token for {mine} must not open {claimed}"
-        );
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.value, None, "a token for {mine} must not open {owner}");
     }
 }
 
@@ -1708,7 +1728,7 @@ async fn a_named_binding_written_over_the_wire_survives_a_restart() {
     assert!(
         data.path()
             .join("db")
-            .join("shop.production@MEDIA.sqlite")
+            .join(format!("{}@MEDIA.sqlite", key_of("shop.production")))
             .is_file(),
         "a database binding is stored under the namespace, not the tenant: {:?}",
         std::fs::read_dir(data.path().join("db"))
@@ -1719,7 +1739,7 @@ async fn a_named_binding_written_over_the_wire_survives_a_restart() {
     assert!(
         data.path()
             .join("blob")
-            .join("shop.production@MEDIA")
+            .join(format!("{}@MEDIA", key_of("shop.production")))
             .is_dir()
     );
 

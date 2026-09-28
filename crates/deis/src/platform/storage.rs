@@ -11,13 +11,12 @@
 //!
 //! # Identity on the wire
 //!
-//! Every call carries the tenant in `x-deis-tenant` and, when one was
-//! handed to this session, the capability token that proves it may act as
-//! that tenant in `Authorization: Bearer` - the same two headers
-//! `deis-runtime` stamps for an application's own storage calls, spelled
-//! once in `deis_wire::conventions` so the three components that read and
-//! write them cannot drift apart. A session built with no token stamps only
-//! the tenant, which deis-store refuses: every call needs a capability.
+//! Every call carries the capability token the control plane minted for the
+//! tenant in `Authorization: Bearer`. deis-store acts for the one tenant that
+//! token names; nothing in the request names it. A session built with no
+//! token sends none, which deis-store refuses: every call needs a
+//! capability. The `<app>.<environment>` label a session holds is for the
+//! operator to read.
 //!
 //! # What is and is not implemented
 //!
@@ -36,8 +35,8 @@ use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
 use deis_wire::conventions::{
-    BINDING_HEADER, MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES, TENANT_HEADER,
-    is_valid_binding_name, split_tenant,
+    BINDING_HEADER, MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES, is_valid_binding_name,
+    split_tenant,
 };
 
 /// KV and the SQL database share one proto file and one gRPC service
@@ -85,7 +84,8 @@ const MAX_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 /// a person happens to make.
 #[derive(Clone)]
 struct Identity {
-    tenant_header: MetadataValue<Ascii>,
+    /// The `<app>.<environment>` label, for the operator to read.
+    tenant: String,
     /// Raw token string for building the Authorization: Bearer header.
     token: Option<String>,
     /// Which namespace inside the tenant these calls act in, or `None` for the
@@ -111,9 +111,6 @@ impl Identity {
                  them failed its own name check first."
             );
         }
-        let tenant_header = tenant.parse::<MetadataValue<Ascii>>().map_err(|_| {
-            anyhow!("tenant {tenant:?} cannot be sent as gRPC metadata; every call would fail")
-        })?;
         let trimmed_token = token.map(str::trim).filter(|t| !t.is_empty());
         // Validate the token can be sent as gRPC metadata at construction time,
         // rather than failing on the first call.
@@ -143,7 +140,7 @@ impl Identity {
                 None => None,
             };
         Ok(Self {
-            tenant_header,
+            tenant,
             token: trimmed_token.map(str::to_string),
             binding_header,
         })
@@ -151,9 +148,6 @@ impl Identity {
 
     fn stamp<T>(&self, message: T) -> Request<T> {
         let mut request = Request::new(message);
-        request
-            .metadata_mut()
-            .insert(TENANT_HEADER, self.tenant_header.clone());
         if let Some(token) = &self.token {
             let bearer = format!("Bearer {}", token);
             request
@@ -181,10 +175,7 @@ impl Identity {
 impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Identity")
-            .field(
-                "tenant",
-                &self.tenant_header.to_str().unwrap_or("<unprintable>"),
-            )
+            .field("tenant", &self.tenant)
             .field(
                 "token",
                 &if self.token.is_some() {
@@ -941,10 +932,7 @@ mod tests {
         // the unnamed namespace under the name the operator typed.
         let identity = Identity::new("demo.production".to_string(), None, Some("HOT")).unwrap();
         let request = identity.stamp(());
-        assert_eq!(
-            request.metadata().get(TENANT_HEADER).unwrap(),
-            "demo.production"
-        );
+        assert!(request.metadata().get("x-deis-tenant").is_none());
         assert_eq!(request.metadata().get(BINDING_HEADER).unwrap(), "HOT");
 
         // No binding is the unnamed namespace, and the header is simply not

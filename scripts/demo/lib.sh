@@ -75,11 +75,10 @@ DEFAULT_ACME_CA_PORT=8089
 ACME_ZONE="deislet.test"
 
 # The example app, and the names the demo files it under. deis-store and
-# deis-queue still understand exactly one tenant dimension, but that key is now
-# the application and the environment joined by a dot - "demo.production" - and
-# it travels in the x-deis-tenant header. So a preview environment of this same
-# app gets its own KV, database, blob and queue namespace and cannot read or
-# overwrite what production stored.
+# deis-queue key everything by the canonical tenant of one application
+# environment, which the capability a call carries names. So a preview
+# environment of this same app gets its own KV, database, blob and queue
+# namespace and cannot read or overwrite what production stored.
 APP_SRC_DIR="${APP_SRC_DIR:-${ROOT_DIR}/scripts/demo-assets/example-app}"
 # A second, much smaller project, built and never deployed. The example app
 # above declares queues, cron, KV and a service binding, and `deis build`
@@ -2437,6 +2436,19 @@ storage_token() {
   [ "${1:-store}" = "queue" ] && field=queue_token
   control_api "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/storage-token" \
     | jq -r --arg f "$field" '.[$f] // empty' 2>/dev/null || true
+}
+
+# The canonical tenant (`v1/<application id>/<environment id>`) of one
+# environment of the demo app, as the storage-token route names it.
+canonical_tenant() {
+  control_api "/api/v1/apps/${APP_ID}/environments/${1:-$ENV_NAME}/storage-token" \
+    | jq -r '.tenant // empty' 2>/dev/null || true
+}
+
+# The on-disk key deis-store and deis-queue keep that tenant under:
+# `ct1_<application id>_<environment id>`.
+canonical_tenant_key() {
+  canonical_tenant "${1:-$ENV_NAME}" | sed -n 's#^v1/\([^/]*\)/\([^/]*\)$#ct1_\1_\2#p'
 }
 
 # The `jti` a capability carries, read off its claims without verifying them:

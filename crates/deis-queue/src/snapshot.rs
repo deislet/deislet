@@ -286,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_restores_messages_dead_letters_and_a_new_incarnation() {
         let source = TempDir::new().unwrap();
-        let tenant = TenantId::parse("shop.production").unwrap();
+        let tenant = TenantId::for_label("shop.production");
         let queue = QueueService::open(
             source.path(),
             2,

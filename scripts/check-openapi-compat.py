@@ -779,6 +779,7 @@ PRERELEASE_CORRECTIONS = frozenset(
     {
         "GET /api/v1/apps/{application_name}/identity-migration: operation removed",
         "POST /api/v1/apps/{application_name}/identity-migration: operation removed",
+        "GET /api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments 200 application/json.items[].operation.kind: enum values removed: ['migrate']",
     }
 )
 

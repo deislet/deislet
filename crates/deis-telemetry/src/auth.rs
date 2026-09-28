@@ -378,7 +378,8 @@ fn map_capability_error(e: CapabilityError) -> Status {
             );
             Status::permission_denied(e.to_string())
         }
-        CapabilityError::BindingNotAuthorized { .. } => {
+        CapabilityError::BindingNotAuthorized { .. }
+        | CapabilityError::NoSingleTenant { .. } => {
             tracing::warn!(
                 "refused a telemetry call whose capability does not authorize the binding"
             );

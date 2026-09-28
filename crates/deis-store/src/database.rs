@@ -1295,10 +1295,6 @@ impl DatabaseService {
     ) -> StoreResult<Self> {
         let root = data_dir.join("db");
         std::fs::create_dir_all(&root)?;
-        // One file per tenant. A file named by a bare application id belongs
-        // to the layout this change replaced, and the tables in it would
-        // never be opened again.
-        crate::legacy::reject_pre_tenant_database_files(&root)?;
         let connections_per_tenant = if connections_per_tenant < MIN_TENANT_CONNECTIONS {
             tracing::warn!(
                 configured = connections_per_tenant,
@@ -2581,7 +2577,7 @@ mod tests {
     }
 
     fn tenant(name: &str) -> TenantId {
-        TenantId::parse(name).unwrap()
+        TenantId::for_label(name)
     }
 
     async fn make_table(svc: &DatabaseService, tenant: &TenantId) {
@@ -2676,8 +2672,8 @@ mod tests {
         let err = svc.fetch_rows(&two, "SELECT * FROM users", &[]).await;
         assert!(matches!(err, Err(StoreError::Sqlite(_))));
 
-        assert!(dir.path().join("db/app-one.production.sqlite").exists());
-        assert!(dir.path().join("db/app-two.production.sqlite").exists());
+        assert!(dir.path().join("db").join(format!("{}.sqlite", tenant("app-one.production"))).exists());
+        assert!(dir.path().join("db").join(format!("{}.sqlite", tenant("app-two.production"))).exists());
     }
 
     #[tokio::test]
@@ -3439,7 +3435,7 @@ mod tests {
         let (dir, svc) = service();
         let a = tenant("app-one.production");
         make_table(&svc, &a).await;
-        let path = dir.path().join("db/app-one.production.sqlite");
+        let path = dir.path().join("db").join(format!("{}.sqlite", tenant("app-one.production")));
 
         let tx = svc.open_transaction(&a, None).await.unwrap();
         // Not one statement has run inside the transaction yet.
@@ -3550,12 +3546,7 @@ mod tests {
 
     /// A request carrying the tenant header the handlers read.
     fn tagged<T>(tenant: &TenantId, message: T) -> Request<T> {
-        let mut request = Request::new(message);
-        request.metadata_mut().insert(
-            crate::tenant::TENANT_HEADER,
-            tenant.as_str().parse().expect("a tenant id is ASCII"),
-        );
-        request
+        tenant.request(message)
     }
 
     #[test]

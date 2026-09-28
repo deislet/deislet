@@ -1,10 +1,9 @@
 //! SQL client backing `ctx.db`, the equivalent of Cloudflare D1.
 //!
 //! Talks to deis-store, which gives each tenant -- one application in one
-//! environment -- its own SQLite file: the tenant travels in the
-//! `x-deis-tenant` metadata header, with the capability token that proves
-//! this node may act as it alongside (both stamped by [`StorageIdentity`]),
-//! not in the proto messages, so one client speaks for exactly one environment of one
+//! environment -- its own SQLite file: the tenant is the one named by the
+//! capability token this node presents (stamped by [`StorageIdentity`]), not
+//! a field of the proto messages, so one client speaks for exactly one environment of one
 //! application and a preview's writes never reach production's database.
 //! Prepared-statement handles are owned by the tenant that created them and
 //! the store refuses them across tenants.
@@ -469,7 +468,8 @@ mod tests {
     /// use, carrying whatever proof the node was handed for this tenant.
     fn client(store: &TestStore, tenant: &str) -> DbClient {
         let token = store.capability_token_for(tenant, "sql");
-        let identity = StorageIdentity::new(tenant, Some(&token)).expect("a legal tenant");
+        let identity = StorageIdentity::new(crate::runtime::tenant::test_tenant(tenant), Some(&token))
+            .expect("a legal tenant");
         DbClient::connect_lazy(&store.endpoint, &identity).expect("client is built")
     }
 

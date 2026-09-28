@@ -143,10 +143,6 @@ impl KvService {
             durability,
         );
         pool.migrate(|conn| {
-            // Before anything is created: a kv.sqlite from before the tenant
-            // change would otherwise gain a second, empty table beside the
-            // one holding the data nobody can reach any more.
-            crate::legacy::reject_pre_tenant_table(conn, "kv")?;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS kv (
                      tenant     TEXT NOT NULL,
@@ -628,7 +624,6 @@ impl KvStore for KvService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tenant::TENANT_HEADER;
     use tempfile::TempDir;
 
     async fn service() -> (TempDir, KvService) {
@@ -638,17 +633,13 @@ mod tests {
     }
 
     fn tenant(name: &str) -> TenantId {
-        TenantId::parse(name).unwrap()
+        TenantId::for_label(name)
     }
 
     /// Stamp the tenant the way deis-runtime does, for the tests that go
     /// through the gRPC surface rather than the storage methods.
     fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
-        let mut request = Request::new(message);
-        request
-            .metadata_mut()
-            .insert(TENANT_HEADER, tenant.parse().unwrap());
-        request
+        TenantId::for_label(tenant).request(message)
     }
 
     /// Just the names of a listed page, for the tests that only care about

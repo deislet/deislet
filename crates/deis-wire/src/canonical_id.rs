@@ -25,6 +25,25 @@ impl CanonicalId {
         Self(Uuid::now_v7())
     }
 
+    /// A canonical identity derived deterministically from `label`.
+    ///
+    /// For fixtures and tests that need a stable, readable way to name a
+    /// tenant (`CanonicalId::derived_from_label("shop")` is the same id on
+    /// every run). Never used to allocate a real identity: the catalog
+    /// allocates with [`Self::new_v7`].
+    #[must_use]
+    pub fn derived_from_label(label: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(label.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Self(
+            uuid::Builder::from_custom_bytes(bytes)
+                .with_version(uuid::Version::SortRand)
+                .into_uuid(),
+        )
+    }
+
     /// Expose the parsed UUID when code needs its version or byte layout.
     #[must_use]
     pub const fn as_uuid(&self) -> &Uuid {
@@ -102,6 +121,14 @@ mod tests {
     use super::*;
 
     const VALID: &str = "018f2518-7e38-7f80-8000-000000000001";
+
+    #[test]
+    fn a_derived_id_is_a_stable_canonical_v7() {
+        let id = CanonicalId::derived_from_label("shop");
+        assert_eq!(id, CanonicalId::derived_from_label("shop"));
+        assert_ne!(id, CanonicalId::derived_from_label("shop-eu"));
+        assert_eq!(id.to_string().parse::<CanonicalId>().unwrap(), id);
+    }
 
     #[test]
     fn generated_id_has_the_only_allowed_text_form() {

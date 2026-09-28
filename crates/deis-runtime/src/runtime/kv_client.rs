@@ -1,10 +1,9 @@
 //! Key/value client backing `ctx.kv`.
 //!
 //! Talks to deis-store, which partitions data by tenant -- one application in
-//! one environment. The tenant travels in the `x-deis-tenant` metadata header
-//! and the capability token that proves this node may act as it travels in
-//! `Authorization: Bearer` (both stamped by [`StorageIdentity`]), not in the
-//! proto messages, so one client speaks for exactly one environment of one
+//! one environment. The tenant is the one named by the capability token this
+//! node presents in `Authorization: Bearer` (stamped by [`StorageIdentity`]),
+//! not a field of the proto messages, so one client speaks for exactly one environment of one
 //! application and a preview cannot read or overwrite what production
 //! stored.
 
@@ -411,7 +410,7 @@ mod tests {
                 1,
                 Duration::from_secs(900),
                 vec![CapabilityResource {
-                    tenant: tenant.to_string(),
+                    tenant: crate::runtime::tenant::test_tenant(tenant),
                     binding: "kv".to_string(),
                     generation: None,
                 }],
@@ -423,7 +422,9 @@ mod tests {
         /// lazily dialled, carrying whatever proof the node was handed.
         /// `tenant` is the `<app>.<environment>` pair the store keys on.
         fn binding(&self, tenant: &str, token: Option<&str>) -> KvClient {
-            let identity = StorageIdentity::new(tenant, token).expect("a legal tenant");
+            let identity =
+                StorageIdentity::new(crate::runtime::tenant::test_tenant(tenant), token)
+                    .expect("a legal tenant");
             KvClient::connect_lazy(&self.endpoint, &identity).expect("client is built")
         }
 
@@ -804,19 +805,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_token_minted_for_another_tenant_is_refused() {
-        // What makes a leaked token harmless elsewhere: the store checks the
-        // capability names the tenant the call itself claims, so presenting
-        // production's token while naming the preview proves nothing.
+    async fn the_capability_not_the_client_decides_the_tenant() {
+        // deis-store acts for the tenant the capability names. A client
+        // labelled for the preview but carrying production's token writes
+        // production's data - and the preview, with its own token, sees none
+        // of it.
         let store = Store::start().await;
         let production_token = store.capability_token_for("demo.production");
 
-        let error = store
+        store
             .binding("demo.preview-7", Some(&production_token))
             .set("k".to_string(), b"v".to_vec())
             .await
-            .expect_err("one environment's token must not authorise another's namespace");
-        assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
+            .expect("production's token is served");
+        assert_eq!(
+            store.client("demo.production").get("k".to_string()).await.unwrap(),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(
+            store.client("demo.preview-7").get("k".to_string()).await.unwrap(),
+            None
+        );
     }
 
     /// A token the store refuses is reported to the renewer from under the
@@ -825,9 +834,28 @@ mod tests {
     async fn a_refused_token_is_reported_to_the_renewer() {
         use crate::deployment::capability_renewer;
         let store = Store::start().await;
-        let tenant = "kv-refused.production";
-        let wrong = store.capability_token_for("kv-refused.preview");
-        let identity = StorageIdentity::new(tenant, Some(&wrong)).expect("a legal tenant");
+        let tenant = &crate::runtime::tenant::test_tenant("kv-refused.production");
+        // A genuine signature for this tenant, but for the sql binding: the
+        // kv service finds no tenant it may act for and refuses it.
+        let wrong = {
+            use deis_capability::{encode, CapabilityClaims, CapabilityResource};
+            encode(
+                &CapabilityClaims::new(
+                    "store",
+                    "spiffe://deislet/control/main",
+                    "spiffe://deislet/node/test",
+                    1,
+                    std::time::Duration::from_secs(900),
+                    vec![CapabilityResource {
+                        tenant: tenant.clone(),
+                        binding: "sql".to_string(),
+                        generation: None,
+                    }],
+                ),
+                &store.signing_key,
+            )
+        };
+        let identity = StorageIdentity::new(tenant.as_str(), Some(&wrong)).expect("a legal tenant");
         capability_renewer::register(tenant, "store", identity.token_lock());
         let client = KvClient::connect_lazy(&store.endpoint, &identity).expect("client is built");
         assert!(!capability_renewer::is_refused(tenant, "store"));
@@ -835,7 +863,7 @@ mod tests {
         let error = client
             .get("k".to_string())
             .await
-            .expect_err("a token naming another tenant is refused");
+            .expect_err("a token naming no tenant for kv is refused");
         assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
         assert!(
             capability_renewer::is_refused(tenant, "store"),
@@ -848,7 +876,9 @@ mod tests {
         // Nothing listens on port 1. Building the client must succeed -- an
         // app may not be blocked from loading by a store outage -- and the
         // call must fail with something an operator can act on.
-        let identity = StorageIdentity::new("demo.production", None).expect("a legal tenant");
+        let identity =
+            StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), None)
+                .expect("a legal tenant");
         let client =
             KvClient::connect_lazy("http://127.0.0.1:1", &identity).expect("client is built");
         let error = client

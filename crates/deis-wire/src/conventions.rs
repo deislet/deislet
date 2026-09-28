@@ -48,25 +48,20 @@ pub const OBSERVED_ROUTING_TABLE_HEADER: &str = "x-deis-observed-routing-table";
 /// The environment a request belongs to when nothing says otherwise.
 pub const DEFAULT_ENVIRONMENT: &str = "production";
 
-/// Header carrying the tenant on calls into the storage services.
+/// Separator between the application and the environment inside a tenant
+/// label.
 ///
-/// Deliberately a different header from [`APP_ID_HEADER`], because it carries
-/// a different thing: a tenant is one application *in one environment*, so a
-/// preview deployment cannot read or overwrite what production stored. The
-/// value is built by [`tenant_id`] and the storage services treat it as one
-/// opaque key - they still understand exactly one tenant dimension and know
-/// nothing about environments.
-pub const TENANT_HEADER: &str = "x-deis-tenant";
-
-/// Separator between the application and the environment inside a tenant id.
-///
-/// Neither an app id nor an environment name may contain it, so a tenant id
+/// Neither an app id nor an environment name may contain it, so a label
 /// splits unambiguously and no pair of legal names can collide with another
-/// pair. It is also safe in a file name, which matters because deis-store
-/// turns a tenant id into a directory and a database file name.
+/// pair.
 pub const TENANT_SEPARATOR: char = '.';
 
-/// Build the tenant a storage call belongs to.
+/// The `<app>.<environment>` label of one application environment.
+///
+/// A label, not a storage authority. deis-telemetry attributes records to
+/// it and log lines print it, because an operator reads names. deis-store
+/// and deis-queue never see it: they key everything by the canonical tenant
+/// (`v1/<application id>/<environment id>`) the caller's capability names.
 ///
 /// Callers must have validated both halves against [`is_valid_tenant_part`]
 /// first; this function only joins them.
@@ -74,11 +69,10 @@ pub fn tenant_id(app_id: &str, environment: &str) -> String {
     format!("{app_id}{TENANT_SEPARATOR}{environment}")
 }
 
-/// Split a tenant id back into its application and environment.
+/// Split a tenant label back into its application and environment.
 ///
-/// Returns `None` for anything that is not exactly two valid parts, which is
-/// what a storage service should reject: a value with no separator, with two,
-/// or with a part that could name something outside its own directory.
+/// Returns `None` for anything that is not exactly two valid parts: a value
+/// with no separator, with two, or with a part outside the character set.
 pub fn split_tenant(tenant: &str) -> Option<(&str, &str)> {
     let (app, env) = tenant.split_once(TENANT_SEPARATOR)?;
     if is_valid_tenant_part(app) && is_valid_tenant_part(env) {
@@ -88,12 +82,10 @@ pub fn split_tenant(tenant: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Whether one half of a tenant id is legal.
+/// Whether one half of a tenant label is legal.
 ///
-/// The rule is deliberately narrow. A tenant id becomes a path on disk in
-/// deis-store, so this is a hard check rather than a sanitising pass: the
-/// character set has no `.`, `/` or `\`, which means no combination of legal
-/// parts can express a parent directory.
+/// The rule is deliberately narrow - no `.`, `/` or `\` - so that a label
+/// is always safe to print, to use as a metric label, and to split.
 pub fn is_valid_tenant_part(part: &str) -> bool {
     !part.is_empty()
         && part.len() <= 64
@@ -107,32 +99,20 @@ pub fn is_valid_tenant_part(part: &str) -> bool {
 // A tenant is one application in one environment, and that is the boundary
 // the storage services enforce. Inside it an application may want more than
 // one namespace - hot data apart from cold, two buckets, a second database -
-// and that is what a *binding* names. These four items are the whole of the
-// mechanism, and they live here because deis-bundle validates a name,
-// deis-runtime stamps it on a call, and deis-store and deis-queue turn it
-// into a column value, a file name and a directory. A disagreement about the
-// separator would put one application's writes in another namespace of its
-// own, silently.
+// and that is what a *binding* names. The header and the name rule live here
+// because deis-bundle validates a name, deis-runtime stamps it on a call, and
+// deis-store turns it into part of a column value, a file name and a
+// directory.
 
 /// Header naming which namespace inside the tenant a storage call wants.
 ///
-/// Absent means the tenant's unnamed namespace - the one every application
-/// had before bindings existed, and the one `context.services.kv` still
-/// reaches. This header is deliberately *not* a credential and does not need
-/// to be: [`STORAGE_TOKEN_HEADER`] authorises the tenant, and a binding is
-/// always inside the tenant it is stamped beside, so the worst a forged value
-/// can reach is another namespace of the caller's own data.
+/// Absent means the tenant's unnamed namespace, the one
+/// `context.services.kv` reaches. This header is deliberately *not* a
+/// credential and does not need to be: the tenant is the one the caller's
+/// capability names, never something the request says, and a binding only
+/// selects a namespace inside that tenant, so the worst a forged value can
+/// reach is another namespace of the caller's own data.
 pub const BINDING_HEADER: &str = "x-deis-binding";
-
-/// Separator between a tenant and a binding name inside a namespace id.
-///
-/// Deliberately a character [`is_valid_tenant_part`] and
-/// [`is_valid_binding_name`] both refuse, which is what makes
-/// [`namespace_id`] injective: no pair of (tenant, binding) can spell another
-/// pair's namespace, and no namespace with a binding can spell a bare tenant.
-/// It is also legal in a file name on every platform this runs on, because
-/// deis-store turns a namespace id into a database file and a directory.
-pub const BINDING_SEPARATOR: char = '@';
 
 /// The one name on `context.env` the platform owns.
 ///
@@ -171,56 +151,15 @@ pub const RESERVED_PLATFORM_PREFIX: &str = "DEIS_";
 /// differ only in case would be one directory on a case-insensitive
 /// filesystem.
 ///
-/// This function, together with [`is_valid_tenant_part`], is what carries the
-/// path-safety argument for the *composed* form. A namespace id is at most
-/// three of these parts joined by the two separators, and no part may hold a
-/// `.`, a `/`, a `\` or a NUL, so `app.environment@BINDING`:
-///
-/// * is a single path component - the separators are not path separators, and
-///   nothing inside a part can become one;
-/// * can never spell `.` or `..`, since every part is non-empty and holds no
-///   `.` of its own;
-/// * can never be absolute, since no part may begin with `/`;
-/// * is at most 194 bytes, so appending a suffix such as `.sqlite-journal`
-///   still leaves it inside the 255-byte name limit.
-///
+/// It carries the path-safety argument for the composed namespace key
+/// (`ct1_<application id>_<environment id>@BINDING`, see
+/// [`crate::DeisletCanonicalNamespaceKey`]): no part may hold a `.`, a `/`, a
+/// `\` or a NUL, so the key is always a single path component, can never
+/// spell `.` or `..`, and stays short enough for a `.sqlite-journal` suffix.
 /// A binding therefore widens what a tenant may address inside its own
 /// directory and never where that directory is.
 pub fn is_valid_binding_name(name: &str) -> bool {
     is_valid_tenant_part(name)
-}
-
-/// The namespace one storage call acts in: a tenant, and the binding inside
-/// it when the call names one.
-///
-/// `None` returns the tenant unchanged, which is why an application deployed
-/// before bindings existed keeps reading and writing exactly the rows, files
-/// and objects it always had.
-pub fn namespace_id(tenant: &str, binding: Option<&str>) -> String {
-    match binding {
-        Some(binding) => format!("{tenant}{BINDING_SEPARATOR}{binding}"),
-        None => tenant.to_string(),
-    }
-}
-
-/// Split a namespace id back into its tenant and its binding.
-///
-/// Returns `None` for anything that is not a legal tenant, optionally
-/// followed by the separator and a legal binding name. Two separators, an
-/// empty binding and a binding holding a `.` are all refused rather than
-/// read loosely: this is what a storage service parses before it touches
-/// anything on disk.
-pub fn split_namespace(namespace: &str) -> Option<(&str, Option<&str>)> {
-    match namespace.split_once(BINDING_SEPARATOR) {
-        Some((tenant, binding)) => {
-            if split_tenant(tenant).is_some() && is_valid_binding_name(binding) {
-                Some((tenant, Some(binding)))
-            } else {
-                None
-            }
-        }
-        None => split_tenant(namespace).map(|_| (namespace, None)),
-    }
 }
 
 /// The request methods no application on this platform can be built to answer.
@@ -343,28 +282,6 @@ pub const ASSIGNMENTS_WITHHELD_HEADER: &str = "x-deis-assignments-withheld";
 /// every upgrade back into an error storm.
 pub const NODE_ID_HELD_BY_LIVE_CHANNEL: &str = "is held by a live channel";
 
-// ---- proving a storage caller may be the tenant it claims --------------
-//
-// The tenant header above says *which* namespace a call wants. On its own it
-// is a claim and nothing more: a caller that can reach deis-store or
-// deis-queue can name any tenant and be served. These three names are the
-// proof that goes with the claim, and they live here for the usual reason -
-// deis-control mints the token, deis-runtime carries it, and the two storage
-// services check it, so a disagreement about the header name or the digest
-// would show up as every storage call being refused.
-
-/// Header carrying the capability token that proves a caller may act as the
-/// tenant it names in [`TENANT_HEADER`].
-///
-/// Its own header rather than a field in an existing one: the tenant header
-/// is a routing key that deis-runtime fills in from the request it is
-/// serving, while this is a credential the node was handed. Keeping them
-/// apart means a log line, a trace or a proxy rule that prints the tenant
-/// does not thereby print the credential.
-pub const STORAGE_TOKEN_HEADER: &str = "x-deis-storage-token";
-
-
-
 /// A single chunk plus its framing must never approach the ceiling, otherwise
 /// streaming would start failing on the transport instead of being bounded by
 /// our own logic. Checked at compile time so it cannot drift.
@@ -409,75 +326,9 @@ mod tests {
         for h in [
             APP_ID_HEADER,
             ENVIRONMENT_HEADER,
-            TENANT_HEADER,
-            STORAGE_TOKEN_HEADER,
+            BINDING_HEADER,
         ] {
             assert_eq!(h, h.to_ascii_lowercase(), "{h} must be lowercase");
-        }
-    }
-
-    #[test]
-    fn a_binding_names_a_namespace_inside_one_tenant() {
-        let tenant = tenant_id("shop", "production");
-        assert_eq!(namespace_id(&tenant, None), "shop.production");
-        assert_eq!(namespace_id(&tenant, Some("HOT")), "shop.production@HOT");
-        assert_eq!(
-            split_namespace("shop.production@HOT"),
-            Some(("shop.production", Some("HOT")))
-        );
-        assert_eq!(
-            split_namespace("shop.production"),
-            Some(("shop.production", None))
-        );
-    }
-
-    #[test]
-    fn no_two_binding_names_can_spell_the_same_namespace() {
-        // The property the whole mechanism rests on. The separator is refused
-        // by both halves of a namespace id, so the only string a pair can
-        // produce is its own - there is no (tenant, binding) that spells
-        // another pair's namespace, and none that spells a bare tenant.
-        assert!(!is_valid_tenant_part("a@b"));
-        assert!(!is_valid_binding_name("a@b"));
-        assert!(!is_valid_binding_name("a.b"));
-        assert!(!is_valid_binding_name(""));
-
-        let mut seen = std::collections::HashSet::new();
-        for app in ["shop", "shop-eu", "shop_eu"] {
-            for env in ["production", "preview-1"] {
-                for binding in [None, Some("HOT"), Some("COLD"), Some("HOT-2")] {
-                    let id = namespace_id(&tenant_id(app, env), binding);
-                    assert!(seen.insert(id.clone()), "{id} was produced twice");
-                    assert_eq!(
-                        split_namespace(&id).map(|(t, b)| (t.to_string(), b.map(str::to_string))),
-                        Some((tenant_id(app, env), binding.map(str::to_string))),
-                        "{id} did not round trip"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_namespace_id_cannot_be_talked_into_another_tenant() {
-        // The attempt an application would actually make: put a separator, a
-        // dot or a traversal inside the name it declares, and reach a
-        // namespace belonging to something else. Every one of them is refused
-        // before it becomes a file name.
-        for hostile in [
-            "shop.production@..",
-            "shop.production@a.b",
-            "shop.production@a@b",
-            "shop.production@",
-            "shop.production@a/b",
-            "shop@HOT",
-            "@HOT",
-            "shop.production.preview@HOT",
-        ] {
-            assert!(
-                split_namespace(hostile).is_none(),
-                "{hostile} must not parse as a namespace"
-            );
         }
     }
 

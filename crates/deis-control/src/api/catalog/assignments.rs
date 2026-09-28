@@ -345,8 +345,11 @@ pub(crate) struct VisibleDeployment {
     /// secret revisions and so has nothing to fetch.
     pub snapshot_id: Option<String>,
     /// `<app>.<environment>`, as `deis_wire::conventions::tenant_id` spells
-    /// it: the tenant a store, queue or telemetry capability names.
+    /// it: the tenant label a telemetry capability names.
     pub tenant: String,
+    /// `v1/<application id>/<environment id>`: the tenant a store or queue
+    /// capability names.
+    pub canonical_tenant: String,
     /// The routing generation this deployment serves under.
     pub routing_generation: String,
 }
@@ -374,6 +377,8 @@ pub(crate) async fn deployments_visible_to(
     let mut visible = BTreeMap::new();
     if state.nodes.node(node_id).is_some() {
         for assignment in state.store.list_assignments().await?.assignments {
+            let canonical_tenant =
+                canonical_tenant_of(state, &assignment.app_id, &assignment.environment_id).await?;
             visible.insert(
                 assignment.deployment_id,
                 VisibleDeployment {
@@ -383,6 +388,7 @@ pub(crate) async fn deployments_visible_to(
                         &assignment.app_id,
                         &assignment.environment,
                     ),
+                    canonical_tenant,
                     routing_generation: assignment.routing_generation,
                 },
             );
@@ -395,15 +401,29 @@ pub(crate) async fn deployments_visible_to(
             continue;
         }
         let environment = state.store.get_environment_by_id(&plan.env_id).await?;
+        let canonical_tenant = canonical_tenant_of(state, &plan.app_id, &plan.env_id).await?;
         visible.insert(
             plan.id,
             VisibleDeployment {
                 env_id: plan.env_id,
                 snapshot_id: plan.snapshot_id,
                 tenant: deis_wire::conventions::tenant_id(&plan.app_id, &environment.name),
+                canonical_tenant,
                 routing_generation: plan.routing_generation.to_string(),
             },
         );
     }
     Ok(visible)
+}
+
+/// The canonical tenant (`v1/<application id>/<environment id>`) of one
+/// environment: what a store or queue capability for it names.
+pub(crate) async fn canonical_tenant_of(
+    state: &CatalogState,
+    app_id: &str,
+    env_id: &str,
+) -> crate::catalog::CatalogResult<String> {
+    let app = state.store.get_app(app_id).await?;
+    let environment = state.store.get_environment_by_id(env_id).await?;
+    Ok(deis_wire::CanonicalTenantId::new(app.canonical_id, environment.canonical_id).to_string())
 }

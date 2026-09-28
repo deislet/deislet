@@ -198,10 +198,11 @@ own version, variables and secrets. On the data path the pair travels as
 production.
 
 **Storage sees one opaque key.** deis-store and deis-queue know nothing about
-environments: they get `x-deis-tenant`, whose value is
-`deis_wire::conventions::tenant_id(app, environment)` — `demo.production`. A
-preview writing to its KV therefore cannot overwrite production's, which
-matters because rolling back returns the code and not the data.
+environments: the capability a call carries names one canonical tenant,
+`v1/<application id>/<environment id>`, and that is whose data the call
+touches - nothing in the request names it. A preview writing to its KV
+therefore cannot overwrite production's, which matters because rolling back
+returns the code and not the data.
 
 **Nodes pull, the control plane also pushes.** A node fetches its assignment
 list on startup over `deis.machine.MachineChannel`, fetches each bundle over

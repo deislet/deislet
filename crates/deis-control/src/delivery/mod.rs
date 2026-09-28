@@ -49,6 +49,7 @@ use crate::catalog::{
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
 use deis_capability::resources_for_audience;
+use deis_wire::CanonicalTenantId;
 
 /// How the control plane names itself, once for each audience that is given
 /// an absolute URL.
@@ -287,21 +288,15 @@ impl StorageWiring {
     /// The capability this control plane presents to deis-queue for one
     /// tenant.
     ///
-    /// The tenant is the whole `<app>.<environment>` pair, the same string
-    /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: deis-queue
-    /// checks the token names that tenant, the `queue` audience and the
-    /// `queue` binding, so a token minted for anything else is refused.
-    pub async fn queue_token_for(
-        &self,
-        app_id: &str,
-        environment: &str,
-    ) -> anyhow::Result<String> {
-        let tenant = deis_wire::conventions::tenant_id(app_id, environment);
+    /// It names the canonical tenant, the `queue` audience and the `queue`
+    /// binding; deis-queue acts for exactly the tenant it names, so nothing
+    /// in the request has to say which one.
+    pub async fn queue_token_for(&self, tenant: &CanonicalTenantId) -> anyhow::Result<String> {
         self.issuer
             .issue(
                 AUD_QUEUE,
-                &format!("spiffe://deislet/control/{app_id}"),
-                resources_for_audience(&tenant, AUD_QUEUE),
+                &format!("spiffe://deislet/control/{}", tenant.application_id()),
+                resources_for_audience(&tenant.to_string(), AUD_QUEUE),
             )
             .await
             .map_err(|error| anyhow::anyhow!("could not issue a queue capability: {error}"))
@@ -354,8 +349,7 @@ impl StorageWiring {
     /// leases without admitting the candidate before pointer commit.
     pub async fn prepare_consumer_generation(
         &self,
-        app_id: &str,
-        environment: &str,
+        tenant: &CanonicalTenantId,
         deployment_id: &str,
         generation: &str,
         expected_previous_generation: Option<&str>,
@@ -366,7 +360,6 @@ impl StorageWiring {
         };
 
         let channel = self.queue_channel()?;
-        let tenant = deis_wire::conventions::tenant_id(app_id, environment);
         let mut request = tonic::Request::new(PrepareConsumerGenerationRequest {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
@@ -375,14 +368,7 @@ impl StorageWiring {
                 .to_string(),
             expected_previous_deployment_id: expected_previous_deployment_id.map(str::to_string),
         });
-        request.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            tenant.parse().map_err(|error| {
-                anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
-            })?,
-        );
-        self.stamp_queue_capability(&mut request, app_id, environment)
-            .await?;
+        self.stamp_queue_capability(&mut request, tenant).await?;
         Ok(QueueClient::new(channel)
             .prepare_consumer_generation(request)
             .await?
@@ -392,21 +378,19 @@ impl StorageWiring {
     /// Admit a queue generation whose pre-commit barrier completed.
     pub async fn activate_consumer_generation(
         &self,
-        app_id: &str,
-        environment: &str,
+        tenant: &CanonicalTenantId,
         deployment_id: &str,
         generation: &str,
     ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
         use deis_queue::proto::queue::{
             ActivateConsumerGenerationRequest, queue_client::QueueClient,
         };
-        let (channel, tenant) = self.queue_channel_and_tenant(app_id, environment)?;
+        let channel = self.queue_channel()?;
         let mut request = tonic::Request::new(ActivateConsumerGenerationRequest {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
         });
-        self.authorize_queue_request(&mut request, app_id, environment, &tenant)
-            .await?;
+        self.stamp_queue_capability(&mut request, tenant).await?;
         Ok(QueueClient::new(channel)
             .activate_consumer_generation(request)
             .await?
@@ -416,52 +400,21 @@ impl StorageWiring {
     /// Cancel an uncommitted queue barrier and restore old Pull admission.
     pub async fn abort_consumer_generation(
         &self,
-        app_id: &str,
-        environment: &str,
+        tenant: &CanonicalTenantId,
         deployment_id: &str,
         generation: &str,
     ) -> anyhow::Result<deis_queue::proto::queue::AbortConsumerGenerationResponse> {
         use deis_queue::proto::queue::{AbortConsumerGenerationRequest, queue_client::QueueClient};
-        let (channel, tenant) = self.queue_channel_and_tenant(app_id, environment)?;
+        let channel = self.queue_channel()?;
         let mut request = tonic::Request::new(AbortConsumerGenerationRequest {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
         });
-        self.authorize_queue_request(&mut request, app_id, environment, &tenant)
-            .await?;
+        self.stamp_queue_capability(&mut request, tenant).await?;
         Ok(QueueClient::new(channel)
             .abort_consumer_generation(request)
             .await?
             .into_inner())
-    }
-
-    fn queue_channel_and_tenant(
-        &self,
-        app_id: &str,
-        environment: &str,
-    ) -> anyhow::Result<(tonic::transport::Channel, String)> {
-        let channel = self.queue_channel()?;
-        Ok((
-            channel,
-            deis_wire::conventions::tenant_id(app_id, environment),
-        ))
-    }
-
-    async fn authorize_queue_request<T>(
-        &self,
-        request: &mut tonic::Request<T>,
-        app_id: &str,
-        environment: &str,
-        tenant: &str,
-    ) -> anyhow::Result<()> {
-        request.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            tenant.parse().map_err(|error| {
-                anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
-            })?,
-        );
-        self.stamp_queue_capability(request, app_id, environment)
-            .await
     }
 
     /// Put this control plane's queue capability in `Authorization: Bearer`,
@@ -469,10 +422,9 @@ impl StorageWiring {
     async fn stamp_queue_capability<T>(
         &self,
         request: &mut tonic::Request<T>,
-        app_id: &str,
-        environment: &str,
+        tenant: &CanonicalTenantId,
     ) -> anyhow::Result<()> {
-        let token = self.queue_token_for(app_id, environment).await?;
+        let token = self.queue_token_for(tenant).await?;
         request.metadata_mut().insert(
             "authorization",
             format!("Bearer {token}").parse().map_err(|error| {
@@ -989,16 +941,23 @@ impl DeploymentDeliverer {
         self.storage.requires_consumer_fence(version)
     }
 
+    /// The canonical tenant of `environment`: what a store or queue
+    /// capability for it names.
+    async fn canonical_tenant(&self, environment: &Environment) -> CatalogResult<CanonicalTenantId> {
+        let app = self.store.get_app(&environment.app_id).await?;
+        Ok(CanonicalTenantId::new(app.canonical_id, environment.canonical_id))
+    }
+
     pub async fn prepare_consumer_generation(
         &self,
         environment: &Environment,
         plan: &crate::catalog::DeploymentPlan,
     ) -> anyhow::Result<deis_queue::proto::queue::PrepareConsumerGenerationResponse> {
+        let tenant = self.canonical_tenant(environment).await?;
         let progress = self
             .storage
             .prepare_consumer_generation(
-                &environment.app_id,
-                &environment.name,
+                &tenant,
                 &plan.id,
                 &plan.routing_generation.to_string(),
                 plan.previous_generation.as_deref(),
@@ -1020,11 +979,11 @@ impl DeploymentDeliverer {
         environment: &Environment,
         plan: &crate::catalog::DeploymentPlan,
     ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
+        let tenant = self.canonical_tenant(environment).await?;
         let progress = self
             .storage
             .activate_consumer_generation(
-                &environment.app_id,
-                &environment.name,
+                &tenant,
                 &plan.id,
                 &plan.routing_generation.to_string(),
             )
@@ -1044,11 +1003,11 @@ impl DeploymentDeliverer {
         environment: &Environment,
         plan: &crate::catalog::DeploymentPlan,
     ) -> anyhow::Result<deis_queue::proto::queue::AbortConsumerGenerationResponse> {
+        let tenant = self.canonical_tenant(environment).await?;
         let progress = self
             .storage
             .abort_consumer_generation(
-                &environment.app_id,
-                &environment.name,
+                &tenant,
                 &plan.id,
                 &plan.routing_generation.to_string(),
             )
@@ -1366,26 +1325,6 @@ impl DeploymentDeliverer {
                     "This version's manifest has no `environment` declarations, so it binds no secret and none is delivered; declare each secret under `environment` to have the node fetch it"
                 );
             }
-        }
-
-        // The node builds its storage tenant from this pair
-        // (`conventions::tenant_id`), and deis-store rejects a tenant id it
-        // cannot split back into exactly two legal parts. Names created
-        // today cannot break that rule; a row written before the rule
-        // existed can, and the only symptom on the node would be every
-        // ctx.services call failing with an opaque error from the store.
-        if deis_wire::conventions::split_tenant(&deis_wire::conventions::tenant_id(
-            &env.app_id,
-            &env.name,
-        ))
-        .is_none()
-        {
-            error!(
-                app_id = %env.app_id,
-                environment = %env.name,
-                version_id = %version_id,
-                "This app and environment do not form a storage tenant id, so deis-store and deis-queue will reject every call this deployment makes; the code still loads and serves, but its kv, database, blob and queue bindings are unusable until the environment is recreated with a name of letters, digits, '-' and '_'"
-            );
         }
 
         let (environment_declarations_json, environment_snapshot_json, environment_snapshot_id) =
@@ -2778,22 +2717,16 @@ mod tests {
         let issuer = wiring.issuer.clone();
         let mut request = tonic::Request::new(());
         wiring
-            .stamp_queue_capability(&mut request, "demo", "production")
+            .stamp_queue_capability(&mut request, &CanonicalTenantId::derived_from_label("demo.production"))
             .await
             .unwrap();
-        assert!(
-            request
-                .metadata()
-                .get(deis_wire::conventions::STORAGE_TOKEN_HEADER)
-                .is_none()
-        );
         let header = request.metadata().get("authorization").unwrap().to_str().unwrap();
         let token = header.strip_prefix("Bearer ").expect("a bearer credential");
         deis_capability::CapabilityVerifier::new(issuer.verifying_key().await)
             .verify(
                 token,
                 AUD_QUEUE,
-                &deis_wire::conventions::tenant_id("demo", "production"),
+                &CanonicalTenantId::derived_from_label("demo.production").to_string(),
                 "queue",
             )
             .expect("deis-queue accepts it");

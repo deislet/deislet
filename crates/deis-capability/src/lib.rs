@@ -200,6 +200,14 @@ pub enum CapabilityError {
     #[error("binding {binding} not authorized for tenant {tenant}")]
     BindingNotAuthorized { tenant: String, binding: String },
 
+    /// The token does not name exactly one tenant for the binding a service
+    /// serves, so the service cannot tell whose data the call is about. A
+    /// data service takes its tenant from the capability alone; a token that
+    /// names none, or several, for its binding is refused rather than
+    /// resolved by anything the request says.
+    #[error("capability names {named} tenants for binding {binding}; exactly one is required")]
+    NoSingleTenant { binding: String, named: usize },
+
     /// The token's `auth_epoch` is below the verifier's minimum.
     #[error("auth epoch {got} is below the minimum {minimum}")]
     AuthEpochTooLow { got: u64, minimum: u64 },
@@ -235,7 +243,9 @@ pub enum CapabilityError {
 /// Each resource names one tenant+binding pair the holder may access.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityResource {
-    /// The canonical tenant id, e.g. `ct1_<app_uuid>/<env_uuid>`.
+    /// The tenant: for deis-store and deis-queue the canonical
+    /// `v1/<application id>/<environment id>`, for deis-telemetry the
+    /// `<app>.<environment>` label its records carry.
     pub tenant: String,
 
     /// The binding type: `kv`, `sql`, `blob`, or `queue`.
@@ -977,6 +987,39 @@ impl CapabilityVerifier {
             grace_accepted,
             exp: claims.exp,
         })
+    }
+
+    /// Verify a token for a service that serves one `binding` of one tenant
+    /// per call, and return that tenant: the one tenant the capability names
+    /// with `binding`.
+    ///
+    /// This is how deis-store and deis-queue learn whose data a call is
+    /// about. Nothing in the request names the tenant; a capability naming
+    /// no tenant, or more than one, for `binding` is refused with
+    /// [`CapabilityError::NoSingleTenant`]. The same T8 grace as
+    /// [`Self::verify_with_grace`] applies.
+    pub fn verify_tenant_with_grace(
+        &self,
+        token: &str,
+        expected_aud: &str,
+        binding: &str,
+    ) -> Result<VerifiedCapability, CapabilityError> {
+        let grant = self.verify_grant_with_grace(token, expected_aud)?;
+        let tenants: std::collections::BTreeSet<&str> = grant.tenants_with(binding).collect();
+        let mut named = tenants.iter();
+        match (named.next(), named.next()) {
+            (Some(tenant), None) => Ok(VerifiedCapability {
+                node_id: grant.sub.clone(),
+                canonical_tenant_id: (*tenant).to_string(),
+                binding: binding.to_string(),
+                grace_accepted: grant.grace_accepted,
+                exp: grant.exp,
+            }),
+            _ => Err(CapabilityError::NoSingleTenant {
+                binding: binding.to_string(),
+                named: tenants.len(),
+            }),
+        }
     }
 
     /// Check whether the two grace-period conditions are satisfied.
@@ -1823,6 +1866,51 @@ mod tests {
         let mut verifier = CapabilityVerifier::new(verifying);
         verifier.record_sync();
         assert!(!verifier.is_degraded());
+    }
+
+    #[test]
+    fn the_tenant_of_a_call_is_the_one_the_capability_names() {
+        let (signing, verifying) = make_keypair();
+        let verifier = CapabilityVerifier::new(verifying);
+        let tenant = CanonicalTenantId::derived_from_label("shop.production").to_string();
+        let other = CanonicalTenantId::derived_from_label("shop.preview").to_string();
+
+        let one = CapabilityClaims::new(
+            AUD_STORE,
+            "iss",
+            "spiffe://deis.internal/deislet/node/n1",
+            0,
+            Duration::from_secs(600),
+            resources_for_audience(&tenant, AUD_STORE),
+        );
+        let verified = verifier
+            .verify_tenant_with_grace(&encode(&one, &signing), AUD_STORE, "kv")
+            .unwrap();
+        assert_eq!(verified.canonical_tenant_id, tenant);
+        assert_eq!(verified.binding, "kv");
+
+        let mut resources = resources_for_audience(&tenant, AUD_STORE);
+        resources.extend(resources_for_audience(&other, AUD_STORE));
+        let two = CapabilityClaims::new(
+            AUD_STORE,
+            "iss",
+            "spiffe://deis.internal/deislet/node/n1",
+            0,
+            Duration::from_secs(600),
+            resources,
+        );
+        assert!(matches!(
+            verifier.verify_tenant_with_grace(&encode(&two, &signing), AUD_STORE, "kv"),
+            Err(CapabilityError::NoSingleTenant { named: 2, .. })
+        ));
+        assert!(matches!(
+            verifier.verify_tenant_with_grace(&encode(&one, &signing), AUD_STORE, "queue"),
+            Err(CapabilityError::NoSingleTenant { named: 0, .. })
+        ));
+        assert!(matches!(
+            verifier.verify_tenant_with_grace(&encode(&one, &signing), AUD_QUEUE, "kv"),
+            Err(CapabilityError::WrongAudience { .. })
+        ));
     }
 
     #[test]

@@ -1,12 +1,12 @@
 //! Deislet storage services: KV, database and blob.
 //!
-//! This service is deliberately "dumb": one tenant dimension, carried in the
-//! `x-deis-tenant` header, and no idea what a version, an environment or a
-//! deployment is. Those concepts live in deis-control and deis-runtime, which
-//! is also where the tenant id is built - here it is one opaque key.
+//! This service is deliberately "dumb": one tenant dimension, named by the
+//! capability a call carries, and no idea what a version, an environment or a
+//! deployment is. Those concepts live in deis-control and deis-runtime - here
+//! the tenant is one opaque key.
 //!
-//! Who a caller is allowed to be, it does check: a call carries a capability
-//! token for the tenant it names, an Ed25519-signed JCS-JWT verified against
+//! Who a caller is, it does check: a call carries a capability token naming
+//! its tenant, an Ed25519-signed JCS-JWT verified against
 //! the control plane's published keys, read from its JWKS over the machine
 //! channel under mutual TLS. Every call must present a valid token; there is
 //! no anonymous or loopback bypass. See [`deis_store::auth`]. The listener

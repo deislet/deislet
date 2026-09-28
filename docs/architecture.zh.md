@@ -437,7 +437,7 @@ sequenceDiagram
 
     rect rgb(232, 245, 233)
     Note over X,D: ⑥ 存储
-    X->>D: 带 x-deis-tenant 调用（值是 <应用>.<环境>）
+    X->>D: 带 capability 调用（租户是它命名的 v1/<应用 id>/<环境 id>）
     loop 队列消费
         X->>D: Pull（带租约时长）→ 交给 queue 导出 → Ack / Nack
     end
@@ -502,14 +502,16 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 ### 租户维度只有一个，值是「应用 + 环境」
 
 两个组件都只认**一个**租户维度，**不认版本、不认部署，也不知道「环境」是什么**。
-它们收到的租户 id 是一个不透明的字符串，走带外的 `x-deis-tenant` 头传递
-（gRPC metadata），所以 proto 消息里没有租户字段。
+租户是一个应用环境的 canonical id `v1/<应用 id>/<环境 id>`（`deis_wire::CanonicalTenantId`），
+它不在请求里：服务从调用携带的已验证 capability 中取出它为本 binding 命名的唯一租户
+（为同一 binding 命名零个或多个租户的 capability 整次被拒），所以 proto 消息里没有租户字段，
+也没有可以伪造的租户头。
 
-这个串由调用方用 `deis_wire::conventions::tenant_id(app, environment)` 拼出来，形如
-`demo.production`；服务端用同一个 crate 的 `split_tenant` 校验，只接受恰好两段合法
-部分，因此没有哪个取值能拼出上级目录（租户 id 会变成磁盘路径 `db/<tenant>.sqlite`、
-`blob/<tenant>/…`）。缺头、非可打印 ASCII、或校验不过（裸 app id、三段、空段、含
-`.` `/` `\`、半边超 64 字节）一律回 `PermissionDenied`，绝不退回某个默认命名空间。
+落盘时租户编码为 `ct1_<应用 id>_<环境 id>`，named binding 追加 `@<名字>`（数据库文件
+`db/<key>.sqlite`、对象目录 `blob/<key>/…`）。这个 key 不含 `.` `/` `\`，没有哪个取值能
+拼出上级目录；binding 名不合法（含 `.`、`@`、`/`、空、超 64 字节）一律回
+`PermissionDenied`，绝不退回某个默认命名空间。因为是永久 id，删掉一个应用再用同名重建，
+新应用拿到的是新 id，看不到旧数据。
 
 **为什么把环境揉进这把钥匙**：原则 10 说每个环境有自己的数据。如果预览环境和生产共用
 一个命名空间，预览的一次写就能覆盖掉生产的键——而这是回滚救不回来的，回滚只换代码，
@@ -564,9 +566,7 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 
 ### 授权：调用方要证明自己有资格声称这个租户
 
-**这里写清楚，免得被上面那段租户校验误导**：`split_tenant` 只检查
-`x-deis-tenant` 的**形状**（两段合法部分，不含 `.` `/` `\`）。这一节说的是**身份**
-——凭什么相信提出这个租户的调用方真的有权代表它。
+这一节说的是**身份**——凭什么相信调用方有权代表 capability 命名的那个租户。
 
 做法是能力令牌：调用方在 `Authorization: Bearer` 头里带一个控制面用 Ed25519 签发的
 capability（`deis_capability`），写明 audience（`store` / `queue`）、若干
@@ -579,9 +579,8 @@ channel 拉取 JWKS 公钥与签名的吊销名单，按 `kid` 验签。部署�
 Blob / Queue 调用都把它带上（`crates/deis-store/src/auth.rs`、`deis-queue` 的对应
 实现），应用代码摸不到它。
 
-验证的顺序刻意是「先看调用方声称的租户，再看令牌是否为这个租户、这个 binding 签发」，
-而不是反过来拿令牌去决定租户——一份从某个应用那里泄漏出去的令牌，换到别的租户身上
-立刻被拒，包括同一个应用的另一个环境。令牌 15 分钟过期，可按 `jti`、节点、租户单独
+租户由令牌决定，请求里没有任何字段能改它——一份从某个应用那里泄漏出去的令牌，只能
+碰到签发给它的那个租户，碰不到别的租户，包括同一个应用的另一个环境。令牌 15 分钟过期，可按 `jti`、节点、租户单独
 吊销，也可递增 `auth_epoch` 批量作废（见 `docs/trust-boundaries.md` 的「Taking
 capabilities back」）。
 
@@ -589,10 +588,10 @@ capabilities back」）。
 gRPC 监听只说 TLS。启动时缺 `[machine_identity]` 直接拒绝启动。这和控制面的节点通道
 是同一个形状：a7ba508 起那条通道只认证书，`node_preshared_keys` 这个字段已删除。
 
-没带令牌、令牌对不上租户或 binding、或者干脆没带 `x-deis-tenant`，三种
+没带令牌、令牌对不上 binding、或者令牌没有为这个 binding 恰好命名一个租户，三种
 情况都在拿到任何数据**之前**被拒——tonic 拦截器挡在每个 handler 前面
 （`crates/deis-store/src/server.rs` 的 `guarded`），新增第四个服务也不可能漏掉这一层。
-拒绝一律以 `warn` 记日志，带上声称的租户，可追查。健康检查端点刻意例外：它不回答
+拒绝一律以 `warn` 记日志，可追查。健康检查端点刻意例外：它不回答
 任何租户的数据，只说这个进程能不能应答，要求它也带令牌，控制面就做不出一个不知道
 任何租户令牌的存活探针了。
 

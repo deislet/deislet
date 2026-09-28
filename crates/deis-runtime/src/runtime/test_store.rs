@@ -103,7 +103,7 @@ impl TestStore {
             1,
             Duration::from_secs(900),
             vec![CapabilityResource {
-                tenant: tenant.to_string(),
+                tenant: crate::runtime::tenant::test_tenant(tenant),
                 binding: binding.to_string(),
                 generation: None,
             }],
@@ -126,17 +126,17 @@ impl TestStore {
             Duration::from_secs(900),
             vec![
                 CapabilityResource {
-                    tenant: tenant.to_string(),
+                    tenant: crate::runtime::tenant::test_tenant(tenant),
                     binding: "kv".into(),
                     generation: None,
                 },
                 CapabilityResource {
-                    tenant: tenant.to_string(),
+                    tenant: crate::runtime::tenant::test_tenant(tenant),
                     binding: "sql".into(),
                     generation: None,
                 },
                 CapabilityResource {
-                    tenant: tenant.to_string(),
+                    tenant: crate::runtime::tenant::test_tenant(tenant),
                     binding: "blob".into(),
                     generation: None,
                 },
@@ -152,7 +152,7 @@ impl TestStore {
         let token = self.capability_token_for_all_bindings(tenant);
         crate::deployment::capability_renewer::adopt(vec![
             crate::deployment::capability_renewer::HeldCapability {
-                tenant: tenant.to_string(),
+                tenant: crate::runtime::tenant::test_tenant(tenant),
                 audience: "store".to_string(),
                 token,
                 exp: std::time::SystemTime::now()

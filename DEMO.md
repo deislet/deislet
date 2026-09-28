@@ -215,9 +215,9 @@ Isolate 里到底有没有 `fetch`，后者说这一发有没有打出去。分�
 里逐个开口子；而平台自己那几个服务地址（deis-store / deis-queue / deis-control /
 deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条目都开不到它们**。
 
-理由很直接：deis-store 信任别人递给它的 `x-deis-tenant` 头——在应用没法自己往外发包
-之前，「只有节点进程能连到它」就是它的全部保护。一旦 Isolate 里有了 `fetch`，一个处理
-函数只要能连上 deis-store，换个租户头就能读、能删别的应用的 KV、数据行和 blob。
+理由很直接：deis-store、deis-queue 与节点的管理端口都是内部服务，应用不该能直接够到。
+租户虽然由 capability 决定、请求里改不了，但一个节点替它运行的所有租户持有 capability，
+不能让 Isolate 里的 `fetch` 成为一个应用摸到这些内部服务的通道。
 
 演示据此摆了一个最小的对照组：脚本自己起一个上游（默认 8094），节点配置里
 `[fetch] allow` 只写这一个地址；deis-store 在同一块回环网卡的另一个端口上，不写。

@@ -42,7 +42,6 @@ use deis_store::proto::storage::{
     ExecuteRequest, GetRequest, SetRequest, database_client::DatabaseClient,
     kv_store_client::KvStoreClient,
 };
-use deis_wire::conventions::TENANT_HEADER;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -53,7 +52,6 @@ const TRUST_DOMAIN: &str = "deis.internal";
 const APP: &str = "shop";
 const ENV: &str = "production";
 const TENANT: &str = "shop.production";
-const OTHER_TENANT: &str = "other.production";
 
 /// How long anything here may take to come up or converge.
 const DEADLINE: Duration = Duration::from_secs(30);
@@ -376,11 +374,10 @@ async fn local_listener() -> tokio::net::TcpListener {
         .expect("a listener")
 }
 
-fn authed<T>(tenant: &str, token: &str, message: T) -> Request<T> {
+/// `message` carrying `token`. The tenant is the one the token names; the
+/// label is only here so a reader sees which tenant a call is meant for.
+fn authed<T>(_tenant: &str, token: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().expect("a header value"));
     request.metadata_mut().insert(
         "authorization",
         format!("Bearer {token}").parse().expect("a header value"),
@@ -449,7 +446,11 @@ impl Api {
                 None,
             )
             .await;
-        assert_eq!(answer["tenant"], TENANT);
+        let tenant = answer["tenant"].as_str().expect("a tenant");
+        assert!(
+            tenant.parse::<deis_wire::CanonicalTenantId>().is_ok(),
+            "the storage token names a canonical tenant, not {tenant}"
+        );
         (
             answer["token"].as_str().expect("a store token").to_string(),
             answer["queue_token"]
@@ -561,26 +562,11 @@ async fn use_queue(queue: &Service, token: &str, marker: &str) {
     }
 }
 
-/// Everything a token must *not* open: another tenant's data, and the other
-/// service, whose audience and bindings it was not minted with.
+/// Everything a token must *not* open: the other service, whose audience and
+/// bindings it was not minted with. (Another tenant's data is out of reach by
+/// construction: the tenant of a call is the one its token names.)
 async fn assert_confined(store: &Service, queue: &Service, store_token: &str, queue_token: &str) {
     let store_channel = store.channel().await;
-
-    let other_tenant = KvStoreClient::new(store_channel.clone())
-        .get(authed(
-            OTHER_TENANT,
-            store_token,
-            GetRequest {
-                key: "k".to_string(),
-            },
-        ))
-        .await
-        .expect_err("a token for one tenant must not read another's");
-    assert_eq!(
-        other_tenant.code(),
-        Code::PermissionDenied,
-        "{other_tenant:?}"
-    );
 
     let queue_token_at_store = KvStoreClient::new(store_channel)
         .get(authed(

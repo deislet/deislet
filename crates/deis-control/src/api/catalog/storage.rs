@@ -49,9 +49,10 @@ use crate::identity::Principal;
 /// left blank.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct StorageTokenResponse {
-    /// The `<app>.<environment>` pair the token authorises. Included so
-    /// a caller never has to rebuild it, and so the tenant this control
-    /// plane signed is visible to anyone debugging a refused call.
+    /// The canonical tenant (`v1/<application id>/<environment id>`) the
+    /// tokens name. deis-store and deis-queue act for exactly this tenant;
+    /// it is returned so the tenant this control plane signed is visible to
+    /// anyone debugging a refused call.
     pub tenant: String,
     /// Where deis-store listens, as configured on this control plane.
     pub store_endpoint: String,
@@ -95,7 +96,7 @@ pub async fn storage_token(
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<StorageTokenResponse>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
-    let tenant = deis_wire::conventions::tenant_id(&app_id, &env.name);
+    let tenant = super::assignments::canonical_tenant_of(&state, &env.app_id, &env.id).await?;
     let caller = match peer {
         Some(ConnectInfo(addr)) => format!("{} from {addr}", principal.label()),
         None => format!("{} from an unknown address", principal.label()),
@@ -198,7 +199,10 @@ mod tests {
         let (status, body) = json(&h.router, "GET", ROUTE, serde_json::Value::Null).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["tenant"], "demo.production");
+        let app = h.state.store.get_app("demo").await.unwrap();
+        let env = h.state.store.get_environment("demo", "production").await.unwrap();
+        let tenant = deis_wire::CanonicalTenantId::new(app.canonical_id, env.canonical_id).to_string();
+        assert_eq!(body["tenant"], tenant.as_str());
         assert_eq!(body["store_endpoint"], "http://127.0.0.1:8090");
 
         let token = body["token"].as_str().unwrap();
@@ -213,7 +217,7 @@ mod tests {
 
         assert_eq!(claims.aud, "store", "aud must be 'store'");
         assert!(
-            claims.authorizes_tenant("demo.production"),
+            claims.authorizes_tenant(&tenant),
             "token must authorise the correct tenant"
         );
         // Human tokens expire in 15 minutes
@@ -224,14 +228,14 @@ mod tests {
         let verifier = deis_capability::CapabilityVerifier::new(verifying_key);
         for binding in deis_capability::STORE_BINDINGS {
             verifier
-                .verify(token, "store", "demo.production", binding)
+                .verify(token, "store", &tenant, binding)
                 .unwrap_or_else(|e| panic!("store/{binding}: {e}"));
         }
         verifier
             .verify(
                 body["queue_token"].as_str().unwrap(),
                 "queue",
-                "demo.production",
+                &tenant,
                 "queue",
             )
             .expect("the queue token is accepted by deis-queue");
@@ -260,7 +264,8 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::OK, "{preview}");
-        assert_eq!(preview["tenant"], "demo.preview");
+        assert_ne!(preview["tenant"], production["tenant"]);
+        assert!(preview["tenant"].as_str().unwrap().starts_with("v1/"));
         assert_ne!(production["token"], preview["token"]);
     }
 

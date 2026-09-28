@@ -1438,6 +1438,7 @@ impl DeploymentManager {
             // Resolved once, here, and asked as a bit test on every request
             // from here on; see `deis_bundle::compatibility`.
             compatibility,
+            storage_tenant: order.canonical_tenant,
             ..Default::default()
         };
 

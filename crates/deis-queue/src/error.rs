@@ -35,9 +35,6 @@ pub enum QueueError {
     /// A tokio blocking task panicked or was cancelled. Nothing to do with a
     /// Cloudflare Worker: this service never runs application code.
     BlockingTask(String),
-    /// The data directory was written before the queue was keyed by tenant,
-    /// so nothing in it can be delivered. Startup only; see [`crate::legacy`].
-    LegacyData(String),
 }
 
 impl fmt::Display for QueueError {
@@ -54,7 +51,6 @@ impl fmt::Display for QueueError {
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::BlockingTask(m) => write!(f, "blocking task: {m}"),
-            Self::LegacyData(m) => write!(f, "data predates the tenant contract: {m}"),
         }
     }
 }
@@ -104,7 +100,6 @@ impl From<QueueError> for Status {
             // Nothing the caller sent is wrong and no retry helps: the
             // service is standing on data it cannot use, and an operator has
             // to move it aside first.
-            QueueError::LegacyData(_) => Code::FailedPrecondition,
             QueueError::Sqlite(_) | QueueError::Io(_) | QueueError::BlockingTask(_) => {
                 Code::Internal
             }
@@ -143,7 +138,6 @@ mod tests {
                 Code::Internal,
             ),
             (QueueError::BlockingTask("x".into()), Code::Internal),
-            (QueueError::LegacyData("x".into()), Code::FailedPrecondition),
         ];
         for (err, want) in cases {
             let status: Status = err.into();

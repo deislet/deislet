@@ -5695,7 +5695,6 @@
               "deploy",
               "promote",
               "rollback",
-              "migrate",
               "export",
               "delete",
               "restore",
@@ -7238,7 +7237,7 @@
             "type": "string"
           },
           "tenant": {
-            "description": "The `<app>.<environment>` pair the token authorises. Included so\na caller never has to rebuild it, and so the tenant this control\nplane signed is visible to anyone debugging a refused call.",
+            "description": "The canonical tenant (`v1/<application id>/<environment id>`) the\ntokens name. deis-store and deis-queue act for exactly this tenant;\nit is returned so the tenant this control plane signed is visible to\nanyone debugging a refused call.",
             "type": "string"
           },
           "token": {

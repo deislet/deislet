@@ -34,11 +34,11 @@
 //! blob/<namespace>/<aa>/<bb>/<sha256>   object content, addressed by digest
 //! ```
 //!
-//! `<namespace>` is the tenant - `demo.production` - for a call that names no
-//! binding, and `demo.production@MEDIA` for one that names `MEDIA`. Both are
-//! ordinary names on disk here; see [`tenant`] for why a binding cannot widen
-//! which tenant is addressed, and [`legacy`] for the startup check that has
-//! to know both forms.
+//! `<namespace>` is the canonical tenant key -
+//! `ct1_<application id>_<environment id>` - for a call that names no
+//! binding, and `ct1_<application id>_<environment id>@MEDIA` for one that
+//! names `MEDIA`. See [`tenant`] for why a binding cannot widen which tenant
+//! is addressed.
 //!
 //! This directory is the only copy of every tenant's data, and it cannot be
 //! backed up by copying it: SQLite runs in WAL mode here, so a plain `cp -r`
@@ -48,35 +48,18 @@
 //! --from DIR` - and that module documents what a snapshot does and does not
 //! promise.
 //!
-//! The tenant id is a directory name and a database file name, which is why
-//! it is validated hard rather than sanitised: the character set has no `.`,
-//! `/` or `\` in either half, so no accepted value can name a parent
-//! directory. See [`tenant`].
+//! The namespace key is a directory name and a database file name. It holds
+//! no `.`, `/` or `\`, so no accepted value can name a parent directory. See
+//! [`tenant`].
 //!
-//! # A data directory from before this change is not readable
+//! # Trust model: the capability names the tenant
 //!
-//! Storage used to be keyed by a bare application id: an `app_id` column,
-//! `db/<app>.sqlite`, `blob/<app>/...`. Those names do not exist under the
-//! tenant scheme and nothing looks for them, so an old data directory holds
-//! data no application can reach. There is no migration - this is a
-//! development platform with no deployed data, and inventing an environment
-//! for old rows would be inventing where production data belongs.
-//!
-//! What there is instead is a refusal: the service checks at startup and
-//! will not serve over a data directory in the old shape, because the
-//! alternative is a store that looks healthy while every read answers "not
-//! found". See [`legacy`].
-//!
-//! # Trust model: a tenant is claimed in a header and proved with a token
-//!
-//! Every request names its tenant in `x-deis-tenant`. On its own that is a
-//! claim: the header says which namespace the caller wants, and nothing in
-//! it says the caller is entitled to it. What goes with the claim is a
-//! capability token in `Authorization: Bearer <token>`, an Ed25519-signed
-//! JCS-JWT minted by deis-control and verified against the control plane's
-//! public key. The token's resources must include a (tenant, binding) pair
-//! that matches the request, so a token minted for one application opens
-//! nothing for another. See [`auth`].
+//! Every call carries a capability token in `Authorization: Bearer <token>`,
+//! an Ed25519-signed JCS-JWT minted by deis-control and verified against the
+//! control plane's published keys. The tenant a call acts for is the one
+//! tenant that token names for the service's binding; nothing in the request
+//! names it, so a token minted for one application environment opens nothing
+//! for another. See [`auth`].
 //!
 //! Every call must carry a valid capability token. There is no anonymous or
 //! loopback bypass. The verifying key is obtained from the control plane's
@@ -107,7 +90,6 @@ pub mod config;
 pub mod database;
 pub mod error;
 pub mod kv;
-pub mod legacy;
 pub mod proto;
 pub mod server;
 pub mod snapshot;

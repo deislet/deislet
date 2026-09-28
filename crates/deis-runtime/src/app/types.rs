@@ -61,6 +61,14 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub permissions: AppPermissions,
+
+    /// The canonical tenant (`v1/<application id>/<environment id>`) this
+    /// application's storage and queue calls are charged to, as the control
+    /// plane sent it with the deployment. `None` only for an application
+    /// that reaches no storage service; building a storage client without
+    /// it fails the load.
+    #[serde(default)]
+    pub storage_tenant: Option<deis_wire::CanonicalTenantId>,
 }
 
 /// Prints the shape of the configuration and the *names* of the environment
@@ -89,6 +97,7 @@ impl std::fmt::Debug for AppConfig {
             .field("resources", &self.resources)
             .field("routes", &self.routes)
             .field("permissions", &self.permissions)
+            .field("storage_tenant", &self.storage_tenant)
             .finish()
     }
 }

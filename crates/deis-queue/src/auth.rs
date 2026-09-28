@@ -1,18 +1,23 @@
-//! Proving that a caller may act as the tenant it names.
+//! Which tenant a caller is.
 //!
-//! Every request names its tenant in `x-deis-tenant` and carries an
-//! Ed25519-signed capability token in `Authorization: Bearer <token>`.
-//! The capability is verified against the control plane's published keys
-//! (picked by the token's `kid`), and
-//! the token's resources must include at least one (tenant, "queue") pair.
+//! Every request carries an Ed25519-signed capability token in
+//! `Authorization: Bearer <token>`, verified against the control plane's
+//! published keys (picked by the token's `kid`). The tenant the call acts
+//! for is the one tenant the token names for the `queue` binding - the
+//! request itself names none - and it reaches the handler as a
+//! [`CallerTenant`] extension. A token naming no tenant or several is
+//! refused.
 //!
 //! There is no loopback bypass and no anonymous mode: every call must
 //! present a valid capability token. The verifying keys come from the
 //! control plane's JWKS, kept current by a background refresher the binary
 //! starts (see `deis_capability::fetch`); this module only reads them.
 
-use deis_capability::{CapabilityError, CapabilityVerifier, KeyRing, SharedVerifier, VerifiedCapability};
-use deis_wire::conventions::TENANT_HEADER;
+use crate::tenant::CallerTenant;
+use deis_capability::{
+    AUD_QUEUE, CapabilityError, CapabilityVerifier, KeyRing, SharedVerifier, VerifiedCapability,
+};
+use deis_wire::CanonicalTenantId;
 use tonic::{Request, Status};
 
 /// The header carrying the capability token.
@@ -20,6 +25,9 @@ const AUTHORIZATION_HEADER: &str = "authorization";
 
 /// The scheme prefix on an `Authorization` value.
 const BEARER_PREFIX: &str = "bearer ";
+
+/// The one binding deis-queue serves.
+const QUEUE_BINDING: &str = "queue";
 
 /// What the process checks on every queue call.
 ///
@@ -52,15 +60,6 @@ impl QueueAuth {
         true
     }
 
-    /// Extract the tenant from request headers.
-    fn tenant_from_request<T>(request: &Request<T>) -> Option<String> {
-        request
-            .metadata()
-            .get(TENANT_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-    }
-
     /// Extract the bearer token from the Authorization header.
     fn token_from_request<T>(request: &Request<T>) -> Option<String> {
         let value = request
@@ -76,26 +75,28 @@ impl QueueAuth {
         }
     }
 
-    /// Verify the caller's capability token.
-    ///
-    /// The binding is always `"queue"` for the queue service.
-    pub async fn verify<T>(
+    /// Verify the caller's capability token and return the tenant it names.
+    pub fn verify<T>(
         &self,
         request: &Request<T>,
-    ) -> Result<VerifiedCapability, CapabilityError> {
+    ) -> Result<(VerifiedCapability, CanonicalTenantId), CapabilityError> {
         let token = Self::token_from_request(request).ok_or_else(|| {
             CapabilityError::ParseError(
                 "missing or malformed Authorization: Bearer <token> header".to_string(),
             )
         })?;
-        let tenant = Self::tenant_from_request(request).ok_or_else(|| {
-            CapabilityError::ParseError(format!("missing or unreadable {TENANT_HEADER} header"))
-        })?;
-
-        self.verifier
+        let verified = self
+            .verifier
             .lock()
             .expect("lock poisoned")
-            .verify_with_grace(&token, "queue", &tenant, "queue")
+            .verify_tenant_with_grace(&token, AUD_QUEUE, QUEUE_BINDING)?;
+        let tenant = verified
+            .canonical_tenant_id
+            .parse::<CanonicalTenantId>()
+            .map_err(|_| CapabilityError::TenantNotAuthorized {
+                tenant: verified.canonical_tenant_id.clone(),
+            })?;
+        Ok((verified, tenant))
     }
 }
 
@@ -112,24 +113,15 @@ impl std::fmt::Debug for QueueAuth {
 /// Applied by [`crate::server`] to every service, so the check runs before
 /// any handler and no queue path has to remember it.
 impl tonic::service::Interceptor for QueueAuth {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        let verifier = self.verifier.clone();
-
-        let tenant = Self::tenant_from_request(&request);
-        let token = Self::token_from_request(&request);
-
-        let v = verifier.lock().expect("lock poisoned");
-        let t = token.as_deref().unwrap_or("");
-        let ten = tenant.as_deref().unwrap_or("");
-        let result = v.verify_with_grace(t, "queue", ten, "queue");
-
-        match result {
-            Ok(verified) => {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        match self.verify(&request) {
+            Ok((verified, tenant)) => {
                 tracing::debug!(
                     node_id = %verified.node_id,
                     tenant = %verified.canonical_tenant_id,
                     "queue capability verified"
                 );
+                request.extensions_mut().insert(CallerTenant(tenant));
                 Ok(request)
             }
             Err(e) => Err(map_capability_error(e)),
@@ -172,6 +164,10 @@ fn map_capability_error(e: CapabilityError) -> Status {
         }
         CapabilityError::BindingNotAuthorized { .. } => {
             tracing::warn!("refused a queue call whose capability does not authorize the binding");
+            Status::permission_denied(e.to_string())
+        }
+        CapabilityError::NoSingleTenant { .. } => {
+            tracing::warn!("refused a queue call whose capability does not name exactly one tenant");
             Status::permission_denied(e.to_string())
         }
         CapabilityError::AuthEpochTooLow { .. } => {

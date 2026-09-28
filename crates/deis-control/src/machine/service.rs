@@ -1315,6 +1315,15 @@ mod tests {
         }
     }
 
+    /// The canonical tenant of `app`'s production environment: what a node
+    /// names in a store or queue capability request.
+    async fn production_tenant(state: &CatalogState, app: &str) -> String {
+        let env = state.store.get_environment(app, "production").await.unwrap();
+        crate::api::catalog::assignments::canonical_tenant_of(state, app, &env.id)
+            .await
+            .unwrap()
+    }
+
     async fn issuance_refusals(state: &CatalogState) -> Vec<crate::audit::AuditEntry> {
         AuditStore::new(state.store.database())
             .query_page(
@@ -1354,6 +1363,7 @@ mod tests {
         let h = harness(true).await;
         deployed_with_secret(&h).await;
         let service = make_service(h.state.clone());
+        let tenant = production_tenant(&h.state, "demo").await;
 
         for aud in [AUD_STORE, AUD_QUEUE] {
             let answer = service
@@ -1362,7 +1372,7 @@ mod tests {
                     capability_request(
                         "runtime-test",
                         aud,
-                        &resources_for_audience("demo.production", aud),
+                        &resources_for_audience(&tenant, aud),
                     ),
                 ))
                 .await
@@ -1398,8 +1408,10 @@ mod tests {
         deployed_with_secret(&h).await;
         let service = make_service(h.state.clone());
 
-        let mut asked = resources_for_audience("demo.production", AUD_STORE);
-        asked.extend(resources_for_audience("victim.production", AUD_STORE));
+        let victim = deis_wire::CanonicalTenantId::derived_from_label("victim.production").to_string();
+        let mut asked =
+            resources_for_audience(&production_tenant(&h.state, "demo").await, AUD_STORE);
+        asked.extend(resources_for_audience(&victim, AUD_STORE));
         let refusal = service
             .issue_capability(from(
                 &node("runtime-test"),
@@ -1408,7 +1420,7 @@ mod tests {
             .await
             .expect_err("a node minted a capability for a tenant it does not run");
         assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
-        assert!(refusal.message().contains("victim.production"));
+        assert!(refusal.message().contains(&victim));
         assert!(issued_jtis(&h.state).await.is_empty(), "nothing was issued");
 
         let lines = issuance_refusals(&h.state).await;
@@ -1481,13 +1493,14 @@ mod tests {
         let h = harness(true).await;
         let (deployment_id, revision) = deployed_with_secret(&h).await;
         let service = make_service(h.state.clone());
+        let tenant = production_tenant(&h.state, "demo").await;
         let ask = || {
             from(
                 &node("runtime-test"),
                 capability_request(
                     "runtime-test",
                     AUD_STORE,
-                    &resources_for_audience("demo.production", AUD_STORE),
+                    &resources_for_audience(&tenant, AUD_STORE),
                 ),
             )
         };

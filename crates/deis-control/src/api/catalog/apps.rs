@@ -290,8 +290,8 @@ pub async fn delete_app(
         app_id,
         retained_note: format!(
             "{}. No part of this platform deletes it. The name is retained until it is released \
-             with DELETE /api/retired-apps/{}, so nothing can be deployed onto that data by \
-             accident",
+             with DELETE /api/retired-apps/{}, so nothing scoped to the name - tokens, hostname \
+             grants - passes to the next application of that name by accident",
             retained.describe_data(),
             retained.app_id
         ),
@@ -386,11 +386,10 @@ pub async fn release_retired_app(
     Ok(Json(ReleaseRetiredAppResponse {
         app_id: released.app_id.clone(),
         accepted: format!(
-            "{} is free again. {}, and the next application created under this name is that same \
-             tenant: it will read and overwrite whatever is there. Credentials follow the name \
-             too - a token scoped to this application, or a storage capability token minted for \
-             one of those tenants, still authorises the next one, so revoke what the deleted \
-             application's owner still holds",
+            "{} is free again. {}; the next application created under this name gets new \
+             canonical ids and does not see that data. Credentials scoped to the name do follow \
+             it - a token scoped to this application still authorises the next one - so revoke \
+             what the deleted application's owner still holds",
             released.app_id,
             released.describe_data()
         ),
@@ -538,7 +537,7 @@ mod tests {
         let h = platform().await;
         app_with_production(&h, "victim").await;
         let before = storage_token(&h, "victim").await;
-        assert_eq!(before["tenant"], "victim.production");
+        assert!(before["tenant"].as_str().unwrap().starts_with("v1/"));
 
         let (status, deleted) = json(&h.router, "DELETE", "/api/apps/victim", Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{deleted}");
@@ -598,12 +597,12 @@ mod tests {
         )
         .await;
         let after = storage_token(&h, "victim").await;
-        assert_eq!(after["tenant"], before["tenant"]);
+        assert_ne!(
+            after["tenant"], before["tenant"],
+            "a re-created application is a new canonical tenant and never sees the old data"
+        );
 
-        // Both tokens must be valid Ed25519 capabilities for the same tenant.
-        // They differ byte-for-byte (random jti), but authorise the same tenant
-        // because releasing a name means someone else can now use it under the
-        // same `<app>.<environment>` string.
+        // Each token authorises its own canonical tenant and not the other.
         let verifying_key = h.state.issuer.verifying_key().await;
         let before_claims =
             deis_capability::decode(before["token"].as_str().unwrap(), &verifying_key)
@@ -611,15 +610,8 @@ mod tests {
         let after_claims =
             deis_capability::decode(after["token"].as_str().unwrap(), &verifying_key)
                 .expect("after token must be a valid Ed25519 capability");
-        assert!(
-            before_claims.authorizes_tenant("victim.production"),
-            "before token must authorise the tenant"
-        );
-        assert!(
-            after_claims.authorizes_tenant("victim.production"),
-            "the tenant key is (application, environment) by design; releasing the name is the \
-             moment somebody accepted that"
-        );
+        assert!(before_claims.authorizes_tenant(before["tenant"].as_str().unwrap()));
+        assert!(!after_claims.authorizes_tenant(before["tenant"].as_str().unwrap()));
     }
 
     /// A name nothing retired must not answer "released": a caller that

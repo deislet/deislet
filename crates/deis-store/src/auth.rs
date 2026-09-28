@@ -1,11 +1,12 @@
-//! Proving that a caller may act as the tenant it names.
+//! Which tenant a caller is.
 //!
-//! Every request names its tenant in `x-deis-tenant` and carries an
-//! Ed25519-signed capability token in `Authorization: Bearer <token>`.
-//! The capability is verified against the control plane's published keys
-//! (picked by the token's `kid`), and
-//! the token's resources must include at least one (tenant, binding) pair
-//! that matches the request.
+//! Every request carries an Ed25519-signed capability token in
+//! `Authorization: Bearer <token>`, verified against the control plane's
+//! published keys (picked by the token's `kid`). The tenant the call acts
+//! for is the one tenant the token names for this service's binding - the
+//! request itself names none - and it reaches the handler as a
+//! [`CallerTenant`] extension. A token naming no tenant or several for the
+//! binding is refused.
 //!
 //! There is no loopback bypass and no anonymous mode: every call must
 //! present a valid capability token. The verifying keys come from the
@@ -23,8 +24,9 @@
 //! probe that needs a tenant credential is a probe the control plane cannot
 //! make.
 
-use deis_capability::{CapabilityError, SharedVerifier, VerifiedCapability};
-use deis_wire::conventions::TENANT_HEADER;
+use crate::tenant::CallerTenant;
+use deis_capability::{AUD_STORE, CapabilityError, SharedVerifier, VerifiedCapability};
+use deis_wire::CanonicalTenantId;
 use tonic::{Request, Status};
 
 /// The header carrying the capability token.
@@ -72,15 +74,6 @@ impl StorageAuth {
         true
     }
 
-    /// Extract the tenant from request headers.
-    fn tenant_from_request<T>(request: &Request<T>) -> Option<String> {
-        request
-            .metadata()
-            .get(TENANT_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-    }
-
     /// Extract the bearer token from the Authorization header.
     fn token_from_request<T>(request: &Request<T>) -> Option<String> {
         let value = request
@@ -96,24 +89,28 @@ impl StorageAuth {
         }
     }
 
-    /// Verify the caller's capability token.
-    pub async fn verify<T>(
+    /// Verify the caller's capability token and return the tenant it names.
+    pub fn verify<T>(
         &self,
         request: &Request<T>,
-    ) -> Result<VerifiedCapability, CapabilityError> {
+    ) -> Result<(VerifiedCapability, CanonicalTenantId), CapabilityError> {
         let token = StorageAuth::token_from_request(request).ok_or_else(|| {
             CapabilityError::ParseError(
                 "missing or malformed Authorization: Bearer <token> header".to_string(),
             )
         })?;
-        let tenant = StorageAuth::tenant_from_request(request).ok_or_else(|| {
-            CapabilityError::ParseError(format!("missing or unreadable {TENANT_HEADER} header"))
-        })?;
-
-        self.verifier
+        let verified = self
+            .verifier
             .lock()
             .expect("lock poisoned")
-            .verify_with_grace(&token, "store", &tenant, self.binding)
+            .verify_tenant_with_grace(&token, AUD_STORE, self.binding)?;
+        let tenant = verified
+            .canonical_tenant_id
+            .parse::<CanonicalTenantId>()
+            .map_err(|_| CapabilityError::TenantNotAuthorized {
+                tenant: verified.canonical_tenant_id.clone(),
+            })?;
+        Ok((verified, tenant))
     }
 }
 
@@ -130,25 +127,16 @@ impl std::fmt::Debug for StorageAuth {
 /// Applied by [`crate::server`] to every service, so the check runs before
 /// any handler and no storage path has to remember it.
 impl tonic::service::Interceptor for StorageAuth {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        let verifier = self.verifier.clone();
-        let binding = self.binding;
-        let tenant = Self::tenant_from_request(&request);
-        let token = Self::token_from_request(&request);
-
-        let v = verifier.lock().expect("lock poisoned");
-        let t = token.as_deref().unwrap_or("");
-        let ten = tenant.as_deref().unwrap_or("");
-        let result = v.verify_with_grace(t, "store", ten, binding);
-
-        match result {
-            Ok(verified) => {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        match self.verify(&request) {
+            Ok((verified, tenant)) => {
                 tracing::debug!(
                     node_id = %verified.node_id,
                     tenant = %verified.canonical_tenant_id,
                     binding = %verified.binding,
                     "capability verified"
                 );
+                request.extensions_mut().insert(CallerTenant(tenant));
                 Ok(request)
             }
             Err(e) => Err(map_capability_error(e)),
@@ -192,6 +180,13 @@ fn map_capability_error(e: CapabilityError) -> Status {
         CapabilityError::BindingNotAuthorized { .. } => {
             tracing::warn!(
                 "refused a storage call whose capability does not authorize the requested binding"
+            );
+            Status::permission_denied(e.to_string())
+        }
+        CapabilityError::NoSingleTenant { .. } => {
+            tracing::warn!(
+                "refused a storage call whose capability does not name exactly one tenant for \
+                 this binding"
             );
             Status::permission_denied(e.to_string())
         }
@@ -274,7 +269,10 @@ mod tests {
             "spiffe://deis.internal/deislet/node/n1",
             1,
             std::time::Duration::from_secs(900),
-            resources_for_audience("app.production", AUD_STORE),
+            resources_for_audience(
+                &CanonicalTenantId::derived_from_label("app.production").to_string(),
+                AUD_STORE,
+            ),
         );
         let token = encode(&claims, &signing);
         let request = |token: &str| {
@@ -284,12 +282,13 @@ mod tests {
                 format!("Bearer {token}").parse().unwrap(),
             );
             request
-                .metadata_mut()
-                .insert(TENANT_HEADER, "app.production".parse().unwrap());
-            request
         };
         for mut guard in guards.clone() {
-            tonic::service::Interceptor::call(&mut guard, request(&token)).unwrap();
+            let admitted = tonic::service::Interceptor::call(&mut guard, request(&token)).unwrap();
+            assert_eq!(
+                admitted.extensions().get::<CallerTenant>(),
+                Some(&CallerTenant(CanonicalTenantId::derived_from_label("app.production")))
+            );
         }
 
         let signed = revocation::sign(

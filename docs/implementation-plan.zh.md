@@ -85,8 +85,8 @@ date、账号与作用域 token 与审计日志、ACME 签发与续期、回滚�
 
 这个维度是什么，deis-store / deis-queue 与 deis-telemetry 的答案不同，原因也不同：
 
-- **deis-store 与 deis-queue** 认的是**租户** `<应用>.<环境>`（例如 `demo.production`），走 `x-deis-tenant` 头，服务端用 `deis_wire::conventions::split_tenant` 校验。它们看不见「环境」这个概念，租户 id 对它们只是一把更长的、不透明的钥匙。之所以要把环境揉进这把钥匙：预览环境一旦能读写生产的 KV / 库 / 对象 / 队列，覆盖掉的数据是回滚不回来的——回滚只换代码，不还数据。
-- **deis-telemetry** 的查询维度是**应用**，环境作为普通字段（日志）、普通标签（指标）或显式属性（trace）随行。它不按环境分物理区，应用数据凭证也不提供租户隔离：能持有共享 telemetry token 的调用方仍能读写任意 app。迁移管理例外地把三种表达统一映射回 `<应用>.<环境>`，用独立管理员凭证和提交边界 writer fence 冻结指定环境；这不改变日常查询仍可覆盖一个应用全部环境的产品语义。
+- **deis-store 与 deis-queue** 认的是**租户**，即 canonical id `v1/<应用 id>/<环境 id>`（`CanonicalTenantId`）。租户不由请求决定：服务从调用携带的 capability 中取出它为本 binding 命名的唯一租户，落盘键为 `ct1_<应用 id>_<环境 id>`。它们看不见「环境」这个概念，租户 id 对它们只是一把不透明的钥匙。之所以要把环境揉进这把钥匙：预览环境一旦能读写生产的 KV / 库 / 对象 / 队列，覆盖掉的数据是回滚不回来的——回滚只换代码，不还数据。
+- **deis-telemetry** 的查询维度是**应用**，环境作为普通字段（日志）、普通标签（指标）或显式属性（trace）随行。它不按环境分物理区，应用数据凭证也不提供租户隔离：能持有共享 telemetry token 的调用方仍能读写任意 app。记录按 `<应用>.<环境>` 标签归属。
 
 ---
 
@@ -500,7 +500,7 @@ authoritative assignment 会按 durable plan state 发 `prepare` 或 `activate`�
 
 ## 5. 三个新组件
 
-deis-store 与 deis-queue 按**租户**隔离数据，租户 id 是 `conventions::tenant_id(app, environment)` 的结果（`demo.production`），由调用方在 `x-deis-tenant` 头里带来；deis-telemetry 按应用聚合。三个都用 SQLite 起步（内部规模足够，且省去外部依赖）。
+deis-store 与 deis-queue 按**租户**隔离数据，租户是 capability 命名的 canonical id `v1/<应用 id>/<环境 id>`，请求本身不携带租户；deis-telemetry 按应用聚合。三个都用 SQLite 起步（内部规模足够，且省去外部依赖）。
 
 **现状**：三个组件都已建好并在 `scripts/demo.sh` 里被真实调用。
 
@@ -682,7 +682,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 **一、环境即身份。** 节点上一个应用原先只按 `app_id` 记，于是同一应用的生产与预览在节点上共用一个槽位——后到的那份会把先到的版本、环境变量和密钥整个盖掉，日志里一个字都没有。现在运行中的应用由 `(app_id, environment)` 这对值标识：
 
 - 数据面 `deis-proxy → deis-runtime` 除 `x-deis-app-id` 外新增 `x-deis-environment`；不带等于 `production`，所以老调用方仍然落到生产而不是被拒。
-- 存储面 `deis-runtime → deis-store / deis-queue` 走 `x-deis-tenant`，值是 `conventions::tenant_id(app, env)`（`demo.production`），见 §5。
+- 存储面 `deis-runtime → deis-store / deis-queue` 的租户由 capability 决定（canonical id `v1/<应用 id>/<环境 id>`），见 §5。
 - 环境名不再允许 `.`（要满足 `is_valid_tenant_part`）：带点会让 `split_tenant` 切出三段被存储拒绝，应用能跑但 kv/db/blob/queue 全废。构造预览环境名请用 `-`（`pr-42-1` 而不是 `pr-42.1`）。
 
 **二、节点通道单独鉴权。** `GET /api/nodes/{id}/assignments` 会把全部环境的明文密钥当 JSON 返回，而它原先只挂在面板的 `api_key_auth` 上，`api_auth_enabled` 默认 false——默认配置下任何能连到控制面 HTTP 端口的人 curl 一次就能拿走整个平台的密钥。后来它和 bundle 下载一起挂在独立的 `node_auth` 上（这个中间态凭据复用节点注册时已在用的 `node_preshared_keys`，不受 `api_auth_enabled` 影响，也不接受面板 API Key；节点侧对应加了 `[control] secret`，只发往配置里那个控制面地址）。

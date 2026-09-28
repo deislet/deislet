@@ -43,6 +43,16 @@ impl CanonicalTenantId {
         self.environment_id
     }
 
+    /// A tenant derived deterministically from `label`, for fixtures and
+    /// tests; see [`CanonicalId::derived_from_label`].
+    #[must_use]
+    pub fn derived_from_label(label: &str) -> Self {
+        Self::new(
+            CanonicalId::derived_from_label(&format!("{label}/application")),
+            CanonicalId::derived_from_label(&format!("{label}/environment")),
+        )
+    }
+
     /// Decode the additive two-field form used by protobuf and legacy-tolerant
     /// JSON contracts.
     ///

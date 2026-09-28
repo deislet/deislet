@@ -2027,10 +2027,21 @@ impl RuntimePool {
         replacing: bool,
     ) -> Result<StagedVersion> {
         let wiring = ServiceWiring::take_from_env(&mut spec.env);
-        let storage_tenant = spec
-            .storage_tenant
-            .clone()
-            .unwrap_or_else(|| tenant.clone());
+        // Empty when the version names no canonical tenant: fine for an
+        // application that reaches no storage service, refused when a
+        // storage client is built for one that does.
+        let storage_tenant = spec.storage_tenant.clone().unwrap_or_default();
+        // Tests name tenants by label; see the same step in `AppRuntime::new`.
+        #[cfg(test)]
+        let storage_tenant = crate::runtime::tenant::test_tenant(if storage_tenant.is_empty() {
+            &tenant
+        } else {
+            &storage_tenant
+        });
+        #[cfg(test)]
+        {
+            spec.storage_tenant = Some(storage_tenant.clone());
+        }
         let execution_timeout = Duration::from_millis(spec.limits.timeout_ms);
 
         // Reserved before the isolate is built, so no second load can be sent

@@ -29,7 +29,8 @@ const MULTI_CHUNK_LEN: usize = 2 * 1024 * 1024 + 4242;
 /// bare application id is refused by [`StorageIdentity`].
 fn client(store: &TestStore, tenant: &str) -> BlobClient {
     let token = store.capability_token_for(tenant, "blob");
-    let identity = StorageIdentity::new(tenant, Some(&token)).expect("a legal tenant");
+    let identity = StorageIdentity::new(crate::runtime::tenant::test_tenant(tenant), Some(&token))
+        .expect("a legal tenant");
     BlobClient::connect_lazy(&store.endpoint, &identity).expect("client is built")
 }
 

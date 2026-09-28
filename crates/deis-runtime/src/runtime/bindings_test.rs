@@ -14,7 +14,7 @@ mod tests {
     /// `AppServices` holds gRPC clients and cannot derive `Debug`, so the
     /// `expect` family is unavailable; this keeps the failure message useful.
     fn connect_or_panic(tenant: &str, wiring: &ServiceWiring) -> AppServices {
-        match AppServices::connect(tenant, wiring) {
+        match AppServices::connect(&crate::runtime::tenant::test_tenant(tenant), wiring) {
             Ok(services) => services,
             Err(error) => panic!("connecting services for {tenant} failed: {error}"),
         }
@@ -253,21 +253,22 @@ mod tests {
         // preview that stamped only "demo-app" would read and overwrite what
         // production stored.
         let services = connect_or_panic("demo-app.preview-7", &wiring);
+        let tenant = crate::runtime::tenant::test_tenant("demo-app.preview-7");
         assert_eq!(
             services.kv.get("").map(|c| c.tenant()),
-            Some("demo-app.preview-7")
+            Some(tenant.as_str())
         );
         assert_eq!(
             services.database.get("").map(|c| c.tenant()),
-            Some("demo-app.preview-7")
+            Some(tenant.as_str())
         );
         assert_eq!(
             services.blob.get("").map(|c| c.tenant()),
-            Some("demo-app.preview-7")
+            Some(tenant.as_str())
         );
         assert_eq!(
             services.queue.as_ref().map(|c| c.tenant()),
-            Some("demo-app.preview-7")
+            Some(tenant.as_str())
         );
     }
 
@@ -289,11 +290,11 @@ mod tests {
         };
 
         let error = match AppServices::connect("demo", &wiring) {
-            Ok(_) => panic!("a bare application id names no environment and must be refused"),
+            Ok(_) => panic!("a bare application id is not a canonical tenant and must be refused"),
             Err(error) => error,
         };
         assert!(
-            error.to_string().contains("not a storage tenant"),
+            error.to_string().contains("not a canonical storage tenant"),
             "{error}"
         );
     }
@@ -327,7 +328,7 @@ mod tests {
             consumers: Vec::new(),
             ..ServiceWiring::default()
         };
-        let error = match AppServices::connect("demo.production", &wiring) {
+        let error = match AppServices::connect(&crate::runtime::tenant::test_tenant("demo.production"), &wiring) {
             Ok(_) => panic!("an address that is not a URL must be refused"),
             Err(error) => error,
         };
@@ -349,7 +350,7 @@ mod tests {
             consumers: Vec::new(),
             ..ServiceWiring::default()
         };
-        let services = match AppServices::connect("demo.production", &wiring) {
+        let services = match AppServices::connect(&crate::runtime::tenant::test_tenant("demo.production"), &wiring) {
             Ok(services) => services,
             Err(error) => panic!("a lazy client is built even when nothing answers: {error}"),
         };
@@ -610,17 +611,19 @@ mod tests {
     fn a_blank_token_counts_as_absent() {
         // An empty header would be presented as a token and refused, which
         // reads as a bad credential rather than as none yet.
-        let identity = StorageIdentity::new("demo.production", Some("   ")).expect("a tenant");
+        let identity = StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), Some("   ")).expect("a tenant");
         assert!(!identity.is_proven());
     }
 
     #[test]
-    fn a_storage_call_carries_the_tenant_and_the_proof_together() {
-        // Both headers or neither: a call with the tenant alone is refused by
-        // every data service, and a token without the tenant
-        // names no namespace at all.
-        let identity = StorageIdentity::new("demo.production", Some("a-minted-token"))
-            .expect("a legal tenant and a sendable token");
+    fn a_storage_call_carries_the_proof_and_no_tenant_header() {
+        // The data services take the tenant from the capability, so the
+        // capability is the whole of what a call has to carry.
+        let identity = StorageIdentity::new(
+            crate::runtime::tenant::test_tenant("demo.production"),
+            Some("a-minted-token"),
+        )
+        .expect("a legal tenant and a sendable token");
         let request = identity.stamp(());
 
         let header = |name: &str| {
@@ -630,10 +633,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string)
         };
-        assert_eq!(
-            header(deis_wire::conventions::TENANT_HEADER).as_deref(),
-            Some("demo.production")
-        );
+        assert_eq!(header("x-deis-tenant"), None);
         assert_eq!(
             header("authorization").as_deref(),
             Some("Bearer a-minted-token")
@@ -642,15 +642,11 @@ mod tests {
     }
 
     #[test]
-    fn a_node_with_no_token_still_names_its_tenant() {
-        // The single-box default. Stamping an empty token instead would turn
-        // a working install into one where every call is refused.
-        let identity = StorageIdentity::new("demo.production", None).expect("a legal tenant");
+    fn a_node_with_no_token_yet_sends_no_authorization() {
+        let identity =
+            StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), None)
+                .expect("a legal tenant");
         let request = identity.stamp(());
-        assert!(request
-            .metadata()
-            .get(deis_wire::conventions::TENANT_HEADER)
-            .is_some());
         assert!(request.metadata().get("authorization").is_none());
         assert!(!identity.is_proven());
     }
@@ -660,7 +656,7 @@ mod tests {
         // A value that is not sendable metadata can only be a control plane
         // that handed this node something that was never a token, and every
         // storage call would fail with a message about the tenant instead.
-        let error = StorageIdentity::new("demo.production", Some("line\nbreak"))
+        let error = StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), Some("line\nbreak"))
             .expect_err("a token with a control character cannot be sent");
         assert!(
             error
@@ -696,7 +692,7 @@ mod tests {
             1,
             std::time::Duration::from_secs(900),
             vec![deis_capability::CapabilityResource {
-                tenant: tenant.to_string(),
+                tenant: crate::runtime::tenant::test_tenant(tenant),
                 binding: "kv".to_string(),
                 generation: None,
             }],
@@ -766,7 +762,7 @@ mod tests {
         );
         assert!(rendered.contains("<present>"), "{rendered}");
 
-        let identity = StorageIdentity::new("demo.production", Some("a-minted-token"))
+        let identity = StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), Some("a-minted-token"))
             .expect("a legal tenant");
         let rendered = format!("{identity:?}");
         assert!(

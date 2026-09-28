@@ -1,9 +1,8 @@
 # deis-store
 
 KV, per-tenant SQL and content-addressed blobs, as three gRPC services in one
-process on SQLite and the local disk. Every call is scoped by the
-`x-deis-tenant` header and proved by an Ed25519 capability the control plane
-signed for that tenant; the listener speaks TLS only. The crate docs in `src/lib.rs` describe the
+process on SQLite and the local disk. Every call acts for the one tenant named
+by the Ed25519 capability the control plane signed for it; the listener speaks TLS only. The crate docs in `src/lib.rs` describe the
 layout; `proto/storage.proto` and `proto/blob.proto` are the contracts.
 
 The data directory also holds `backend-incarnation`, the UUIDv7 that names

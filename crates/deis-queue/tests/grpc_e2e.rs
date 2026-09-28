@@ -33,9 +33,9 @@ use deis_queue::proto::queue::{
     PullRequest, QueueMessage, ReplayDeadLettersRequest, SendBatchRequest, SendRequest,
     queue_client::QueueClient,
 };
-use deis_queue::tenant::TENANT_HEADER;
 use deis_queue::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, tenant_id};
+use deis_wire::CanonicalTenantId;
+use deis_wire::conventions::{DEPLOYMENT_GENERATION_HEADER, tenant_id};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -65,9 +65,15 @@ fn test_signing_key() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&seed)
 }
 
+/// The canonical tenant a test label stands for.
+fn canonical(label: &str) -> String {
+    CanonicalTenantId::derived_from_label(label).to_string()
+}
+
 /// Mint a capability token for `tenant` with audience `"queue"` and binding
 /// `"queue"`.
 fn queue_capability(signing_key: &ed25519_dalek::SigningKey, tenant: &str) -> String {
+    let tenant = canonical(tenant);
     let claims = CapabilityClaims::new(
         "queue",
         "spiffe://deislet/control/main",
@@ -176,9 +182,6 @@ impl Drop for Harness {
 /// token so the call passes the interceptor.
 fn as_tenant<T>(harness: &Harness, tenant: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     let token = queue_capability(&harness.signing_key, tenant);
     request
         .metadata_mut()
@@ -188,28 +191,22 @@ fn as_tenant<T>(harness: &Harness, tenant: &str, message: T) -> Request<T> {
 
 /// Stamp *only* the tenant header, without a capability token. Used by tests
 /// that need to provoke an auth rejection.
-fn as_tenant_only<T>(tenant: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
-    request
+fn as_tenant_only<T>(_tenant: &str, message: T) -> Request<T> {
+    Request::new(message)
 }
 
-/// Stamp the tenant header and a capability token minted for `token_tenant`
-/// under the harness's signing key. The two tenants are separate arguments
-/// on purpose: presenting a token minted for one tenant on a call that
-/// claims another is exactly the attack the derivation is meant to defeat.
+/// Carry a capability minted for `token_tenant` and name `claimed` in the
+/// retired `x-deis-tenant` header, which the service must ignore.
 fn as_tenant_with_capability<T>(
     harness: &Harness,
-    tenant: &str,
+    claimed: &str,
     token_tenant: &str,
     message: T,
 ) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
+        .insert("x-deis-tenant", canonical(claimed).parse().unwrap());
     let token = queue_capability(&harness.signing_key, token_tenant);
     request
         .metadata_mut()
@@ -1149,7 +1146,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
 }
 
 #[tokio::test]
-async fn a_call_without_the_tenant_header_is_refused() {
+async fn a_call_without_one_capability_tenant_is_refused() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
 
@@ -1174,25 +1171,6 @@ async fn a_call_without_the_tenant_header_is_refused() {
         .expect_err("a call with no tenant must be refused");
     assert_eq!(status.code(), Code::Unauthenticated);
 
-    // The application header is not the storage tenant. A caller that stamps
-    // only `x-deis-app-id` - which is what every caller did before this
-    // change - is refused rather than served production's queue.
-    let mut request = Request::new(PullRequest {
-        queue_name: "jobs".to_string(),
-        max_messages: 10,
-        lease_seconds: 30,
-    });
-    request
-        .metadata_mut()
-        .insert(APP_ID_HEADER, "app-one".parse().unwrap());
-    let status = client
-        .pull(request)
-        .await
-        .expect_err("the application header alone must not identify a tenant");
-    // The app-id-only call has no Authorization header, so the interceptor
-    // refuses it with Unauthenticated.
-    assert_eq!(status.code(), Code::Unauthenticated);
-
     // A tenant header but no capability: the interceptor refuses it.
     let status = client
         .pull(as_tenant_only(
@@ -1207,33 +1185,42 @@ async fn a_call_without_the_tenant_header_is_refused() {
         .expect_err("a call with no capability token must be refused");
     assert_eq!(status.code(), Code::Unauthenticated);
 
-    // Malformed tenant values: the interceptor passes them (the capability
-    // matches what the header says) but the handler's tenant validation
-    // catches them.
-    for bad in [
-        // A bare application id names no environment, so it names no tenant.
-        "app-one",
-        "../../etc",
-        "a.b.c",
-        "app-one.",
+    // A capability whose tenant is not a canonical id, or that names two
+    // tenants, says nothing about whose queue the call is about.
+    for tenants in [
+        vec!["app-one.production".to_string()],
+        vec!["../../etc".to_string()],
+        vec![canonical("app-one.production"), canonical("app-two.production")],
     ] {
-        let status = client
-            .pull(as_tenant(
-                &harness,
-                bad,
-                PullRequest {
-                    queue_name: "jobs".to_string(),
-                    max_messages: 10,
-                    lease_seconds: 30,
-                },
-            ))
-            .await
-            .expect_err("a malformed tenant must be refused");
-        assert_eq!(
-            status.code(),
-            Code::PermissionDenied,
-            "{bad} should be refused"
+        let claims = CapabilityClaims::new(
+            "queue",
+            "spiffe://deislet/control/main",
+            "spiffe://deislet/node/test",
+            1,
+            Duration::from_secs(900),
+            tenants
+                .iter()
+                .map(|tenant| CapabilityResource {
+                    tenant: tenant.clone(),
+                    binding: "queue".to_string(),
+                    generation: None,
+                })
+                .collect(),
         );
+        let token = encode_capability(&claims, &harness.signing_key);
+        let mut request = Request::new(PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 10,
+            lease_seconds: 30,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let status = client
+            .pull(request)
+            .await
+            .expect_err("a capability without one canonical tenant must be refused");
+        assert_eq!(status.code(), Code::PermissionDenied, "{tenants:?}");
     }
 }
 
@@ -1379,8 +1366,6 @@ async fn concurrent_consumers_never_receive_the_same_message() {
                 max_messages: 5,
                 lease_seconds: 60,
             });
-            req.metadata_mut()
-                .insert(TENANT_HEADER, "app-one.production".parse().unwrap());
             let token = queue_capability(&sk, "app-one.production");
             req.metadata_mut()
                 .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -1474,23 +1459,24 @@ async fn a_call_with_no_token_is_refused() {
 }
 
 #[tokio::test]
-async fn a_token_minted_for_another_tenant_drains_nothing() {
+async fn a_tenant_named_in_the_request_drains_nothing() {
     // Draining is destructive: a message another tenant's consumer takes is
-    // one its owner never receives. This is the check that stops a token that
-    // leaked out of one application from being used to do that.
+    // one its owner never receives. The tenant is the one the capability
+    // names, so a token for one tenant that names another in a header drains
+    // its own queue and leaves the other's alone.
     let harness = Harness::start().await;
     let mine = tenant_id("app-one", "production");
+    let mut client = harness.client().await;
 
-    for claimed in [
+    for owner in [
         tenant_id("app-two", "production"),
         tenant_id("app-one", "preview"),
     ] {
-        let status = harness
-            .client()
-            .await
+        send(&mut client, &harness, &owner, "jobs", "theirs").await;
+        let pulled = client
             .pull(as_tenant_with_capability(
                 &harness,
-                &claimed,
+                &owner,
                 &mine,
                 PullRequest {
                     queue_name: "jobs".to_string(),
@@ -1499,12 +1485,26 @@ async fn a_token_minted_for_another_tenant_drains_nothing() {
                 },
             ))
             .await
-            .unwrap_err();
-        assert_eq!(
-            status.code(),
-            Code::PermissionDenied,
-            "a token for {mine} must not drain {claimed}"
+            .unwrap()
+            .into_inner();
+        assert!(
+            pulled.messages.is_empty(),
+            "a token for {mine} must not drain {owner}"
         );
+        let theirs = client
+            .pull(as_tenant(
+                &harness,
+                &owner,
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 10,
+                    lease_seconds: 30,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(theirs.messages.len(), 1, "{owner} keeps its message");
     }
 }
 
@@ -1526,9 +1526,6 @@ async fn a_token_minted_under_a_different_key_is_refused() {
         max_messages: 10,
         lease_seconds: 30,
     });
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     let token = queue_capability(&other_key, &tenant);
     request
         .metadata_mut()
@@ -1551,7 +1548,7 @@ async fn a_wrong_audience_tokens_is_refused() {
         1,
         Duration::from_secs(900),
         vec![CapabilityResource {
-            tenant: tenant.clone(),
+            tenant: canonical(&tenant),
             binding: "queue".to_string(),
             generation: None,
         }],
@@ -1563,9 +1560,6 @@ async fn a_wrong_audience_tokens_is_refused() {
         max_messages: 10,
         lease_seconds: 30,
     });
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     request
         .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -1587,7 +1581,7 @@ async fn a_wrong_binding_tokens_is_refused() {
         1,
         Duration::from_secs(900),
         vec![CapabilityResource {
-            tenant: tenant.clone(),
+            tenant: canonical(&tenant),
             binding: "kv".to_string(), // wrong binding
             generation: None,
         }],
@@ -1599,9 +1593,6 @@ async fn a_wrong_binding_tokens_is_refused() {
         max_messages: 10,
         lease_seconds: 30,
     });
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     request
         .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());

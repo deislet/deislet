@@ -4,13 +4,11 @@ package deis.queue;
 
 // A durable message queue with lease-based consumption.
 //
-// The tenant is not a field on any message here: it travels out of band in
-// the `x-deis-tenant` gRPC metadata header, whose value is one application in
-// one environment ("demo.production"). That is deliberately not the
-// `x-deis-app-id` header deis-proxy stamps on the HTTP data path, which names
-// the application alone: a preview deployment must not be able to consume
-// what production enqueued. A call that arrives without the tenant header is
-// refused rather than served from some default namespace.
+// The tenant is not a field on any message here: it is the one application
+// environment the call's capability (`Authorization: Bearer`) names, so a
+// preview deployment cannot consume what production enqueued. A call without
+// a capability naming exactly one tenant is refused rather than served from
+// some default namespace.
 //
 // DELIVERY IS AT-LEAST-ONCE. A message handed out by Pull stays in the queue
 // until it is acknowledged; a consumer that crashes, is restarted, or simply

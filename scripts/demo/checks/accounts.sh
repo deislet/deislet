@@ -644,12 +644,12 @@ check_a_wide_credential_cannot_mint_a_storage_token() {
   tenant=$(control_answer GET "$route" "$narrow" | jq -r '.tenant // empty')
 
   if [ "$refused" = "403" ] && [ "$allowed" = "200" ] \
-    && [ "$tenant" = "${APP_ID}.${ENV_NAME}" ] && [ "$blanket_status" -ne 0 ]; then
+    && [ "$tenant" = "$(canonical_tenant)" ] && [ -n "$tenant" ] && [ "$blanket_status" -ne 0 ]; then
     pass_check "$title" \
       "a credential carrying deploy:*/* and secrets:*/* was refused GET ${route} (HTTP ${refused}); the one carrying storage:${APP_ID}/${ENV_NAME} was served (HTTP ${allowed}) for tenant ${tenant}. \`deis token create --scope storage:*/*\` was refused outright (exit ${blanket_status}), so there is no blanket form of the grant to hand out by accident"
   else
     fail_check "$title" \
-      "the wide credential answered ${refused} (expected 403), the tenant-scoped one ${allowed} for tenant '${tenant:-none}' (expected 200 for ${APP_ID}.${ENV_NAME}), and minting storage:*/* exited ${blanket_status} (expected non-zero)"
+      "the wide credential answered ${refused} (expected 403), the tenant-scoped one ${allowed} for tenant '${tenant:-none}' (expected 200 for the canonical tenant of ${APP_ID}/${ENV_NAME}), and minting storage:*/* exited ${blanket_status} (expected non-zero)"
   fi
 }
 

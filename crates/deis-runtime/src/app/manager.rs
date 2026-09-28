@@ -792,7 +792,7 @@ impl ApplicationManager {
             env: config.env.clone(),
             standard_env: config.standard_env.clone(),
             node_process_env: Some(config.node_process_env.clone()),
-            storage_tenant: Some(key.tenant_id()),
+            storage_tenant: config.storage_tenant.map(|tenant| tenant.to_string()),
             permissions: config.permissions.clone(),
             memory_limit_mb: Some(self.effective_memory_limit_mb(&key, config.limits.as_ref())),
             resource_table_max: config.limits.as_ref().and_then(|l| l.resource_table_max),
@@ -1172,7 +1172,7 @@ impl ApplicationManager {
             env: record.config.env.clone(),
             standard_env: record.config.standard_env.clone(),
             node_process_env: Some(record.config.node_process_env.clone()),
-            storage_tenant: Some(key.tenant_id()),
+            storage_tenant: record.config.storage_tenant.map(|tenant| tenant.to_string()),
             permissions: record.config.permissions.clone(),
             memory_limit_mb: Some(
                 self.effective_memory_limit_mb(key, record.config.limits.as_ref()),

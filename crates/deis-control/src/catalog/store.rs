@@ -240,14 +240,11 @@ impl CatalogStore {
                     return Err(CatalogError::conflict(format!("app {id} already exists")));
                 }
                 // A name that belonged to a deleted application is not free.
-                // Its data is still in deis-store and deis-queue, keyed by
-                // (application, environment), so an application created here
-                // would be that tenant: it would read and overwrite the
-                // deleted application's kv, database, objects and queued
-                // messages, and it can belong to a different account
-                // entirely. Refused until somebody releases the name and
-                // says, on the record, that the next application of that name
-                // may have what the last one left.
+                // Its stored data is keyed by canonical ids and stays out of
+                // reach of a new application, but tokens and hostname grants
+                // are scoped by name, and a new application under the name
+                // can belong to a different account entirely. Refused until
+                // somebody releases the name on the record.
                 if let Some(retired) = retired_name(conn, &id)?.filter(RetiredAppName::is_held) {
                     warn!(
                         app_id = %id,
@@ -615,7 +612,7 @@ impl CatalogStore {
             app_id = %released.app_id,
             retired_at = released.retired_at,
             tenants = ?released.tenants(),
-            "Released a retired application name; it can be created again, and the next application called {} will be the same storage tenant as the deleted one - {}. Every token scoped to this application, and every storage capability token minted for those tenants, also still authorises it: a capability token is derived from the tenant name and never expires, so revoke what the deleted application's owner still holds",
+            "Released a retired application name; it can be created again. The next application called {} gets new canonical ids and does not see the deleted one's data - {}. Every token scoped to this application's name still authorises it, so revoke what the deleted application's owner still holds",
             released.app_id,
             released.describe_data()
         );

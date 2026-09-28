@@ -22,8 +22,8 @@ English: [README.md](README.md)。
 | `APP_ID_HEADER`（`x-deis-app-id`） | 进来的请求是给哪个应用的 |
 | `ENVIRONMENT_HEADER`（`x-deis-environment`） | 是这个应用的哪个环境；不带就是 `DEFAULT_ENVIRONMENT` |
 | `DEFAULT_ENVIRONMENT`（`production`） | 让还不知道有「环境」这回事的调用方也能落到一个说得通的地方 |
-| `TENANT_HEADER`（`x-deis-tenant`） | 存储租户——**另起一个头**，因为它装的是另一样东西 |
-| `tenant_id(app, env)` / `split_tenant` / `is_valid_tenant_part` | `demo.production`；字符集里没有 `.`、`/`、`\`，所以任何合法的两半都拼不出上级目录 |
+| `BINDING_HEADER`（`x-deis-binding`） | 存储调用要租户里的哪个命名空间；租户本身由调用携带的 capability 决定 |
+| `tenant_id(app, env)` / `split_tenant` / `is_valid_tenant_part` | telemetry 用来归属记录的 `demo.production` 标签；存储改按 `CanonicalTenantId` 键控 |
 | `MAX_GRPC_MESSAGE_BYTES`（16 MB） | 一个上限，两个方向，全部服务通用 |
 | `STREAM_CHUNK_BYTES`（1 MB） | blob 上传下载的分块大小 |
 | `STORE_ENDPOINT_ENV` / `QUEUE_ENDPOINT_ENV` | 装存储地址的保留 env 键，进 Isolate 之前会被取走 |

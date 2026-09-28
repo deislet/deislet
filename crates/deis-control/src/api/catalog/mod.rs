@@ -465,6 +465,25 @@ pub(crate) mod tests {
                     .unwrap();
             deis_queue::proto::queue::queue_client::QueueClient::new(channel)
         }
+
+        /// `message` as a call to the harness queue for one environment,
+        /// carrying the queue capability this control plane issues for it.
+        pub(crate) async fn queue_request<T>(
+            &self,
+            app_id: &str,
+            environment: &str,
+            message: T,
+        ) -> tonic::Request<T> {
+            let app = self.state.store.get_app(app_id).await.unwrap();
+            let env = self.state.store.get_environment(app_id, environment).await.unwrap();
+            let tenant = deis_wire::CanonicalTenantId::new(app.canonical_id, env.canonical_id);
+            let token = self.state.storage.queue_token_for(&tenant).await.unwrap();
+            let mut request = tonic::Request::new(message);
+            request
+                .metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            request
+        }
     }
 
     struct PreparedRuntime;
@@ -590,6 +609,13 @@ pub(crate) mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("https://{}", listener.local_addr().unwrap());
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let issuer =
+            crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test");
+        // Guarded like deis-queue is: the tenant of a call is the one its
+        // capability names.
+        let queue_auth = deis_queue::auth::QueueAuth::new(deis_capability::KeyRing::from_keys([
+            issuer.verifying_key().await,
+        ]));
         // Served over TLS with a queue's certificate, as deis-queue is: the
         // control plane's own calls refuse anything else.
         let fleet = deis_identity_test_pki::TestFleet::new();
@@ -610,9 +636,11 @@ pub(crate) mod tests {
                 },
             );
             tonic::transport::Server::builder()
-                .add_service(deis_queue::proto::queue::queue_server::QueueServer::new(
-                    queue,
-                ))
+                .add_service(
+                    deis_queue::proto::queue::queue_server::QueueServer::with_interceptor(
+                        queue, queue_auth,
+                    ),
+                )
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = shutdown_rx.await;
                 })
@@ -624,7 +652,7 @@ pub(crate) mod tests {
                 queue_endpoint: Some(endpoint.clone()),
                 ..Default::default()
             },
-            crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+            issuer,
         )
         .with_service_trust(Some(deis_identity::ServiceTrust::from_identity(
             control_identity,

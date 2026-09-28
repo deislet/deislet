@@ -390,8 +390,8 @@ impl RetiredAppName {
         self.released_at.is_none()
     }
 
-    /// The tenant ids whose data is still in deis-store and deis-queue,
-    /// spelled the way those services see them.
+    /// The `<app>.<environment>` labels of the environments whose data is
+    /// still in deis-store and deis-queue, under their canonical tenants.
     pub fn tenants(&self) -> Vec<String> {
         self.environments
             .iter()
@@ -412,7 +412,7 @@ impl RetiredAppName {
         } else {
             format!(
                 "the kv, database, object and queue data of {} is still in deis-store and \
-                 deis-queue under tenant(s) {}",
+                 deis-queue under the canonical tenant(s) of {}",
                 self.app_id,
                 tenants.join(", ")
             )

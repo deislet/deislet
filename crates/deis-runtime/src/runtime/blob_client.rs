@@ -6,13 +6,12 @@
 //! whole object fits in a single gRPC message, so this client always frames
 //! uploads and always reassembles downloads.
 //!
-//! The tenant travels out of band in the `x-deis-tenant` metadata header, and
-//! the capability token proving this node may act as it in
-//! `Authorization: Bearer` (see [`StorageIdentity`]): one
-//! application in one environment (see [`Tenant`]). deis-store refuses any
-//! request that arrives without it, so a client is bound to exactly one
-//! environment of one application for its whole life, and a preview cannot
-//! read or overwrite an object production stored.
+//! The tenant is the one application environment named by the capability
+//! token this node presents in `Authorization: Bearer` (see
+//! [`StorageIdentity`] and [`Tenant`]). deis-store refuses any request that
+//! arrives without one, so a client is bound to exactly one environment of
+//! one application for its whole life, and a preview cannot read or
+//! overwrite an object production stored.
 
 use super::bindings::CapabilityChannel;
 use super::bindings::StorageIdentity;

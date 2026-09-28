@@ -3,8 +3,8 @@
 A durable queue with lease-based consumption: `Send` and `SendBatch`, `Pull`
 under a lease, `Ack`, `Nack` with a delay, and a dead-letter table with the
 reason a message was given up on. Nodes poll it; it never pushes. Every call
-is scoped by the `x-deis-tenant` header and proved by an Ed25519 capability
-the control plane signed for that tenant; the listener speaks TLS only. The crate docs in `src/lib.rs` describe
+acts for the one tenant named by the Ed25519 capability the control plane
+signed for it; the listener speaks TLS only. The crate docs in `src/lib.rs` describe
 the design; `proto/queue.proto` is the contract.
 
 The data directory also holds `backend-incarnation`, the UUIDv7 that names

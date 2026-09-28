@@ -2318,30 +2318,7 @@ mod tests {
         use deis_queue::proto::queue::{AckRequest, MessageHandle, PullRequest, SendRequest};
 
         let h = harness_with_queue(true).await;
-        let tenant = "demo.production";
         let mut queue = h.queue_client().await;
-        for body in ["old lease", "next generation"] {
-            let mut request = tonic::Request::new(SendRequest {
-                queue_name: "jobs".to_string(),
-                message_body: body.as_bytes().to_vec(),
-            });
-            request.metadata_mut().insert(
-                deis_wire::conventions::TENANT_HEADER,
-                tenant.parse().unwrap(),
-            );
-            queue.send(request).await.unwrap();
-        }
-        let mut request = tonic::Request::new(PullRequest {
-            queue_name: "jobs".to_string(),
-            max_messages: 1,
-            lease_seconds: 60,
-        });
-        request.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            tenant.parse().unwrap(),
-        );
-        let old = queue.pull(request).await.unwrap().into_inner().messages;
-        assert_eq!(old.len(), 1);
 
         json(
             &h.router,
@@ -2370,6 +2347,32 @@ mod tests {
             serde_json::json!({"name": "production"}),
         )
         .await;
+        for body in ["old lease", "next generation"] {
+            let request = h
+                .queue_request(
+                    "demo",
+                    "production",
+                    SendRequest {
+                        queue_name: "jobs".to_string(),
+                        message_body: body.as_bytes().to_vec(),
+                    },
+                )
+                .await;
+            queue.send(request).await.unwrap();
+        }
+        let request = h
+            .queue_request(
+                "demo",
+                "production",
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 1,
+                    lease_seconds: 60,
+                },
+            )
+            .await;
+        let old = queue.pull(request).await.unwrap().into_inner().messages;
+        assert_eq!(old.len(), 1);
         let (status, accepted) = json(
             &h.router,
             "POST",
@@ -2409,17 +2412,19 @@ mod tests {
         );
 
         let leased = &old[0];
-        let mut ack = tonic::Request::new(AckRequest {
-            queue_name: "jobs".to_string(),
-            messages: vec![MessageHandle {
-                id: leased.id.clone(),
-                lease_token: leased.lease_token.clone(),
-            }],
-        });
-        ack.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            tenant.parse().unwrap(),
-        );
+        let ack = h
+            .queue_request(
+                "demo",
+                "production",
+                AckRequest {
+                    queue_name: "jobs".to_string(),
+                    messages: vec![MessageHandle {
+                        id: leased.id.clone(),
+                        lease_token: leased.lease_token.clone(),
+                    }],
+                },
+            )
+            .await;
         queue.ack(ack).await.unwrap();
 
         let plan = h.state.store.deployment_plan(plan_id).await.unwrap();
@@ -3281,24 +3286,28 @@ mod tests {
             .unwrap()
             .to_string();
         let mut queue = h.queue_client().await;
-        let mut send = tonic::Request::new(SendRequest {
-            queue_name: "jobs".to_string(),
-            message_body: b"finish under the old secret".to_vec(),
-        });
-        send.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            "demo.production".parse().unwrap(),
-        );
+        let send = h
+            .queue_request(
+                "demo",
+                "production",
+                SendRequest {
+                    queue_name: "jobs".to_string(),
+                    message_body: b"finish under the old secret".to_vec(),
+                },
+            )
+            .await;
         queue.send(send).await.unwrap();
-        let mut pull = tonic::Request::new(PullRequest {
-            queue_name: "jobs".to_string(),
-            max_messages: 1,
-            lease_seconds: 60,
-        });
-        pull.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            "demo.production".parse().unwrap(),
-        );
+        let mut pull = h
+            .queue_request(
+                "demo",
+                "production",
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 1,
+                    lease_seconds: 60,
+                },
+            )
+            .await;
         pull.metadata_mut().insert(
             deis_wire::conventions::DEPLOYMENT_GENERATION_HEADER,
             first_generation.parse().unwrap(),
@@ -3340,17 +3349,19 @@ mod tests {
             "202 exposes candidate metadata but the current secret head stays unchanged"
         );
         let leased = &old_lease[0];
-        let mut ack = tonic::Request::new(AckRequest {
-            queue_name: "jobs".to_string(),
-            messages: vec![MessageHandle {
-                id: leased.id.clone(),
-                lease_token: leased.lease_token.clone(),
-            }],
-        });
-        ack.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            "demo.production".parse().unwrap(),
-        );
+        let ack = h
+            .queue_request(
+                "demo",
+                "production",
+                AckRequest {
+                    queue_name: "jobs".to_string(),
+                    messages: vec![MessageHandle {
+                        id: leased.id.clone(),
+                        lease_token: leased.lease_token.clone(),
+                    }],
+                },
+            )
+            .await;
         queue.ack(ack).await.unwrap();
         let plan = h.state.store.deployment_plan(rotation_plan).await.unwrap();
         reconcile_plan(&h.state, plan).await.unwrap();

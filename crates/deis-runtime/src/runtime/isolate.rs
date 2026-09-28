@@ -1028,10 +1028,10 @@ pub struct IsolateSpec {
 
     /// Storage authority presented by KV, SQL, blob and queue clients.
     ///
-    /// Kept separate from the runtime's `app_id`: the latter is the rolling-
+    /// The canonical tenant `v1/<application id>/<environment id>`. Kept
+    /// separate from the runtime's `app_id`: the latter is the rolling-
     /// upgrade placement and telemetry key, while this field is the data
-    /// boundary. `None` preserves callers that do not use the deployment
-    /// pipeline; deployed versions always set it explicitly.
+    /// boundary. `None` for an application that reaches no storage service.
     pub storage_tenant: Option<String>,
 
     /// Net and env permissions granted to the isolate.
@@ -1423,8 +1423,19 @@ impl AppRuntime {
         // that is not a tenant, fails the load outright rather than after V8
         // has been spun up. An address that is merely unreachable is not a
         // failure here: the channels are lazy.
-        let storage_tenant = storage_tenant.as_deref().unwrap_or(&app_id);
-        let services = AppServices::connect(storage_tenant, wiring)?;
+        // No canonical tenant is only an error for an application that
+        // actually reaches a storage service, and `connect` says so then.
+        let storage_tenant = storage_tenant.unwrap_or_default();
+        // Tests name their tenants by label (`"kv_app.production"`) and the
+        // test store mints capabilities for the canonical tenant each label
+        // stands for; this is the one place the two meet.
+        #[cfg(test)]
+        let storage_tenant = crate::runtime::tenant::test_tenant(if storage_tenant.is_empty() {
+            &app_id
+        } else {
+            &storage_tenant
+        });
+        let services = AppServices::connect(&storage_tenant, wiring)?;
         if services.is_empty() && !wiring.declaration.is_empty() {
             tracing::warn!(
                 app_id = %app_id,

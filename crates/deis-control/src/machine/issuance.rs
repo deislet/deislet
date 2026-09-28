@@ -9,9 +9,12 @@
 //! - the audience is one whose services check per-tenant bindings
 //!   ([`deis_capability::bindings_for_audience`]) - no `telemetry.read`, no
 //!   audience string nothing verifies;
-//! - the tenant is `<app>.<environment>` of a deployment
+//! - the tenant is one of a deployment
 //!   [`deployments_visible_to`](crate::api::catalog::assignments::deployments_visible_to)
-//!   that node - the one place placement will narrow;
+//!   that node - the one place placement will narrow. For deis-store and
+//!   deis-queue that is the canonical `v1/<application id>/<environment id>`;
+//!   for deis-telemetry, whose records carry names, the `<app>.<environment>`
+//!   label;
 //! - the binding is one that audience defines;
 //! - a generation, if the resource names one, is that deployment's routing
 //!   generation;
@@ -35,15 +38,22 @@ use deis_capability::{
 
 use crate::api::catalog::assignments::VisibleDeployment;
 
-/// The tenants a node may name, each with the routing generations it may
-/// name for that tenant.
-pub(crate) fn tenants_of(
-    visible: &BTreeMap<String, VisibleDeployment>,
-) -> BTreeMap<&str, BTreeSet<&str>> {
+/// The tenants a node may name for `audience`, each with the routing
+/// generations it may name for that tenant: canonical tenants for the data
+/// services, labels for deis-telemetry.
+pub(crate) fn tenants_of<'a>(
+    audience: &str,
+    visible: &'a BTreeMap<String, VisibleDeployment>,
+) -> BTreeMap<&'a str, BTreeSet<&'a str>> {
     let mut tenants: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for deployment in visible.values() {
+        let tenant = if audience == AUD_TELEMETRY {
+            deployment.tenant.as_str()
+        } else {
+            deployment.canonical_tenant.as_str()
+        };
         tenants
-            .entry(deployment.tenant.as_str())
+            .entry(tenant)
             .or_default()
             .insert(deployment.routing_generation.as_str());
     }
@@ -66,7 +76,7 @@ pub(crate) fn authorize(
     if resources.is_empty() {
         return Err("at least one resource must be requested".to_string());
     }
-    let tenants = tenants_of(visible);
+    let tenants = tenants_of(audience, visible);
     for resource in resources {
         if audience == AUD_TELEMETRY && resource.binding != TELEMETRY_INGEST {
             return Err(format!(
@@ -111,6 +121,10 @@ mod tests {
     use super::*;
     use deis_capability::{AUD_QUEUE, AUD_STORE, TELEMETRY_READ, resources_for_audience};
 
+    fn canonical(label: &str) -> String {
+        deis_wire::CanonicalTenantId::derived_from_label(label).to_string()
+    }
+
     fn visible() -> BTreeMap<String, VisibleDeployment> {
         BTreeMap::from([(
             "dep-a".to_string(),
@@ -118,40 +132,51 @@ mod tests {
                 env_id: "env-a".to_string(),
                 snapshot_id: None,
                 tenant: "a.production".to_string(),
+                canonical_tenant: canonical("a.production"),
                 routing_generation: "gen-a".to_string(),
             },
         )])
     }
 
     #[test]
+    fn a_data_service_capability_names_the_canonical_tenant_not_the_label() {
+        for aud in [AUD_STORE, AUD_QUEUE] {
+            assert!(
+                authorize("n", aud, &resources_for_audience("a.production", aud), &visible())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn a_node_may_have_what_it_runs() {
         for aud in [AUD_STORE, AUD_QUEUE] {
-            authorize("n", aud, &resources_for_audience("a.production", aud), &visible())
+            authorize("n", aud, &resources_for_audience(&canonical("a.production"), aud), &visible())
                 .unwrap();
         }
-        let mut pinned = resources_for_audience("a.production", AUD_STORE);
+        let mut pinned = resources_for_audience(&canonical("a.production"), AUD_STORE);
         pinned[0].generation = Some("gen-a".to_string());
         authorize("n", AUD_STORE, &pinned, &visible()).unwrap();
     }
 
     #[test]
     fn one_resource_outside_what_it_runs_refuses_the_request() {
-        let mut asked = resources_for_audience("a.production", AUD_STORE);
-        asked.extend(resources_for_audience("b.production", AUD_STORE));
+        let mut asked = resources_for_audience(&canonical("a.production"), AUD_STORE);
+        asked.extend(resources_for_audience(&canonical("b.production"), AUD_STORE));
         let refusal = authorize("n", AUD_STORE, &asked, &visible()).unwrap_err();
-        assert!(refusal.contains("b.production"), "{refusal}");
+        assert!(refusal.contains(&canonical("b.production")), "{refusal}");
     }
 
     #[test]
     fn a_binding_or_audience_nothing_checks_is_refused() {
-        let mut wrong = resources_for_audience("a.production", AUD_STORE);
+        let mut wrong = resources_for_audience(&canonical("a.production"), AUD_STORE);
         wrong[0].binding = "queue".to_string();
         assert!(authorize("n", AUD_STORE, &wrong, &visible()).is_err());
         assert!(
             authorize(
                 "n",
                 "telemetry.read",
-                &resources_for_audience("a.production", AUD_STORE),
+                &resources_for_audience(&canonical("a.production"), AUD_STORE),
                 &visible()
             )
             .is_err()
@@ -196,7 +221,7 @@ mod tests {
 
     #[test]
     fn a_generation_that_is_not_deployed_is_refused() {
-        let mut pinned = resources_for_audience("a.production", AUD_STORE);
+        let mut pinned = resources_for_audience(&canonical("a.production"), AUD_STORE);
         pinned[0].generation = Some("gen-old".to_string());
         assert!(authorize("n", AUD_STORE, &pinned, &visible()).is_err());
     }
@@ -207,7 +232,7 @@ mod tests {
             authorize(
                 "n",
                 AUD_STORE,
-                &resources_for_audience("a.production", AUD_STORE),
+                &resources_for_audience(&canonical("a.production"), AUD_STORE),
                 &BTreeMap::new()
             )
             .is_err()

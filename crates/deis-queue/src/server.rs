@@ -371,41 +371,6 @@ mod tests {
         assert!(dir.path().join("queue.sqlite").exists());
     }
 
-    /// A queue.sqlite written before the tenant change holds messages that
-    /// can never be delivered under the new keying. Opening over it would
-    /// create a second, empty pair of tables and report every queue empty, so
-    /// the service refuses to open at all.
-    #[tokio::test]
-    async fn a_database_from_before_the_tenant_change_is_refused() {
-        let dir = TempDir::new().unwrap();
-        let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE messages (
-                 app_id     TEXT    NOT NULL,
-                 queue      TEXT    NOT NULL,
-                 id         TEXT    NOT NULL,
-                 body       BLOB    NOT NULL,
-                 attempts   INTEGER NOT NULL DEFAULT 0,
-                 visible_at INTEGER NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 PRIMARY KEY (app_id, queue, id)
-             )",
-        )
-        .unwrap();
-        drop(conn);
-
-        let error = match open(&config_for(&dir)).await {
-            Ok(_) => panic!("an old database must not be served over"),
-            Err(e) => e,
-        };
-        // `{:#}` so the whole chain is searched: the outer context only
-        // says which store failed to open.
-        assert!(
-            format!("{error:#}").contains("predates the tenant contract"),
-            "the refusal must say what is wrong: {error:#}"
-        );
-    }
-
     #[tokio::test]
     async fn no_sweeper_runs_when_dead_letters_are_kept_forever() {
         let dir = TempDir::new().unwrap();
@@ -435,7 +400,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tenant = TenantId::parse("app-one.production").unwrap();
+        let tenant = TenantId::for_label("app-one.production");
         queue.send(&tenant, "jobs", b"work".to_vec()).await.unwrap();
         let leased = queue.pull(&tenant, "jobs", None, None).await.unwrap();
         let handles = leased

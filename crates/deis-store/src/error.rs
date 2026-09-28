@@ -67,9 +67,6 @@ pub enum StoreError {
     /// The peer stopped sending in the middle of a streamed request and did
     /// not close it either. Whatever it had sent is discarded.
     Stalled(String),
-    /// The data directory was written before storage was keyed by tenant, so
-    /// nothing in it can be read back. Startup only; see [`crate::legacy`].
-    LegacyData(String),
 }
 
 impl fmt::Display for StoreError {
@@ -89,7 +86,6 @@ impl fmt::Display for StoreError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::BlockingTask(m) => write!(f, "blocking task: {m}"),
             Self::Stalled(m) => write!(f, "stalled: {m}"),
-            Self::LegacyData(m) => write!(f, "data predates the tenant contract: {m}"),
         }
     }
 }
@@ -159,7 +155,6 @@ impl From<StoreError> for Status {
             // Nothing the caller sent is wrong and no retry helps: the
             // service is standing on data it cannot use, and an operator has
             // to move it aside first.
-            StoreError::LegacyData(_) => Code::FailedPrecondition,
             StoreError::Sqlite(_) | StoreError::Io(_) | StoreError::BlockingTask(_) => {
                 Code::Internal
             }
@@ -203,7 +198,6 @@ mod tests {
                 Code::Internal,
             ),
             (StoreError::BlockingTask("x".into()), Code::Internal),
-            (StoreError::LegacyData("x".into()), Code::FailedPrecondition),
         ];
         for (err, want) in cases {
             let status: Status = err.into();

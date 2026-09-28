@@ -528,7 +528,7 @@
           "released_at": null,
           "retired_at": 1767225600
         },
-        "retained_note": "the kv, database, object and queue data of demo is still in deis-store and deis-queue under tenant(s) demo.production. No part of this platform deletes it. The name is retained until it is released with DELETE /api/retired-apps/demo, so nothing can be deployed onto that data by accident",
+        "retained_note": "the kv, database, object and queue data of demo is still in deis-store and deis-queue under the canonical tenant(s) of demo.production. No part of this platform deletes it. The name is retained until it is released with DELETE /api/retired-apps/demo, so nothing scoped to the name - tokens, hostname grants - passes to the next application of that name by accident",
         "unloaded": {
           "app_id": "demo",
           "environments": [
@@ -859,7 +859,7 @@
     },
     "ReleaseRetiredAppResponse": {
       "body": {
-        "accepted": "demo is free again. the kv, database, object and queue data of demo is still in deis-store and deis-queue under tenant(s) demo.production, and the next application created under this name is that same tenant: it will read and overwrite whatever is there. Credentials follow the name too - a token scoped to this application, or a storage capability token minted for one of those tenants, still authorises the next one, so revoke what the deleted application's owner still holds",
+        "accepted": "demo is free again. the kv, database, object and queue data of demo is still in deis-store and deis-queue under the canonical tenant(s) of demo.production; the next application created under this name gets new canonical ids and does not see that data. Credentials scoped to the name do follow it - a token scoped to this application still authorises the next one - so revoke what the deleted application's owner still holds",
         "app_id": "demo",
         "released": {
           "app_id": "demo",

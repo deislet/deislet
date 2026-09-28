@@ -175,10 +175,6 @@ impl BlobService {
     ) -> StoreResult<Self> {
         let root = data_dir.join("blob");
         std::fs::create_dir_all(&root)?;
-        // One content directory per tenant. A directory named by a bare
-        // application id belongs to the layout this change replaced, and its
-        // objects are unreachable now.
-        crate::legacy::reject_pre_tenant_blob_dirs(&root)?;
         let pool = SqlitePool::new(
             data_dir.join("blob.sqlite"),
             "blob",
@@ -186,7 +182,6 @@ impl BlobService {
             durability,
         );
         pool.migrate(|conn| {
-            crate::legacy::reject_pre_tenant_table(conn, "blob")?;
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS blob (
                      tenant       TEXT NOT NULL,
@@ -2332,7 +2327,7 @@ mod tests {
     }
 
     fn tenant(name: &str) -> TenantId {
-        TenantId::parse(name).unwrap()
+        TenantId::for_label(name)
     }
 
     fn chunks(data: Vec<Vec<u8>>) -> impl Stream<Item = StoreResult<Vec<u8>>> + Unpin {
@@ -2926,7 +2921,8 @@ mod tests {
             .unconditional();
         let expected = dir
             .path()
-            .join("blob/app-one.production")
+            .join("blob")
+            .join(a.as_str())
             .join(&meta.sha256[0..2])
             .join(&meta.sha256[2..4])
             .join(&meta.sha256);
@@ -3007,7 +3003,7 @@ mod tests {
         // been removed rather than left to age. Every re-upload of an
         // unchanged asset takes this path, so a leak here grows without end.
         assert_eq!(
-            incoming_count(&dir, "app-one.production"),
+            incoming_count(&dir, tenant("app-one.production").as_str()),
             0,
             "the deduplicated upload left its temporary file behind"
         );
@@ -3044,7 +3040,7 @@ mod tests {
         assert!(matches!(err, StoreError::TooLarge(_)));
         assert!(svc.head(&a, "big").await.unwrap().is_none());
         assert_eq!(
-            incoming_count(&dir, "app-one.production"),
+            incoming_count(&dir, tenant("app-one.production").as_str()),
             0,
             "the temporary file should have been removed"
         );
@@ -3089,7 +3085,7 @@ mod tests {
         assert!(matches!(err, StoreError::Stalled(_)), "got {err:?}");
         assert!(svc.head(&a, "stalled").await.unwrap().is_none());
         assert_eq!(
-            incoming_count(&dir, "app-one.production"),
+            incoming_count(&dir, tenant("app-one.production").as_str()),
             0,
             "the abandoned upload's temporary file should have been removed"
         );
@@ -3138,9 +3134,11 @@ mod tests {
     #[tokio::test]
     async fn startup_clears_abandoned_uploads() {
         let dir = TempDir::new().unwrap();
+        let a = tenant("app-one.production");
         let incoming = dir
             .path()
-            .join("blob/app-one.production")
+            .join("blob")
+            .join(a.as_str())
             .join(INCOMING_DIR);
         std::fs::create_dir_all(&incoming).unwrap();
         std::fs::write(incoming.join("stale.part"), b"half an object").unwrap();
@@ -3367,7 +3365,7 @@ mod tests {
             );
         }
         assert_eq!(
-            incoming_count(&dir, "app-one.production"),
+            incoming_count(&dir, tenant("app-one.production").as_str()),
             0,
             "the uploads that deduplicated left their temporary files behind"
         );
@@ -3605,9 +3603,9 @@ mod tests {
             !svc.content_path(&a, &orphan).exists(),
             "a write whose row never landed must not leave its content behind"
         );
-        assert_eq!(incoming_count(&dir, "app-one.production"), 0);
+        assert_eq!(incoming_count(&dir, a.as_str()), 0);
         assert_eq!(
-            content_files(&dir, "app-one.production").len(),
+            content_files(&dir, tenant("app-one.production").as_str()).len(),
             1,
             "only the object that has a row keeps its file"
         );
