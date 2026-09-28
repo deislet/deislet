@@ -98,15 +98,23 @@ top of `crates/deis-provider-driver-cloudflare/src/commands.rs`):
 * **upload** first asks whether the Worker exists. wrangler refuses
   `versions upload` for a Worker that does not exist yet, so the first upload
   creates it with `wrangler deploy` of a placeholder script that answers 503
-  and is deployed with `workers_dev = false`, so nothing is reachable. Then
-  `versions upload` uploads the real version without deploying it.
+  and is deployed with `workers_dev = false` and `preview_urls = false`, so
+  nothing is reachable. Then `versions upload` uploads the real version
+  without deploying it. The rendered `wrangler.toml` also sets `preview_urls
+  = false`, so an uploaded version has no workers.dev preview URL before it
+  is activated. If the placeholder deploy fails before the Worker exists, a
+  reconcile of the upload reports it as not applied and the upload is
+  retried.
 * **activate** runs `versions deploy <version>@100%` and then `triggers
   deploy` with the rendered `wrangler.toml`. `versions upload` and `versions
   deploy` never change what Cloudflare keeps per Worker rather than per
   version; `triggers deploy` applies it: the cron schedule, each queue
   consumer, and the workers.dev route. The rendered file always carries
   `[triggers] crons`, empty when the application has no cron, so removing the
-  last cron clears the schedule.
+  last cron clears the schedule. `triggers deploy` runs in a directory that
+  holds only the rendered file plus, for an application with static assets,
+  an empty `[assets] directory`: wrangler checks that the directory exists
+  even though this command uploads nothing from it.
 * **rollback** redeploys the target version, then re-applies the
   configuration that version was activated with (the driver keeps it in its
   state directory). If that state was lost, the version is served and the
@@ -116,14 +124,22 @@ Known limits: `triggers deploy` adds and updates queue consumers but never
 detaches one the application no longer lists; detach it in the dashboard or
 with `wrangler queues consumer remove`. Secrets are additive for the same
 reason: `--secrets-file` never deletes a secret an application stopped
-declaring.
+declaring. The account must have a workers.dev subdomain registered
+(Workers & Pages → your subdomain): `triggers deploy` enables the workers.dev
+route and fails without one, and it runs after `versions deploy` has already
+moved traffic, so activate then reports a possible side effect and reconcile
+keeps failing until the subdomain exists. `versions list` returns only the
+10 most recent versions, so a version followed by more than 10 further
+uploads before its verify or upload reconcile is reported as missing.
 
 The fake `wrangler` the tests use
 (`crates/deis-provider-driver-cloudflare/tests/fixtures/fake-wrangler.sh`)
 models exactly these behaviours: `versions upload` fails for an unknown
 Worker with wrangler's code-less error, only `deploy` and `triggers deploy`
-change schedules, consumers and workers.dev, version ids are UUIDs, and a
-Worker that was never deployed has no deployment status.
+change schedules, consumers and workers.dev, version ids are UUIDs, a
+Worker that was never deployed has no deployment status, `deploy`, `versions
+upload` and `triggers deploy` refuse a missing `[assets] directory`, and
+versions get preview URLs unless `preview_urls = false`.
 
 ## What the driver creates
 

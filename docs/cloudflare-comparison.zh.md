@@ -19,7 +19,7 @@
 >   `deis-provider-driver-cloudflare`，由它驱动 wrangler 走 preflight → plan → prepare → upload →
 >   verify → activate → observe。wrangler 不允许给还不存在的 Worker 执行 `versions upload`，所以首次
 >   upload 先用 `wrangler deploy` 部署一个返回 503、不挂 workers.dev 的占位脚本来建出 Worker，再上传真实
->   版本；activate 在 `versions deploy` 之后执行 `triggers deploy`，由它把 cron、队列消费者和 workers.dev
+>   版本（占位与渲染后的配置都设 `preview_urls = false`，未激活的版本没有 preview URL）；activate 在 `versions deploy` 之后执行 `triggers deploy`，由它把 cron、队列消费者和 workers.dev
 >   应用到 Worker 上（这些是按 Worker 而不是按版本保存的，`versions upload`/`versions deploy` 不会碰）。
 >   这条链路的测试用的是记录调用的假 wrangler 可执行文件，它按 wrangler 4.129.0 源码模拟 driver 依赖的
 >   行为（未知 Worker 拒绝 `versions upload`、只有 `deploy`/`triggers deploy` 改 cron 与消费者等），
@@ -27,7 +27,9 @@
 >   按签名 release 启动真实的 driver 进程，假 wrangler 收到回填完毕且带命名空间的 `wrangler.toml`，
 >   激活后 cron 与队列消费者已生效，第二次部署复用已有资源，delete 删掉 Worker。**尚未在真实
 >   Cloudflare 账号上验证**。已知限制：`triggers deploy` 只增改队列消费者、不会摘掉应用不再声明的
->   消费者；`--secrets-file` 也只增不删。真实账号验证用
+>   消费者；`--secrets-file` 也只增不删；账号必须已注册 workers.dev 子域，否则 `triggers deploy` 会在
+>   流量已切换后失败；`versions list` 只返回最近 10 个版本，upload 之后再有 10 次以上上传会让 verify
+>   找不到该版本。真实账号验证用
 >   [`scripts/cloudflare-smoke.sh`](../scripts/cloudflare-smoke.sh)（或手动触发的
 >   `.github/workflows/cloudflare-smoke.yml`），跑通之前不应把 Cloudflare 部署当作已验证能力。
 >   运维接入步骤见 [`docs/operations/cloudflare.md`](operations/cloudflare.md)。
