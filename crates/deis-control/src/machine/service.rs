@@ -584,11 +584,14 @@ impl MachineChannel for MachineChannelService {
 
         // What this node runs, from its proved name - never from anything
         // the request says about itself.
-        let visible = assignments::deployments_visible_to(&self.state, &node_id)
-            .await
-            .map_err(|error| {
-                Status::internal(format!("could not list visible deployments: {error:?}"))
-            })?;
+        let visible = match assignments::deployments_visible_to(&self.state, &node_id).await {
+            Ok(visible) => visible,
+            Err(error) => {
+                let refusal =
+                    Status::internal(format!("could not list visible deployments: {error:?}"));
+                return Err(self.refuse_issuance(&proved, Some(audience), refusal).await);
+            }
+        };
         if let Err(reason) = issuance::authorize(&node_id, audience, &resources, &visible) {
             let refusal = if resources.is_empty() {
                 Status::invalid_argument(reason)
