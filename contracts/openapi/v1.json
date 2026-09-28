@@ -6804,6 +6804,44 @@
         },
         "type": "object"
       },
+      "ProviderPayloadUploadResponse": {
+        "description": "The stored identity of a driver-deployed provider payload: exactly what\n`POST …/provider-deployments` names in its `artifact`.",
+        "properties": {
+          "artifactId": {
+            "description": "The canonical parent this payload was derived from.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "created": {
+            "description": "False when this exact derivation was already recorded.",
+            "type": "boolean"
+          },
+          "manifestSha256": {
+            "description": "Identity of the derivation record.",
+            "type": "string"
+          },
+          "payloadRootSha256": {
+            "description": "File-set digest of the payload tree; a provider deployment's\n`artifact.providerPayloadSha256`.",
+            "type": "string"
+          },
+          "provider": {
+            "description": "`cloudflare`.",
+            "type": "string"
+          },
+          "standardVersion": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifactId",
+          "provider",
+          "standardVersion",
+          "manifestSha256",
+          "payloadRootSha256",
+          "created"
+        ],
+        "type": "object"
+      },
       "ProviderTarget": {
         "properties": {
           "backendId": {
@@ -9855,6 +9893,90 @@
           }
         },
         "summary": "Read one canonical artifact.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/artifacts/{artifact_id}/provider-payloads": {
+      "post": {
+        "description": "The body is a zip envelope with `.deislet/provider-derivation.json` and\nthe payload tree under `payload/` (for Cloudflare: `wrangler.toml`, the\nWorker bundle and `binding-plan.json`). Control revalidates the stored\ncanonical parent, the derivation record and the payload's file-set digest,\nstores the tree under that digest and records the derivation. When a\nprovider deployment names the digest, the Control copies this tree into\nthe driver's per-operation workspace and verifies it again there.",
+        "operationId": "uploadProviderPayload",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The canonical artifact's UUIDv7.",
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "$ref": "#/components/schemas/BinaryBody"
+              }
+            }
+          },
+          "description": "The provider payload envelope.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderPayloadUploadResponse"
+                }
+              }
+            },
+            "description": "This exact derivation was already recorded; `created` is false and nothing was written."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderPayloadUploadResponse"
+                }
+              }
+            },
+            "description": "The payload was verified and stored."
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Upload a payload that an external provider driver deploys.",
         "tags": [
           "product"
         ]

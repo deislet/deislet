@@ -12,7 +12,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use deis_provider_driver::{
-    DriverInstallationError, DriverReleaseInstaller, ExecutableProviderDriver,
+    DriverInstallationError, DriverReleaseInstaller, DriverWorkspaceRoot, ExecutableProviderDriver,
     ExecutableProviderDriverConfig, HostOperatingSystem, InstalledDriverRelease,
     ProviderCredentialBroker, Sha256Digest, ValidatedDriverReleaseAuthorization,
     ValidatedDriverReleaseTransparencyProof, ValidatedDriverReleaseTrustRoot,
@@ -82,10 +82,34 @@ pub struct ProviderDriverReleaseRegistry {
     trust_root: Arc<ValidatedDriverReleaseTrustRoot>,
 }
 
+/// How long the Control lets one driver process run before killing it.
+///
+/// The process holds one credential lease for its whole run, and the vault
+/// grants at most five minutes
+/// (`provider_credential::MAX_CREDENTIAL_LEASE`); the launcher
+/// refuses to start a process whose lease cannot outlast its timeout. A
+/// provider operation that uploads a Worker or installs its pinned toolchain
+/// on first use can take minutes, so the budget sits just under the lease.
+/// Drivers keep their own budget below this so they can still report a
+/// retryable timeout outcome.
+pub const DRIVER_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(270);
+
+/// The launcher bounds the Control runs provider driver processes with.
+#[must_use]
+pub fn driver_process_config() -> ExecutableProviderDriverConfig {
+    ExecutableProviderDriverConfig {
+        credential_lease_duration: super::provider_credential::MAX_CREDENTIAL_LEASE,
+        process_timeout: DRIVER_PROCESS_TIMEOUT,
+        ..ExecutableProviderDriverConfig::default()
+    }
+}
+
 #[derive(Clone)]
 pub struct ProviderDriverDispatcher {
     registry: ProviderDriverReleaseRegistry,
     credential_broker: Arc<dyn ProviderCredentialBroker>,
+    /// Where every driver process gets its verified payload and state.
+    workspaces: DriverWorkspaceRoot,
     process_config: ExecutableProviderDriverConfig,
 }
 
@@ -1023,6 +1047,7 @@ impl ProviderDriverDispatcher {
     pub fn new(
         registry: ProviderDriverReleaseRegistry,
         credential_vault: Arc<CatalogProviderCredentialVault>,
+        workspaces: DriverWorkspaceRoot,
         process_config: ExecutableProviderDriverConfig,
     ) -> CatalogResult<Self> {
         if !credential_vault.belongs_to(&registry.store) {
@@ -1037,6 +1062,7 @@ impl ProviderDriverDispatcher {
         Ok(Self {
             registry,
             credential_broker,
+            workspaces,
             process_config,
         })
     }
@@ -1057,12 +1083,14 @@ impl ProviderDriverDispatcher {
     ) -> CatalogResult<ExecutableProviderDriver> {
         let resolved = self.registry.resolve_for_target(target_id).await?;
         let credential_broker = Arc::clone(&self.credential_broker);
+        let workspaces = self.workspaces.clone();
         let process_config = self.process_config;
         tokio::task::spawn_blocking(move || {
             ExecutableProviderDriver::new(
                 resolved.manifest,
                 resolved.installed,
                 credential_broker,
+                workspaces,
                 process_config,
             )
         })
@@ -2091,6 +2119,16 @@ pub(crate) mod tests {
 
     impl Fixture {
         pub(crate) fn new() -> Self {
+            Self::build(None)
+        }
+
+        /// A release whose driver entrypoint is `driver`, so a test can
+        /// launch a real process through the installed, verified tree.
+        pub(crate) fn with_driver_executable(driver: Vec<u8>) -> Self {
+            Self::build(Some(driver))
+        }
+
+        fn build(driver: Option<Vec<u8>>) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let install_root = temporary.path().join("installed");
             fs::create_dir(&install_root).unwrap();
@@ -2108,15 +2146,13 @@ pub(crate) mod tests {
                 .files
                 .iter()
                 .map(|file| {
-                    let byte = if file.path.contains("driver") {
-                        b'd'
-                    } else {
-                        b'w'
+                    let is_driver = file.path.contains("driver");
+                    let content = match (&driver, is_driver) {
+                        (Some(driver), true) => driver.clone(),
+                        (None, true) => vec![b'd'; 128],
+                        (_, false) => vec![b'w'; 256],
                     };
-                    (
-                        file.path.clone(),
-                        vec![byte; if byte == b'd' { 128 } else { 256 }],
-                    )
+                    (file.path.clone(), content)
                 })
                 .collect::<BTreeMap<_, _>>();
             bind_file_table(&mut distribution.files, &contents);
@@ -3201,6 +3237,7 @@ pub(crate) mod tests {
         let dispatcher = ProviderDriverDispatcher::new(
             registry.clone(),
             Arc::clone(&vault),
+            crate::catalog::provider_payload::test_workspaces(),
             ExecutableProviderDriverConfig::default(),
         )
         .unwrap();

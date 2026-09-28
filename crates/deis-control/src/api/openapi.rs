@@ -115,6 +115,7 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         crate::api::catalog::artifacts::list_artifacts,
         crate::api::catalog::artifacts::upload_artifact,
         crate::api::catalog::artifacts::get_artifact,
+        crate::api::catalog::artifacts::upload_provider_payload,
         crate::api::catalog::versions::upload_version_with_lineage,
         crate::api::catalog::versions::list_versions,
         crate::api::catalog::versions::upload_version,

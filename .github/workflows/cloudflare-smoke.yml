@@ -1,0 +1,50 @@
+# The one check that talks to a real Cloudflare account.
+#
+# Everything else about the Cloudflare target is tested against a fake
+# `wrangler` on every push (checks.yml). This workflow deploys a sample
+# application with KV, D1, R2, a queue, a secret and a cron trigger to a
+# throwaway, per-run environment on the account named by the repository
+# secrets, checks every binding answers, and deletes everything it created.
+# See scripts/cloudflare-smoke.sh and docs/operations/cloudflare.md.
+#
+# Manual only: it spends real account quota and needs credentials, so no push
+# or pull request ever starts it.
+name: cloudflare-smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, linux, x64, deislet]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/build-host
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+
+      - name: Real-account smoke
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::set the repository secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+          cargo build -p deis -p deis-provider-driver-cloudflare
+          DEIS_BIN="$CARGO_TARGET_DIR/debug/deis" \
+          DEIS_CLOUDFLARE_DRIVER_BIN="$CARGO_TARGET_DIR/debug/deis-provider-driver-cloudflare" \
+            scripts/cloudflare-smoke.sh

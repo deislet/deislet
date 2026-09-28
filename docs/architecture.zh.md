@@ -11,7 +11,7 @@
 > 目标口径：自托管（deislet）与 Cloudflare 为支持的目标；Deno、EdgeOne 仅生成无状态函数产物，不做认证，不承诺绑定。
 > 配套 [`implementation-plan.zh.md`](implementation-plan.zh.md)：那份讲「照着写什么」，这份讲「为什么这么分」。
 
-**现在这套东西是通的。** 波次 A 与波次 B 已经合入：`deis build --vendor deislet`
+**现在这套东西是通的。** 波次 A 与波次 B 已经合入：`deis build --target deislet`
 产出应用包，控制面把它存成不可变版本，环境指针指向版本，节点自己把包拉下来对外服务；
 静态资产先于任何 Isolate 命中；`context.env.<binding>` 的 KV、Database、Blob、Queue
 真的走到 deis-store 与 deis-queue；cron 到点在**一个**节点上执行；日志进 deis-telemetry；

@@ -991,7 +991,7 @@ acme_ca_stats() {
 #
 # Nothing here is a shortcut. The same five steps a person takes:
 #
-#   1. `deis build --vendor deislet`  -> dist/providers/deislet/<digest>/bundle.zip
+#   1. `deis build --target deislet`  -> dist/providers/deislet/<digest>/bundle.zip
 #   2. POST /api/v1/apps              -> the application exists
 #   3. POST .../versions              -> the bundle becomes an immutable version
 #   4. POST .../environments          -> production exists

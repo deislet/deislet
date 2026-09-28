@@ -92,7 +92,7 @@ date、账号与作用域 token 与审计日志、ACME 签发与续期、回滚�
 
 ## 2. 应用包格式
 
-`deis build --vendor deislet` 产出一个 zip，是版本的唯一载体。
+`deis build --target deislet` 产出一个 zip，是版本的唯一载体。
 
 ```
 manifest.json
@@ -667,7 +667,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 
 ### 波次 B 收尾（B1–B7 已合入，2026-08-29）
 
-`scripts/demo.sh start` 起全部六个进程并按真实路径部署（`deis build --vendor deislet` → 建应用 → 传版本 → 建环境 → 存密钥 → 切指针 → 节点自取），`scripts/demo.sh verify` 逐项跑通并打印证据：静态资产（含 ETag 与 `If-None-Match` 回 304）、路由占位符、密钥下发且不落盘、KV 经 deis-store 往返、队列产出与消费、cron 到点在单个节点上执行、回滚（函数与资产一起回到上一版）、日志可从 deis-telemetry 查回。
+`scripts/demo.sh start` 起全部六个进程并按真实路径部署（`deis build --target deislet` → 建应用 → 传版本 → 建环境 → 存密钥 → 切指针 → 节点自取），`scripts/demo.sh verify` 逐项跑通并打印证据：静态资产（含 ETag 与 `If-None-Match` 回 304）、路由占位符、密钥下发且不落盘、KV 经 deis-store 往返、队列产出与消费、cron 到点在单个节点上执行、回滚（函数与资产一起回到上一版）、日志可从 deis-telemetry 查回。
 
 合入时补齐的三处：`wire_deployment_env` 此前无人调用（存储绑定全部落空）；`MetricShipper` 无人启动；节点的 `Trigger.OnScheduled` 是个只回 success 的桩，控制面每次触发都被当成成功。
 

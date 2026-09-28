@@ -1,12 +1,22 @@
 # Deislet
 
 A self-hosted mini Cloudflare Workers and Pages: you write an edge function
-once, and either run it on your own machines or compile it for Cloudflare.
+once, and either run it on your own machines or deploy it to Cloudflare.
 
 **Supported targets.** Self-hosted (this platform) and Cloudflare are the
-supported deployment targets. Deno Deploy and Tencent EdgeOne are frozen:
-`deis build` still emits their stateless-function artifacts, but they get no
-authentication story, no binding support and no new work.
+supported deployment targets. `deis deploy` deploys to this platform;
+`deis deploy --target cloudflare` builds the Cloudflare payload and has the
+control plane's Cloudflare provider driver deploy it through `wrangler`,
+creating per-application KV, D1, R2 and Queue resources. That path is
+implemented and tested against a fake `wrangler` that replays real outputs
+and exit codes; it has **not yet been verified against a real Cloudflare
+account** — [`scripts/cloudflare-smoke.sh`](scripts/cloudflare-smoke.sh) is
+that verification, and setup is in
+[`docs/operations/cloudflare.md`](docs/operations/cloudflare.md). Deno Deploy
+and Tencent EdgeOne are frozen: `deis build --target deno|tencent` still
+emits their stateless-function artifacts when asked, but they are never built
+by default and get no authentication story, no binding support and no new
+work.
 
 **Trust model.** deislet assumes the application code deployed into one
 installation is trusted. The V8 isolate is resource isolation, not a security
@@ -57,7 +67,7 @@ for two consecutive checks:
 |---|---|
 | `deis deploy` takes a project from source to serving | one command builds, uploads a version, moves the pointer, and the app answers |
 | `deis versions` lists what was deployed | both versions, with the one production points at marked |
-| one project compiles for all four build targets | `deis build -v all` writes a deislet bundle, a Cloudflare `index.js` with its `wrangler.toml`, a Deno handler with a generated router, and an EdgeOne `edge-functions/index.js` — each the shape that host expects, not one output copied four times; of the four, the deislet bundle and the Cloudflare artifact are the supported targets, the Deno and EdgeOne outputs are frozen stateless functions |
+| one project compiles for all four build targets | `deis build --target all` writes a deislet bundle, a Cloudflare `index.js` with its `wrangler.toml`, a Deno handler with a generated router, and an EdgeOne `edge-functions/index.js` — each the shape that host expects, not one output copied four times; of the four, the deislet bundle and the Cloudflare artifact are the supported targets, the Deno and EdgeOne outputs are frozen stateless functions |
 | a handler that reaches for `WebSocketPair` is refused by the build | `deis deploy` stops at its first step with `EC_STREAM_WEBSOCKET_NONPORTABLE`, no bundle is written and no application is created — Edge Canon v1 has no portable server-side WebSocket API, so the refusal is the promise, not a 101 |
 | static asset served from the bundle | without entering an isolate |
 | `If-None-Match` answers 304 | the ETag is the asset's own sha256 |
@@ -154,6 +164,8 @@ protocol.
 | [`deis-telemetry`](crates/deis-telemetry) | Logs, metrics and invocation traces, independent of everything else. Three services side by side: batched logs with `Query` and a streaming `Tail`; one trace per invocation with `QueryTraces` and `TailTraces`, which is what `deis trace` reads; and metrics exported in Prometheus format, latency among them as a histogram rather than a high-water mark. Only deis-runtime ships to it so far; the other components still log to their own stdout. |
 | [`deis`](crates/deis) | The developer CLI, and the only interface a person needs. `init`, `dev`, `validate` and `build` work on the project on disk; `targets` reads the locked registry-derived standard status embedded at build time; and `config` holds the CLI's own settings — the credential among them, which it will not write into the project. `deploy`, `versions`, `rollback`, `status`, `secret`, `logs`, `tail`, `trace`, `kv`, `db`, `blob`, `queue`, `account`, `token` and `audit` talk to a running platform. Delegates every bit of parsing and compiling to deis-build. |
 | [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four build targets. This platform and Cloudflare Workers are the supported ones; Deno Deploy and Tencent EdgeOne are frozen at stateless-function artifacts — no authentication, no bindings, no new work. Translation only: it never deploys. |
+| [`deis-provider-driver`](crates/deis-provider-driver) | The provider driver contract and launcher. The control plane runs a signed, installed driver release as a process per operation, hands it an operation-scoped credential and a private work directory holding the provider payload it re-verified against the requested digest (`contracts/v1/provider-driver-process.schema.json`). |
+| [`deis-provider-driver-cloudflare`](crates/deis-provider-driver-cloudflare) | The Cloudflare provider driver: maps preflight/plan/prepare/upload/verify/activate/observe/delete/cleanup onto a pinned `wrangler`, creates namespaced KV/D1/R2/Queue resources and fills the payload's `deis:unresolved/...` placeholders. Verified against a fake `wrangler` only; see `docs/operations/cloudflare.md`. |
 | [`deis-wire`](crates/deis-wire) | The gRPC toolkit and, in `deis_wire::conventions`, the names both sides of every wire agree on: the header names, the tenant id, the message ceiling, the reserved environment keys. |
 
 A few more crates carry contracts rather than behaviour:
@@ -168,7 +180,7 @@ Each of those has four readers and one definition, which is the whole reason
 the crate exists; [`deis-build-core`](crates/deis-build-core) holds the types,
 config and bundling logic every compile target's code generator shares; and
 `deis-build-adapter-*` are one code generator per compile target, each named
-after the `--vendor` value it answers for —
+after the build target it answers for —
 `deis-build-adapter-{cloudflare,deno,tencent,deislet}`.
 
 Six crates carry a README of their own — `deis`, `deis-build`, `deis-control`,

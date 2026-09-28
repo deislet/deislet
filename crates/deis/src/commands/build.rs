@@ -1,8 +1,10 @@
 //! `deis build` - compile the project for one or more targets.
 //!
 //! The deislet target is this platform's own: it produces the application
-//! bundle `deis deploy` uploads. The other targets produce what each vendor's
-//! own tooling deploys, and this CLI does not deploy them.
+//! bundle `deis deploy` uploads. The cloudflare target produces the payload
+//! `deis deploy --target cloudflare` hands to the control plane's Cloudflare
+//! provider driver. The frozen deno and tencent targets produce stateless
+//! artifacts only when named explicitly; nothing deploys them.
 
 use std::env;
 use std::fs;
@@ -14,17 +16,40 @@ use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use deis_build::Compiler;
 
-/// The vendor name of this platform's own target.
+/// The build target name of this platform's own target.
 pub const DEISLET_VENDOR: &str = "deislet";
 
-pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<()> {
+/// What a `deis build` without `--target` builds: every target .config.json
+/// enables, minus the frozen ones (deno, tencent), which still build
+/// stateless artifacts when named but are never part of a default build.
+fn default_targets(config: &deis_build::ProjectConfig) -> Vec<String> {
+    let Some(vendors) = config.vendors.as_ref() else {
+        return Vec::new();
+    };
+    [
+        (
+            DEISLET_VENDOR,
+            vendors.deislet.as_ref().is_some_and(|v| v.enabled),
+        ),
+        (
+            "cloudflare",
+            vendors.cloudflare.as_ref().is_some_and(|v| v.enabled),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, enabled)| *enabled)
+    .map(|(name, _)| name.to_string())
+    .collect()
+}
+
+pub async fn execute(targets: Vec<String>, watch: bool, minify: bool) -> Result<()> {
     // Refused rather than ignored. A `--watch` that silently builds once and
     // exits looks exactly like a watch that is running and seeing no
     // changes, which is the slowest possible way to find out it does nothing.
     if watch {
         bail!(
             "`deis build --watch` is not implemented. `deis dev` rebuilds and reloads on every \
-             change for this platform; for a vendor target, run `deis build --vendor <name>` from \
+             change for this platform; for another target, run `deis build --target <name>` from \
              your own file watcher."
         );
     }
@@ -34,6 +59,20 @@ pub async fn execute(vendors: Vec<String>, watch: bool, minify: bool) -> Result<
     let start = Instant::now();
     let project_dir = env::current_dir()?;
     let compiler = Compiler::new();
+    let vendors = if targets.is_empty() {
+        let config = deis_build::load_project_config(&project_dir.to_string_lossy())
+            .context("reading .config.json to choose the default build targets")?;
+        let defaults = default_targets(&config);
+        if defaults.is_empty() {
+            bail!(
+                ".config.json enables neither the deislet nor the cloudflare target; enable one \
+                 under \"vendors\" or name a target with --target"
+            );
+        }
+        defaults
+    } else {
+        targets
+    };
 
     // First validate
     println!("{}", "Validating project...".dimmed());
@@ -215,6 +254,71 @@ impl Bundle {
 /// Validation runs first: a bundle that would be refused at upload is better
 /// refused here, next to the code that produced it.
 pub async fn deislet_bundle(project_dir: &Path, minify: bool) -> Result<Bundle> {
+    Ok(build_for_deploy(project_dir, None, minify).await?.0)
+}
+
+/// A provider payload an external provider driver deploys, with the
+/// derivation record binding it to the canonical parent.
+#[derive(Debug, Clone)]
+pub struct ProviderPayload {
+    pub provider: String,
+    pub payload_root: PathBuf,
+    pub payload_root_sha256: String,
+    pub derivation_manifest_path: PathBuf,
+    pub derivation_manifest_sha256: String,
+}
+
+impl ProviderPayload {
+    /// The upload envelope: the exact derivation record beside the payload
+    /// tree under `payload/`. The outer zip is only a carrier; the Control
+    /// re-derives the payload's file-set digest from the unpacked tree.
+    pub fn envelope(&self) -> Result<Vec<u8>> {
+        let derivation = fs::read(&self.derivation_manifest_path).with_context(|| {
+            format!(
+                "reading provider derivation {}",
+                self.derivation_manifest_path.display()
+            )
+        })?;
+        if deis_build::canonical_artifact::sha256(&derivation) != self.derivation_manifest_sha256 {
+            bail!("the provider derivation identity changed before upload");
+        }
+        let mut files = walkdir::WalkDir::new(&self.payload_root)
+            .follow_links(false)
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        files.retain(|entry| entry.file_type().is_file());
+        files.sort_by(|left, right| left.path().cmp(right.path()));
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        writer.start_file(".deislet/provider-derivation.json", options)?;
+        writer.write_all(&derivation)?;
+        for entry in files {
+            let relative = entry
+                .path()
+                .strip_prefix(&self.payload_root)?
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("provider payload path is not UTF-8"))?
+                .replace('\\', "/");
+            writer.start_file(format!("payload/{relative}"), options)?;
+            writer.write_all(&fs::read(entry.path())?)?;
+        }
+        Ok(writer.finish()?.into_inner())
+    }
+}
+
+/// Build the Deislet bundle and, when `provider` is named, that provider's
+/// payload, from one compile so both derive from the same canonical parent.
+///
+/// The Deislet version is what a provider deployment's artifact names, so it
+/// is always built: a Cloudflare deploy records a version exactly as a
+/// self-hosted one does, without moving any environment pointer.
+pub async fn build_for_deploy(
+    project_dir: &Path,
+    provider: Option<&str>,
+    minify: bool,
+) -> Result<(Bundle, Option<ProviderPayload>)> {
     let compiler = Compiler::new();
     let validation = compiler
         .validate(project_dir, false)
@@ -229,17 +333,12 @@ pub async fn deislet_bundle(project_dir: &Path, minify: bool) -> Result<Bundle> 
         );
     }
 
+    let mut targets = vec![DEISLET_VENDOR.to_string()];
+    targets.extend(provider.map(str::to_string));
     let result = compiler
-        .compile(project_dir, vec![DEISLET_VENDOR.to_string()], minify)
+        .compile(project_dir, targets, minify)
         .await
         .context("building the application bundle")?;
-
-    let build = result.builds.get(DEISLET_VENDOR).ok_or_else(|| {
-        anyhow::anyhow!(
-            "the build produced no {DEISLET_VENDOR} target. Enable it in .config.json:\n\n  \
-             \"vendors\": {{ \"deislet\": {{ \"enabled\": true }} }}"
-        )
-    })?;
 
     // Deployment is a new trust boundary. Recompute both the canonical parent
     // and the provider payload lineage here rather than trusting the checks
@@ -258,36 +357,63 @@ pub async fn deislet_bundle(project_dir: &Path, minify: bool) -> Result<Bundle> 
     {
         bail!("the canonical artifact identity changed after the build completed");
     }
-    let derivation = build.derivation.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("the deislet bundle has no canonical parent derivation record")
-    })?;
-    let derivation_path = derivation.manifest_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("the deislet bundle has no retained provider derivation manifest")
-    })?;
-    let derived = deis_build::provider_derivation::validate(
-        Path::new(derivation_path),
-        Path::new(&build.output_path),
-        Some(DEISLET_VENDOR),
-        Some(&canonical_summary.standard_version),
-        Some(&canonical.artifact_sha256),
-    )
-    .context("revalidating the deislet provider payload before deployment")?;
-    if derivation.manifest_sha256.as_deref() != Some(derived.manifest_sha256.as_str())
-        || derivation.payload_root_sha256.as_deref() != Some(derived.payload_root_sha256.as_str())
-    {
-        bail!("the deislet provider derivation identity changed after the build completed");
-    }
+    let verified = |target: &str| -> Result<(
+        PathBuf,
+        deis_build::provider_derivation::ProviderDerivationSummary,
+    )> {
+        let build = result.builds.get(target).ok_or_else(|| {
+            anyhow::anyhow!(
+                "the build produced no {target} target. Enable it in .config.json:\n\n  \
+                 \"vendors\": {{ \"{target}\": {{ \"enabled\": true }} }}"
+            )
+        })?;
+        let derivation = build.derivation.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("the {target} build has no canonical parent derivation record")
+        })?;
+        let derivation_path = derivation.manifest_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("the {target} build has no retained provider derivation manifest")
+        })?;
+        let derived = deis_build::provider_derivation::validate(
+            Path::new(derivation_path),
+            Path::new(&build.output_path),
+            Some(target),
+            Some(&canonical_summary.standard_version),
+            Some(&canonical.artifact_sha256),
+        )
+        .with_context(|| format!("revalidating the {target} provider payload before deployment"))?;
+        if derivation.manifest_sha256.as_deref() != Some(derived.manifest_sha256.as_str())
+            || derivation.payload_root_sha256.as_deref()
+                != Some(derived.payload_root_sha256.as_str())
+        {
+            bail!("the {target} provider derivation identity changed after the build completed");
+        }
+        Ok((PathBuf::from(&build.output_path), derived))
+    };
 
-    let path = Path::new(&build.output_path).join(deis_build::adapter_deislet::BUNDLE_FILE_NAME);
+    let (deislet_root, deislet) = verified(DEISLET_VENDOR)?;
+    let path = deislet_root.join(deis_build::adapter_deislet::BUNDLE_FILE_NAME);
     let mut bundle = read_bundle(&path)?;
     bundle.lineage = Some(BundleLineage {
-        canonical_root: canonical_summary.root,
-        artifact_sha256: canonical_summary.artifact_sha256,
-        content_root_sha256: canonical_summary.content_root_sha256,
-        derivation_manifest_path: derived.manifest_path,
-        derivation_manifest_sha256: derived.manifest_sha256,
+        canonical_root: canonical_summary.root.clone(),
+        artifact_sha256: canonical_summary.artifact_sha256.clone(),
+        content_root_sha256: canonical_summary.content_root_sha256.clone(),
+        derivation_manifest_path: deislet.manifest_path,
+        derivation_manifest_sha256: deislet.manifest_sha256,
     });
-    Ok(bundle)
+    let payload = match provider {
+        Some(provider) => {
+            let (payload_root, derived) = verified(provider)?;
+            Some(ProviderPayload {
+                provider: provider.to_string(),
+                payload_root,
+                payload_root_sha256: derived.payload_root_sha256,
+                derivation_manifest_path: derived.manifest_path,
+                derivation_manifest_sha256: derived.manifest_sha256,
+            })
+        }
+        None => None,
+    };
+    Ok((bundle, payload))
 }
 
 /// Read the last completed, fully verified Deislet payload and its retained
@@ -337,7 +463,7 @@ pub fn last_deislet_bundle(project_dir: &Path) -> Result<Bundle> {
 pub fn read_bundle(path: &Path) -> Result<Bundle> {
     let bytes = std::fs::read(path).with_context(|| {
         format!(
-            "reading the application bundle {}. Build it first with `deis build --vendor {}`.",
+            "reading the application bundle {}. Build it first with `deis build --target {}`.",
             path.display(),
             DEISLET_VENDOR
         )
@@ -424,7 +550,25 @@ mod tests {
             panic!("a bundle that is not on disk must not read as one that is");
         };
         let error = error.to_string();
-        assert!(error.contains("deis build --vendor deislet"), "{error}");
+        assert!(error.contains("deis build --target deislet"), "{error}");
+    }
+
+    #[test]
+    fn a_default_build_leaves_out_frozen_targets() {
+        let config: deis_build::ProjectConfig = serde_json::from_value(serde_json::json!({
+            "version": "1.0",
+            "name": "demo",
+            "runtime": "standard-v1",
+            "language": "javascript",
+            "vendors": {
+                "deislet": {"enabled": true},
+                "cloudflare": {"enabled": true},
+                "deno": {"enabled": true},
+                "tencent": {"enabled": true}
+            }
+        }))
+        .unwrap();
+        assert_eq!(default_targets(&config), ["deislet", "cloudflare"]);
     }
 
     #[test]

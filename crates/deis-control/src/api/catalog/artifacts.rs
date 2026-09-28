@@ -202,3 +202,112 @@ pub async fn get_artifact(
         .await?;
     Ok(Json(artifact.record))
 }
+
+/// The stored identity of a driver-deployed provider payload: exactly what
+/// `POST …/provider-deployments` names in its `artifact`.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPayloadUploadResponse {
+    /// The canonical parent this payload was derived from.
+    #[schema(value_type = String, format = Uuid)]
+    pub artifact_id: CanonicalId,
+    /// `cloudflare`.
+    pub provider: String,
+    pub standard_version: String,
+    /// Identity of the derivation record.
+    pub manifest_sha256: String,
+    /// File-set digest of the payload tree; a provider deployment's
+    /// `artifact.providerPayloadSha256`.
+    pub payload_root_sha256: String,
+    /// False when this exact derivation was already recorded.
+    pub created: bool,
+}
+
+/// Upload a payload that an external provider driver deploys.
+///
+/// The body is a zip envelope with `.deislet/provider-derivation.json` and
+/// the payload tree under `payload/` (for Cloudflare: `wrangler.toml`, the
+/// Worker bundle and `binding-plan.json`). Control revalidates the stored
+/// canonical parent, the derivation record and the payload's file-set digest,
+/// stores the tree under that digest and records the derivation. When a
+/// provider deployment names the digest, the Control copies this tree into
+/// the driver's per-operation workspace and verifies it again there.
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/artifacts/{artifact_id}/provider-payloads",
+    operation_id = "uploadProviderPayload",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("artifact_id" = String, Path, description = "The canonical artifact's UUIDv7.")),
+    request_body(content = openapi::BinaryBody, content_type = "application/octet-stream", description = "The provider payload envelope."),
+    responses(
+        (status = 200, description = "This exact derivation was already recorded; `created` is false and nothing was written.", body = ProviderPayloadUploadResponse),
+        (status = 201, description = "The payload was verified and stored.", body = ProviderPayloadUploadResponse),
+        (status = 400, response = openapi::BadRequest),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 413, response = openapi::PayloadTooLarge),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
+pub async fn upload_provider_payload(
+    State(state): State<CatalogState>,
+    Path((app_id, artifact_id)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, Json<ProviderPayloadUploadResponse>)> {
+    let artifact_id = artifact_id.parse::<CanonicalId>().map_err(|error| {
+        ApiError::BadRequest(format!("canonical artifact id is invalid: {error}"))
+    })?;
+    let artifact = state
+        .store
+        .get_canonical_artifact(&app_id, artifact_id)
+        .await?;
+    let app = state.store.get_app(&app_id).await?;
+    if std::path::Path::new(&artifact.storage_path)
+        != state
+            .artifacts
+            .path_for(app.canonical_id, &artifact.artifact_sha256)
+    {
+        return Err(ApiError::InternalError(
+            "canonical artifact catalog path is outside its application store".into(),
+        ));
+    }
+    let payloads = state.provider_payloads.clone();
+    let bytes = body.to_vec();
+    let stored = tokio::task::spawn_blocking(move || {
+        payloads.store_envelope(app.canonical_id, &artifact, &bytes)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::InternalError(format!(
+            "provider payload processing task failed to complete: {error}"
+        ))
+    })??;
+    let (derivation, created) = state
+        .store
+        .record_provider_derivation(&app_id, artifact_id, stored.spec)
+        .await?;
+    info!(
+        app_id = %app_id,
+        artifact_id = %artifact_id,
+        provider = %derivation.provider,
+        payload_root_sha256 = %derivation.payload_root_sha256,
+        created,
+        "Provider payload upload accepted"
+    );
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(ProviderPayloadUploadResponse {
+            artifact_id,
+            provider: derivation.provider,
+            standard_version: derivation.standard_version,
+            manifest_sha256: derivation.manifest_sha256,
+            payload_root_sha256: derivation.payload_root_sha256,
+            created,
+        }),
+    ))
+}

@@ -925,6 +925,21 @@ fn classify_canonical(
         ["api", "apps", app, "artifacts", artifact] if !writing => {
             Requirement::new("artifact.get", Verb::Read, named(app), Resource::Any).about(artifact)
         }
+        [
+            "api",
+            "apps",
+            app,
+            "artifacts",
+            artifact,
+            "provider-payloads",
+        ] => Requirement::new(
+            "provider_payload.upload",
+            Verb::Deploy,
+            named(app),
+            Resource::Any,
+        )
+        .about(artifact)
+        .changes_state(),
         ["api", "apps", app, "artifacts", artifact, "versions"] => Requirement::new(
             "version.upload_lineage",
             Verb::Deploy,

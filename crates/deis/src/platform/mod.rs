@@ -279,6 +279,40 @@ pub struct ArtifactUploadResponse {
     pub created: bool,
 }
 
+/// A stored provider payload, as `POST …/provider-payloads` answers it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPayloadUpload {
+    pub artifact_id: CanonicalId,
+    pub provider: String,
+    pub standard_version: String,
+    pub manifest_sha256: String,
+    pub payload_root_sha256: String,
+    pub created: bool,
+}
+
+/// One environment's authorization to deploy to one provider target.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderTargetGrant {
+    pub grant_id: CanonicalId,
+    pub provider_target_id: CanonicalId,
+    /// `cloudflare-workers-pages` for Cloudflare.
+    pub backend_id: String,
+    pub target_name: String,
+    pub target_status: String,
+    pub status: String,
+}
+
+/// The exact artifact a provider deployment deploys.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderArtifactRef {
+    pub artifact_version_id: CanonicalId,
+    pub canonical_artifact_sha256: String,
+    pub provider_payload_sha256: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Environment {
     pub id: String,
@@ -1483,6 +1517,29 @@ impl Control {
         .await
     }
 
+    /// Store a payload an external provider driver deploys, bound to the
+    /// canonical artifact it was derived from.
+    pub async fn upload_provider_payload(
+        &self,
+        app_id: &str,
+        artifact_id: CanonicalId,
+        envelope: Vec<u8>,
+    ) -> Result<ProviderPayloadUpload> {
+        self.send(
+            self.request(
+                Method::POST,
+                &format!("/apps/{app_id}/artifacts/{artifact_id}/provider-payloads"),
+            )
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/vnd.deislet.provider-envelope.v1+zip",
+            )
+            .body(envelope),
+            &format!("uploading a provider payload for app {app_id}"),
+        )
+        .await
+    }
+
     pub async fn list_versions(&self, app_id: &str) -> Result<Vec<Version>> {
         self.list_all(
             &format!("/apps/{app_id}/versions"),
@@ -2035,6 +2092,77 @@ impl Control {
             bail!(
                 "{what}: rollback operation {} returned Location {location:?}, expected the \
                  scoped path {expected:?}",
+                operation.operation_id
+            );
+        }
+        Ok(operation)
+    }
+
+    /// The provider targets this environment may deploy to right now.
+    pub async fn list_provider_target_grants(
+        &self,
+        app_id: &str,
+        environment: &str,
+    ) -> Result<Vec<ProviderTargetGrant>> {
+        self.list_all(
+            &format!(
+                "/apps/{app_id}/environments/{environment}/provider-target-grants?status=active"
+            ),
+            &format!("listing the provider targets {environment} of app {app_id} may deploy to"),
+        )
+        .await
+    }
+
+    /// Record a provider deployment of `artifact` to `provider_target_id`.
+    ///
+    /// Idempotent per invocation, like a rollback: a redelivery of these
+    /// bytes answers the one operation, while running the command again asks
+    /// for a second deployment.
+    pub async fn begin_provider_deployment(
+        &self,
+        app_id: &str,
+        environment: &str,
+        provider_target_id: CanonicalId,
+        artifact: &ProviderArtifactRef,
+    ) -> Result<ProviderOperationSummary> {
+        let what = format!(
+            "starting a provider deployment of {environment} of app {app_id} to target {provider_target_id}"
+        );
+        let (_, headers, operation) = self
+            .send_with_metadata::<ProviderOperationSummary>(
+                self.request(
+                    Method::POST,
+                    &format!("/apps/{app_id}/environments/{environment}/provider-deployments"),
+                )
+                .header(IDEMPOTENCY_KEY, new_idempotency_key())
+                .json(&serde_json::json!({
+                    "providerTargetId": provider_target_id,
+                    "artifact": artifact,
+                })),
+                &what,
+            )
+            .await?;
+        // Checked against the path this CLI would have built, never followed
+        // as an arbitrary URL; see `rollback_provider_deployment`.
+        let expected = format!(
+            "{}{}",
+            self.product_prefix(),
+            Self::provider_deployment_route(app_id, environment, operation.operation_id)
+        );
+        let location = headers
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{what}: operation {} was accepted without a Location to poll",
+                    operation.operation_id
+                )
+            })?
+            .to_str()
+            .context("reading the provider deployment Location")?;
+        if location != expected {
+            bail!(
+                "{what}: operation {} returned Location {location:?}, expected the scoped path \
+                 {expected:?}",
                 operation.operation_id
             );
         }

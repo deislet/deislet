@@ -168,7 +168,13 @@ def target_status() -> dict[str, Any]:
             {
                 "id": backend["id"],
                 "displayName": backend["displayName"],
-                "role": backend["role"],
+                # A frozen target is not first-class whatever the upstream
+                # registry calls it: its role follows the freeze.
+                "role": (
+                    "experimental"
+                    if backend["id"] in FROZEN_BACKENDS
+                    else backend["role"]
+                ),
                 "lifecycle": (
                     "frozen" if backend["id"] in FROZEN_BACKENDS else "active"
                 ),

@@ -28,7 +28,7 @@ cd my-app
 
 ```
 my-app/
-├── .config.json        # what to build and which vendors
+├── .config.json        # what to build and for which targets
 ├── functions/          # one file per route
 │   ├── index.ts        #   → /
 │   └── api/hello.ts    #   → /api/hello
@@ -252,16 +252,20 @@ back with the code, because they travel inside the version.
 
 ## 8. Somebody else's platform
 
-The same source compiles for the vendors:
+The same source deploys to Cloudflare, through the control plane's
+Cloudflare provider driver (setup: `docs/operations/cloudflare.md`):
 
 ```bash
-deis build --vendor cloudflare      # then: wrangler deploy
-deis build --vendor deno            # then: deployctl deploy
-deis build --vendor tencent
+deis deploy --target cloudflare
 ```
 
-`deis deploy` does not push to any of them, on purpose: each owns its own
-credentials and deployment model, and their tools already do it properly.
+The frozen Deno and EdgeOne targets still compile when named, and nothing
+deploys them:
+
+```bash
+deis build --target deno
+deis build --target tencent
+```
 
 ## Scripting
 

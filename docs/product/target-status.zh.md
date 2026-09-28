@@ -14,7 +14,7 @@ normative release：否。
 |---|---|---|---|---|---:|---:|---:|---|
 | Deislet (`deislet`) | `first-class` | `active` | `deployed` | `pass` | `not-certified` | 否 | 否 | — |
 | Cloudflare Workers/Pages (`cloudflare-workers-pages`) | `first-class` | `active` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
-| Tencent EdgeOne Makers (`tencent-edgeone-makers`) | `first-class` | `frozen` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
+| Tencent EdgeOne Makers (`tencent-edgeone-makers`) | `experimental` | `frozen` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
 | Deno (`deno`) | `experimental` | `frozen` | `artifact-generated` | `pass` | `not-certified` | 否 | 否 | — |
 
 ## 当前阻断项
