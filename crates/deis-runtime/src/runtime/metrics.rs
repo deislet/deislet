@@ -1451,21 +1451,27 @@ async fn push_once(
                 debug!(count, "Pushed metric samples to deis-telemetry");
             }
         }
-        Err(status) if status.code() == tonic::Code::Unauthenticated => error!(
-            count,
-            carrying_a_token = credential.is_present(),
-            error = %status.message(),
-            "deis-telemetry refused this node's metrics: this node has no telemetry capability \
-             from the control plane yet, or the collector does not trust the control plane's \
-             signing keys (check its [machine_identity] control_endpoint). The counters are cumulative, so the \
-             next accepted push carries them"
-        ),
-        Err(status) => warn!(
-            count,
-            error = %status,
-            "Pushing metrics to deis-telemetry failed; the counters are cumulative so nothing is \
-             lost, but dashboards will show a gap until the next push succeeds"
-        ),
+        Err(status) if status.code() == tonic::Code::Unauthenticated => {
+            credential.observe(&status);
+            error!(
+                count,
+                carrying_a_token = credential.is_present(),
+                error = %status.message(),
+                "deis-telemetry refused this node's metrics: this node has no telemetry capability \
+                 from the control plane yet, or the collector does not trust the control plane's \
+                 signing keys (check its [machine_identity] control_endpoint). The counters are cumulative, so the \
+                 next accepted push carries them"
+            )
+        }
+        Err(status) => {
+            credential.observe(&status);
+            warn!(
+                count,
+                error = %status,
+                "Pushing metrics to deis-telemetry failed; the counters are cumulative so nothing is \
+                 lost, but dashboards will show a gap until the next push succeeds"
+            )
+        }
     }
 }
 
@@ -1519,6 +1525,7 @@ async fn push_traces_once(
             // not also erase the evidence that traces were lost during it.
             recorder.restore_gaps(gaps);
             let returned = recorder.requeue(batch);
+            credential.observe(&status);
             if status.code() == tonic::Code::Unauthenticated {
                 error!(
                     count,

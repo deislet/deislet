@@ -506,6 +506,7 @@ impl LogSink for TelemetrySink {
                 // Drop the channel rather than reuse one the server may have
                 // closed; the next attempt dials again.
                 self.client = None;
+                self.credential.observe(&status);
                 if status.code() == tonic::Code::Unauthenticated {
                     // Its own line, at error, because from the outside it
                     // looks exactly like a transient outage: the collector is

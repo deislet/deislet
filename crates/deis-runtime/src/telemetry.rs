@@ -22,6 +22,12 @@
 //! before the current one's 15 minutes run out, and again as soon as the set
 //! of application environments the node runs changes - a newly deployed
 //! application's lines would otherwise be refused until the next renewal.
+//! And again as soon as deis-telemetry refuses the one held (revoked, or
+//! issued under an auth epoch since bumped; every push reports its refusal
+//! through [`TelemetryCredential::observe`]), no sooner than
+//! [`REFUSED_RETRY`] after it was issued: this one capability names every
+//! tenant the node runs, so revoking any of them takes it back, and until it
+//! is replaced the shippers keep their batches queued.
 //! A failed request is retried every 30 seconds or so; until one succeeds the
 //! shippers keep their batches queued, exactly as they do when deis-telemetry
 //! is down.
@@ -34,6 +40,7 @@
 //! each shipper's refusal message.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -64,6 +71,11 @@ const RETRY_JITTER: Duration = Duration::from_secs(10);
 /// the one the current capability names.
 const TENANT_CHECK_EVERY: Duration = Duration::from_secs(5);
 
+/// The soonest a refused capability is replaced after it was issued. A
+/// refusal of a fresh one is one a new capability would not fix, so it is
+/// retried no faster than a failed request.
+const REFUSED_RETRY: Duration = Duration::from_secs(30);
+
 /// The token this node presents on every telemetry call.
 ///
 /// Cheap to clone, and deliberately shared by the three channels and the
@@ -73,6 +85,8 @@ const TENANT_CHECK_EVERY: Duration = Duration::from_secs(5);
 pub struct TelemetryCredential {
     /// Pre-formatted `Bearer <token>` value.
     bearer: Arc<RwLock<Option<MetadataValue<Ascii>>>>,
+    /// deis-telemetry refused the token held; cleared by the next one.
+    refused: Arc<AtomicBool>,
 }
 
 impl TelemetryCredential {
@@ -90,7 +104,27 @@ impl TelemetryCredential {
             .parse::<MetadataValue<Ascii>>()
             .map_err(|_| "the telemetry capability is not valid gRPC metadata".to_string())?;
         *self.bearer.write().unwrap_or_else(|e| e.into_inner()) = Some(bearer);
+        self.refused.store(false, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Note what deis-telemetry answered a push with. A refusal of the
+    /// credential itself (`Unauthenticated`, `PermissionDenied`) while one is
+    /// held has the renewal task replace it now rather than when it falls
+    /// due.
+    pub fn observe(&self, status: &tonic::Status) {
+        if matches!(
+            status.code(),
+            tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+        ) && self.is_present()
+        {
+            self.refused.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether deis-telemetry refused the token held.
+    fn is_refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
     }
 
     /// Whether this node holds a capability at all.
@@ -209,15 +243,20 @@ where
 {
     tokio::spawn(async move {
         let mut client = client;
-        // What the capability held now names, and when it has to be renewed
-        // regardless. `None` until the first request succeeds.
-        let mut issued: Option<(BTreeSet<String>, tokio::time::Instant)> = None;
+        // What the capability held now names, when it was issued, and when
+        // it has to be renewed regardless. `None` until the first request
+        // succeeds.
+        let mut issued: Option<(BTreeSet<String>, tokio::time::Instant, tokio::time::Instant)> =
+            None;
         loop {
             let wanted = tenants();
+            let now = tokio::time::Instant::now();
             let due = match &issued {
                 None => true,
-                Some((named, renew_at)) => {
-                    *named != wanted || tokio::time::Instant::now() >= *renew_at
+                Some((named, issued_at, renew_at)) => {
+                    *named != wanted
+                        || now >= *renew_at
+                        || (credential.is_refused() && now >= *issued_at + REFUSED_RETRY)
                 }
             };
             if !due {
@@ -232,9 +271,9 @@ where
                             "Obtained a telemetry capability for this node's application \
                              environments and its own records"
                         );
-                        let renew_at =
-                            tokio::time::Instant::now() + RENEW_EVERY - jitter(RENEW_JITTER);
-                        issued = Some((wanted, renew_at));
+                        let issued_at = tokio::time::Instant::now();
+                        let renew_at = issued_at + RENEW_EVERY - jitter(RENEW_JITTER);
+                        issued = Some((wanted, issued_at, renew_at));
                     }
                     Err(error) => {
                         tracing::error!(%error, "The control plane returned an unusable telemetry capability");
@@ -283,6 +322,23 @@ mod tests {
             .metadata()
             .get("authorization")
             .is_none());
+    }
+
+    /// A refusal of the credential marks it for replacement, any other
+    /// failure does not, and a new token clears the mark.
+    #[test]
+    fn a_refused_credential_is_marked_until_replaced() {
+        let credential = TelemetryCredential::default();
+        credential.observe(&tonic::Status::permission_denied("revoked"));
+        assert!(!credential.is_refused(), "nothing held, nothing to replace");
+
+        credential.set("v1.first.sig").unwrap();
+        credential.observe(&tonic::Status::unavailable("down"));
+        assert!(!credential.is_refused());
+        credential.observe(&tonic::Status::permission_denied("revoked"));
+        assert!(credential.clone().is_refused(), "shared by every clone");
+        credential.set("v1.second.sig").unwrap();
+        assert!(!credential.is_refused());
     }
 
     #[test]

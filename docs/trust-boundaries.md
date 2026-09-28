@@ -459,9 +459,22 @@ that is older than two minutes, from the future, or older than the one they
 last adopted - so a list edited on the way, or an old one replayed, changes
 nothing. A revocation is therefore in force within one poll.
 
+A revocation costs nobody but whom it names. A node asks for its store and
+queue capabilities **one tenant at a time**, so each token names a single
+application environment and revoking a tenant takes back only the tokens
+naming it - never another tenant's storage on the same node
+(`crates/deis-runtime/src/deployment/capability_renewer.rs`). And a node
+does not sit on a revoked token until it falls due: when deis-store,
+deis-queue or deis-telemetry refuses the capability a call presented
+(`Unauthenticated` or `PermissionDenied`), the node asks for a new one at
+once, no sooner than 30 seconds after the refused one was issued. The node's
+telemetry capability is still one token for every tenant it runs, so a
+tenant revocation briefly refuses that node's pushes too; the shippers keep
+their batches queued and the replacement arrives within seconds.
+
 Two things a revocation does not do. It does not stop a node asking again:
 a node still in the fleet and still running the tenant is issued a new
-capability on its next renewal - to shut a machine out, remove it from the
+capability straight away - to shut a machine out, remove it from the
 fleet and stop trusting its certificate. And it does not reach a verifier cut
 off from the control plane: in T8 degraded mode a verifier enforces the last
 list it adopted.
