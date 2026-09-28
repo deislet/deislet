@@ -14,10 +14,10 @@
 //! acknowledged, so a consumer that crashes mid-batch sees the same messages
 //! again once the lease lapses. Application queue handlers must be idempotent.
 
+use super::bindings::CapabilityChannel;
 use super::bindings::StorageIdentity;
 use anyhow::{Context, Result};
 use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
 
 pub mod proto {
     tonic::include_proto!("deis.queue");
@@ -174,7 +174,7 @@ pub struct NackOutcome {
 /// would hold up a request handler's `send` on the same node.
 #[derive(Clone)]
 pub struct QueueClient {
-    client: GrpcQueueClient<Channel>,
+    client: GrpcQueueClient<CapabilityChannel>,
     identity: StorageIdentity,
     consumer_generation: Option<MetadataValue<tonic::metadata::Ascii>>,
 }
@@ -185,7 +185,8 @@ impl QueueClient {
     /// Fails only on an address that is not a URL -- a configuration mistake
     /// that no retry would fix.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel = super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Queue)?;
+        let channel =
+            super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Queue, identity)?;
         let client = GrpcQueueClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);

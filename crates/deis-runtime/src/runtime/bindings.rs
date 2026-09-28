@@ -815,8 +815,15 @@ fn lazy_channel(
 }
 
 /// A unary-call channel: bounded per call.
-pub(crate) fn unary_channel(endpoint: &str, kind: deis_identity::ServiceKind) -> Result<Channel> {
-    lazy_channel(endpoint, kind, Some(REQUEST_TIMEOUT))
+pub(crate) fn unary_channel(
+    endpoint: &str,
+    kind: deis_identity::ServiceKind,
+    identity: &StorageIdentity,
+) -> Result<CapabilityChannel> {
+    Ok(CapabilityChannel::new(
+        lazy_channel(endpoint, kind, Some(REQUEST_TIMEOUT))?,
+        identity,
+    ))
 }
 
 /// A streaming channel: bounded only on the dial.
@@ -827,8 +834,90 @@ pub(crate) fn unary_channel(endpoint: &str, kind: deis_identity::ServiceKind) ->
 pub(crate) fn streaming_channel(
     endpoint: &str,
     kind: deis_identity::ServiceKind,
-) -> Result<Channel> {
-    lazy_channel(endpoint, kind, None)
+    identity: &StorageIdentity,
+) -> Result<CapabilityChannel> {
+    Ok(CapabilityChannel::new(
+        lazy_channel(endpoint, kind, None)?,
+        identity,
+    ))
+}
+
+/// A channel to deis-store or deis-queue that tells the capability renewer
+/// when the service refuses the capability a call presented.
+///
+/// A revoked capability, or one issued under an auth epoch since bumped, is
+/// refused on every call until it is replaced; left to its schedule, the
+/// renewer would replace it only five minutes before it expires. Watching
+/// here, under every client rather than in each of their calls, means no
+/// call can forget to report it.
+///
+/// The service refuses a credential before it answers anything, so the
+/// refusal is a trailers-only response: its `grpc-status` is in the response
+/// headers, where this reads it, for unary and streaming calls alike.
+#[derive(Clone)]
+pub struct CapabilityChannel {
+    inner: Channel,
+    token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+}
+
+impl CapabilityChannel {
+    fn new(inner: Channel, identity: &StorageIdentity) -> Self {
+        Self {
+            inner,
+            token: identity.token_lock(),
+        }
+    }
+}
+
+/// `grpc-status` values that refuse the credential itself.
+fn refuses_the_credential(headers: &tonic::codegen::http::HeaderMap) -> bool {
+    let unauthenticated = tonic::Code::Unauthenticated as i32;
+    let permission_denied = tonic::Code::PermissionDenied as i32;
+    headers
+        .get("grpc-status")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i32>().ok())
+        .is_some_and(|code| code == unauthenticated || code == permission_denied)
+}
+
+impl tower::Service<tonic::codegen::http::Request<tonic::body::BoxBody>> for CapabilityChannel {
+    type Response =
+        <Channel as tower::Service<tonic::codegen::http::Request<tonic::body::BoxBody>>>::Response;
+    type Error =
+        <Channel as tower::Service<tonic::codegen::http::Request<tonic::body::BoxBody>>>::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower::Service::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(
+        &mut self,
+        request: tonic::codegen::http::Request<tonic::body::BoxBody>,
+    ) -> Self::Future {
+        let presented = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_string);
+        let token = std::sync::Arc::clone(&self.token);
+        let response = tower::Service::call(&mut self.inner, request);
+        Box::pin(async move {
+            let response = response.await?;
+            if let Some(presented) = presented {
+                if refuses_the_credential(response.headers()) {
+                    crate::deployment::capability_renewer::refused(&token, &presented);
+                }
+            }
+            Ok(response)
+        })
+    }
 }
 
 /// Who a storage call says it is, and the proof that goes with the claim.

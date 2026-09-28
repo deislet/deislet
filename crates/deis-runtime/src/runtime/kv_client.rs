@@ -8,9 +8,9 @@
 //! application and a preview cannot read or overwrite what production
 //! stored.
 
+use super::bindings::CapabilityChannel;
 use super::bindings::StorageIdentity;
 use anyhow::Result;
-use tonic::transport::Channel;
 
 // Import generated proto code
 pub mod proto {
@@ -80,7 +80,7 @@ pub struct KvListPage {
 /// call would stall every other one the application had in flight.
 #[derive(Clone)]
 pub struct KvClient {
-    client: KvStoreClient<Channel>,
+    client: KvStoreClient<CapabilityChannel>,
     identity: StorageIdentity,
 }
 
@@ -115,7 +115,8 @@ impl KvClient {
     /// back. Only an address that is not a URL is refused here -- and it would
     /// never start working.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel = super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Store)?;
+        let channel =
+            super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Store, identity)?;
         let client = KvStoreClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
@@ -816,6 +817,30 @@ mod tests {
             .await
             .expect_err("one environment's token must not authorise another's namespace");
         assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
+    }
+
+    /// A token the store refuses is reported to the renewer from under the
+    /// client, so the node replaces it now rather than when it falls due.
+    #[tokio::test]
+    async fn a_refused_token_is_reported_to_the_renewer() {
+        use crate::deployment::capability_renewer;
+        let store = Store::start().await;
+        let tenant = "kv-refused.production";
+        let wrong = store.capability_token_for("kv-refused.preview");
+        let identity = StorageIdentity::new(tenant, Some(&wrong)).expect("a legal tenant");
+        capability_renewer::register(tenant, "store", identity.token_lock());
+        let client = KvClient::connect_lazy(&store.endpoint, &identity).expect("client is built");
+        assert!(!capability_renewer::is_refused(tenant, "store"));
+
+        let error = client
+            .get("k".to_string())
+            .await
+            .expect_err("a token naming another tenant is refused");
+        assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
+        assert!(
+            capability_renewer::is_refused(tenant, "store"),
+            "the refusal did not reach the renewer"
+        );
     }
 
     #[tokio::test]

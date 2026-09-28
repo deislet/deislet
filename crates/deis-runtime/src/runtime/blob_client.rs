@@ -14,12 +14,12 @@
 //! environment of one application for its whole life, and a preview cannot
 //! read or overwrite an object production stored.
 
+use super::bindings::CapabilityChannel;
 use super::bindings::StorageIdentity;
 use crate::STREAM_CHUNK_BYTES;
 use anyhow::{anyhow, Result};
 use futures_util::{stream, Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use tonic::transport::Channel;
 use tonic::{Code, Status};
 
 pub mod proto {
@@ -188,7 +188,7 @@ pub struct BlobListPage {
 /// blob call behind it.
 #[derive(Clone)]
 pub struct BlobClient {
-    client: GrpcBlobClient<Channel>,
+    client: GrpcBlobClient<CapabilityChannel>,
     identity: StorageIdentity,
     max_object_bytes: usize,
 }
@@ -224,8 +224,11 @@ impl BlobClient {
     /// of the object, so a fixed deadline would cut off large-but-healthy
     /// downloads. [`DEFAULT_MAX_OBJECT_BYTES`] bounds the cost instead.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel =
-            super::bindings::streaming_channel(endpoint, deis_identity::ServiceKind::Store)?;
+        let channel = super::bindings::streaming_channel(
+            endpoint,
+            deis_identity::ServiceKind::Store,
+            identity,
+        )?;
         let client = GrpcBlobClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);

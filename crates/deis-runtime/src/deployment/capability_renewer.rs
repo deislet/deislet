@@ -8,9 +8,25 @@
 //! together does not renew in lockstep; after a failure the loop retries every
 //! 30 seconds plus jitter until it succeeds.
 //!
+//! # One token per tenant
+//!
+//! Every token names exactly one tenant and one audience. A revocation by
+//! tenant takes back the tokens that name that tenant and nothing else, so
+//! revoking one application environment never costs another one on the same
+//! node its storage; and a tenant the control plane refuses (an environment
+//! deleted before the node unloads it) fails its own renewal, not everyone
+//! else's.
+//!
+//! # Renewal on demand
+//!
 //! A new tenant is not left waiting for a timer: [`register`] wakes the loop,
 //! so the first capability for an application is asked for the moment its
-//! storage client is built.
+//! storage client is built. Neither is a refused one: when deis-store or
+//! deis-queue refuses the token a client presented - revoked, below the
+//! current auth epoch, or otherwise not accepted - the client reports it
+//! ([`refused`]) and the loop asks for a new one straight away, at most once
+//! every [`REFUSED_RETRY_SECS`] per tenant so a refusal no renewal can fix
+//! does not become a request storm.
 //!
 //! The renewal loop is spawned as a tokio task by the assignment control loop,
 //! which holds a [`MachineChannelClient`] connected to the control plane over
@@ -66,6 +82,16 @@ const RETRY_BASE_SECS: u64 = 30;
 /// Jitter ceiling added on each retry, in seconds.
 const RETRY_JITTER_SECS: u64 = 10;
 
+/// The soonest a capability refused by a data service is replaced after it
+/// was issued. A refusal right after issuance is one a new token will not
+/// fix (the tenant is not this node's any more, or the service does not
+/// trust the control plane's keys), so it is retried no faster than a failed
+/// renewal.
+const REFUSED_RETRY_SECS: u64 = 30;
+
+/// How many tenants' capabilities are asked for at once.
+const RENEW_CONCURRENCY: usize = 8;
+
 /// How long the loop sleeps when it holds nothing at all. A registration
 /// wakes it sooner.
 const IDLE_SECS: u64 = 5 * 60;
@@ -90,6 +116,9 @@ struct Slot {
     /// without a lock until one registers; any other slot left with no lock
     /// is dropped.
     adopted: bool,
+    /// A data service refused the capability held; it is replaced as soon
+    /// as [`REFUSED_RETRY_SECS`] have passed since it was issued.
+    refused: bool,
 }
 
 /// A capability this node holds, and when it expires.
@@ -97,6 +126,9 @@ struct Slot {
 struct Held {
     token: String,
     exp: u64,
+    /// When this node was handed it; 0 for one taken back from the offline
+    /// cache, which may be replaced at once.
+    issued_at: u64,
 }
 
 type TokenMap = BTreeMap<TenantAudience, Slot>;
@@ -164,6 +196,56 @@ fn is_due(held: &Held, now: u64) -> bool {
     held.exp <= now.saturating_add(RENEW_BEFORE_SECS)
 }
 
+/// Report that a data service refused `presented`, the token read out of
+/// `lock` for the call.
+///
+/// Called for a refusal of the credential itself (`Unauthenticated` or
+/// `PermissionDenied`): a capability revoked, issued under an auth epoch
+/// since bumped, or otherwise no longer accepted. The pair's capability is
+/// then renewed now instead of when it falls due - a revoked token is
+/// otherwise presented and refused until five minutes before it expires.
+///
+/// A refusal of a token the lock no longer holds is ignored: a newer one has
+/// already replaced it.
+pub fn refused(lock: &TokenLock, presented: &str) {
+    if lock.read().unwrap().as_deref() != Some(presented) {
+        return;
+    }
+    let now = unix_now();
+    let wake_now = {
+        let mut map = registry().write().unwrap();
+        let Some(slot) = map.values_mut().find(|slot| {
+            slot.locks
+                .iter()
+                .any(|held| held.upgrade().is_some_and(|held| Arc::ptr_eq(&held, lock)))
+        }) else {
+            return;
+        };
+        let first = !slot.refused;
+        slot.refused = true;
+        first
+            && slot
+                .held
+                .as_ref()
+                .is_none_or(|held| held.issued_at.saturating_add(REFUSED_RETRY_SECS) <= now)
+    };
+    // A refusal too soon after issuance is picked up by the loop's own timer
+    // (see `retry_at`), so every call failing at once does not wake it.
+    if wake_now {
+        wake().notify_one();
+    }
+}
+
+/// Whether a data service refused the capability held for the pair.
+#[cfg(test)]
+pub(crate) fn is_refused(tenant: &str, audience: &'static str) -> bool {
+    registry()
+        .read()
+        .unwrap()
+        .get(&(tenant.to_string(), audience))
+        .is_some_and(|slot| slot.refused)
+}
+
 /// A capability as the offline cache keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HeldCapability {
@@ -224,9 +306,11 @@ pub fn adopt(capabilities: Vec<HeldCapability>) -> usize {
             }
         }
         slot.adopted = slot.locks.is_empty();
+        slot.refused = false;
         slot.held = Some(Held {
             token: capability.token,
             exp: capability.exp,
+            issued_at: 0,
         });
         adopted += 1;
     }
@@ -256,6 +340,11 @@ fn snapshot() -> Vec<TokenEntry> {
             audience: *audience,
             locks: slot.locks.iter().filter_map(Weak::upgrade).collect(),
             held_exp: slot.held.as_ref().map(|held| held.exp),
+            retry_at: slot.refused.then(|| {
+                slot.held
+                    .as_ref()
+                    .map_or(0, |held| held.issued_at.saturating_add(REFUSED_RETRY_SECS))
+            }),
         })
         .filter(|entry| !entry.locks.is_empty())
         .collect()
@@ -277,6 +366,9 @@ pub struct TokenEntry {
     /// When the capability held for the pair expires; `None` before the
     /// first one arrives.
     held_exp: Option<u64>,
+    /// When a refused capability may be replaced; `None` unless a data
+    /// service refused the one held.
+    retry_at: Option<u64>,
 }
 
 /// Exported metrics from the renewal loop, intended to be wired to
@@ -311,37 +403,50 @@ pub fn spawn(
     let last_success = Arc::clone(&metrics.last_success_at);
 
     tokio::spawn(async move {
+        use futures_util::StreamExt;
         loop {
-            // One RPC per audience that has anything due, each covering every
-            // tenant registered for it. A failure of one audience does not
-            // hold up the others; it only shortens the wait before the next
-            // cycle.
+            // One request per tenant and audience that is due. A failure of
+            // one does not hold up the others; it only shortens the wait
+            // before the next cycle.
             let now = unix_now();
+            let due: Vec<TokenEntry> = snapshot()
+                .into_iter()
+                .filter(|entry| entry_is_due(entry, now))
+                .collect();
+            let outcomes: Vec<(TokenEntry, Result<(), RenewError>)> =
+                futures_util::stream::iter(due)
+                    .map(|entry| {
+                        let client = client.clone();
+                        let node_id = node_id.as_str();
+                        async move {
+                            let outcome = renew_entry(client, node_id, &entry).await;
+                            (entry, outcome)
+                        }
+                    })
+                    .buffer_unordered(RENEW_CONCURRENCY)
+                    .collect()
+                    .await;
             let mut failed = false;
-            let mut renewed = false;
-            for (audience, group) in group_by_audience(&snapshot()) {
-                if !group.iter().any(|entry| entry_is_due(entry, now)) {
-                    continue;
-                }
-                match renew_audience(client.clone(), &node_id, audience, &group).await {
-                    Ok(()) => {
-                        renewed = true;
-                        *last_success.write().unwrap() = Some(unix_now());
-                        tracing::info!(audience, tenants = group.len(), "Renewed capability token");
-                    }
+            let mut renewed = 0usize;
+            for (entry, outcome) in outcomes {
+                match outcome {
+                    Ok(()) => renewed += 1,
                     Err(e) => {
                         failed = true;
                         failures.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!(
-                            audience,
+                            tenant = %entry.tenant,
+                            audience = entry.audience,
                             error = %e,
-                            "Capability renewal failed for audience; retrying in about {}s",
+                            "Capability renewal failed; retrying in about {}s",
                             RETRY_BASE_SECS
                         );
                     }
                 }
             }
-            if renewed {
+            if renewed > 0 {
+                *last_success.write().unwrap() = Some(unix_now());
+                tracing::info!(renewed, "Renewed capability tokens");
                 if let Some(on_renewed) = &on_renewed {
                     on_renewed();
                 }
@@ -367,46 +472,61 @@ fn entry_is_due(entry: &TokenEntry, now: u64) -> bool {
     entry
         .held_exp
         .is_none_or(|exp| exp <= now.saturating_add(RENEW_BEFORE_SECS))
+        || entry.retry_at.is_some_and(|at| at <= now)
 }
 
 /// How long until the first held capability falls due, less up to
-/// [`RENEW_JITTER_SECS`]; [`IDLE_SECS`] when nothing is held.
+/// [`RENEW_JITTER_SECS`], or until the first refused one may be replaced;
+/// [`IDLE_SECS`] when nothing is held.
 fn next_renewal_in(entries: &[TokenEntry], now: u64) -> Duration {
-    let Some(first_exp) = entries.iter().filter_map(|entry| entry.held_exp).min() else {
-        return Duration::from_secs(IDLE_SECS);
-    };
-    let due_at = first_exp.saturating_sub(RENEW_BEFORE_SECS);
-    let until = Duration::from_secs(due_at.saturating_sub(now));
-    until
-        .saturating_sub(jitter(Duration::from_secs(RENEW_JITTER_SECS)))
-        .max(Duration::from_secs(1))
-}
-
-/// What to ask the control plane for: every binding of `audience` for every
-/// tenant in `entries`, so the one token returned is accepted by each service
-/// behind that audience for each of them.
-fn resources_for(audience: &str, entries: &[TokenEntry]) -> Vec<CapabilityResource> {
-    entries
+    let by_expiry = entries
         .iter()
-        .flat_map(|entry| resources_for_audience(&entry.tenant, audience))
-        .collect()
+        .filter_map(|entry| entry.held_exp)
+        .min()
+        .map(|first_exp| {
+            let due_at = first_exp.saturating_sub(RENEW_BEFORE_SECS);
+            Duration::from_secs(due_at.saturating_sub(now))
+                .saturating_sub(jitter(Duration::from_secs(RENEW_JITTER_SECS)))
+        });
+    let by_refusal = entries
+        .iter()
+        .filter_map(|entry| entry.retry_at)
+        .min()
+        .map(|at| Duration::from_secs(at.saturating_sub(now)));
+    match (by_expiry, by_refusal) {
+        (None, None) => Duration::from_secs(IDLE_SECS),
+        (a, b) => a
+            .into_iter()
+            .chain(b)
+            .min()
+            .unwrap_or_default()
+            .max(Duration::from_secs(1)),
+    }
 }
 
-/// Write `token` into every lock of every entry, and remember it as what
-/// each pair holds.
-fn apply_token(entries: &[TokenEntry], token: &str) {
-    let exp = expiry_of(token).unwrap_or_else(|| unix_now() + CAPABILITY_LIFETIME_SECS);
+/// What to ask the control plane for: every binding of the entry's audience
+/// for its one tenant, so the token returned is accepted by each service
+/// behind that audience for that tenant - and for no other.
+fn resources_for(entry: &TokenEntry) -> Vec<CapabilityResource> {
+    resources_for_audience(&entry.tenant, entry.audience)
+}
+
+/// Write `token` into every lock of `entry`, and remember it as what the
+/// pair holds.
+fn apply_token(entry: &TokenEntry, token: &str) {
+    let now = unix_now();
+    let exp = expiry_of(token).unwrap_or(now + CAPABILITY_LIFETIME_SECS);
     let mut map = registry().write().unwrap();
-    for entry in entries {
-        for lock in &entry.locks {
-            *lock.write().unwrap() = Some(token.to_string());
-        }
-        if let Some(slot) = map.get_mut(&(entry.tenant.clone(), entry.audience)) {
-            slot.held = Some(Held {
-                token: token.to_string(),
-                exp,
-            });
-        }
+    for lock in &entry.locks {
+        *lock.write().unwrap() = Some(token.to_string());
+    }
+    if let Some(slot) = map.get_mut(&(entry.tenant.clone(), entry.audience)) {
+        slot.refused = false;
+        slot.held = Some(Held {
+            token: token.to_string(),
+            exp,
+            issued_at: now,
+        });
     }
 }
 
@@ -424,15 +544,17 @@ fn expiry_of(token: &str) -> Option<u64> {
         .map(|claims| claims.exp)
 }
 
-/// Call `IssueCapability` for one audience and write the result into every
-/// registered lock in `entries`.
-async fn renew_audience(
+type RenewError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Call `IssueCapability` for one tenant and audience and write the result
+/// into every lock registered for the pair.
+async fn renew_entry(
     mut client: MachineChannelClient<Channel>,
     node_id: &str,
-    audience: &str,
-    entries: &[TokenEntry],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let resources = resources_for(audience, entries);
+    entry: &TokenEntry,
+) -> Result<(), RenewError> {
+    let audience = entry.audience;
+    let resources = resources_for(entry);
     if resources.is_empty() {
         return Err(format!("audience {audience} has no per-tenant bindings to renew").into());
     }
@@ -453,7 +575,7 @@ async fn renew_audience(
         .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
         .map_err(|_| "capability token returned by control plane is not ASCII")?;
 
-    apply_token(entries, &token);
+    apply_token(entry, &token);
     Ok(())
 }
 
@@ -487,18 +609,6 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Group entries by audience so we issue one RPC per audience.
-fn group_by_audience(entries: &[TokenEntry]) -> Vec<(&'static str, Vec<TokenEntry>)> {
-    let mut groups: BTreeMap<&'static str, Vec<TokenEntry>> = BTreeMap::new();
-    for entry in entries {
-        groups
-            .entry(entry.audience)
-            .or_default()
-            .push(entry.clone());
-    }
-    groups.into_iter().collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,7 +637,7 @@ mod tests {
         let entries = entries_for(tenant);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].locks.len(), 2);
-        apply_token(&entries, "v1.renewed.sig");
+        apply_token(&entries[0], "v1.renewed.sig");
         assert_eq!(first.read().unwrap().as_deref(), Some("v1.renewed.sig"));
         assert_eq!(second.read().unwrap().as_deref(), Some("v1.renewed.sig"));
     }
@@ -555,26 +665,89 @@ mod tests {
         );
     }
 
-    /// The renewal asks for every binding the verifiers check - the empty
-    /// binding it used to send matched none of them.
+    /// The renewal asks for every binding the verifiers check, for the one
+    /// tenant of the entry and no other.
     #[test]
-    fn a_renewal_requests_every_binding_of_the_audience() {
-        let entries = vec![TokenEntry {
-            tenant: "app.production".to_string(),
-            audience: "store",
-            locks: vec![],
-            held_exp: None,
-        }];
-        let bindings: Vec<String> = resources_for("store", &entries)
-            .into_iter()
-            .map(|r| r.binding)
-            .collect();
+    fn a_renewal_requests_every_binding_of_the_audience_for_one_tenant() {
+        let store = entry(None);
+        let resources = resources_for(&store);
+        assert!(resources.iter().all(|r| r.tenant == "app.production"));
+        let bindings: Vec<String> = resources.into_iter().map(|r| r.binding).collect();
         assert_eq!(bindings, ["kv", "sql", "blob"]);
-        let queue: Vec<String> = resources_for("queue", &entries)
-            .into_iter()
-            .map(|r| r.binding)
-            .collect();
+        let queue: Vec<String> = resources_for(&TokenEntry {
+            audience: "queue",
+            ..entry(None)
+        })
+        .into_iter()
+        .map(|r| r.binding)
+        .collect();
         assert_eq!(queue, ["queue"]);
+    }
+
+    /// Two tenants of one node each get their own token: a token applied to
+    /// one never reaches the other's clients, so revoking one tenant's token
+    /// leaves the other's storage alone.
+    #[test]
+    fn each_tenant_holds_its_own_token() {
+        let (a, b) = (lock(), lock());
+        register("renew-own-a.production", "store", Arc::clone(&a));
+        register("renew-own-b.production", "store", Arc::clone(&b));
+        apply_token(&entries_for("renew-own-a.production")[0], "v1.a.sig");
+        assert_eq!(a.read().unwrap().as_deref(), Some("v1.a.sig"));
+        assert_eq!(*b.read().unwrap(), None);
+    }
+
+    /// A refused capability is due again at once when it was issued long
+    /// enough ago, and not before [`REFUSED_RETRY_SECS`] when it is fresh.
+    #[test]
+    fn a_refused_capability_is_renewed_early_but_not_in_a_storm() {
+        let now = unix_now();
+        let old = lock();
+        adopt(vec![HeldCapability {
+            tenant: "renew-refused-old.production".to_string(),
+            audience: "store".to_string(),
+            token: token_expiring_at(now + 600),
+            exp: now + 600,
+        }]);
+        register("renew-refused-old.production", "store", Arc::clone(&old));
+        let entry = &entries_for("renew-refused-old.production")[0];
+        assert!(!entry_is_due(entry, now), "ten minutes left is not due");
+
+        let presented = old.read().unwrap().clone().unwrap();
+        refused(&old, "v1.some-older-token");
+        assert!(
+            !entry_is_due(&entries_for("renew-refused-old.production")[0], now),
+            "a refusal of a token no longer held changes nothing"
+        );
+        refused(&old, &presented);
+        assert!(
+            entry_is_due(&entries_for("renew-refused-old.production")[0], now),
+            "an adopted token that is refused is replaced at once"
+        );
+
+        let fresh = lock();
+        register(
+            "renew-refused-fresh.production",
+            "store",
+            Arc::clone(&fresh),
+        );
+        apply_token(
+            &entries_for("renew-refused-fresh.production")[0],
+            &token_expiring_at(now + 900),
+        );
+        let presented = fresh.read().unwrap().clone().unwrap();
+        refused(&fresh, &presented);
+        let entry = &entries_for("renew-refused-fresh.production")[0];
+        assert!(!entry_is_due(entry, now), "refused moments after issuance");
+        assert!(entry_is_due(entry, now + REFUSED_RETRY_SECS));
+        let wait = next_renewal_in(std::slice::from_ref(entry), now);
+        assert!(wait <= Duration::from_secs(REFUSED_RETRY_SECS), "{wait:?}");
+
+        apply_token(entry, &token_expiring_at(now + 900));
+        assert!(
+            !entry_is_due(&entries_for("renew-refused-fresh.production")[0], now + 60),
+            "a new token clears the refusal"
+        );
     }
 
     #[test]
@@ -595,6 +768,7 @@ mod tests {
             audience: "store",
             locks: vec![],
             held_exp,
+            retry_at: None,
         }
     }
 
