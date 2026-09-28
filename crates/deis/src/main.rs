@@ -1193,7 +1193,8 @@ enum TargetsAction {
 
     /// Inspect one target's implementation evidence and certification blockers.
     Inspect {
-        /// Registry target id, as printed by `deis targets list`.
+        /// The target: its `--target` id (`cloudflare`), as `deis targets
+        /// list` prints it, or its registry id (`cloudflare-workers-pages`).
         id: String,
 
         #[command(flatten)]

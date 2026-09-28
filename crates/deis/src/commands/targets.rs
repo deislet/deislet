@@ -13,6 +13,35 @@ use crate::render::{Output, Table};
 
 const STATUS_JSON: &str = include_str!("target-status.json");
 
+/// The `--target` id each registry entry answers to. The registry is
+/// upstream's and spells its entries in its own long form
+/// (`cloudflare-workers-pages`); everything else in this CLI says
+/// `cloudflare`. Both are accepted wherever a target is named here.
+const TARGET_IDS: &[(&str, &str)] = &[
+    ("deislet", "deislet"),
+    ("cloudflare", "cloudflare-workers-pages"),
+    ("deno", "deno"),
+    ("tencent", "tencent-edgeone-makers"),
+];
+
+/// The `--target` id for a registry id, or the registry id itself when
+/// this build has no target for it.
+fn target_id(registry_id: &str) -> &str {
+    TARGET_IDS
+        .iter()
+        .find(|(_, registry)| *registry == registry_id)
+        .map_or(registry_id, |(target, _)| target)
+}
+
+/// The registry id a name given on the command line means: a `--target`
+/// id or a registry id.
+fn registry_id(name: &str) -> &str {
+    TARGET_IDS
+        .iter()
+        .find(|(target, _)| *target == name)
+        .map_or(name, |(_, registry)| registry)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TargetStatus {
@@ -139,7 +168,7 @@ pub fn list(output: Output) -> Result<()> {
             format!(
                 "{} ({})",
                 escaped(&backend.display_name),
-                escaped(&backend.id)
+                escaped(target_id(&backend.id))
             ),
             escaped(&backend.role),
             escaped(&backend.lifecycle),
@@ -160,12 +189,12 @@ pub fn inspect(id: &str, output: Output) -> Result<()> {
         .backends
         .iter()
         .enumerate()
-        .find(|(_, backend)| backend.id == id)
+        .find(|(_, backend)| backend.id == registry_id(id))
     else {
         let choices = status
             .backends
             .iter()
-            .map(|backend| backend.id.as_str())
+            .map(|backend| target_id(&backend.id))
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
@@ -195,8 +224,9 @@ pub fn inspect(id: &str, output: Output) -> Result<()> {
         escaped(&status.generated_from.registry_sha256)
     );
     println!(
-        "{} ({})",
+        "{} (target {}, registry id {})",
         escaped(&backend.display_name),
+        escaped(target_id(&backend.id)),
         escaped(&backend.id)
     );
     println!("Role: {}", escaped(&backend.role));
@@ -280,6 +310,28 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), before);
+    }
+
+    /// Every registry entry is reachable by the id `--target` spells it
+    /// with, and that id is one `deis build --target` knows.
+    #[test]
+    fn every_registry_entry_has_its_target_id() {
+        let (_, status) = document().unwrap();
+        for backend in &status.backends {
+            assert!(
+                TARGET_IDS
+                    .iter()
+                    .any(|(_, registry)| *registry == backend.id),
+                "{} has no --target id",
+                backend.id
+            );
+            assert_eq!(registry_id(target_id(&backend.id)), backend.id);
+        }
+        assert_eq!(registry_id("cloudflare"), "cloudflare-workers-pages");
+        assert_eq!(
+            registry_id("cloudflare-workers-pages"),
+            "cloudflare-workers-pages"
+        );
     }
 
     #[test]
