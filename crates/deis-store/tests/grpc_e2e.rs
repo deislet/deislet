@@ -13,10 +13,6 @@
 //! and one test pairs `app-one.production` with `app-one.preview` to check
 //! that two environments of the *same* application are also two namespaces.
 
-use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
-use deis_backend_migration::proto::{
-    AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
-};
 use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode};
 use deis_identity::{Protocol, ServiceKind};
 use deis_identity_test_pki::TestFleet;
@@ -110,7 +106,7 @@ impl Harness {
     async fn start() -> Self {
         let data = TempDir::new().unwrap();
         let data_dir = data.path().to_path_buf();
-        Self::start_over(Some(data), data_dir, None).await
+        Self::start_over(Some(data), data_dir).await
     }
 
     /// A server that requires a capability token, as any deployment that is
@@ -122,19 +118,12 @@ impl Harness {
     /// A server over a data directory the caller keeps, so the same one can
     /// be served twice.
     async fn start_on(data_dir: &std::path::Path) -> Self {
-        Self::start_over(None, data_dir.to_path_buf(), None).await
-    }
-
-    async fn start_migration_authenticated(token: &str) -> Self {
-        let data = TempDir::new().unwrap();
-        let data_dir = data.path().to_path_buf();
-        Self::start_over(Some(data), data_dir, Some(token.to_string())).await
+        Self::start_over(None, data_dir.to_path_buf()).await
     }
 
     async fn start_over(
         owned: Option<TempDir>,
         data_dir: std::path::PathBuf,
-        migration_admin_token: Option<String>,
     ) -> Self {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
@@ -142,7 +131,6 @@ impl Harness {
             // Small enough that the size limit is reachable in a test, large
             // enough for the multi-chunk object below.
             max_object_bytes: 8 * 1024 * 1024,
-            migration_admin_token,
             ..Config::default()
         };
         // Bind first, so the port is known before anything is spawned and no
@@ -206,11 +194,6 @@ impl Harness {
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
 
-    async fn migration(&self) -> BackendMigrationClient<Channel> {
-        BackendMigrationClient::new(self.channel().await)
-            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-    }
 }
 
 impl Drop for Harness {
@@ -233,14 +216,6 @@ fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
             .parse()
             .unwrap(),
     );
-    request
-}
-
-fn as_migration_admin<T>(token: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {token}").parse().unwrap());
     request
 }
 
@@ -1854,120 +1829,6 @@ async fn a_single_chunk_above_the_message_ceiling_is_refused_not_an_internal_err
         .await
         .unwrap_err();
     assert_eq!(absent.code(), tonic::Code::NotFound);
-}
-
-#[tokio::test]
-async fn migration_management_is_absent_by_default_and_independently_authenticated() {
-    const ADMIN: &str = "migration-admin-token-000000000000000001";
-    const MIGRATION: &str = "01990f44-1000-7000-8000-000000000050";
-    const FENCE: &str = "migration-fence-token-00000000000000001";
-    const UNKNOWN_INCARNATION: &str = "01990f44-1000-7000-8000-000000000099";
-    let request = |backend_incarnation_id: &str| AcquireWriteFenceRequest {
-        tenant: "shop.production".to_string(),
-        migration_id: MIGRATION.to_string(),
-        expected_application_revision: 3,
-        fence_token: FENCE.to_string(),
-        expected_backend_incarnation_id: backend_incarnation_id.to_string(),
-    };
-
-    let without_management = Harness::start().await;
-    let error = without_management
-        .migration()
-        .await
-        .acquire_write_fence(Request::new(request(UNKNOWN_INCARNATION)))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::Unimplemented);
-    drop(without_management);
-
-    let harness = Harness::start_migration_authenticated(ADMIN).await;
-    let mut migration = harness.migration().await;
-    let backend_info = migration
-        .get_backend_info(as_migration_admin(ADMIN, GetBackendInfoRequest {}))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(backend_info.backend, "deis-store");
-    let backend_incarnation_id = backend_info.backend_incarnation_id;
-    let mut application_credential = Request::new(request(&backend_incarnation_id));
-    application_credential
-        .metadata_mut()
-        .insert(AUTHORIZATION, "Bearer not-an-admin-token".parse().unwrap());
-    assert_eq!(
-        migration
-            .acquire_write_fence(application_credential)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unauthenticated
-    );
-    let receipt = migration
-        .acquire_write_fence(as_migration_admin(ADMIN, request(&backend_incarnation_id)))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(receipt.tenant, "shop.production");
-    assert_eq!(receipt.receipt_sha256.len(), 64);
-
-    let error = harness
-        .kv()
-        .await
-        .set(as_tenant_with_token(
-            "shop.production",
-            "shop.production",
-            "kv",
-            SetRequest {
-                key: "blocked".to_string(),
-                value: b"value".to_vec(),
-                ttl_seconds: None,
-                metadata: None,
-            },
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-
-    let inventory = migration
-        .inspect_tenant(as_migration_admin(
-            ADMIN,
-            InspectTenantRequest {
-                tenant: "shop.production".to_string(),
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(inventory.backend, "deis-store");
-    assert_eq!(inventory.components.len(), 3);
-
-    let stale = ReleaseWriteFenceRequest {
-        tenant: "shop.production".to_string(),
-        migration_id: MIGRATION.to_string(),
-        expected_application_revision: 3,
-        fence_token: "different-fence-token-00000000000000002".to_string(),
-        expected_backend_incarnation_id: backend_incarnation_id.clone(),
-    };
-    assert_eq!(
-        migration
-            .release_write_fence(as_migration_admin(ADMIN, stale))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Aborted
-    );
-    migration
-        .release_write_fence(as_migration_admin(
-            ADMIN,
-            ReleaseWriteFenceRequest {
-                tenant: "shop.production".to_string(),
-                migration_id: MIGRATION.to_string(),
-                expected_application_revision: 3,
-                fence_token: FENCE.to_string(),
-                expected_backend_incarnation_id: backend_incarnation_id,
-            },
-        ))
-        .await
-        .unwrap();
 }
 
 /// The transport half of the store's contract: a caller that trusts this

@@ -14,7 +14,6 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 deis-wire = { workspace = true }
-deis-backend-migration = { path = "../deis-backend-migration" }
 deis-capability = { path = "../deis-capability", features = ["jwks-fetch"] }
 deis-identity = { path = "../deis-identity" }
 tokio-rustls = "0.26"

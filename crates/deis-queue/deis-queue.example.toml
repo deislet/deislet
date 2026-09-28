@@ -18,11 +18,6 @@ listen = "127.0.0.1:8091"
 # a token names a key not yet fetched - so a key rotation on the control plane
 # needs nothing done on this host.
 
-# Enables the separate BackendMigration gRPC service used by Control to
-# acquire durable queue writer fences and collect deterministic inventory.
-# Calls must send `Authorization: Bearer <token>` even on loopback.
-# migration_admin_token = "put a different long random string here"
-
 # Directory holding queue.sqlite.
 #
 # A tenant is one application in one environment, spelled "<app>.<environment>"

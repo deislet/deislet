@@ -1,6 +1,6 @@
-//! The legacy telemetry record shape carries application and environment in
-//! different places for each signal. This module is the one translation into
-//! the platform tenant identity used by migration fencing and inventory.
+//! A telemetry record carries application and environment in different places
+//! for each signal. This module is the one translation into the tenant a
+//! capability names, which is what decides who may push or read a record.
 
 use std::collections::BTreeMap;
 

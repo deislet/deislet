@@ -5,7 +5,7 @@
   "restoreSetId": "01990f44-1000-7000-8000-000000000060",
   "restoreSetSha256": {
     "algorithm": "sha256",
-    "value": "1ee60f0681910ef5836347420418ca8e13c957987a21a8662d52815c10fed24b"
+    "value": "601ee9d16c7409ec63d1db8c256bbd54d0720025e65fc1ba30117fcd9c0d0b73"
   },
   "state": "succeeded",
   "components": [

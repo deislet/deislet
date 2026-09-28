@@ -4,32 +4,30 @@
 //! executable and its config are absolute, stdout is bounded and parsed as a
 //! shared report, and an exit/timeout is an unknown outcome: Control leaves
 //! the durable operation waiting so the same driver journal can reconcile it.
+//!
+//! The report is the evidence. The driver is pinned by digest in the restore
+//! set, it restarts the three services itself, and it reads each restored
+//! directory's backend incarnation from disk before it reports; Control
+//! checks that the report binds to the immutable restore set and commits it.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use deis_backend_migration::MIGRATION_AUTH_HEADER;
-use deis_backend_migration::proto::{
-    GetBackendInfoRequest, backend_migration_client::BackendMigrationClient,
-};
 use deis_wire::{
     BackendRestoreExecutionReport, BackendRestoreExecutionState, CanonicalId, ProductOperation,
-    RestoreBackend,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tonic::Request;
 use tracing::warn;
 
 use super::{BackendRestorePlan, CatalogError, CatalogStore};
 use crate::config::ControlConfig;
 
 const MAX_DRIVER_OUTPUT_BYTES: u64 = 1024 * 1024;
-const BACKEND_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const COORDINATOR_LEASE_SECONDS: u64 = 30;
 const COORDINATOR_HEARTBEAT_SECONDS: u64 = 10;
 
@@ -45,24 +43,12 @@ pub enum BackendRestoreCoordinatorError {
     Protocol(String),
 }
 
-#[derive(Clone)]
-struct VerificationTarget {
-    backend: RestoreBackend,
-    endpoint: String,
-    admin_token: String,
-}
-
 pub struct BackendRestoreCoordinator {
     catalog: Arc<CatalogStore>,
     executable: PathBuf,
     driver_config: PathBuf,
     timeout: Duration,
-    targets: Vec<VerificationTarget>,
     coordinator_id: CanonicalId,
-    /// What a backend's certificate is checked against when the endpoint is
-    /// `https://`, which it is for every real deis-store, deis-queue and
-    /// deis-telemetry: they serve TLS only.
-    service_trust: Option<deis_identity::ServiceTrust>,
 }
 
 impl BackendRestoreCoordinator {
@@ -92,117 +78,13 @@ impl BackendRestoreCoordinator {
                 "backend_restore_driver_timeout_secs must be 1..=3600".to_string(),
             ));
         }
-        let targets = [
-            (
-                RestoreBackend::DeisStore,
-                config.store_endpoint.as_deref(),
-                config.store_migration_admin_token.as_deref(),
-            ),
-            (
-                RestoreBackend::DeisQueue,
-                config.queue_endpoint.as_deref(),
-                config.queue_migration_admin_token.as_deref(),
-            ),
-            (
-                RestoreBackend::DeisTelemetry,
-                config.telemetry_endpoint.as_deref(),
-                config.telemetry_migration_admin_token.as_deref(),
-            ),
-        ]
-        .into_iter()
-        .map(|(backend, endpoint, token)| {
-            let endpoint = endpoint
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    BackendRestoreCoordinatorError::Configuration(format!(
-                        "{} endpoint is required for post-restore verification",
-                        backend.as_str()
-                    ))
-                })?
-                .to_string();
-            validate_loopback_endpoint(&endpoint, backend)?;
-            let token = token
-                .filter(|value| value.len() >= 32 && !value.chars().any(char::is_control))
-                .ok_or_else(|| {
-                    BackendRestoreCoordinatorError::Configuration(format!(
-                        "{} migration administrator credential of at least 32 bytes is required for post-restore verification",
-                        backend.as_str()
-                    ))
-                })?
-                .to_string();
-            Ok::<_, BackendRestoreCoordinatorError>(VerificationTarget {
-                backend,
-                endpoint,
-                admin_token: token,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-        let mut credentials = std::collections::BTreeSet::new();
-        if targets
-            .iter()
-            .any(|target| !credentials.insert(target.admin_token.as_str()))
-        {
-            return Err(BackendRestoreCoordinatorError::Configuration(
-                "backend restore verification credentials must be distinct per backend".to_string(),
-            ));
-        }
-        let mut endpoints = std::collections::BTreeSet::new();
-        if targets
-            .iter()
-            .any(|target| !endpoints.insert(target.endpoint.as_str()))
-        {
-            return Err(BackendRestoreCoordinatorError::Configuration(
-                "backend restore verification endpoints must be distinct per backend".to_string(),
-            ));
-        }
         Ok(Self {
             catalog,
             executable,
             driver_config,
             timeout: Duration::from_secs(config.backend_restore_driver_timeout_secs),
-            targets,
             coordinator_id: CanonicalId::new_v7(),
-            service_trust: None,
         })
-    }
-
-    /// Check each backend's certificate against `trust` when verifying a
-    /// restore: this control plane's own machine identity.
-    pub fn with_service_trust(mut self, trust: Option<deis_identity::ServiceTrust>) -> Self {
-        self.service_trust = trust;
-        self
-    }
-
-    /// A connection to one backend's management service. An `https://`
-    /// endpoint is dialled only with a trust to check the certificate
-    /// against, and only a certificate naming that kind of backend is
-    /// accepted; plain `http://` is reachable only on loopback, which the
-    /// configuration check already requires of every endpoint.
-    async fn verification_channel(
-        &self,
-        target: &VerificationTarget,
-    ) -> Result<tonic::transport::Channel, String> {
-        let endpoint = tonic::transport::Endpoint::from_shared(target.endpoint.clone())
-            .map_err(|error| format!("{} endpoint is invalid: {error}", target.backend.as_str()))?;
-        if !target.endpoint.starts_with("https://") {
-            return endpoint.connect().await.map_err(|error| error.to_string());
-        }
-        let trust = self.service_trust.as_ref().ok_or_else(|| {
-            format!(
-                "{} is reached over TLS and this control plane has no machine identity to check \
-                 its certificate against",
-                target.backend.as_str()
-            )
-        })?;
-        let kind = match target.backend {
-            RestoreBackend::DeisStore => deis_identity::ServiceKind::Store,
-            RestoreBackend::DeisQueue => deis_identity::ServiceKind::Queue,
-            RestoreBackend::DeisTelemetry => deis_identity::ServiceKind::Telemetry,
-        };
-        endpoint
-            .connect_with_connector(trust.dialler(kind, &[deis_identity::Protocol::Http2]))
-            .await
-            .map_err(|error| error.to_string())
     }
 
     pub async fn coordinate(
@@ -353,15 +235,6 @@ impl BackendRestoreCoordinator {
             )
             .await?;
             return Err(BackendRestoreCoordinatorError::Protocol(error.to_string()));
-        }
-        if let Err(error) = self.verify_live_incarnations(&report).await {
-            self.defer(
-                report.operation_id,
-                operation_revision,
-                "live backend services did not attest the topology driver terminal report",
-            )
-            .await?;
-            return Err(BackendRestoreCoordinatorError::Protocol(error));
         }
         match report.state {
             BackendRestoreExecutionState::Succeeded => {
@@ -546,100 +419,6 @@ impl BackendRestoreCoordinator {
         }
         Ok(output)
     }
-
-    async fn verify_live_incarnations(
-        &self,
-        report: &BackendRestoreExecutionReport,
-    ) -> Result<(), String> {
-        for (index, target) in self.targets.iter().enumerate() {
-            let component = report
-                .components
-                .get(index)
-                .filter(|component| component.backend == target.backend)
-                .ok_or_else(|| {
-                    format!(
-                        "topology report omitted or reordered {}",
-                        target.backend.as_str()
-                    )
-                })?;
-            let expected = match report.state {
-                BackendRestoreExecutionState::Succeeded => component.restored_incarnation_id,
-                BackendRestoreExecutionState::RolledBack => component.previous_incarnation_id,
-            };
-            let mut client =
-                tokio::time::timeout(BACKEND_VERIFY_TIMEOUT, self.verification_channel(target))
-                    .await
-                    .map_err(|_| {
-                        format!(
-                            "{} verification connection timed out",
-                            target.backend.as_str()
-                        )
-                    })?
-                    .map(BackendMigrationClient::new)
-                    .map_err(|error| {
-                        format!(
-                            "{} verification connection failed: {error}",
-                            target.backend.as_str()
-                        )
-                    })?;
-            let mut request = Request::new(GetBackendInfoRequest {});
-            let authorization = format!("Bearer {}", target.admin_token)
-                .parse()
-                .map_err(|_| {
-                    format!(
-                        "{} administrator credential is not valid metadata",
-                        target.backend.as_str()
-                    )
-                })?;
-            request
-                .metadata_mut()
-                .insert(MIGRATION_AUTH_HEADER, authorization);
-            let info =
-                tokio::time::timeout(BACKEND_VERIFY_TIMEOUT, client.get_backend_info(request))
-                    .await
-                    .map_err(|_| format!("{} GetBackendInfo timed out", target.backend.as_str()))?
-                    .map_err(|error| {
-                        format!("{} GetBackendInfo failed: {error}", target.backend.as_str())
-                    })?
-                    .into_inner();
-            if info.backend != target.backend.as_str()
-                || info.backend_incarnation_id != expected.to_string()
-            {
-                return Err(format!(
-                    "{} live service did not attest the {:?} topology incarnation",
-                    target.backend.as_str(),
-                    report.state
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
-fn validate_loopback_endpoint(
-    endpoint: &str,
-    backend: RestoreBackend,
-) -> Result<(), BackendRestoreCoordinatorError> {
-    let uri: axum::http::Uri = endpoint.parse().map_err(|_| {
-        BackendRestoreCoordinatorError::Configuration(format!(
-            "{} restore verification endpoint is not an absolute HTTP URI",
-            backend.as_str()
-        ))
-    })?;
-    let scheme = uri.scheme_str();
-    let host = uri.host();
-    if !matches!(scheme, Some("http") | Some("https"))
-        || !matches!(host, Some("127.0.0.1") | Some("::1") | Some("localhost"))
-        || uri.port_u16().is_none()
-        || !matches!(uri.path(), "" | "/")
-        || uri.query().is_some()
-    {
-        return Err(BackendRestoreCoordinatorError::Configuration(format!(
-            "{} restore verification endpoint must be a loopback HTTP(S) origin with an explicit port",
-            backend.as_str()
-        )));
-    }
-    Ok(())
 }
 
 fn paired_absolute_path(
@@ -711,111 +490,14 @@ fn file_sha256(path: &Path) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use deis_backend_migration::proto::backend_migration_server::{
-        BackendMigration, BackendMigrationServer,
+    use deis_wire::{
+        BACKEND_RESTORE_REPORT_SCHEMA_V1, BackendRestoredComponent, RestoreBackend, RestoreDigest,
     };
-    use deis_backend_migration::proto::{
-        AcquireWriteFenceRequest, BackendInfo, FenceReceipt, InspectTenantRequest,
-        ReleaseWriteFenceRequest, ReleaseWriteFenceResponse, TenantInventory,
-    };
-    use deis_wire::{BACKEND_RESTORE_REPORT_SCHEMA_V1, BackendRestoredComponent, RestoreDigest};
     use tempfile::TempDir;
-    use tokio::net::TcpListener;
-    use tokio::sync::oneshot;
-    use tokio_stream::wrappers::TcpListenerStream;
-    use tonic::transport::Server;
-    use tonic::{Response, Status, async_trait};
 
     use super::*;
     use crate::catalog::{BackendRestoreState, OperationRequestContext};
     use crate::database::Database;
-
-    #[derive(Clone)]
-    struct InfoBackend {
-        backend: RestoreBackend,
-        incarnation_id: CanonicalId,
-        expected_authorization: Arc<str>,
-        calls: Arc<Mutex<u64>>,
-    }
-
-    #[async_trait]
-    impl BackendMigration for InfoBackend {
-        async fn get_backend_info(
-            &self,
-            request: Request<GetBackendInfoRequest>,
-        ) -> Result<Response<BackendInfo>, Status> {
-            let authorization = request
-                .metadata()
-                .get(MIGRATION_AUTH_HEADER)
-                .and_then(|value| value.to_str().ok());
-            if authorization != Some(self.expected_authorization.as_ref()) {
-                return Err(Status::unauthenticated("credential rejected"));
-            }
-            *self
-                .calls
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
-            Ok(Response::new(BackendInfo {
-                backend: self.backend.as_str().to_string(),
-                backend_incarnation_id: self.incarnation_id.to_string(),
-            }))
-        }
-
-        async fn acquire_write_fence(
-            &self,
-            _request: Request<AcquireWriteFenceRequest>,
-        ) -> Result<Response<FenceReceipt>, Status> {
-            Err(Status::unimplemented("not used by restore verification"))
-        }
-
-        async fn inspect_tenant(
-            &self,
-            _request: Request<InspectTenantRequest>,
-        ) -> Result<Response<TenantInventory>, Status> {
-            Err(Status::unimplemented("not used by restore verification"))
-        }
-
-        async fn release_write_fence(
-            &self,
-            _request: Request<ReleaseWriteFenceRequest>,
-        ) -> Result<Response<ReleaseWriteFenceResponse>, Status> {
-            Err(Status::unimplemented("not used by restore verification"))
-        }
-    }
-
-    async fn serve_info_backend(
-        backend: RestoreBackend,
-        incarnation_id: CanonicalId,
-        token: &str,
-    ) -> (
-        String,
-        oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-        Arc<Mutex<u64>>,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let calls = Arc::new(Mutex::new(0));
-        let service = InfoBackend {
-            backend,
-            incarnation_id,
-            expected_authorization: Arc::from(format!("Bearer {token}")),
-            calls: Arc::clone(&calls),
-        };
-        let handle = tokio::spawn(async move {
-            Server::builder()
-                .add_service(BackendMigrationServer::new(service))
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
-                    let _ = shutdown_receiver.await;
-                })
-                .await
-                .unwrap();
-        });
-        (format!("http://{address}"), shutdown_sender, handle, calls)
-    }
 
     async fn planned_restore(store: &CatalogStore, key: &str) -> BackendRestorePlan {
         let installation = store.product_installation().await.unwrap();
@@ -843,9 +525,8 @@ mod tests {
 
     async fn verify_terminal_case(
         state: BackendRestoreExecutionState,
-        mismatched_backend: Option<RestoreBackend>,
         mismatched_operation: bool,
-    ) -> (BackendRestoreState, deis_wire::OperationState, Vec<u64>) {
+    ) -> (BackendRestoreState, deis_wire::OperationState) {
         let directory = TempDir::new().unwrap();
         let database = Arc::new(
             Database::init(directory.path().join("control.sqlite"))
@@ -884,52 +565,17 @@ mod tests {
             components,
         };
 
-        let tokens = ["s".repeat(32), "q".repeat(32), "t".repeat(32)];
-        let mut targets = Vec::new();
-        let mut shutdown = Vec::new();
-        let mut handles = Vec::new();
-        let mut calls = Vec::new();
-        for (index, backend) in RestoreBackend::REQUIRED.into_iter().enumerate() {
-            let expected = match state {
-                BackendRestoreExecutionState::Succeeded => {
-                    report.components[index].restored_incarnation_id
-                }
-                BackendRestoreExecutionState::RolledBack => {
-                    report.components[index].previous_incarnation_id
-                }
-            };
-            let observed = if mismatched_backend == Some(backend) {
-                CanonicalId::new_v7()
-            } else {
-                expected
-            };
-            let (endpoint, stop, handle, call_count) =
-                serve_info_backend(backend, observed, &tokens[index]).await;
-            targets.push(VerificationTarget {
-                backend,
-                endpoint,
-                admin_token: tokens[index].clone(),
-            });
-            shutdown.push(stop);
-            handles.push(handle);
-            calls.push(call_count);
-        }
         let coordinator = BackendRestoreCoordinator {
             catalog: Arc::clone(&store),
             executable: PathBuf::from("/bin/true"),
             driver_config: directory.path().join("unused.toml"),
             timeout: Duration::from_secs(1),
-            targets,
             coordinator_id,
-            service_trust: None,
         };
         let outcome = coordinator
             .accept_terminal_report(claimed.operation_id, report, operation.revision)
             .await;
-        if mismatched_backend.is_some()
-            || mismatched_operation
-            || state == BackendRestoreExecutionState::RolledBack
-        {
+        if mismatched_operation || state == BackendRestoreExecutionState::RolledBack {
             assert!(outcome.is_err());
         } else {
             outcome.unwrap();
@@ -944,51 +590,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        for stop in shutdown {
-            let _ = stop.send(());
-        }
-        for handle in handles {
-            handle.await.unwrap();
-        }
-        let calls = calls
-            .into_iter()
-            .map(|count| {
-                *count
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            })
-            .collect();
-        (persisted.state, operation.state, calls)
+        (persisted.state, operation.state)
     }
 
     #[tokio::test]
-    async fn terminal_reports_require_live_attestation_before_catalog_commit() {
-        let succeeded =
-            verify_terminal_case(BackendRestoreExecutionState::Succeeded, None, false).await;
+    async fn only_a_report_bound_to_the_claimed_restore_is_committed() {
+        let succeeded = verify_terminal_case(BackendRestoreExecutionState::Succeeded, false).await;
         assert_eq!(succeeded.0, BackendRestoreState::Succeeded);
         assert_eq!(succeeded.1, deis_wire::OperationState::Succeeded);
-        assert_eq!(succeeded.2, vec![1, 1, 1]);
 
         let rolled_back =
-            verify_terminal_case(BackendRestoreExecutionState::RolledBack, None, false).await;
+            verify_terminal_case(BackendRestoreExecutionState::RolledBack, false).await;
         assert_eq!(rolled_back.0, BackendRestoreState::Failed);
         assert_eq!(rolled_back.1, deis_wire::OperationState::Failed);
-        assert_eq!(rolled_back.2, vec![1, 1, 1]);
-
-        let mismatch = verify_terminal_case(
-            BackendRestoreExecutionState::Succeeded,
-            Some(RestoreBackend::DeisQueue),
-            false,
-        )
-        .await;
-        assert_eq!(mismatch.0, BackendRestoreState::Waiting);
-        assert_eq!(mismatch.1, deis_wire::OperationState::Waiting);
-        assert_eq!(mismatch.2, vec![1, 1, 0]);
 
         let wrong_operation =
-            verify_terminal_case(BackendRestoreExecutionState::Succeeded, None, true).await;
+            verify_terminal_case(BackendRestoreExecutionState::Succeeded, true).await;
         assert_eq!(wrong_operation.0, BackendRestoreState::Waiting);
         assert_eq!(wrong_operation.1, deis_wire::OperationState::Waiting);
-        assert_eq!(wrong_operation.2, vec![0, 0, 0]);
     }
 }

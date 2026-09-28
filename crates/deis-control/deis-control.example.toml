@@ -298,26 +298,23 @@ data_dir = "/var/lib/deis-control"
 # Storage services and cron
 # ========================================
 
-# gRPC addresses of deis-store and deis-queue, as a node has to dial them,
-# plus deis-telemetry as the identity-migration coordinator must dial it.
-# The control plane owns the storage addresses and hands those down with every
+# gRPC addresses of deis-store and deis-queue, as a node has to dial them.
+# The control plane owns these addresses and hands them down with every
 # deployment; they are deliberately not written into a node's own file, so
-# moving a service does not mean editing every node. telemetry_endpoint is
-# used here only for its independently authenticated migration management
-# surface; runtime/CLI telemetry delivery has its own configuration.
+# moving a service does not mean editing every node. Runtime and CLI telemetry
+# delivery has its own configuration.
 #
 # Leave them unset and applications that declare kv / database / blob /
 # queue still load, but every ctx.services call they make answers "service
 # not available" and their declared queue consumers never start.
 #
-# They are addresses, not credentials, and are logged like any variable. All
-# three services serve TLS only, so the addresses are https://: a node checks
+# They are addresses, not credentials, and are logged like any variable. Both
+# services serve TLS only, so the addresses are https://: a node checks
 # each certificate against the fleet's authority - it must name that kind of
 # service - before a capability leaves it, and so does this control plane
 # when it calls deis-queue itself.
 # store_endpoint = "https://127.0.0.1:8090"
 # queue_endpoint = "https://127.0.0.1:8091"
-# telemetry_endpoint = "https://127.0.0.1:8092"
 
 # There is no storage secret to configure. Calls to deis-store and deis-queue
 # carry Ed25519 capabilities this control plane signs with keys it keeps in
@@ -326,22 +323,6 @@ data_dir = "/var/lib/deis-control"
 # /.well-known/deis/capability-jwks.json on the [machine] listener below, under
 # mutual TLS with their own machine identities (their [machine_identity]
 # control_endpoint). The human listener does not serve it.
-
-# Independent backend-migration administrator credentials. Each value must
-# match migration_admin_token on the corresponding service, contain at least
-# 32 bytes, and be different from every application, node, human API and
-# other-backend credential. Control keeps them on its management side; they
-# are never handed to a runtime node, application, browser or CLI.
-#
-# All three are required before POST /api/apps/<app>/identity-migration will
-# plan or fence anything. Generate three values, not one copied repeatedly:
-#
-#   openssl rand -hex 32
-#   openssl rand -hex 32
-#   openssl rand -hex 32
-# store_migration_admin_token = "put the deis-store migration token here"
-# queue_migration_admin_token = "put the deis-queue migration token here"
-# telemetry_migration_admin_token = "put the deis-telemetry migration token here"
 
 # Coordinated platform restore remains unavailable unless both absolute paths
 # are configured. Control starts the fixed executable directly, sends the

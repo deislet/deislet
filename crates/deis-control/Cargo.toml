@@ -103,7 +103,6 @@ utoipa = { version = "5.5", features = ["axum_extras", "uuid", "chrono", "preser
 # Control Wire SDK
 deis-wire = { path = "../deis-wire" }
 deis-capability = { path = "../deis-capability" }
-deis-backend-migration = { path = "../deis-backend-migration" }
 deis-queue = { path = "../deis-queue" }
 # Drives the node session lifecycle (src/session.rs) and the command
 # lifecycle (src/database/command_status.rs).

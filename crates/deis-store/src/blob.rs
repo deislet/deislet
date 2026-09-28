@@ -51,11 +51,10 @@ use crate::tenant::{TenantId, tenant_of};
 use crate::unix_seconds;
 // Body slice size for `Get`, and the size clients are expected to use for
 // `Put`; see deis_wire::conventions for why it lives in one place.
-use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences};
 use deis_wire::conventions::{MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 #[cfg(test)]
@@ -142,7 +141,6 @@ pub struct BlobService {
     /// `<data_dir>/blob`
     root: PathBuf,
     pool: SqlitePool,
-    fences: TenantWriteFences,
     limits: BlobLimits,
     /// Serialises the two critical sections that share one content file.
     content_locks: ContentLocks,
@@ -166,16 +164,14 @@ impl BlobService {
         connections: usize,
         limits: BlobLimits,
     ) -> StoreResult<Self> {
-        let fences = TenantWriteFences::open(data_dir.join("migration-fences.sqlite")).await?;
-        Self::open_with_fences(data_dir, connections, Durability::default(), limits, fences).await
+        Self::open_with(data_dir, connections, Durability::default(), limits).await
     }
 
-    pub(crate) async fn open_with_fences(
+    pub(crate) async fn open_with(
         data_dir: &Path,
         connections: usize,
         durability: Durability,
         limits: BlobLimits,
-        fences: TenantWriteFences,
     ) -> StoreResult<Self> {
         let root = data_dir.join("blob");
         std::fs::create_dir_all(&root)?;
@@ -210,7 +206,6 @@ impl BlobService {
         let service = Self {
             root,
             pool,
-            fences,
             limits,
             content_locks: ContentLocks::default(),
             #[cfg(test)]
@@ -318,19 +313,6 @@ impl BlobService {
                 // refused to start over a pre-tenant layout, so this is at
                 // most a stray directory an operator put here.
                 continue;
-            };
-            let _permit = match self.fences.permit(tenant.as_str()).await {
-                Ok(permit) => permit,
-                Err(deis_backend_migration::FenceError::Fenced(_)) => continue,
-                Err(error) => {
-                    kept_unchecked += 1;
-                    tracing::warn!(
-                        tenant = %tenant,
-                        error = %error,
-                        "could not enter the tenant writer boundary for orphan inspection; its content is left untouched"
-                    );
-                    continue;
-                }
             };
             for sha256 in content_digests_under(&tenant_dir.path()) {
                 let _content = self.content_locks.acquire(&tenant, &sha256).await;
@@ -646,110 +628,6 @@ impl BlobService {
             .await
     }
 
-    /// Deterministic metadata evidence plus a content-integrity and orphan
-    /// check under an active writer fence.
-    pub async fn inventory(&self, tenant: &TenantId) -> StoreResult<ComponentInventory> {
-        let (_receipt, _fence) = self.fences.fenced_read(tenant.as_str()).await?;
-        self.inventory_with_fence_held(tenant).await
-    }
-
-    /// Build inventory while the caller holds this tenant's fence read guard.
-    pub(crate) async fn inventory_with_fence_held(
-        &self,
-        tenant: &TenantId,
-    ) -> StoreResult<ComponentInventory> {
-        let tenant_id = tenant.as_str().to_string();
-        let rows = self
-            .pool
-            .with_conn(move |conn| {
-                let mut statement = conn.prepare(
-                    "SELECT key, sha256, size, content_type, created_at
-                       FROM blob WHERE tenant = ?1 ORDER BY key",
-                )?;
-                let rows = statement
-                    .query_map([tenant_id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, Option<String>>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
-            .await?;
-
-        let mut hash = InventoryHasher::new("blob");
-        let mut logical_bytes = 0u64;
-        let mut referenced = HashSet::new();
-        for (key, digest, size, content_type, created_at) in &rows {
-            if *size < 0 {
-                return Err(StoreError::Corrupt(format!(
-                    "blob {key:?} has negative stored size {size}"
-                )));
-            }
-            if digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err(StoreError::Corrupt(format!(
-                    "blob {key:?} has a non-canonical content digest"
-                )));
-            }
-            hash.field(key.as_bytes());
-            hash.field(digest.as_bytes());
-            hash.field(&size.to_be_bytes());
-            hash.optional_field(content_type.as_deref().map(str::as_bytes));
-            hash.field(&created_at.to_be_bytes());
-            logical_bytes = logical_bytes.saturating_add(*size as u64);
-            referenced.insert(digest.clone());
-        }
-
-        // A metadata digest alone would certify a row that points at missing
-        // or corrupted bytes. Read every unique content object without ever
-        // holding the whole object in memory.
-        let mut buffer = vec![0u8; 1024 * 1024];
-        for digest in &referenced {
-            let path = self.content_path(tenant, digest);
-            let mut file = tokio::fs::File::open(&path).await.map_err(|error| {
-                StoreError::Corrupt(format!(
-                    "blob content {digest} for tenant {tenant} cannot be opened at {}: {error}",
-                    path.display()
-                ))
-            })?;
-            let mut actual = Sha256::new();
-            loop {
-                let read = file.read(&mut buffer).await?;
-                if read == 0 {
-                    break;
-                }
-                actual.update(&buffer[..read]);
-            }
-            let actual = format!("{:x}", actual.finalize());
-            if actual != *digest {
-                return Err(StoreError::Corrupt(format!(
-                    "blob content digest mismatch for tenant {tenant}: path names {digest}, bytes hash to {actual}"
-                )));
-            }
-        }
-
-        let (content, unchecked) = inspect_content_tree(&self.tenant_root(tenant));
-        let orphan_count = content
-            .iter()
-            .filter(|digest| !referenced.contains(*digest))
-            .count() as u64;
-        Ok(hash.finish(
-            "blob",
-            rows.len() as u64,
-            logical_bytes,
-            orphan_count,
-            unchecked,
-        ))
-    }
-
     /// Store `body` under `key`, replacing whatever was there unless
     /// `precondition` says the object has to be in some particular state
     /// first.
@@ -776,7 +654,6 @@ impl BlobService {
     where
         S: Stream<Item = StoreResult<Vec<u8>>> + Unpin,
     {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let key = check_key(key)?;
         let incoming = self.tenant_root(tenant).join(INCOMING_DIR);
         tokio::fs::create_dir_all(&incoming).await?;
@@ -1124,7 +1001,6 @@ impl BlobService {
         key: &str,
         precondition: Option<Precondition>,
     ) -> StoreResult<Conditional<bool>> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let key = check_key(key)?;
         let tenant_id = tenant.as_str().to_string();
         let target = key.clone();
@@ -1734,98 +1610,6 @@ fn content_digests_under(tenant_root: &Path) -> Vec<String> {
         }
     }
     found
-}
-
-/// Strict companion to the best-effort startup sweep. Inventory must expose
-/// anything it could not classify instead of silently omitting it from the
-/// migration proof.
-fn inspect_content_tree(tenant_root: &Path) -> (Vec<String>, u64) {
-    let mut found = Vec::new();
-    let mut unchecked = 0u64;
-    let shards = match std::fs::read_dir(tenant_root) {
-        Ok(shards) => shards,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return (found, 0),
-        Err(_) => return (found, 1),
-    };
-    for shard in shards {
-        let shard = match shard {
-            Ok(shard) => shard,
-            Err(_) => {
-                unchecked += 1;
-                continue;
-            }
-        };
-        if shard.file_name() == INCOMING_DIR {
-            // The directory is created for every upload and intentionally
-            // retained. Only entries inside it are abandoned/unclassified
-            // evidence; an empty directory is normal.
-            match std::fs::read_dir(shard.path()) {
-                Ok(entries) => unchecked += entries.count() as u64,
-                Err(_) => unchecked += 1,
-            }
-            continue;
-        }
-        let shard_name = shard.file_name().to_string_lossy().into_owned();
-        if shard_name.len() != 2 || !shard_name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            unchecked += 1;
-            continue;
-        }
-        let subshards = match std::fs::read_dir(shard.path()) {
-            Ok(subshards) => subshards,
-            Err(_) => {
-                unchecked += 1;
-                continue;
-            }
-        };
-        for subshard in subshards {
-            let subshard = match subshard {
-                Ok(subshard) => subshard,
-                Err(_) => {
-                    unchecked += 1;
-                    continue;
-                }
-            };
-            let subshard_name = subshard.file_name().to_string_lossy().into_owned();
-            if subshard_name.len() != 2
-                || !subshard_name.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                unchecked += 1;
-                continue;
-            }
-            let files = match std::fs::read_dir(subshard.path()) {
-                Ok(files) => files,
-                Err(_) => {
-                    unchecked += 1;
-                    continue;
-                }
-            };
-            for file in files {
-                let file = match file {
-                    Ok(file) => file,
-                    Err(_) => {
-                        unchecked += 1;
-                        continue;
-                    }
-                };
-                let name = file.file_name().to_string_lossy().into_owned();
-                let is_digest = name.len() == 64
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-                if !is_digest
-                    || shard_name != name[0..2]
-                    || subshard_name != name[2..4]
-                    || !file.path().is_file()
-                {
-                    unchecked += 1;
-                    continue;
-                }
-                found.push(name);
-            }
-        }
-    }
-    found.sort();
-    (found, unchecked)
 }
 
 /// One `tokio::Mutex` per `(tenant, digest)`, created on demand and dropped
@@ -3938,40 +3722,5 @@ mod tests {
         reopened.sweep_orphans(true).await;
         assert!(!orphan_path.exists());
         assert!(reopened.content_path(&a, &kept).exists());
-    }
-
-    #[tokio::test]
-    async fn migration_inventory_rejects_a_non_canonical_metadata_digest() {
-        let (_dir, svc) = service().await;
-        let tenant = tenant("app-one.production");
-        put(&svc, &tenant, "asset", b"content").await;
-        let request = deis_backend_migration::FenceRequest::parse(
-            tenant.as_str(),
-            "01990f44-1000-7000-8000-000000000050",
-            1,
-            "test-fence-token-00000000000000000001",
-            &svc.fences.backend_incarnation_id().to_string(),
-        )
-        .unwrap();
-        svc.fences.acquire(request).await.unwrap();
-
-        let clean = svc.inventory(&tenant).await.unwrap();
-        assert_eq!(clean.unchecked_orphan_count, 0);
-
-        let tenant_id = tenant.as_str().to_string();
-        svc.pool
-            .with_conn(move |connection| {
-                connection.execute(
-                    "UPDATE blob SET sha256 = 'short' WHERE tenant = ?1 AND key = 'asset'",
-                    [tenant_id],
-                )?;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        assert!(matches!(
-            svc.inventory(&tenant).await,
-            Err(StoreError::Corrupt(message)) if message.contains("non-canonical")
-        ));
     }
 }

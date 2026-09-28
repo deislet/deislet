@@ -149,13 +149,7 @@ pub async fn build_api_router(
     };
 
     let operation_state = operations::OperationApiState::new(Arc::clone(&catalog_state.store));
-    let restore_state = restores::RestoreApiState::new(
-        Arc::clone(&catalog_state.store),
-        &config,
-        deis_runtime_manager
-            .machine_identity()
-            .map(deis_identity::ServiceTrust::from_identity),
-    );
+    let restore_state = restores::RestoreApiState::new(Arc::clone(&catalog_state.store), &config);
     restore_state.resume_on_start();
 
     // One gate for the whole human surface. It resolves the credential into

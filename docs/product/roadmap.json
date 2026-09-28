@@ -372,10 +372,6 @@
             },
             {
               "type": "local-path",
-              "value": "crates/deis-control/src/catalog/identity_migration.rs"
-            },
-            {
-              "type": "local-path",
               "value": "crates/deis-control/src/database/schema.rs"
             },
             {
@@ -388,35 +384,11 @@
             },
             {
               "type": "local-path",
-              "value": "contracts/v1/backend-migration-evidence.schema.json"
-            },
-            {
-              "type": "local-path",
-              "value": "crates/deis-backend-migration/proto/migration.proto"
-            },
-            {
-              "type": "local-path",
-              "value": "crates/deis-backend-migration/src/lib.rs"
-            },
-            {
-              "type": "local-path",
-              "value": "crates/deis-store/src/migration.rs"
-            },
-            {
-              "type": "local-path",
               "value": "crates/deis-store/src/snapshot.rs"
             },
             {
               "type": "local-path",
-              "value": "crates/deis-queue/src/migration.rs"
-            },
-            {
-              "type": "local-path",
               "value": "crates/deis-queue/src/snapshot.rs"
-            },
-            {
-              "type": "local-path",
-              "value": "crates/deis-telemetry/src/migration.rs"
             },
             {
               "type": "local-path",
@@ -428,19 +400,11 @@
             },
             {
               "type": "local-path",
-              "value": "crates/deis-control/src/catalog/backend_migration.rs"
-            },
-            {
-              "type": "local-path",
               "value": "crates/deis-control/src/catalog/operation.rs"
             },
             {
               "type": "local-path",
               "value": "crates/deis-wire/src/operation.rs"
-            },
-            {
-              "type": "local-path",
-              "value": "crates/deis-control/src/api/migrations.rs"
             },
             {
               "type": "local-path",

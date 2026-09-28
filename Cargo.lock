@@ -2066,30 +2066,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "deis-backend-migration"
-version = "0.1.0"
-dependencies = [
- "deis-wire",
- "prost 0.13.5",
- "prost-build",
- "protoc-bin-vendored",
- "rusqlite",
- "sha2",
- "tempfile",
- "tokio",
- "tonic",
- "tonic-build",
- "tracing",
-]
-
-[[package]]
 name = "deis-backend-topology"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap 4.6.6",
- "deis-backend-migration",
  "deis-queue",
  "deis-store",
  "deis-telemetry",
@@ -2260,7 +2242,6 @@ dependencies = [
  "chrono",
  "dashmap 6.2.1",
  "deis-artifact",
- "deis-backend-migration",
  "deis-build-adapter-cloudflare",
  "deis-build-core",
  "deis-bundle",
@@ -2438,7 +2419,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
- "deis-backend-migration",
  "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",
@@ -2540,7 +2520,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
- "deis-backend-migration",
  "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",
@@ -2576,7 +2555,6 @@ dependencies = [
  "axum",
  "chrono",
  "clap 4.6.6",
- "deis-backend-migration",
  "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",

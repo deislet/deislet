@@ -23,10 +23,6 @@
 //! fixed pause is enough, so a broken lease fails the test instead of making
 //! it flaky.
 
-use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
-use deis_backend_migration::proto::{
-    AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
-};
 use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode as encode_capability};
 use deis_identity::{Protocol, ServiceKind};
 use deis_identity_test_pki::TestFleet;
@@ -105,15 +101,6 @@ impl Harness {
         Self::start_with(Config::default()).await
     }
 
-    /// Start with a config that carries a migration admin token.
-    async fn start_migration_authenticated(token: &str) -> Self {
-        Self::start_with(Config {
-            migration_admin_token: Some(token.to_string()),
-            ..Config::default()
-        })
-        .await
-    }
-
     /// Start with a fully custom config.
     async fn start_with(config: Config) -> Self {
         let data = TempDir::new().unwrap();
@@ -175,11 +162,6 @@ impl Harness {
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
 
-    async fn migration(&self) -> BackendMigrationClient<Channel> {
-        BackendMigrationClient::new(self.channel().await)
-            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-    }
 }
 
 impl Drop for Harness {
@@ -188,122 +170,6 @@ impl Drop for Harness {
             let _ = shutdown.send(());
         }
     }
-}
-
-#[tokio::test]
-async fn migration_management_is_absent_by_default_and_freezes_queue_mutations() {
-    const ADMIN: &str = "migration-admin-token-000000000000000001";
-    const MIGRATION: &str = "01990f44-1000-7000-8000-000000000050";
-    const FENCE: &str = "migration-fence-token-00000000000000001";
-    const UNKNOWN_INCARNATION: &str = "01990f44-1000-7000-8000-000000000099";
-    let acquire = |backend_incarnation_id: &str| AcquireWriteFenceRequest {
-        tenant: "shop.production".to_string(),
-        migration_id: MIGRATION.to_string(),
-        expected_application_revision: 3,
-        fence_token: FENCE.to_string(),
-        expected_backend_incarnation_id: backend_incarnation_id.to_string(),
-    };
-
-    let without_management = Harness::start().await;
-    assert_eq!(
-        without_management
-            .migration()
-            .await
-            .acquire_write_fence(Request::new(acquire(UNKNOWN_INCARNATION)))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::Unimplemented
-    );
-    drop(without_management);
-
-    let harness = Harness::start_migration_authenticated(ADMIN).await;
-    let mut queue = harness.client().await;
-    queue
-        .send(as_tenant(
-            &harness,
-            "shop.production",
-            SendRequest {
-                queue_name: "jobs".to_string(),
-                message_body: b"one".to_vec(),
-            },
-        ))
-        .await
-        .unwrap();
-    let mut migration = harness.migration().await;
-    let backend_info = migration
-        .get_backend_info(as_migration_admin(ADMIN, GetBackendInfoRequest {}))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(backend_info.backend, "deis-queue");
-    let backend_incarnation_id = backend_info.backend_incarnation_id;
-    assert_eq!(
-        migration
-            .acquire_write_fence(Request::new(acquire(&backend_incarnation_id)))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::Unauthenticated
-    );
-    migration
-        .acquire_write_fence(as_migration_admin(ADMIN, acquire(&backend_incarnation_id)))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        queue
-            .pull(as_tenant(
-                &harness,
-                "shop.production",
-                PullRequest {
-                    queue_name: "jobs".to_string(),
-                    max_messages: 1,
-                    lease_seconds: 30,
-                },
-            ))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::FailedPrecondition
-    );
-    let inventory = migration
-        .inspect_tenant(as_migration_admin(
-            ADMIN,
-            InspectTenantRequest {
-                tenant: "shop.production".to_string(),
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(inventory.backend, "deis-queue");
-    assert_eq!(inventory.components[0].item_count, 1);
-
-    migration
-        .release_write_fence(as_migration_admin(
-            ADMIN,
-            ReleaseWriteFenceRequest {
-                tenant: "shop.production".to_string(),
-                migration_id: MIGRATION.to_string(),
-                expected_application_revision: 3,
-                fence_token: FENCE.to_string(),
-                expected_backend_incarnation_id: backend_incarnation_id,
-            },
-        ))
-        .await
-        .unwrap();
-    queue
-        .send(as_tenant(
-            &harness,
-            "shop.production",
-            SendRequest {
-                queue_name: "jobs".to_string(),
-                message_body: b"two".to_vec(),
-            },
-        ))
-        .await
-        .unwrap();
 }
 
 /// Stamp the tenant the way deis-runtime has to. Also stamps a capability
@@ -345,14 +211,6 @@ fn as_tenant_with_capability<T>(
         .metadata_mut()
         .insert(TENANT_HEADER, tenant.parse().unwrap());
     let token = queue_capability(&harness.signing_key, token_tenant);
-    request
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {token}").parse().unwrap());
-    request
-}
-
-fn as_migration_admin<T>(token: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
     request
         .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());

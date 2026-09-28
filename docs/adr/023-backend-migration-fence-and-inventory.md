@@ -1,6 +1,6 @@
 # ADR-023：后端迁移清单与写入栅栏必须位于真实提交边界
 
-- 状态：Accepted
+- 状态：Deprecated（2026-09-28：没有任何安装持有按名字键控的数据，身份迁移子系统连同本 ADR 的 `BackendMigration` 服务、写入栅栏、inventory 与 `migration_admin_token` 一并删除；恢复所需的 backend incarnation 改为数据目录中的 `backend-incarnation` 文件，见 ADR-024）
 - 日期：2026-09-04
 - 决策者：产品负责人已确认的统一标准方向；本记录落实 ADR-019 的后端约束
 - 关联：[ADR-019](019-coordinated-data-lifecycle.md)、`../archive/phase-analysis-2026-09-03.zh.md` 第 13 节、`../../contracts/v1/backend-migration-evidence.schema.json`

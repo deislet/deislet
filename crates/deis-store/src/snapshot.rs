@@ -98,7 +98,6 @@
 use crate::error::{StoreError, StoreResult};
 use crate::tenant::TenantId;
 use crate::unix_seconds;
-use deis_backend_migration::TenantWriteFences;
 use deis_wire::CanonicalId;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -167,8 +166,9 @@ pub struct RestoreReport {
     /// good.
     pub damaged_objects: usize,
     pub source_backend_incarnation_id: Option<CanonicalId>,
-    /// Fresh identity assigned to the restored data. It never copies the
-    /// source fence journal or inherits its active writer fences.
+    /// Fresh identity assigned to the restored data. A snapshot never
+    /// carries the source's incarnation record, so the restored directory
+    /// can never claim to be the one it was copied from.
     pub restored_backend_incarnation_id: CanonicalId,
 }
 
@@ -186,9 +186,7 @@ pub fn take(data_dir: &Path, out: &Path) -> StoreResult<Manifest> {
     prepare_destination(out, "snapshot")?;
 
     let started = unix_seconds();
-    let source_backend_incarnation_id =
-        TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?
-            .backend_incarnation_id();
+    let source_backend_incarnation_id = deis_wire::incarnation::load_or_create(data_dir)?;
     let mut databases = Vec::new();
 
     // The shared databases first, and blob.sqlite before any content: the
@@ -354,9 +352,7 @@ pub fn restore(snapshot: &Path, data_dir: &Path) -> StoreResult<RestoreReport> {
         }
     }
 
-    let restored_backend_incarnation_id =
-        TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?
-            .backend_incarnation_id();
+    let restored_backend_incarnation_id = deis_wire::incarnation::load_or_create(data_dir)?;
     if manifest.source_backend_incarnation_id == Some(restored_backend_incarnation_id) {
         return Err(StoreError::Corrupt(
             "restore generated the same backend incarnation as its source".to_string(),
@@ -811,15 +807,14 @@ mod tests {
         );
         assert_ne!(report.restored_backend_incarnation_id, source_incarnation);
         assert_eq!(
-            TenantWriteFences::open_blocking(restored.join("migration-fences.sqlite"))
-                .unwrap()
-                .backend_incarnation_id(),
-            report.restored_backend_incarnation_id
+            deis_wire::incarnation::read(&restored).unwrap(),
+            Some(report.restored_backend_incarnation_id)
         );
         assert!(
             !snapshot
                 .path()
-                .join("snap/migration-fences.sqlite")
+                .join("snap")
+                .join(deis_wire::incarnation::INCARNATION_FILE)
                 .exists()
         );
 

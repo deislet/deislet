@@ -3,13 +3,11 @@
 //! Both the binary and the integration tests come through here, so what the
 //! tests exercise is the same assembly the binary runs.
 //!
-//! # Application telemetry and migration management have separate doors
+//! # One door, and it checks the capability
 //!
 //! The capability token is checked by an interceptor applied in [`guarded`],
 //! which is the only way an application-facing gRPC service is handed to the
 //! server below, and by one layer over the scrape router in [`crate::http`].
-//! Migration management is optional and uses an independent bearer
-//! interceptor; application callers cannot inherit authority to freeze data.
 //! The health service is registered without either credential on purpose - it
 //! names no application and reads no data. See [`crate::auth`].
 //!
@@ -27,8 +25,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
-use deis_backend_migration::{FenceError, MigrationAuth, TenantWriteFences};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
@@ -46,7 +42,6 @@ use tracing::{error, info, warn};
 use crate::auth::TelemetryAuth;
 use crate::config::Config;
 use crate::http::{self, MetricsState};
-use crate::migration::TelemetryMigrationService;
 use crate::proto::log_service_server::LogServiceServer;
 use crate::proto::metric_service_server::MetricServiceServer;
 use crate::proto::trace_service_server::TraceServiceServer;
@@ -73,7 +68,6 @@ pub struct RunningServer {
     pub grpc_addr: SocketAddr,
     pub metrics_addr: SocketAddr,
     pub store: TelemetryStore,
-    pub fences: TenantWriteFences,
     pub stats: Arc<ServiceStats>,
     hub: Arc<TailHub>,
     trace_hub: Arc<TraceHub>,
@@ -215,18 +209,10 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     config.validate()?;
     let (identity, control) = machine_identity(config)?;
 
-    let migration_auth = match config.migration_admin_token.as_deref() {
-        Some(token) => Some(
-            MigrationAuth::new(token)
-                .context("invalid migration_admin_token; the management service was not started")?,
-        ),
-        None => None,
-    };
-    let migration_enabled = migration_auth.is_some();
     let store = TelemetryStore::open(&config.data_dir)?;
-    let fences = TenantWriteFences::open(config.data_dir.join("migration-fences.sqlite"))
-        .await
-        .context("cannot open the telemetry migration fence journal")?;
+    let incarnation = deis_wire::incarnation::load_or_create(&config.data_dir)
+        .context("cannot read or record this data directory's backend incarnation")?;
+    info!(backend_incarnation_id = %incarnation, "telemetry data directory opened");
     let stats = Arc::new(ServiceStats::new());
     let hub = Arc::new(TailHub::new(config.tail_capacity, Arc::clone(&stats)));
     let trace_hub = Arc::new(TraceHub::new(
@@ -247,7 +233,6 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     };
     let logs = LogService::new(
         store.clone(),
-        fences.clone(),
         Arc::clone(&hub),
         Arc::clone(&stats),
         limits,
@@ -255,7 +240,6 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     );
     let traces = TraceService::new(
         store.clone(),
-        fences.clone(),
         Arc::clone(&trace_hub),
         Arc::clone(&stats),
         limits,
@@ -263,7 +247,6 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     );
     let metrics_service = MetricService::new(
         store.clone(),
-        fences.clone(),
         Arc::clone(&stats),
         limits,
         retention,
@@ -308,12 +291,7 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     // probe asks about when it names nothing - says the same as the three.
     // It answers for this process only.
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
-    set_all_health(
-        &mut health_reporter,
-        ServingStatus::Serving,
-        migration_enabled,
-    )
-    .await;
+    set_all_health(&mut health_reporter, ServingStatus::Serving).await;
 
     // Log batches are the reason this ceiling exists: a runtime shipping a few
     // thousand lines at once must not be cut off at tonic's 4 MB default.
@@ -335,27 +313,6 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     let log_service = guarded(log_service, &auth);
     let trace_service = guarded(trace_service, &auth);
     let metric_service = guarded(metric_service, &auth);
-    let migration_service = match migration_auth {
-        Some(auth) => {
-            info!("telemetry migration management enabled with independent bearer authentication");
-            Some(InterceptedService::new(
-                BackendMigrationServer::new(TelemetryMigrationService::new(
-                    store.clone(),
-                    fences.clone(),
-                ))
-                .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-                auth,
-            ))
-        }
-        None => {
-            warn!(
-                "migration_admin_token is not configured, so telemetry inventory and writer-fence RPCs are not registered"
-            );
-            None
-        }
-    };
-
     let grpc_shutdown = subscribe(&shutdown);
     let grpc = tokio::spawn(async move {
         let result = Server::builder()
@@ -363,7 +320,6 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
             .add_service(log_service)
             .add_service(trace_service)
             .add_service(metric_service)
-            .add_optional_service(migration_service)
             .serve_with_incoming_shutdown(tls_incoming(grpc_listener, identity), grpc_shutdown)
             .await;
         match result {
@@ -405,13 +361,11 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     let health = tokio::spawn(health_follows_the_store(
         health_reporter,
         stats.store_health.subscribe(),
-        migration_enabled,
         subscribe(&shutdown),
     ));
 
     let retention = tokio::spawn(retention_loop(
         store.clone(),
-        fences.clone(),
         Arc::clone(&stats),
         RetentionPolicy {
             log_days: config.log_retention_days,
@@ -436,7 +390,6 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
         grpc_addr,
         metrics_addr,
         store,
-        fences,
         stats,
         hub,
         trace_hub,
@@ -462,7 +415,6 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
 async fn health_follows_the_store(
     mut reporter: tonic_health::server::HealthReporter,
     mut state: watch::Receiver<StoreState>,
-    migration_enabled: bool,
     shutdown: impl std::future::Future<Output = ()> + Send,
 ) {
     tokio::pin!(shutdown);
@@ -476,10 +428,10 @@ async fn health_follows_the_store(
                 }
                 let serving = state.borrow_and_update().is_serving();
                 if serving {
-                    set_all_health(&mut reporter, ServingStatus::Serving, migration_enabled).await;
+                    set_all_health(&mut reporter, ServingStatus::Serving).await;
                     info!("grpc.health.v1 now reports SERVING for all three services again");
                 } else {
-                    set_all_health(&mut reporter, ServingStatus::NotServing, migration_enabled).await;
+                    set_all_health(&mut reporter, ServingStatus::NotServing).await;
                     warn!(
                         "grpc.health.v1 now reports NOT_SERVING for all three services: the \
                          database behind them stopped answering, so anything this process is \
@@ -506,7 +458,6 @@ async fn health_follows_the_store(
 async fn set_all_health(
     reporter: &mut tonic_health::server::HealthReporter,
     status: ServingStatus,
-    migration_enabled: bool,
 ) {
     reporter
         .set_service_status(<LogServiceServer<LogService> as NamedService>::NAME, status)
@@ -523,14 +474,6 @@ async fn set_all_health(
             status,
         )
         .await;
-    if migration_enabled {
-        reporter
-            .set_service_status(
-                <BackendMigrationServer<TelemetryMigrationService> as NamedService>::NAME,
-                status,
-            )
-            .await;
-    }
     reporter.set_service_status("", status).await;
 }
 
@@ -557,7 +500,6 @@ struct RetentionPolicy {
 /// Drop expired day partitions and metric samples on a timer.
 async fn retention_loop(
     store: TelemetryStore,
-    fences: TenantWriteFences,
     stats: Arc<ServiceStats>,
     policy: RetentionPolicy,
     shutdown: impl std::future::Future<Output = ()> + Send,
@@ -576,7 +518,7 @@ async fn retention_loop(
     loop {
         tokio::select! {
             // The first tick fires immediately, which is the startup sweep.
-            _ = ticker.tick() => sweep_once(&store, &fences, &stats, policy).await,
+            _ = ticker.tick() => sweep_once(&store, &stats, policy).await,
             _ = &mut shutdown => {
                 info!("retention sweeper stopped");
                 break;
@@ -585,59 +527,10 @@ async fn retention_loop(
     }
 }
 
-async fn sweep_once(
-    store: &TelemetryStore,
-    fences: &TenantWriteFences,
-    stats: &Arc<ServiceStats>,
-    policy: RetentionPolicy,
-) {
-    let inventory_store = store.clone();
-    let tenants = match tokio::task::spawn_blocking(move || inventory_store.tenant_ids()).await {
-        Ok(Ok(tenants)) => tenants,
-        Ok(Err(error)) => {
-            ServiceStats::incr(&stats.storage_failures);
-            ServiceStats::incr(&stats.retention_sweeps_failed);
-            stats
-                .store_health
-                .record_failure(Access::Read, "retention tenant inventory");
-            warn!(error = %error, "retention skipped: stored telemetry cannot be assigned safely to tenant fences");
-            return;
-        }
-        Err(error) => {
-            ServiceStats::incr(&stats.storage_failures);
-            ServiceStats::incr(&stats.retention_sweeps_failed);
-            stats
-                .store_health
-                .record_failure(Access::Read, "retention tenant inventory");
-            warn!(error = %error, "retention skipped: tenant inventory task failed");
-            return;
-        }
-    };
-    let permits = match fences.permits(&tenants).await {
-        Ok(permits) => permits,
-        Err(FenceError::Fenced(receipt)) => {
-            ServiceStats::incr(&stats.retention_sweeps_skipped_fenced);
-            info!(
-                tenant = %receipt.tenant,
-                migration_id = %receipt.migration_id,
-                "retention skipped while a telemetry tenant is write-fenced"
-            );
-            return;
-        }
-        Err(error) => {
-            ServiceStats::incr(&stats.storage_failures);
-            ServiceStats::incr(&stats.retention_sweeps_failed);
-            stats
-                .store_health
-                .record_failure(Access::Write, "retention tenant permits");
-            warn!(error = %error, "retention skipped: tenant write permits could not be acquired");
-            return;
-        }
-    };
+async fn sweep_once(store: &TelemetryStore, stats: &Arc<ServiceStats>, policy: RetentionPolicy) {
     let store = store.clone();
     let now = now_us();
     let outcome = tokio::task::spawn_blocking(move || {
-        let _permits = permits;
         store.sweep_retention(now, policy.log_days, policy.metric_days, policy.trace_days)
     })
     .await;
@@ -720,63 +613,5 @@ async fn sweep_once(
                  the next attempt is one interval away"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use deis_backend_migration::FenceRequest;
-
-    use super::*;
-    use crate::store::LogRecord;
-
-    #[tokio::test]
-    async fn retention_never_deletes_through_an_active_tenant_fence() {
-        let directory = tempfile::tempdir().unwrap();
-        let store = TelemetryStore::open(directory.path()).unwrap();
-        let fences = TenantWriteFences::open(directory.path().join("migration-fences.sqlite"))
-            .await
-            .unwrap();
-        store
-            .insert_logs(&[LogRecord {
-                timestamp_us: 1,
-                level: 3,
-                component: "runtime".to_string(),
-                app_id: "shop".to_string(),
-                message: "old".to_string(),
-                fields: BTreeMap::new(),
-                trace_id: String::new(),
-                span_id: String::new(),
-            }])
-            .unwrap();
-        let incarnation = fences.backend_incarnation_id().to_string();
-        let request = || {
-            FenceRequest::parse(
-                "shop.production",
-                "01990f44-1000-7000-8000-000000000088",
-                4,
-                "retention-fence-token-0000000000000001",
-                &incarnation,
-            )
-            .unwrap()
-        };
-        fences.acquire(request()).await.unwrap();
-
-        let stats = Arc::new(ServiceStats::new());
-        let policy = RetentionPolicy {
-            log_days: 1,
-            metric_days: 1,
-            trace_days: 1,
-            interval: Duration::from_secs(60),
-        };
-        sweep_once(&store, &fences, &stats, policy).await;
-        assert_eq!(store.partition_count().unwrap(), 1);
-        assert_eq!(ServiceStats::get(&stats.retention_sweeps_skipped_fenced), 1);
-
-        fences.release(request()).await.unwrap();
-        sweep_once(&store, &fences, &stats, policy).await;
-        assert_eq!(store.partition_count().unwrap(), 0);
     }
 }

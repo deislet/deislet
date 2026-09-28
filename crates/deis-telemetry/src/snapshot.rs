@@ -4,10 +4,9 @@
 //! committed WAL pages. [`take`] uses SQLite `VACUUM INTO` to materialize one
 //! complete database and records its digest and signal counts. [`restore`]
 //! verifies both the snapshot and the copied file, accepts only an empty
-//! target, and deliberately creates a fresh migration backend incarnation.
+//! target, and deliberately mints a fresh backend incarnation.
 
 use anyhow::{Context, Result, anyhow, bail};
-use deis_backend_migration::TenantWriteFences;
 use deis_wire::CanonicalId;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -55,9 +54,7 @@ pub fn take(data_dir: &Path, out: &Path) -> Result<Manifest> {
         bail!("{} is not a telemetry data directory", data_dir.display());
     }
     prepare_destination(out, "snapshot")?;
-    let source_backend_incarnation_id =
-        TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?
-            .backend_incarnation_id();
+    let source_backend_incarnation_id = deis_wire::incarnation::load_or_create(data_dir)?;
 
     let source = data_dir.join(DATABASE_NAME);
     let destination = out.join(DATABASE_NAME);
@@ -139,9 +136,7 @@ pub fn restore(snapshot: &Path, data_dir: &Path) -> Result<RestoreReport> {
         None
     };
 
-    let restored_backend_incarnation_id =
-        TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?
-            .backend_incarnation_id();
+    let restored_backend_incarnation_id = deis_wire::incarnation::load_or_create(data_dir)?;
     if restored_backend_incarnation_id == manifest.source_backend_incarnation_id {
         bail!("restore generated the same backend incarnation as its source");
     }
@@ -373,7 +368,11 @@ mod tests {
             )),
             Some((1, 1, 1))
         );
-        assert!(!snapshot.join("migration-fences.sqlite").exists());
+        assert!(
+            !snapshot
+                .join(deis_wire::incarnation::INCARNATION_FILE)
+                .exists()
+        );
 
         let restored_root = TempDir::new().unwrap();
         let restored = restored_root.path().join("data");
@@ -409,10 +408,8 @@ mod tests {
             "trace-1"
         );
         assert_eq!(
-            TenantWriteFences::open_blocking(restored.join("migration-fences.sqlite"))
-                .unwrap()
-                .backend_incarnation_id(),
-            report.restored_backend_incarnation_id
+            deis_wire::incarnation::read(&restored).unwrap(),
+            Some(report.restored_backend_incarnation_id)
         );
     }
 

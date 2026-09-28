@@ -17,15 +17,15 @@
 
 | 凭证 | 在哪里 | 它开的是什么门 | 现在的形态 |
 |---|---|---|---|
-| `migration_admin_token` | `crates/deis-control/src/config.rs` 与 `deis-backend-migration` | 后端迁移与恢复的管理操作 | 独立的静态 token |
 | inspector 会话令牌 | `crates/deis-runtime/src/app/manager.rs` | 一个调试会话 | **不属于这一类**：节点自己铸造、驻留内存、会过期，与舰队无关。列在这里只是为了说明它为什么不该跟着一起删 |
 
 deis-store 与 deis-queue 的 `auth_secret`（以及控制面的 `storage_auth_secret`、由它 HMAC 派生的 storage token）已经删掉：两者只认 control 用 Ed25519 签发、15 分钟过期、可按 `jti`/节点/租户吊销的 capability，公钥与签名吊销名单用各自的机器身份经 mTLS 从 machine channel 拉取；节点只能为分配给自己的租户申领。deis-telemetry 的 `auth_secret` 同样已经删掉：遥测只认 control 签发的 capability，写入用 `ingest`、读取用 `read`，都按租户限定，节点经机器通道申领、CLI 向 control 申领并记审计，没有不鉴权的模式。见 `docs/trust-boundaries.md` 的「Telemetry」一节。
 
 ## 还剩下的怎么收
 
-- `migration_admin_token` 与主密钥都是单机持有的静态值，不是全场共享的应用凭证；收敛它们要走
-  ADR-025 的后续阶段，不是把它们换成另一个静态值。
+- 主密钥是单机持有的静态值，不是全场共享的应用凭证；收敛它要走 ADR-025 的后续阶段，
+  不是把它换成另一个静态值。
+- 后端迁移管理凭证 `migration_admin_token` 已随身份迁移子系统一起删除（2026-09-28）。
 - 动它们之前先看 `docs/adr/025-machine-identity-and-capabilities.md` 的非目标一节：
   那里明确禁止为 legacy 凭证发「按节点伪造的衍生 token」，这类捷径在这几处尤其诱人。
 

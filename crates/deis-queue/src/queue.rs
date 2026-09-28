@@ -44,7 +44,6 @@ use crate::proto::queue::{
 };
 use crate::sqlite::{PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
-use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences};
 use rusqlite::{OptionalExtension, Transaction};
 use tonic::{Request, Response, Status};
 
@@ -205,7 +204,6 @@ pub struct ReplayOutcome {
 #[derive(Clone)]
 pub struct QueueService {
     pool: SqlitePool,
-    fences: TenantWriteFences,
     limits: QueueLimits,
     clock: Clock,
 }
@@ -228,16 +226,14 @@ impl QueueService {
         limits: QueueLimits,
         clock: Clock,
     ) -> QueueResult<Self> {
-        let fences = TenantWriteFences::open(data_dir.join("migration-fences.sqlite")).await?;
-        Self::open_with_clock_and_fences(data_dir, connections, limits, clock, fences).await
+        Self::open_inner(data_dir, connections, limits, clock).await
     }
 
-    async fn open_with_clock_and_fences(
+    async fn open_inner(
         data_dir: &std::path::Path,
         connections: usize,
         mut limits: QueueLimits,
         clock: Clock,
-        fences: TenantWriteFences,
     ) -> QueueResult<Self> {
         if limits.max_body_bytes > limits.max_pull_response_bytes {
             tracing::warn!(
@@ -337,7 +333,6 @@ impl QueueService {
         );
         Ok(Self {
             pool,
-            fences,
             limits,
             clock,
         })
@@ -346,10 +341,6 @@ impl QueueService {
     /// The ceilings this service applies.
     pub fn limits(&self) -> &QueueLimits {
         &self.limits
-    }
-
-    pub(crate) fn fences(&self) -> &TenantWriteFences {
-        &self.fences
     }
 
     /// Enqueue one message, visible immediately. Returns its id.
@@ -370,7 +361,6 @@ impl QueueService {
         queue: &str,
         bodies: Vec<Vec<u8>>,
     ) -> QueueResult<Vec<String>> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         if bodies.is_empty() {
             return Err(QueueError::InvalidArgument(
@@ -457,7 +447,6 @@ impl QueueService {
         lease_seconds: Option<i32>,
         consumer_generation: Option<&str>,
     ) -> QueueResult<Vec<LeasedMessage>> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         let wanted = self.clamp_pull_size(max_messages);
         let lease = self.clamp_lease(lease_seconds);
@@ -578,7 +567,6 @@ impl QueueService {
         expected_previous_generation: Option<&str>,
         expected_previous_deployment_id: Option<&str>,
     ) -> QueueResult<PrepareConsumerGenerationResponse> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         validate_generation_identity("deployment_id", deployment_id)?;
         validate_generation_identity("generation", generation)?;
         if let Some(previous) = expected_previous_generation.filter(|value| !value.is_empty()) {
@@ -621,7 +609,6 @@ impl QueueService {
         deployment_id: &str,
         generation: &str,
     ) -> QueueResult<ActivateConsumerGenerationResponse> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         validate_generation_identity("deployment_id", deployment_id)?;
         validate_generation_identity("generation", generation)?;
         let tenant = tenant.as_str().to_string();
@@ -642,7 +629,6 @@ impl QueueService {
         deployment_id: &str,
         generation: &str,
     ) -> QueueResult<AbortConsumerGenerationResponse> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         validate_generation_identity("deployment_id", deployment_id)?;
         validate_generation_identity("generation", generation)?;
         let tenant = tenant.as_str().to_string();
@@ -670,7 +656,6 @@ impl QueueService {
         queue: &str,
         handles: Vec<MessageHandle>,
     ) -> QueueResult<AckOutcome> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         if handles.is_empty() {
             return Ok(AckOutcome::default());
@@ -782,7 +767,6 @@ impl QueueService {
         delay_seconds: Option<i32>,
         refund_attempt: bool,
     ) -> QueueResult<NackOutcome> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         if handles.is_empty() {
             return Ok(NackOutcome::default());
@@ -1031,7 +1015,6 @@ impl QueueService {
         ids: Vec<String>,
         delay_seconds: Option<i32>,
     ) -> QueueResult<ReplayOutcome> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         if ids.is_empty() {
             tracing::warn!(
@@ -1128,87 +1111,6 @@ impl QueueService {
         })
     }
 
-    /// Deterministic evidence for ready/delayed/leased and dead-letter rows
-    /// under an active writer fence.
-    pub async fn inventory(&self, tenant: &TenantId) -> QueueResult<ComponentInventory> {
-        let (_receipt, _fence) = self.fences.fenced_read(tenant.as_str()).await?;
-        self.inventory_with_fence_held(tenant).await
-    }
-
-    /// Build inventory while the caller holds this tenant's fence read guard.
-    pub(crate) async fn inventory_with_fence_held(
-        &self,
-        tenant: &TenantId,
-    ) -> QueueResult<ComponentInventory> {
-        let tenant_id = tenant.as_str().to_string();
-        self.pool
-            .with_conn(move |conn| {
-                let tx = conn.transaction()?;
-                let mut hash = InventoryHasher::new("queue");
-                let mut count = 0u64;
-                let mut logical_bytes = 0u64;
-                {
-                    let mut statement = tx.prepare(
-                        "SELECT queue, id, body, attempts, visible_at, created_at, lease_token
-                           FROM messages
-                          WHERE tenant = ?1
-                          ORDER BY queue, id",
-                    )?;
-                    let mut rows = statement.query([&tenant_id])?;
-                    while let Some(row) = rows.next()? {
-                        let queue: String = row.get(0)?;
-                        let id: String = row.get(1)?;
-                        let body: Vec<u8> = row.get(2)?;
-                        let attempts: i32 = row.get(3)?;
-                        let visible_at: i64 = row.get(4)?;
-                        let created_at: i64 = row.get(5)?;
-                        let lease_token: String = row.get(6)?;
-                        hash.field(b"message");
-                        hash.field(queue.as_bytes());
-                        hash.field(id.as_bytes());
-                        hash.field(&body);
-                        hash.field(&attempts.to_be_bytes());
-                        hash.field(&visible_at.to_be_bytes());
-                        hash.field(&created_at.to_be_bytes());
-                        hash.field(lease_token.as_bytes());
-                        count += 1;
-                        logical_bytes = logical_bytes.saturating_add(body.len() as u64);
-                    }
-                }
-                {
-                    let mut statement = tx.prepare(
-                        "SELECT queue, id, body, attempts, created_at, died_at, reason
-                           FROM dead_letter
-                          WHERE tenant = ?1
-                          ORDER BY queue, id",
-                    )?;
-                    let mut rows = statement.query([&tenant_id])?;
-                    while let Some(row) = rows.next()? {
-                        let queue: String = row.get(0)?;
-                        let id: String = row.get(1)?;
-                        let body: Vec<u8> = row.get(2)?;
-                        let attempts: i32 = row.get(3)?;
-                        let created_at: i64 = row.get(4)?;
-                        let died_at: i64 = row.get(5)?;
-                        let reason: String = row.get(6)?;
-                        hash.field(b"dead-letter");
-                        hash.field(queue.as_bytes());
-                        hash.field(id.as_bytes());
-                        hash.field(&body);
-                        hash.field(&attempts.to_be_bytes());
-                        hash.field(&created_at.to_be_bytes());
-                        hash.field(&died_at.to_be_bytes());
-                        hash.field(reason.as_bytes());
-                        count += 1;
-                        logical_bytes = logical_bytes.saturating_add(body.len() as u64);
-                    }
-                }
-                tx.commit()?;
-                Ok(hash.finish("queue", count, logical_bytes, 0, 0))
-            })
-            .await
-    }
-
     /// Delete dead letters older than the configured retention, across all
     /// tenants. A retention of zero keeps them forever and this does nothing.
     /// Returns how many rows went away.
@@ -1218,40 +1120,12 @@ impl QueueService {
             return Ok(0);
         }
         let cutoff = self.clock.now().saturating_sub(retention);
-        let tenants = self
-            .pool
-            .with_conn(|conn| {
-                let mut statement =
-                    conn.prepare("SELECT DISTINCT tenant FROM dead_letter ORDER BY tenant")?;
-                let tenants = statement
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(tenants)
+        self.pool
+            .with_conn(move |conn| {
+                let count = conn.execute("DELETE FROM dead_letter WHERE died_at <= ?1", [cutoff])?;
+                Ok(count)
             })
-            .await?;
-        let mut removed = 0usize;
-        for tenant in tenants {
-            // Retention is a mutation too. A fenced tenant keeps its dead
-            // letters unchanged until migration completes or rolls back.
-            let permit = match self.fences.permit(&tenant).await {
-                Ok(permit) => permit,
-                Err(deis_backend_migration::FenceError::Fenced(_)) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let scoped_tenant = tenant.clone();
-            removed += self
-                .pool
-                .with_conn(move |conn| {
-                    let count = conn.execute(
-                        "DELETE FROM dead_letter WHERE tenant = ?1 AND died_at <= ?2",
-                        rusqlite::params![scoped_tenant, cutoff],
-                    )?;
-                    Ok(count)
-                })
-                .await?;
-            drop(permit);
-        }
-        Ok(removed)
+            .await
     }
 
     /// Reject queue names that are empty, oversized, or carry characters that

@@ -7,14 +7,9 @@ is scoped by the `x-deis-tenant` header and proved by an Ed25519 capability
 the control plane signed for that tenant; the listener speaks TLS only. The crate docs in `src/lib.rs` describe
 the design; `proto/queue.proto` is the contract.
 
-When `migration_admin_token` is configured, the process also exposes the
-shared `deis.backend.migration.v1.BackendMigration` management service. It
-accepts only `Authorization: Bearer <token>` and never the queue's application
-credential. A tenant fence drains earlier mutations, is durable across a
-restart in `migration-fences.sqlite`, and covers send, lease, ack, nack,
-dead-letter replay and retention. Inventory remains readable while writes are
-frozen. Leaving the setting absent means the management service is not
-registered.
+The data directory also holds `backend-incarnation`, the UUIDv7 that names
+this physical copy of the queue. It is minted the first time the directory is
+opened and never copied into a snapshot, so a restore always starts a new one.
 
 Consistent operator backups use `deis-queue snapshot --out <directory>` and
 `deis-queue restore --from <directory>`. Snapshotting uses SQLite's

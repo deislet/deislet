@@ -6,14 +6,9 @@ process on SQLite and the local disk. Every call is scoped by the
 signed for that tenant; the listener speaks TLS only. The crate docs in `src/lib.rs` describe the
 layout; `proto/storage.proto` and `proto/blob.proto` are the contracts.
 
-When `migration_admin_token` is configured, the process also exposes the
-shared `deis.backend.migration.v1.BackendMigration` management service. It
-accepts only `Authorization: Bearer <token>` and deliberately does not accept
-the application data credential. Acquiring a tenant fence drains earlier KV,
-SQL and blob writers, persists the fence in `migration-fences.sqlite`, and
-refuses later writes until the exact pre-cutover release credential is used.
-Inventory remains readable under the fence. An empty value fails configuration
-validation; leaving the setting absent does not register the service at all.
+The data directory also holds `backend-incarnation`, the UUIDv7 that names
+this physical copy of the data. It is minted the first time the directory is
+opened, never copied into a snapshot, and therefore new after every restore.
 
 ## What one tenant can do to every other tenant
 

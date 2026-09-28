@@ -80,7 +80,7 @@
       "additionalProperties": false,
       "required": [
         "backend", "snapshotArtifactId", "snapshotUri", "snapshotManifestDigest",
-        "sourceBackendIncarnationId", "sizeBytes", "capturedAt", "containsFenceJournal"
+        "sourceBackendIncarnationId", "sizeBytes", "capturedAt"
       ],
       "properties": {
         "backend": {"enum": ["deis-store", "deis-queue", "deis-telemetry"]},
@@ -94,8 +94,7 @@
         "snapshotManifestDigest": {"$ref": "#/$defs/digest"},
         "sourceBackendIncarnationId": {"$ref": "#/$defs/canonicalId"},
         "sizeBytes": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
-        "capturedAt": {"type": "string", "format": "date-time"},
-        "containsFenceJournal": {"const": false}
+        "capturedAt": {"type": "string", "format": "date-time"}
       }
     }
   }

@@ -15,6 +15,7 @@ pub mod deislet_storage_key;
 pub mod durability;
 pub mod environment;
 pub mod error;
+pub mod incarnation;
 pub mod logging;
 pub mod models;
 pub mod operation;

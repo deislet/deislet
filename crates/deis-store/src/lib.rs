@@ -108,7 +108,6 @@ pub mod database;
 pub mod error;
 pub mod kv;
 pub mod legacy;
-pub mod migration;
 pub mod proto;
 pub mod server;
 pub mod snapshot;

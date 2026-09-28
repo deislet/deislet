@@ -31,12 +31,9 @@
 use crate::MAX_GRPC_MESSAGE_BYTES;
 use crate::auth::QueueAuth;
 use crate::config::Config;
-use crate::migration::QueueMigrationService;
 use crate::proto::queue::queue_server::QueueServer;
 use crate::queue::QueueService;
 use anyhow::{Context, Result};
-use deis_backend_migration::MigrationAuth;
-use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,6 +66,9 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 pub async fn open(config: &Config) -> Result<QueueService> {
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("cannot create data dir {}", config.data_dir.display()))?;
+    let incarnation = deis_wire::incarnation::load_or_create(&config.data_dir)
+        .context("cannot read or record this data directory's backend incarnation")?;
+    tracing::info!(backend_incarnation_id = %incarnation, "queue data directory opened");
     QueueService::open(&config.data_dir, config.connections, config.limits())
         .await
         .context("cannot open the queue")
@@ -222,13 +222,6 @@ pub async fn serve(
             }),
         );
     }
-    let migration_auth = match config.migration_admin_token.as_deref() {
-        Some(token) => Some(
-            MigrationAuth::new(token)
-                .context("invalid migration_admin_token; the management service was not started")?,
-        ),
-        None => None,
-    };
     let queue = open(&config).await?;
     let sweeper = spawn_dead_letter_sweeper(queue.clone(), config.dead_letter_sweep_interval_secs);
 
@@ -240,32 +233,6 @@ pub async fn serve(
     health_reporter
         .set_serving::<QueueServer<QueueService>>()
         .await;
-    if migration_auth.is_some() {
-        health_reporter
-            .set_serving::<BackendMigrationServer<QueueMigrationService>>()
-            .await;
-    }
-
-    let migration_service = match migration_auth {
-        Some(auth) => {
-            tracing::info!(
-                "queue migration management enabled with independent bearer authentication"
-            );
-            Some(InterceptedService::new(
-                BackendMigrationServer::new(QueueMigrationService::new(queue.clone()))
-                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-                auth,
-            ))
-        }
-        None => {
-            tracing::warn!(
-                "migration_admin_token is not configured, so queue inventory and writer-fence RPCs are not registered"
-            );
-            None
-        }
-    };
-
     info_ready(&config, addr, &identity, &auth);
 
     let mut builder = Server::builder()
@@ -283,7 +250,6 @@ pub async fn serve(
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
             &auth,
         ))
-        .add_optional_service(migration_service)
         .serve_with_incoming_shutdown(tls_incoming(listener, identity), shutdown)
         .await;
 
@@ -403,33 +369,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let _queue = open(&config_for(&dir)).await.unwrap();
         assert!(dir.path().join("queue.sqlite").exists());
-    }
-
-    #[tokio::test]
-    async fn migration_management_without_auth_secret_still_works() {
-        // With capability-based auth, there is no auth_secret to check
-        // against. The migration_admin_token is always independent.
-        let dir = TempDir::new().unwrap();
-        let config = Config {
-            migration_admin_token: Some("an-independent-migration-secret".to_string()),
-            data_dir: dir.path().to_path_buf(),
-            ..Config::default()
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fleet = deis_identity_test_pki::TestFleet::new();
-        let result = serve(
-            config,
-            listener,
-            async {},
-            deis_capability::KeyRing::from_keys([ed25519_dalek::SigningKey::from_bytes(
-                &[0u8; 32],
-            )
-            .verifying_key()]),
-            fleet.service_identity(deis_identity::ServiceKind::Queue),
-        )
-        .await;
-        // Will fail on queue open (empty dir) but NOT on credential check
-        let _ = result;
     }
 
     /// A queue.sqlite written before the tenant change holds messages that

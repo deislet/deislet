@@ -22,12 +22,6 @@ listen = "127.0.0.1:8090"
 # The machine identity this is read with is the [machine_identity] table at
 # the end of this file.
 
-# Enables the separate BackendMigration gRPC service used by Control to
-# acquire durable writer fences and collect deterministic KV/SQL/blob
-# inventory. It is never optional once configured: even loopback calls must
-# send `Authorization: Bearer <token>`.
-# migration_admin_token = "put a different long random string here"
-
 # Directory holding kv.sqlite, blob.sqlite, db/<tenant>.sqlite and the blob
 # content tree. Back this up: it is the only copy of every tenant's data.
 #
