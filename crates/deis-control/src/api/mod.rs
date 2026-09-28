@@ -742,7 +742,7 @@ async fn build_catalog_state(
                                         registry,
                                         Arc::clone(&provider_credentials),
                                         workspaces,
-                                        deis_provider_driver::ExecutableProviderDriverConfig::default(),
+                                        crate::catalog::provider_driver_release::driver_process_config(),
                                     )
                                 }) {
                                     Ok(dispatcher) => Some(Arc::new(dispatcher)),

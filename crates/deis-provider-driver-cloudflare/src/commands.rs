@@ -53,7 +53,8 @@ pub const NOT_FOUND_CODES: [u64; 2] = [10007, 10090];
 /// Cloudflare API codes meaning the credential is not accepted.
 const AUTHENTICATION_CODES: [u64; 4] = [9106, 9109, 10000, 10001];
 
-/// Timeouts for wrangler invocations.
+/// Timeouts for wrangler invocations, each inside the process budget
+/// ([`crate::protocol::PROCESS_TIMEOUT`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Timeouts {
     pub command: Duration,
@@ -63,8 +64,8 @@ pub struct Timeouts {
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
-            command: Duration::from_secs(120),
-            upload: Duration::from_secs(300),
+            command: Duration::from_secs(90),
+            upload: Duration::from_secs(200),
         }
     }
 }

@@ -82,6 +82,28 @@ pub struct ProviderDriverReleaseRegistry {
     trust_root: Arc<ValidatedDriverReleaseTrustRoot>,
 }
 
+/// How long the Control lets one driver process run before killing it.
+///
+/// The process holds one credential lease for its whole run, and the vault
+/// grants at most five minutes
+/// (`provider_credential::MAX_CREDENTIAL_LEASE`); the launcher
+/// refuses to start a process whose lease cannot outlast its timeout. A
+/// provider operation that uploads a Worker or installs its pinned toolchain
+/// on first use can take minutes, so the budget sits just under the lease.
+/// Drivers keep their own budget below this so they can still report a
+/// retryable timeout outcome.
+pub const DRIVER_PROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(270);
+
+/// The launcher bounds the Control runs provider driver processes with.
+#[must_use]
+pub fn driver_process_config() -> ExecutableProviderDriverConfig {
+    ExecutableProviderDriverConfig {
+        credential_lease_duration: super::provider_credential::MAX_CREDENTIAL_LEASE,
+        process_timeout: DRIVER_PROCESS_TIMEOUT,
+        ..ExecutableProviderDriverConfig::default()
+    }
+}
+
 #[derive(Clone)]
 pub struct ProviderDriverDispatcher {
     registry: ProviderDriverReleaseRegistry,

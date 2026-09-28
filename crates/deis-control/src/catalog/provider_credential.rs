@@ -29,7 +29,7 @@ use super::secrets::{SecretsBackend, provider_credential_revision_aad};
 use super::store::CatalogStore;
 use super::{CatalogError, CatalogResult};
 
-const MAX_CREDENTIAL_LEASE: Duration = Duration::from_secs(5 * 60);
+pub(crate) const MAX_CREDENTIAL_LEASE: Duration = Duration::from_secs(5 * 60);
 const SYSTEM_VAULT_ACTOR: &str = "system:provider-credential-vault";
 const SYSTEM_DRIVER_ACTOR: &str = "system:provider-driver";
 

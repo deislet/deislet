@@ -31,7 +31,13 @@ use crate::toolchain::{
 use crate::wrangler::{Wrangler, WranglerError};
 
 /// The whole process's budget, including a first-run toolchain install.
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(600);
+///
+/// It must end before the Control's launcher gives up on the process
+/// (`deis_control::catalog::provider_driver_release::DRIVER_PROCESS_TIMEOUT`,
+/// 270 s, bounded by the five-minute credential lease), so a slow operation
+/// is reported as this driver's retryable `DRIVER_TIMEOUT` outcome rather
+/// than as a killed process with no outcome at all.
+pub const PROCESS_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// A zero digest for placeholder errors before real request data is available.
 fn zero_digest() -> deis_provider_driver::Sha256Digest {
