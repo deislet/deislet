@@ -407,7 +407,7 @@ mod tests {
         }
 
         fn capability_token_for(&self, tenant: &str) -> String {
-            use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+            use deis_capability::{encode, CapabilityClaims, CapabilityResource};
             use std::time::Duration;
             let claims = CapabilityClaims::new(
                 "store",
@@ -851,7 +851,7 @@ mod tests {
         // A genuine signature for this tenant, but for the sql binding: the
         // kv service finds no tenant it may act for and refuses it.
         let wrong = {
-            use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+            use deis_capability::{encode, CapabilityClaims, CapabilityResource};
             encode(
                 &CapabilityClaims::new(
                     "store",

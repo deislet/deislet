@@ -1302,11 +1302,21 @@ export default function handler(context: any): Response {
             }
         "#;
         assert_eq!(
-            body_of_one_request("storage-owner.production", reader, &store.kv_wiring_for("storage-owner.production"),).await,
+            body_of_one_request(
+                "storage-owner.production",
+                reader,
+                &store.kv_wiring_for("storage-owner.production"),
+            )
+            .await,
             "\"separate-authority\""
         );
         assert_eq!(
-            body_of_one_request("routing-name.production", reader, &store.kv_wiring_for("routing-name.production")).await,
+            body_of_one_request(
+                "routing-name.production",
+                reader,
+                &store.kv_wiring_for("routing-name.production")
+            )
+            .await,
             "null",
             "the runtime lookup name must not silently become the storage tenant"
         );
@@ -1333,8 +1343,12 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body =
-            body_of_one_request("kv_metadata_app.production", code, &store.kv_wiring_for("kv_metadata_app.production")).await;
+        let body = body_of_one_request(
+            "kv_metadata_app.production",
+            code,
+            &store.kv_wiring_for("kv_metadata_app.production"),
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
 
         assert_eq!(parsed["withMetadata"]["value"], "png-bytes");
@@ -1385,7 +1399,12 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body = body_of_one_request("kv_bytes_app.production", code, &store.kv_wiring_for("kv_bytes_app.production")).await;
+        let body = body_of_one_request(
+            "kv_bytes_app.production",
+            code,
+            &store.kv_wiring_for("kv_bytes_app.production"),
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         assert_eq!(parsed["length"], 256, "{body}");
         assert_eq!(parsed["first"], 0, "{body}");
@@ -1424,7 +1443,12 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body = body_of_one_request("kv_types_app.production", code, &store.kv_wiring_for("kv_types_app.production")).await;
+        let body = body_of_one_request(
+            "kv_types_app.production",
+            code,
+            &store.kv_wiring_for("kv_types_app.production"),
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         assert_eq!(parsed["plainIsString"], true, "{body}");
         assert_eq!(parsed["plain"], r#"{"n":7}"#, "{body}");
@@ -1463,8 +1487,12 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body =
-            body_of_one_request("kv_bad_type_app.production", code, &store.kv_wiring_for("kv_bad_type_app.production")).await;
+        let body = body_of_one_request(
+            "kv_bad_type_app.production",
+            code,
+            &store.kv_wiring_for("kv_bad_type_app.production"),
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         let refusal = parsed["stream"].as_str().expect("a message");
         assert!(
@@ -1516,8 +1544,12 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body =
-            body_of_one_request("kv_put_shapes_app.production", code, &store.kv_wiring_for("kv_put_shapes_app.production")).await;
+        let body = body_of_one_request(
+            "kv_put_shapes_app.production",
+            code,
+            &store.kv_wiring_for("kv_put_shapes_app.production"),
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
         for shape in ["string", "buffer", "view", "slice"] {
             assert_eq!(parsed[shape], "hi", "{shape} did not round trip: {body}");
@@ -1550,7 +1582,12 @@ export default function handler(context: any): Response {
             }
         "#;
 
-        let body = body_of_one_request("kv_expiry_app.production", code, &store.kv_wiring_for("kv_expiry_app.production")).await;
+        let body = body_of_one_request(
+            "kv_expiry_app.production",
+            code,
+            &store.kv_wiring_for("kv_expiry_app.production"),
+        )
+        .await;
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
 
         let expiration = parsed["expiration"].as_i64().expect("an expiry");

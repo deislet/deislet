@@ -261,8 +261,7 @@ mod tests {
     #[test]
     fn a_revocation_reaches_every_binding() {
         use deis_capability::{
-            AUD_STORE, CapabilityClaims, RevocationList, encode, resources_for_audience,
-            revocation,
+            AUD_STORE, CapabilityClaims, RevocationList, encode, resources_for_audience, revocation,
         };
         let (signing, vk) = test_key();
         let verifier = deis_capability::CapabilityVerifier::new(vk).shared();
@@ -306,7 +305,9 @@ mod tests {
             let admitted = tonic::service::Interceptor::call(&mut guard, request(&token)).unwrap();
             assert_eq!(
                 admitted.extensions().get::<CallerTenant>(),
-                Some(&CallerTenant(CanonicalTenantId::derived_from_label("app.production")))
+                Some(&CallerTenant(CanonicalTenantId::derived_from_label(
+                    "app.production"
+                )))
             );
         }
 
@@ -314,16 +315,21 @@ mod tests {
             &RevocationList::new("iss", 1, vec![claims.jti.clone()]),
             &signing,
         );
-        let list = revocation::verify(
-            &signed,
-            verifier.lock().unwrap().key_ring(),
-        )
-        .unwrap();
-        verifier.lock().unwrap().apply_revocation_list(list).unwrap();
+        let list = revocation::verify(&signed, verifier.lock().unwrap().key_ring()).unwrap();
+        verifier
+            .lock()
+            .unwrap()
+            .apply_revocation_list(list)
+            .unwrap();
         for mut guard in guards {
             let refusal =
                 tonic::service::Interceptor::call(&mut guard, request(&token)).unwrap_err();
-            assert_eq!(refusal.code(), tonic::Code::PermissionDenied, "{}", guard.binding);
+            assert_eq!(
+                refusal.code(),
+                tonic::Code::PermissionDenied,
+                "{}",
+                guard.binding
+            );
         }
     }
 

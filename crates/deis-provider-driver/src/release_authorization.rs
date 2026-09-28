@@ -555,7 +555,9 @@ impl ValidatedDriverReleaseAuthorization {
     }
 }
 
-fn validate_trust_root(root: &DriverReleaseTrustRoot) -> Result<(), DriverReleaseAuthorizationError> {
+fn validate_trust_root(
+    root: &DriverReleaseTrustRoot,
+) -> Result<(), DriverReleaseAuthorizationError> {
     require(
         root.schema
             .as_deref()

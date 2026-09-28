@@ -407,7 +407,10 @@ impl CapabilityIssuer {
     async fn set_auth_epoch(&self, epoch: u64) {
         let mut inner = self.inner.write().await;
         inner.auth_epoch = epoch;
-        info!(auth_epoch = epoch, "Auth epoch bumped; every capability issued before now is refused once verifiers adopt the next revocation list");
+        info!(
+            auth_epoch = epoch,
+            "Auth epoch bumped; every capability issued before now is refused once verifiers adopt the next revocation list"
+        );
     }
 }
 
@@ -504,12 +507,16 @@ fn load_state(conn: &Connection, vault: &SecretCipher) -> Result<KeyState, Issue
         let public =
             VerifyingKey::from_bytes(&public).map_err(|_| bad("stored public key is invalid"))?;
         if key_id(&public) != kid {
-            return Err(bad("stored kid is not the thumbprint of the stored public key"));
+            return Err(bad(
+                "stored kid is not the thumbprint of the stored public key",
+            ));
         }
         if state == Stage::Active.as_str() {
             let raw = vault.decrypt(&private, &key_aad(&kid)).map_err(|_| {
-                bad("private key does not decrypt with the configured secret_key_file; the \
-                     master key was replaced or the row was copied from another installation")
+                bad(
+                    "private key does not decrypt with the configured secret_key_file; the \
+                     master key was replaced or the row was copied from another installation",
+                )
             })?;
             let raw: [u8; 32] = raw
                 .try_into()
@@ -556,7 +563,10 @@ fn rotation_step(
         rusqlite::params![age(policy.retire_after)],
     )?;
     if retired > 0 {
-        info!(retired, "Retired capability signing key(s); tokens they signed no longer verify anywhere");
+        info!(
+            retired,
+            "Retired capability signing key(s); tokens they signed no longer verify anywhere"
+        );
         changed = true;
     }
 
@@ -657,7 +667,11 @@ mod tests {
 
     async fn store_token(issuer: &CapabilityIssuer) -> String {
         issuer
-            .issue(AUD_STORE, "spiffe://deislet/node/n1", resources_for_audience(TENANT, AUD_STORE))
+            .issue(
+                AUD_STORE,
+                "spiffe://deislet/node/n1",
+                resources_for_audience(TENANT, AUD_STORE),
+            )
             .await
             .unwrap()
     }
@@ -684,7 +698,10 @@ mod tests {
         let token = store_token(&issuer).await;
 
         let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
-        assert_eq!(issuer.verifying_key().await, restarted.verifying_key().await);
+        assert_eq!(
+            issuer.verifying_key().await,
+            restarted.verifying_key().await
+        );
 
         let ring = KeyRing::from_keys(restarted.jwks().await.verifying_keys().unwrap());
         let mut verifier = CapabilityVerifier::with_key_ring(ring);
@@ -700,7 +717,9 @@ mod tests {
         let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
         let signing = issuer.inner.read().await.signing.to_bytes();
         let stored: Vec<u8> = conn
-            .query_row("SELECT private_key FROM capability_signing_keys", [], |r| r.get(0))
+            .query_row("SELECT private_key FROM capability_signing_keys", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(
             !stored.windows(signing.len()).any(|w| w == signing),
@@ -732,7 +751,11 @@ mod tests {
         let old_token = store_token(&issuer).await;
 
         issuer.maintain_at(&conn, t0 + 50).await.unwrap();
-        assert_eq!(issuer.published_keys().await, vec![first], "nothing due yet");
+        assert_eq!(
+            issuer.published_keys().await,
+            vec![first],
+            "nothing due yet"
+        );
 
         issuer.maintain_at(&conn, t0 + 101).await.unwrap();
         let published = issuer.published_keys().await;
@@ -757,7 +780,11 @@ mod tests {
         issuer.maintain_at(&conn, t0 + 163).await.unwrap();
         assert_eq!(issuer.published_keys().await, vec![second]);
         ring.replace(issuer.published_keys().await);
-        assert!(verifier.verify(&old_token, AUD_STORE, TENANT, "kv").is_err());
+        assert!(
+            verifier
+                .verify(&old_token, AUD_STORE, TENANT, "kv")
+                .is_err()
+        );
         verifier
             .verify(&new_token, AUD_STORE, TENANT, "kv")
             .expect("the active key verifies");

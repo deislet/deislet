@@ -332,7 +332,9 @@ mod tests {
         let config = AppConfig {
             env: {
                 let mut env = std::collections::HashMap::new();
-                store.kv_wiring_for("kvtest.production").write_to_env(&mut env);
+                store
+                    .kv_wiring_for("kvtest.production")
+                    .write_to_env(&mut env);
                 env
             },
             ..AppConfig::default()

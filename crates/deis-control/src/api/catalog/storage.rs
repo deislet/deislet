@@ -129,7 +129,9 @@ pub async fn storage_token(
                 .issue(aud, &subject, resources_for_audience(&tenant, aud))
                 .await
                 .map_err(|error| {
-                    ApiError::InternalError(format!("the {aud} capability could not be issued: {error}"))
+                    ApiError::InternalError(format!(
+                        "the {aud} capability could not be issued: {error}"
+                    ))
                 })
         }
     };
@@ -200,8 +202,14 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "{body}");
         let app = h.state.store.get_app("demo").await.unwrap();
-        let env = h.state.store.get_environment("demo", "production").await.unwrap();
-        let tenant = deis_wire::CanonicalTenantId::new(app.canonical_id, env.canonical_id).to_string();
+        let env = h
+            .state
+            .store
+            .get_environment("demo", "production")
+            .await
+            .unwrap();
+        let tenant =
+            deis_wire::CanonicalTenantId::new(app.canonical_id, env.canonical_id).to_string();
         assert_eq!(body["tenant"], tenant.as_str());
         assert_eq!(body["store_endpoint"], "http://127.0.0.1:8090");
 
@@ -221,7 +229,10 @@ mod tests {
             "token must authorise the correct tenant"
         );
         // Human tokens expire in 15 minutes
-        assert!(!claims.is_expired(), "freshly minted token must not be expired");
+        assert!(
+            !claims.is_expired(),
+            "freshly minted token must not be expired"
+        );
 
         // And each is accepted by the verifiers it is for: every store
         // service, and the queue.

@@ -142,8 +142,13 @@ mod tests {
     fn a_data_service_capability_names_the_canonical_tenant_not_the_label() {
         for aud in [AUD_STORE, AUD_QUEUE] {
             assert!(
-                authorize("n", aud, &resources_for_audience("a.production", aud), &visible())
-                    .is_err()
+                authorize(
+                    "n",
+                    aud,
+                    &resources_for_audience("a.production", aud),
+                    &visible()
+                )
+                .is_err()
             );
         }
     }
@@ -151,8 +156,13 @@ mod tests {
     #[test]
     fn a_node_may_have_what_it_runs() {
         for aud in [AUD_STORE, AUD_QUEUE] {
-            authorize("n", aud, &resources_for_audience(&canonical("a.production"), aud), &visible())
-                .unwrap();
+            authorize(
+                "n",
+                aud,
+                &resources_for_audience(&canonical("a.production"), aud),
+                &visible(),
+            )
+            .unwrap();
         }
         let mut pinned = resources_for_audience(&canonical("a.production"), AUD_STORE);
         pinned[0].generation = Some("gen-a".to_string());
@@ -162,7 +172,10 @@ mod tests {
     #[test]
     fn one_resource_outside_what_it_runs_refuses_the_request() {
         let mut asked = resources_for_audience(&canonical("a.production"), AUD_STORE);
-        asked.extend(resources_for_audience(&canonical("b.production"), AUD_STORE));
+        asked.extend(resources_for_audience(
+            &canonical("b.production"),
+            AUD_STORE,
+        ));
         let refusal = authorize("n", AUD_STORE, &asked, &visible()).unwrap_err();
         assert!(refusal.contains(&canonical("b.production")), "{refusal}");
     }
@@ -202,8 +215,13 @@ mod tests {
         )
         .unwrap();
         // Its own records need no deployment at all.
-        authorize("n", AUD_TELEMETRY, &[ingest(TELEMETRY_PLATFORM_TENANT)], &BTreeMap::new())
-            .unwrap();
+        authorize(
+            "n",
+            AUD_TELEMETRY,
+            &[ingest(TELEMETRY_PLATFORM_TENANT)],
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert!(authorize("n", AUD_TELEMETRY, &[ingest("b.production")], &visible()).is_err());
     }
 

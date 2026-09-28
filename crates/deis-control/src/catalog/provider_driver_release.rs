@@ -907,8 +907,8 @@ fn validate_trust_root_transition(
     let mut permanently_revoked_key_ids = BTreeSet::new();
 
     for root_json in historical_root_json {
-        let root = ValidatedDriverReleaseTrustRoot::parse_json(root_json.as_bytes())
-            .map_err(|error| {
+        let root =
+            ValidatedDriverReleaseTrustRoot::parse_json(root_json.as_bytes()).map_err(|error| {
                 CatalogError::invalid(format!(
                     "invalid durable provider driver trust root: {error}"
                 ))

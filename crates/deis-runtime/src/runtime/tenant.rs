@@ -14,7 +14,7 @@
 //! `app_id`, because deis-telemetry attributes records to that label and an
 //! operator reads names (see `crate::logging::layer`).
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use deis_wire::CanonicalTenantId;
 use tonic::Request;
 

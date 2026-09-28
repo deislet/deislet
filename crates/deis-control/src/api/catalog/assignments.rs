@@ -395,8 +395,7 @@ pub(crate) async fn deployments_visible_to(
         }
     }
     for plan in state.store.nonterminal_deployment_plans().await? {
-        if !plan.target_ids.iter().any(|target| target == node_id)
-            || visible.contains_key(&plan.id)
+        if !plan.target_ids.iter().any(|target| target == node_id) || visible.contains_key(&plan.id)
         {
             continue;
         }

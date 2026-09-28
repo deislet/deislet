@@ -413,7 +413,9 @@ pub fn assets_directory(rendered: &str) -> Result<Option<PathBuf>, ArtifactError
     let inside = path
         .components()
         .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-        && path.components().any(|component| matches!(component, Component::Normal(_)));
+        && path
+            .components()
+            .any(|component| matches!(component, Component::Normal(_)));
     if !inside {
         return Err(ArtifactError::Invalid {
             message: format!(

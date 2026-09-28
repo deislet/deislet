@@ -2110,7 +2110,13 @@ async fn a_restart_with_the_control_plane_down_keeps_serving_from_the_offline_ca
     line["env"] = serde_json::json!({ "GREETING": "hello from the last sync" });
     plane.now_assigns(serde_json::json!([line]));
 
-    let cache = || Arc::new(OfflineCache::new(dir.path().join("offline-cache"), [9; 32], "node-a"));
+    let cache = || {
+        Arc::new(OfflineCache::new(
+            dir.path().join("offline-cache"),
+            [9; 32],
+            "node-a",
+        ))
+    };
 
     // First life: the control plane answers, and the sync is sealed.
     {
@@ -2158,7 +2164,13 @@ async fn restart_with_control_down(
     tamper: bool,
 ) -> (Option<crate::app::InstalledVersion>, bool) {
     use super::super::offline_cache::OfflineCache;
-    let cache = || Arc::new(OfflineCache::new(dir.join("offline-cache"), [9; 32], "node-a"));
+    let cache = || {
+        Arc::new(OfflineCache::new(
+            dir.join("offline-cache"),
+            [9; 32],
+            "node-a",
+        ))
+    };
     if tamper {
         let path = cache().path();
         let mut raw = std::fs::read(&path).unwrap();
@@ -2198,8 +2210,19 @@ async fn a_refused_node_does_not_fall_back_to_its_offline_cache() {
     let key = AppKey::new(app, "production");
     let (bytes, sha) = bundle(app);
     let plane = ControlPlane::serving(&[(app, "v1", "/bundle")], bytes, &sha).await;
-    plane.now_assigns(serde_json::json!([plane.line(app, "production", "v1", &sha)]));
-    let cache = || Arc::new(OfflineCache::new(dir.path().join("offline-cache"), [9; 32], "node-a"));
+    plane.now_assigns(serde_json::json!([plane.line(
+        app,
+        "production",
+        "v1",
+        &sha
+    )]));
+    let cache = || {
+        Arc::new(OfflineCache::new(
+            dir.path().join("offline-cache"),
+            [9; 32],
+            "node-a",
+        ))
+    };
 
     // First life: a sync is sealed into the cache.
     {
@@ -2226,12 +2249,18 @@ async fn a_refused_node_does_not_fall_back_to_its_offline_cache() {
     let deployer = deployer(dir.path(), apps.clone()).await;
     let health = crate::health::NodeHealth::starting();
     let watching = health.clone();
-    run_loop_until(client(&plane, "node-a"), deployer, health, cache(), move || {
-        matches!(
-            watching.snapshot(),
-            crate::health::Readiness::Degraded { .. }
-        )
-    })
+    run_loop_until(
+        client(&plane, "node-a"),
+        deployer,
+        health,
+        cache(),
+        move || {
+            matches!(
+                watching.snapshot(),
+                crate::health::Readiness::Degraded { .. }
+            )
+        },
+    )
     .await;
     assert!(
         apps.installed_version(&key).is_none(),

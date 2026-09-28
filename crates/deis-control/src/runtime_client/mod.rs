@@ -717,8 +717,7 @@ impl RuntimeNodeManager {
 
     fn revoked_read(
         &self,
-    ) -> std::sync::RwLockReadGuard<'_, std::collections::BTreeMap<String, Option<NodeEntry>>>
-    {
+    ) -> std::sync::RwLockReadGuard<'_, std::collections::BTreeMap<String, Option<NodeEntry>>> {
         self.revoked.read().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -2383,13 +2382,21 @@ mod tests {
             version: None,
             identity: certificate(id),
         };
-        manager.register("joined", claim("joined"), Utc::now()).unwrap();
+        manager
+            .register("joined", claim("joined"), Utc::now())
+            .unwrap();
 
         assert!(manager.revoke("from-file"));
         assert!(manager.revoke("joined"));
-        assert!(manager.ids().is_empty(), "revoked nodes stay on the fan-out");
+        assert!(
+            manager.ids().is_empty(),
+            "revoked nodes stay on the fan-out"
+        );
         assert!(manager.call_order(0).is_empty());
-        assert!(manager.node("from-file").is_none(), "a revoked node is still dialled");
+        assert!(
+            manager.node("from-file").is_none(),
+            "a revoked node is still dialled"
+        );
         assert!(matches!(
             manager.register("joined", claim("joined"), Utc::now()),
             Err(RegistrationError::Revoked)
@@ -2398,13 +2405,18 @@ mod tests {
             manager.register("from-file", claim("from-file"), Utc::now()),
             Err(RegistrationError::Revoked)
         ));
-        assert!(!manager.revoke("from-file"), "revoking twice finds nothing to take out");
+        assert!(
+            !manager.revoke("from-file"),
+            "revoking twice finds nothing to take out"
+        );
 
         assert!(manager.lift_revocation("from-file"));
         assert_eq!(manager.ids(), vec!["from-file".to_string()]);
         assert!(manager.lift_revocation("joined"));
         assert!(!manager.lift_revocation("joined"));
-        manager.register("joined", claim("joined"), Utc::now()).unwrap();
+        manager
+            .register("joined", claim("joined"), Utc::now())
+            .unwrap();
         assert_eq!(
             manager.ids(),
             vec!["from-file".to_string(), "joined".to_string()]
@@ -2442,7 +2454,10 @@ mod tests {
             for join in joins {
                 join.join().unwrap();
             }
-            assert!(manager.ids().is_empty(), "a racing registration survived the revocation");
+            assert!(
+                manager.ids().is_empty(),
+                "a racing registration survived the revocation"
+            );
             assert!(manager.is_revoked("racer"));
         }
     }

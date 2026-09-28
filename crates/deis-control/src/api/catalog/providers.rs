@@ -2389,10 +2389,7 @@ pub async fn undeploy_provider_deployment(
     Json(request): Json<UndeployProviderDeploymentRequest>,
 ) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
     let app = state.store.get_app(&app_id).await?;
-    let environment = state
-        .store
-        .get_environment(&app_id, &env_name)
-        .await?;
+    let environment = state.store.get_environment(&app_id, &env_name).await?;
     let purge_data = match request.purge_data {
         None => false,
         Some(consent) if consent.environment == env_name => true,

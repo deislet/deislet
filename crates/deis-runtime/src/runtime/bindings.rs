@@ -975,7 +975,13 @@ impl std::fmt::Debug for StorageIdentity {
             )
             .field(
                 "token",
-                &if self.token.read().unwrap().as_ref().map_or(false, |t| !t.is_empty()) {
+                &if self
+                    .token
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map_or(false, |t| !t.is_empty())
+                {
                     "<present>"
                 } else {
                     "<absent>"
@@ -1094,7 +1100,11 @@ impl StorageIdentity {
     /// the first `IssueCapability` answer lands, and every call made before
     /// then is refused, so it is worth a log field wherever a client is built.
     pub fn is_proven(&self) -> bool {
-        self.token.read().unwrap().as_ref().map_or(false, |t| !t.is_empty())
+        self.token
+            .read()
+            .unwrap()
+            .as_ref()
+            .map_or(false, |t| !t.is_empty())
     }
 
     /// Returns the shared lock behind this identity's token so a background
@@ -1255,8 +1265,7 @@ impl AppServices {
         let identity = || StorageIdentity::new(tenant, wiring.storage_token.as_deref());
         // Queue clients use a separate token because the queue audience
         // differs from the store audience in capability tokens.
-        let queue_identity =
-            || StorageIdentity::new(tenant, wiring.queue_token.as_deref());
+        let queue_identity = || StorageIdentity::new(tenant, wiring.queue_token.as_deref());
 
         if !store_kinds.is_empty() {
             match wiring.endpoints.store.as_deref() {

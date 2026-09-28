@@ -230,7 +230,10 @@ mod tests {
     fn a_tampered_list_is_refused() {
         let signing = key();
         let keys = KeyRing::from_keys([signing.verifying_key()]);
-        let signed = sign(&RevocationList::new("iss", 5, vec!["gone".into()]), &signing);
+        let signed = sign(
+            &RevocationList::new("iss", 5, vec!["gone".into()]),
+            &signing,
+        );
 
         let (payload, signature) = parse_token(&signed).unwrap();
         let mut claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
@@ -244,7 +247,9 @@ mod tests {
         );
         assert!(matches!(
             verify(&edited, &keys),
-            Err(RevocationListError::Signature(CapabilityError::BadSignature(_)))
+            Err(RevocationListError::Signature(
+                CapabilityError::BadSignature(_)
+            ))
         ));
     }
 
@@ -254,7 +259,9 @@ mod tests {
         let signed = sign(&RevocationList::new("iss", 1, vec![]), &stranger);
         assert!(matches!(
             verify(&signed, &KeyRing::from_keys([key().verifying_key()])),
-            Err(RevocationListError::Signature(CapabilityError::UnknownKey { .. }))
+            Err(RevocationListError::Signature(
+                CapabilityError::UnknownKey { .. }
+            ))
         ));
     }
 

@@ -155,7 +155,9 @@ async fn mint(
         .issue(AUD_TELEMETRY, &subject, resources)
         .await
         .map_err(|error| {
-            ApiError::InternalError(format!("the telemetry capability could not be issued: {error}"))
+            ApiError::InternalError(format!(
+                "the telemetry capability could not be issued: {error}"
+            ))
         })?;
     let caller = match peer {
         Some(ConnectInfo(addr)) => format!("{} from {addr}", principal.label()),

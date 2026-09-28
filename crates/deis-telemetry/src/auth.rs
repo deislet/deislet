@@ -50,8 +50,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use deis_capability::{
-    AUD_TELEMETRY, CapabilityError, CapabilityVerifier, KeyRing, TELEMETRY_INGEST,
-    SharedVerifier, TELEMETRY_PLATFORM_TENANT, TELEMETRY_READ, VerifiedGrant,
+    AUD_TELEMETRY, CapabilityError, CapabilityVerifier, KeyRing, SharedVerifier, TELEMETRY_INGEST,
+    TELEMETRY_PLATFORM_TENANT, TELEMETRY_READ, VerifiedGrant,
 };
 use deis_wire::conventions::tenant_id;
 use tonic::{Request, Status};
@@ -378,8 +378,7 @@ fn map_capability_error(e: CapabilityError) -> Status {
             );
             Status::permission_denied(e.to_string())
         }
-        CapabilityError::BindingNotAuthorized { .. }
-        | CapabilityError::NoSingleTenant { .. } => {
+        CapabilityError::BindingNotAuthorized { .. } | CapabilityError::NoSingleTenant { .. } => {
             tracing::warn!(
                 "refused a telemetry call whose capability does not authorize the binding"
             );

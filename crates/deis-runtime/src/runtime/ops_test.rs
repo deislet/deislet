@@ -116,8 +116,12 @@ mod tests {
         body_js: &str,
     ) -> String {
         let code = format!("export default async function handler(ctx) {{\n{body_js}\n}}");
-        let wiring =
-            store.wiring_with_bindings_for(app_id, ["kv"], deis_bundle::BindingKind::Kv, bindings.to_vec());
+        let wiring = store.wiring_with_bindings_for(
+            app_id,
+            ["kv"],
+            deis_bundle::BindingKind::Kv,
+            bindings.to_vec(),
+        );
         let mut runtime = AppRuntime::new(
             app_id.to_string(),
             code,

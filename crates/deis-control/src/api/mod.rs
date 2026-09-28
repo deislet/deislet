@@ -654,15 +654,13 @@ async fn build_catalog_state(
     ) {
         (Some(root), Some(trust_root_path), trust_root_rotation_path) => {
             let trust_metadata =
-                deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file(
-                    trust_root_path,
-                )
-                .and_then(|trust_root| {
-                    trust_root_rotation_path
-                        .map(deis_provider_driver::ValidatedDriverTrustRootRotation::load_file)
-                        .transpose()
-                        .map(|rotation| (trust_root, rotation))
-                });
+                deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file(trust_root_path)
+                    .and_then(|trust_root| {
+                        trust_root_rotation_path
+                            .map(deis_provider_driver::ValidatedDriverTrustRootRotation::load_file)
+                            .transpose()
+                            .map(|rotation| (trust_root, rotation))
+                    });
             match trust_metadata {
                 Ok((trust_root, trust_root_rotation)) => {
                     match crate::catalog::ProviderDriverReleaseRegistry::new(
@@ -684,9 +682,9 @@ async fn build_catalog_state(
                             let work_root = config.data_dir.join("provider-work");
                             let workspaces = deis_provider_driver::DriverWorkspaceRoot::new(
                                 &work_root,
-                                Arc::new(crate::catalog::CatalogPayloadSource::new(
-                                    Arc::clone(&provider_payloads),
-                                )),
+                                Arc::new(crate::catalog::CatalogPayloadSource::new(Arc::clone(
+                                    &provider_payloads,
+                                ))),
                             )
                             .map_err(|error| {
                                 crate::catalog::CatalogError::BundleStorage(format!(
@@ -704,7 +702,8 @@ async fn build_catalog_state(
                                         Arc::new(AuditStore::new(store.database())),
                                     )),
                                     workspaces,
-                                    crate::catalog::provider_driver_release::driver_process_config(),
+                                    crate::catalog::provider_driver_release::driver_process_config(
+                                    ),
                                 )
                             }) {
                                 Ok(dispatcher) => Some(Arc::new(dispatcher)),

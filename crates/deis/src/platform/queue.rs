@@ -641,10 +641,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(
-            refused.contains("tenant"),
-            "{refused}"
-        );
+        assert!(refused.contains("tenant"), "{refused}");
 
         let _ = stop.send(());
         server.await.unwrap();

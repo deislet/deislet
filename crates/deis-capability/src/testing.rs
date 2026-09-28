@@ -43,7 +43,9 @@ impl FakeControl {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
         let url = format!(
             "http://{}",
-            listener.local_addr().expect("a bound listener has an address")
+            listener
+                .local_addr()
+                .expect("a bound listener has an address")
         );
         let state = Arc::new(Mutex::new(Served {
             signing,
@@ -112,8 +114,12 @@ fn answer(stream: TcpStream, served: &Mutex<Served>) {
     let body = {
         let served = served.lock().unwrap_or_else(|e| e.into_inner());
         if path == REVOCATION_LIST_PATH {
-            let list = RevocationList::new("spiffe://deislet/control/test", served.auth_epoch, served.revoked_jtis.clone())
-                .with_revoked_nodes(served.revoked_nodes.clone());
+            let list = RevocationList::new(
+                "spiffe://deislet/control/test",
+                served.auth_epoch,
+                served.revoked_jtis.clone(),
+            )
+            .with_revoked_nodes(served.revoked_nodes.clone());
             Some(
                 serde_json::to_string(&SignedRevocationList {
                     signed_list: sign(&list, &served.signing),
@@ -134,7 +140,9 @@ fn answer(stream: TcpStream, served: &Mutex<Served>) {
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         ),
-        None => "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        None => {
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+        }
     };
     let mut stream = stream;
     let _ = stream.write_all(response.as_bytes());

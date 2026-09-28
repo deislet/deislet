@@ -323,11 +323,7 @@ mod tests {
     fn headers_are_lowercase() {
         // gRPC metadata keys must be lowercase; a capitalised key is rejected
         // by tonic at send time rather than ignored.
-        for h in [
-            APP_ID_HEADER,
-            ENVIRONMENT_HEADER,
-            BINDING_HEADER,
-        ] {
+        for h in [APP_ID_HEADER, ENVIRONMENT_HEADER, BINDING_HEADER] {
             assert_eq!(h, h.to_ascii_lowercase(), "{h} must be lowercase");
         }
     }

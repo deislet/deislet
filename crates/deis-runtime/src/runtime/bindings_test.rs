@@ -328,7 +328,10 @@ mod tests {
             consumers: Vec::new(),
             ..ServiceWiring::default()
         };
-        let error = match AppServices::connect(&crate::runtime::tenant::test_tenant("demo.production"), &wiring) {
+        let error = match AppServices::connect(
+            &crate::runtime::tenant::test_tenant("demo.production"),
+            &wiring,
+        ) {
             Ok(_) => panic!("an address that is not a URL must be refused"),
             Err(error) => error,
         };
@@ -350,7 +353,10 @@ mod tests {
             consumers: Vec::new(),
             ..ServiceWiring::default()
         };
-        let services = match AppServices::connect(&crate::runtime::tenant::test_tenant("demo.production"), &wiring) {
+        let services = match AppServices::connect(
+            &crate::runtime::tenant::test_tenant("demo.production"),
+            &wiring,
+        ) {
             Ok(services) => services,
             Err(error) => panic!("a lazy client is built even when nothing answers: {error}"),
         };
@@ -479,8 +485,14 @@ mod tests {
         let dropped = strip_reserved_env(&mut map);
         assert_eq!(dropped, vec!["DEIS_STORE_ENDPOINT", "DEIS_QUEUE_ENDPOINT"]);
 
-        map.insert("DEIS_STORE_ENDPOINT".to_string(), "http://store:8090".to_string());
-        map.insert("DEIS_QUEUE_ENDPOINT".to_string(), "http://queue:8091".to_string());
+        map.insert(
+            "DEIS_STORE_ENDPOINT".to_string(),
+            "http://store:8090".to_string(),
+        );
+        map.insert(
+            "DEIS_QUEUE_ENDPOINT".to_string(),
+            "http://queue:8091".to_string(),
+        );
         wire_deployment_env(
             &manifest(
                 r#"{
@@ -498,7 +510,10 @@ mod tests {
         assert_eq!(wiring.queue_token, None);
         assert_eq!(
             map,
-            env(&[("DEIS_STORAGE_TOKEN", "forged"), ("DEIS_QUEUE_TOKEN", "forged")])
+            env(&[
+                ("DEIS_STORAGE_TOKEN", "forged"),
+                ("DEIS_QUEUE_TOKEN", "forged")
+            ])
         );
     }
 
@@ -611,7 +626,11 @@ mod tests {
     fn a_blank_token_counts_as_absent() {
         // An empty header would be presented as a token and refused, which
         // reads as a bad credential rather than as none yet.
-        let identity = StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), Some("   ")).expect("a tenant");
+        let identity = StorageIdentity::new(
+            crate::runtime::tenant::test_tenant("demo.production"),
+            Some("   "),
+        )
+        .expect("a tenant");
         assert!(!identity.is_proven());
     }
 
@@ -656,8 +675,11 @@ mod tests {
         // A value that is not sendable metadata can only be a control plane
         // that handed this node something that was never a token, and every
         // storage call would fail with a message about the tenant instead.
-        let error = StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), Some("line\nbreak"))
-            .expect_err("a token with a control character cannot be sent");
+        let error = StorageIdentity::new(
+            crate::runtime::tenant::test_tenant("demo.production"),
+            Some("line\nbreak"),
+        )
+        .expect_err("a token with a control character cannot be sent");
         assert!(
             error
                 .to_string()
@@ -762,8 +784,11 @@ mod tests {
         );
         assert!(rendered.contains("<present>"), "{rendered}");
 
-        let identity = StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), Some("a-minted-token"))
-            .expect("a legal tenant");
+        let identity = StorageIdentity::new(
+            crate::runtime::tenant::test_tenant("demo.production"),
+            Some("a-minted-token"),
+        )
+        .expect("a legal tenant");
         let rendered = format!("{identity:?}");
         assert!(
             !rendered.contains("a-minted-token"),

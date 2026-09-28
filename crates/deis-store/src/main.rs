@@ -114,7 +114,15 @@ async fn serve(config: Config) -> Result<()> {
     let listener = server::bind(&config).await?;
     let keys = capability_keys(control.clone());
 
-    server::serve(config, listener, server::shutdown_signal(), keys, control, identity).await
+    server::serve(
+        config,
+        listener,
+        server::shutdown_signal(),
+        keys,
+        control,
+        identity,
+    )
+    .await
 }
 
 /// The verifier's key ring, kept current from the control plane's JWKS.

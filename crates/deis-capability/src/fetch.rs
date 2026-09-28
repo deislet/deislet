@@ -219,7 +219,12 @@ impl Poller {
         };
         let wait = match outcome {
             Ok((auth_epoch, revoked)) => {
-                tracing::debug!(service, auth_epoch, revoked, "Adopted the control plane's revocation list");
+                tracing::debug!(
+                    service,
+                    auth_epoch,
+                    revoked,
+                    "Adopted the control plane's revocation list"
+                );
                 self.backoff = Duration::from_secs(1).min(self.interval);
                 self.interval
             }
@@ -264,7 +269,10 @@ impl Poller {
                  last list arrived; revocations made since are not known here"
             );
         } else if !now_degraded && self.degraded {
-            tracing::info!(service, "Left degraded mode: a fresh revocation list was adopted and expired capabilities are refused again");
+            tracing::info!(
+                service,
+                "Left degraded mode: a fresh revocation list was adopted and expired capabilities are refused again"
+            );
         }
         self.degraded = now_degraded;
         wait
@@ -421,7 +429,10 @@ mod tests {
 
         // Someone on the path strips the revocation and rolls the epoch
         // back, keeping the signature.
-        let genuine = sign(&RevocationList::new("iss", 1, vec![claims.jti.clone()]), &signing);
+        let genuine = sign(
+            &RevocationList::new("iss", 1, vec![claims.jti.clone()]),
+            &signing,
+        );
         let (payload, signature) = crate::parse_token(&genuine).unwrap();
         let mut edited: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         edited["revoked_jtis"] = serde_json::json!([]);
@@ -440,7 +451,10 @@ mod tests {
         // Mass revocation.
         *served.lock().unwrap() = list_body(sign(&RevocationList::new("iss", 2, vec![]), &signing));
         eventually("the epoch bump", || {
-            matches!(check(&verifier), Err(CapabilityError::AuthEpochTooLow { .. }))
+            matches!(
+                check(&verifier),
+                Err(CapabilityError::AuthEpochTooLow { .. })
+            )
         })
         .await;
     }
@@ -528,7 +542,10 @@ mod tests {
         for _ in 0..20 {
             let _ = ring.lookup(&key_id(&second));
         }
-        eventually("the on-demand fetch", || ring.get(&key_id(&second)).is_some()).await;
+        eventually("the on-demand fetch", || {
+            ring.get(&key_id(&second)).is_some()
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(400)).await;
         let fetches = *hits.lock().unwrap() - before;
         assert!(

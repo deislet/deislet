@@ -37,13 +37,13 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub mod keys;
 #[cfg(feature = "jwks-fetch")]
 pub mod control;
 #[cfg(feature = "jwks-fetch")]
 pub mod exposition;
 #[cfg(feature = "jwks-fetch")]
 pub mod fetch;
+pub mod keys;
 pub mod revocation;
 /// Test support: a stand-in control plane serving signed revocation lists.
 #[cfg(feature = "jwks-fetch")]
@@ -774,7 +774,9 @@ impl CapabilityVerifier {
             return None;
         }
         let began = match self.last_sync {
-            Some(last) => last + Duration::from_secs(self.pull_interval_secs * DEGRADED_PULL_INTERVAL_FACTOR),
+            Some(last) => {
+                last + Duration::from_secs(self.pull_interval_secs * DEGRADED_PULL_INTERVAL_FACTOR)
+            }
             None => self.created_at,
         };
         Some(now_secs().saturating_sub(began.elapsed().as_secs()))
@@ -828,7 +830,6 @@ impl CapabilityVerifier {
         out
     }
 
-
     /// The key ring this verifier checks signatures against.
     pub fn key_ring(&self) -> &KeyRing {
         &self.keys
@@ -877,7 +878,10 @@ impl CapabilityVerifier {
     /// Total number of expired tokens accepted under T8 degraded-mode grace
     /// rules since this verifier was created.
     pub fn grace_accepted_total(&self) -> u64 {
-        self.grace_accepted_by_tenant().into_iter().map(|(_, n)| n).sum()
+        self.grace_accepted_by_tenant()
+            .into_iter()
+            .map(|(_, n)| n)
+            .sum()
     }
 
     /// The same, per tenant the accepted tokens named, ordered by tenant.
@@ -892,7 +896,10 @@ impl CapabilityVerifier {
 
     /// Count one grace acceptance against each of `tenants`.
     fn count_grace<'a>(&self, tenants: impl IntoIterator<Item = &'a str>) {
-        let mut counts = self.grace_accepted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut counts = self
+            .grace_accepted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut seen = std::collections::BTreeSet::new();
         for tenant in tenants {
             if seen.insert(tenant) {
@@ -918,9 +925,7 @@ impl CapabilityVerifier {
             None => true,
             Some(last) => {
                 last.elapsed()
-                    > Duration::from_secs(
-                        self.pull_interval_secs * DEGRADED_PULL_INTERVAL_FACTOR,
-                    )
+                    > Duration::from_secs(self.pull_interval_secs * DEGRADED_PULL_INTERVAL_FACTOR)
             }
         }
     }
@@ -1828,10 +1833,7 @@ mod tests {
 
     /// Make a token for a node principal that expires in `offset_secs`
     /// (negative = already expired).
-    fn make_node_token(
-        signing: &SigningKey,
-        offset_secs: i64,
-    ) -> String {
+    fn make_node_token(signing: &SigningKey, offset_secs: i64) -> String {
         let now = now_secs();
         let exp = (now as i64 + offset_secs) as u64;
         let iat = exp.saturating_sub(900);
@@ -1856,10 +1858,7 @@ mod tests {
 
     /// Make a token for a human principal that expires in `offset_secs`
     /// (negative = already expired).
-    fn make_human_token(
-        signing: &SigningKey,
-        offset_secs: i64,
-    ) -> String {
+    fn make_human_token(signing: &SigningKey, offset_secs: i64) -> String {
         let now = now_secs();
         let exp = (now as i64 + offset_secs) as u64;
         let iat = exp.saturating_sub(900);
@@ -1887,7 +1886,10 @@ mod tests {
         let issued = deis_identity::names::node("deis.internal", "runtime-42").unwrap();
         assert!(is_node_subject(issued.as_str(), None));
         assert!(is_node_subject(NODE_SUBJECT, None));
-        assert!(is_node_subject("spiffe://prod.example/deislet/node/n1", None));
+        assert!(is_node_subject(
+            "spiffe://prod.example/deislet/node/n1",
+            None
+        ));
     }
 
     #[test]
@@ -1901,9 +1903,18 @@ mod tests {
         assert!(!is_node_subject("admin", None));
         // The shape this check used to look for, which no node carries.
         assert!(!is_node_subject(LEGACY_SHAPE, None));
-        assert!(!is_node_subject("spiffe://deis.internal/deislet/control", None));
-        assert!(!is_node_subject("spiffe://deis.internal/deislet/proxy/p1", None));
-        assert!(!is_node_subject("spiffe://deis.internal/deislet/node/n1/extra", None));
+        assert!(!is_node_subject(
+            "spiffe://deis.internal/deislet/control",
+            None
+        ));
+        assert!(!is_node_subject(
+            "spiffe://deis.internal/deislet/proxy/p1",
+            None
+        ));
+        assert!(!is_node_subject(
+            "spiffe://deis.internal/deislet/node/n1/extra",
+            None
+        ));
     }
 
     #[test]
@@ -2009,7 +2020,10 @@ mod tests {
         );
         match result {
             Ok(cap) => {
-                assert!(!cap.grace_accepted, "valid token must not be grace_accepted");
+                assert!(
+                    !cap.grace_accepted,
+                    "valid token must not be grace_accepted"
+                );
                 assert_eq!(cap.node_id, NODE_SUBJECT);
             }
             Err(e) => panic!("valid token should pass: {e}"),
@@ -2038,7 +2052,10 @@ mod tests {
         );
         match result {
             Ok(cap) => {
-                assert!(cap.grace_accepted, "expired node token in degraded mode must be grace_accepted");
+                assert!(
+                    cap.grace_accepted,
+                    "expired node token in degraded mode must be grace_accepted"
+                );
                 assert_eq!(cap.node_id, NODE_SUBJECT);
             }
             Err(e) => panic!("grace should accept recently-expired node token: {e}"),
@@ -2055,19 +2072,25 @@ mod tests {
         assert_eq!(verifier.grace_accepted_total(), 0);
 
         // First grace acceptance.
-        let _ = verifier.verify_with_grace(
-            &token, "store",
-            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
-            "kv",
-        ).unwrap();
+        let _ = verifier
+            .verify_with_grace(
+                &token,
+                "store",
+                "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+                "kv",
+            )
+            .unwrap();
         assert_eq!(verifier.grace_accepted_total(), 1);
 
         // Second grace acceptance — counter accumulates.
-        let _ = verifier.verify_with_grace(
-            &token, "store",
-            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
-            "kv",
-        ).unwrap();
+        let _ = verifier
+            .verify_with_grace(
+                &token,
+                "store",
+                "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+                "kv",
+            )
+            .unwrap();
         assert_eq!(verifier.grace_accepted_total(), 2);
     }
 
@@ -2176,7 +2199,11 @@ mod tests {
         verifier
             .apply_revocation_list(signed_list(&signing, 1, vec![]))
             .unwrap();
-        assert!(verifier.verify_with_grace(&token, "store", TENANT, "kv").is_ok());
+        assert!(
+            verifier
+                .verify_with_grace(&token, "store", TENANT, "kv")
+                .is_ok()
+        );
 
         verifier
             .apply_revocation_list(signed_list(&signing, 1, vec![claims.jti.clone()]))
@@ -2243,7 +2270,11 @@ mod tests {
         ));
 
         verifier.set_revoked_nodes(vec!["someone-else".into()]);
-        assert!(verifier.verify_with_grace(&fresh, "store", TENANT, "kv").is_ok());
+        assert!(
+            verifier
+                .verify_with_grace(&fresh, "store", TENANT, "kv")
+                .is_ok()
+        );
     }
 
     /// Mass revocation: a list carrying a higher epoch refuses every token
@@ -2253,12 +2284,16 @@ mod tests {
         let (signing, verifying) = make_keypair();
         let old = encode(&make_claims("store"), &signing);
         let mut verifier = CapabilityVerifier::new(verifying);
-        verifier.apply_revocation_list(signed_list(&signing, 2, vec![])).unwrap();
+        verifier
+            .apply_revocation_list(signed_list(&signing, 2, vec![]))
+            .unwrap();
         assert!(matches!(
             verifier.verify_with_grace(&old, "store", TENANT, "kv"),
             Err(CapabilityError::AuthEpochTooLow { got: 1, minimum: 2 })
         ));
-        verifier.apply_revocation_list(signed_list(&signing, 1, vec![])).unwrap();
+        verifier
+            .apply_revocation_list(signed_list(&signing, 1, vec![]))
+            .unwrap();
         assert_eq!(verifier.min_auth_epoch(), 2);
     }
 
@@ -2290,11 +2325,19 @@ mod tests {
         let (signing, verifying) = make_keypair();
         let mut verifier = CapabilityVerifier::new(verifying);
         let text = verifier.render_metrics("store");
-        assert!(text.contains("deis_auth_degraded{service=\"store\"} 1"), "{text}");
+        assert!(
+            text.contains("deis_auth_degraded{service=\"store\"} 1"),
+            "{text}"
+        );
         assert!(text.contains("# TYPE deis_auth_grace_accepted_total counter"));
-        verifier.apply_revocation_list(signed_list(&signing, 1, vec![])).unwrap();
+        verifier
+            .apply_revocation_list(signed_list(&signing, 1, vec![]))
+            .unwrap();
         let text = verifier.render_metrics("store");
-        assert!(text.contains("deis_auth_degraded{service=\"store\"} 0"), "{text}");
+        assert!(
+            text.contains("deis_auth_degraded{service=\"store\"} 0"),
+            "{text}"
+        );
         assert!(text.contains("deis_auth_degraded_since_seconds{service=\"store\"} 0"));
         assert!(
             !text.contains("deis_auth_grace_accepted_total{"),
@@ -2311,10 +2354,13 @@ mod tests {
         let token = make_node_token(&signing, -60);
         let mut verifier = CapabilityVerifier::new(verifying);
         verifier.last_sync = Some(Instant::now() - Duration::from_secs(3600));
-        let tenant =
-            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002";
-        verifier.verify_with_grace(&token, "store", tenant, "kv").unwrap();
-        verifier.verify_with_grace(&token, "store", tenant, "kv").unwrap();
+        let tenant = "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002";
+        verifier
+            .verify_with_grace(&token, "store", tenant, "kv")
+            .unwrap();
+        verifier
+            .verify_with_grace(&token, "store", tenant, "kv")
+            .unwrap();
         let text = verifier.render_metrics("store");
         assert!(
             text.contains(&format!(

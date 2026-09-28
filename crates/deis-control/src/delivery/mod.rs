@@ -953,9 +953,15 @@ impl DeploymentDeliverer {
 
     /// The canonical tenant of `environment`: what a store or queue
     /// capability for it names.
-    async fn canonical_tenant(&self, environment: &Environment) -> CatalogResult<CanonicalTenantId> {
+    async fn canonical_tenant(
+        &self,
+        environment: &Environment,
+    ) -> CatalogResult<CanonicalTenantId> {
         let app = self.store.get_app(&environment.app_id).await?;
-        Ok(CanonicalTenantId::new(app.canonical_id, environment.canonical_id))
+        Ok(CanonicalTenantId::new(
+            app.canonical_id,
+            environment.canonical_id,
+        ))
     }
 
     pub async fn prepare_consumer_generation(
@@ -992,11 +998,7 @@ impl DeploymentDeliverer {
         let tenant = self.canonical_tenant(environment).await?;
         let progress = self
             .storage
-            .activate_consumer_generation(
-                &tenant,
-                &plan.id,
-                &plan.routing_generation.to_string(),
-            )
+            .activate_consumer_generation(&tenant, &plan.id, &plan.routing_generation.to_string())
             .await?;
         validate_activate_consumer_generation_response(
             &progress,
@@ -1016,11 +1018,7 @@ impl DeploymentDeliverer {
         let tenant = self.canonical_tenant(environment).await?;
         let progress = self
             .storage
-            .abort_consumer_generation(
-                &tenant,
-                &plan.id,
-                &plan.routing_generation.to_string(),
-            )
+            .abort_consumer_generation(&tenant, &plan.id, &plan.routing_generation.to_string())
             .await?;
         validate_abort_consumer_generation_response(
             &progress,
@@ -2763,10 +2761,18 @@ mod tests {
         let issuer = wiring.issuer.clone();
         let mut request = tonic::Request::new(());
         wiring
-            .stamp_queue_capability(&mut request, &CanonicalTenantId::derived_from_label("demo.production"))
+            .stamp_queue_capability(
+                &mut request,
+                &CanonicalTenantId::derived_from_label("demo.production"),
+            )
             .await
             .unwrap();
-        let header = request.metadata().get("authorization").unwrap().to_str().unwrap();
+        let header = request
+            .metadata()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
         let token = header.strip_prefix("Bearer ").expect("a bearer credential");
         let mut verifier = deis_capability::CapabilityVerifier::new(issuer.verifying_key().await);
         verifier

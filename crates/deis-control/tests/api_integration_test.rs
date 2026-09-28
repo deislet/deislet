@@ -319,7 +319,7 @@ async fn the_human_listener_serves_the_api_key_and_nothing_a_node_used_to_call()
         metrics_collector,
         Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
         Arc::new(config),
-    CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
+        CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
     )
     .await;
 
@@ -453,7 +453,7 @@ async fn an_operator_can_mint_a_scoped_token_use_it_revoke_it_and_read_it_back()
         metrics_collector,
         Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
         Arc::new(config),
-    CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
+        CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
     )
     .await;
     // The same startup step the binary runs: it mints the one-time bootstrap
@@ -675,7 +675,7 @@ async fn the_dashboards_restart_body_is_the_one_the_control_plane_accepts() {
         metrics_collector,
         Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
         Arc::new(ControlConfig::default()),
-    CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
+        CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
     )
     .await;
 
@@ -761,7 +761,7 @@ async fn nothing_joins_the_fleet_through_the_human_listener() {
         metrics_collector,
         Arc::clone(&fleet),
         Arc::new(config),
-    CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
+        CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
     )
     .await;
 
@@ -814,7 +814,7 @@ async fn a_stop_signal_drains_in_flight_requests_before_the_server_stops() {
         metrics_collector,
         runtime_manager,
         api_config,
-    CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
+        CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
     )
     .await;
 
@@ -938,7 +938,7 @@ async fn one_port_serves_both_rest_and_the_node_grpc_channel() {
         metrics_collector,
         runtime_manager,
         Arc::new(config),
-    CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
+        CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
     )
     .await;
     // Assembled the same way the binary assembles it.
@@ -1055,7 +1055,7 @@ async fn pushing_config_to_an_unconnected_node_is_a_404_not_a_500() {
         metrics_collector,
         Arc::new(RuntimeNodeManager::new(Vec::new(), 60)),
         Arc::new(ControlConfig::default()),
-    CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
+        CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await,
     )
     .await;
 

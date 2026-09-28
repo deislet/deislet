@@ -247,7 +247,13 @@ mod tests {
 
     async fn platform() -> Harness {
         let h = harness_with_storage(true, storage_wiring()).await;
-        json(&h.router, "POST", "/api/apps", serde_json::json!({"id": "demo"})).await;
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
         json(
             &h.router,
             "POST",
@@ -307,7 +313,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let listed = published_list(&h).await.revoked_jtis;
-        for token in [&first["queue_token"], &second["token"], &second["queue_token"]] {
+        for token in [
+            &first["queue_token"],
+            &second["token"],
+            &second["queue_token"],
+        ] {
             assert!(listed.contains(&jti(token.as_str().unwrap())));
         }
 

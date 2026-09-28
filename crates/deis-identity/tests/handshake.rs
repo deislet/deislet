@@ -840,7 +840,10 @@ async fn a_certificate_issued_for_less_than_three_days_is_refused() {
     std::fs::write(&files.certificate, &rotated.certificate_pem).expect("write certificate");
     std::fs::write(&files.private_key, &rotated.key_pem).expect("write key");
     let error = node.reload().expect_err("a one-day rotation was adopted");
-    assert!(matches!(error, IdentityError::LifetimeTooShort { .. }), "{error}");
+    assert!(
+        matches!(error, IdentityError::LifetimeTooShort { .. }),
+        "{error}"
+    );
     assert_eq!(node.validity().lifetime(), 72 * HOUR as i64);
 }
 

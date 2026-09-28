@@ -167,7 +167,9 @@ fn map_capability_error(e: CapabilityError) -> Status {
             Status::permission_denied(e.to_string())
         }
         CapabilityError::NoSingleTenant { .. } => {
-            tracing::warn!("refused a queue call whose capability does not name exactly one tenant");
+            tracing::warn!(
+                "refused a queue call whose capability does not name exactly one tenant"
+            );
             Status::permission_denied(e.to_string())
         }
         CapabilityError::AuthEpochTooLow { .. } => {

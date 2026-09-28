@@ -30,9 +30,9 @@
 
 mod assignments;
 pub mod capability_renewer;
-pub mod offline_cache;
 mod credential;
 mod fetch;
+pub mod offline_cache;
 mod registration;
 mod secret_cache;
 mod store;
