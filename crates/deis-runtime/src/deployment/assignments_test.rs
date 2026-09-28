@@ -2185,3 +2185,57 @@ async fn restart_with_control_down(
     .await;
     (apps.installed_version(key), apps.is_hosted(key).await)
 }
+
+/// A node the control plane refuses - revoked, say - does not bring back
+/// what its offline cache holds. The cache is for a control plane that
+/// cannot be reached, never for one that answered "no".
+#[tokio::test]
+async fn a_refused_node_does_not_fall_back_to_its_offline_cache() {
+    use super::super::offline_cache::OfflineCache;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = "refused-restart";
+    let key = AppKey::new(app, "production");
+    let (bytes, sha) = bundle(app);
+    let plane = ControlPlane::serving(&[(app, "v1", "/bundle")], bytes, &sha).await;
+    plane.now_assigns(serde_json::json!([plane.line(app, "production", "v1", &sha)]));
+    let cache = || Arc::new(OfflineCache::new(dir.path().join("offline-cache"), [9; 32], "node-a"));
+
+    // First life: a sync is sealed into the cache.
+    {
+        let deployer = deployer(dir.path(), Arc::new(ApplicationManager::new())).await;
+        let health = crate::health::NodeHealth::starting();
+        let offline = cache();
+        let written = offline.path();
+        run_loop_until(
+            client(&plane, "node-a"),
+            deployer,
+            health.clone(),
+            offline,
+            || written.exists() && health.is_healthy(),
+        )
+        .await;
+    }
+    assert!(cache().load().unwrap().is_some(), "the sync was written");
+
+    // Second life: the control plane answers, and refuses this node.
+    *plane.refusal.lock() = Some(Status::permission_denied(
+        "node node-a has been revoked; an operator must lift the revocation",
+    ));
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir.path(), apps.clone()).await;
+    let health = crate::health::NodeHealth::starting();
+    let watching = health.clone();
+    run_loop_until(client(&plane, "node-a"), deployer, health, cache(), move || {
+        matches!(
+            watching.snapshot(),
+            crate::health::Readiness::Degraded { .. }
+        )
+    })
+    .await;
+    assert!(
+        apps.installed_version(&key).is_none(),
+        "a refused node restored what it was last told to run"
+    );
+    assert!(!apps.is_hosted(&key).await);
+}

@@ -274,6 +274,19 @@ impl std::fmt::Display for AssignmentError {
 
 impl std::error::Error for AssignmentError {}
 
+impl AssignmentError {
+    /// Whether the control plane could not be reached at all - a refused
+    /// socket, a failed handshake, a timeout - as opposed to having answered.
+    ///
+    /// Only this may send a node back to its offline cache. A control plane
+    /// that answered with a refusal (this node is revoked, or its
+    /// certificate is not accepted) or with anything else has been heard
+    /// from, and what it said is not "carry on with what you had".
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Transport { .. })
+    }
+}
+
 /// Asks the control plane what this node should run.
 ///
 /// The question and the answer are the same regardless of transport:
@@ -1293,6 +1306,11 @@ pub async fn run_control_loop(
     // is read only before that: once this process has heard from the control
     // plane, what it runs is newer than anything on disk.
     let mut synced_once = false;
+    // Whether the control plane has answered this node with anything but a
+    // list - a refusal above all. The offline cache is never read after
+    // that: a node the control plane has refused, a revoked one for
+    // instance, must not bring back on its own what it was last told to run.
+    let mut answered_without_a_list = false;
 
     loop {
         if unreachable > 0 {
@@ -1367,9 +1385,23 @@ pub async fn run_control_loop(
                     registration = RegistrationState::Pending;
                 }
 
-                if !recovered_locally {
+                let unreachable_now = e.is_unreachable();
+                if !unreachable_now {
+                    answered_without_a_list = true;
+                    // Heard from, and refused or answered with something this
+                    // node cannot act on. Nothing is restored from the
+                    // offline cache or the disk on the strength of it.
+                    warn!(
+                        url = client.url(),
+                        error = %e,
+                        "The control plane answered without an assignment list. This node does \
+                         not fall back to its offline cache for an answer like this - only for \
+                         a control plane it cannot reach - and reports unhealthy until it is \
+                         given a list"
+                    );
+                } else if !recovered_locally {
                     recovered_locally = true;
-                    let restored = match (&offline, synced_once) {
+                    let restored = match (&offline, synced_once || answered_without_a_list) {
                         (Some(cache), false) => restore_offline(cache, &deployer).await,
                         _ => 0,
                     };
@@ -1405,7 +1437,14 @@ pub async fn run_control_loop(
                 // header carries the class that tells an operator which of the
                 // degraded causes this is, and nothing an outside caller has no
                 // business reading.
-                health.mark_degraded("control plane unreachable", apps);
+                health.mark_degraded(
+                    if unreachable_now {
+                        "control plane unreachable"
+                    } else {
+                        "control plane answered without an assignment list"
+                    },
+                    apps,
+                );
             }
         }
     }
