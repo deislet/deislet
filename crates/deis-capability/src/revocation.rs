@@ -3,10 +3,18 @@
 //! # What it carries
 //!
 //! The current `auth_epoch` (a capability below it is refused - that is mass
-//! revocation) and the `jti` of every revoked capability that could still be
-//! accepted somewhere. It is small on purpose: capabilities live fifteen
-//! minutes, so a revoked `jti` drops off the list shortly after the token it
-//! names would have expired anyway.
+//! revocation), the `jti` of every revoked capability that could still be
+//! accepted somewhere, and every node revoked as a principal. It is small on
+//! purpose: capabilities live fifteen minutes, so a revoked `jti` drops off
+//! the list shortly after the token it names would have expired anyway; and
+//! a revoked node is one entry however many tokens it holds or asks for.
+//!
+//! A `jti` names tokens that exist; a node names a holder. Revoking only the
+//! jtis a compromised node held would last until its next renewal, so a
+//! revoked node is carried by name and every capability whose subject names
+//! it is refused - including ones issued after the revocation, ones this
+//! control plane never recorded, and expired ones offered under T8 grace -
+//! until an operator lifts it.
 //!
 //! # Why it is signed
 //!
@@ -68,6 +76,9 @@ pub struct RevocationList {
     pub auth_epoch: u64,
     /// Revoked capabilities that could still be accepted somewhere.
     pub revoked_jtis: Vec<String>,
+    /// Node ids revoked as principals: a capability whose subject is one of
+    /// these nodes' SPIFFE names is refused, whatever its `jti`.
+    pub revoked_nodes: Vec<String>,
 }
 
 impl RevocationList {
@@ -80,6 +91,15 @@ impl RevocationList {
             issued_at: now_secs(),
             auth_epoch,
             revoked_jtis,
+            revoked_nodes: Vec::new(),
+        }
+    }
+
+    /// The same list, also revoking every node in `nodes` as a principal.
+    pub fn with_revoked_nodes(self, nodes: Vec<String>) -> Self {
+        Self {
+            revoked_nodes: nodes,
+            ..self
         }
     }
 }
@@ -194,11 +214,13 @@ mod tests {
     #[test]
     fn a_signed_list_verifies_against_the_issuers_key() {
         let signing = key();
-        let list = RevocationList::new("iss", 3, vec!["a".into(), "b".into()]);
+        let list = RevocationList::new("iss", 3, vec!["a".into(), "b".into()])
+            .with_revoked_nodes(vec!["runtime-a".into()]);
         let signed = sign(&list, &signing);
         let verified = verify(&signed, &KeyRing::from_keys([signing.verifying_key()])).unwrap();
         assert_eq!(verified.auth_epoch, 3);
         assert_eq!(verified.revoked_jtis, vec!["a", "b"]);
+        assert_eq!(verified.revoked_nodes, vec!["runtime-a"]);
         assert_eq!(verified.kid, key_id(&signing.verifying_key()));
     }
 
@@ -214,6 +236,7 @@ mod tests {
         let mut claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         claims["auth_epoch"] = 0.into();
         claims["revoked_jtis"] = serde_json::json!([]);
+        claims["revoked_nodes"] = serde_json::json!([]);
         let edited = format!(
             "{VERSION_PREFIX}{}{TOKEN_SEPARATOR}{}",
             base64url(&serde_jcs::to_vec(&claims).unwrap()),

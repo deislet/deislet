@@ -208,6 +208,11 @@ pub enum CapabilityError {
     #[error("capability {jti} has been revoked")]
     Revoked { jti: String },
 
+    /// The token was issued to a node that has been revoked as a principal:
+    /// no capability naming it is accepted, whenever it was issued.
+    #[error("node {node} has been revoked; no capability issued to it is accepted")]
+    NodeRevoked { node: String },
+
     /// The payload did not deserialize to a valid capability.
     #[error("invalid capability claims: {0}")]
     InvalidClaims(String),
@@ -484,6 +489,7 @@ pub fn verify_for_request(
         binding,
         min_auth_epoch.unwrap_or(0),
         revoked_jtis.unwrap_or_default(),
+        &[],
     )
 }
 
@@ -497,6 +503,7 @@ fn check_claims(
     binding: &str,
     min_auth_epoch: u64,
     revoked_jtis: &[String],
+    revoked_nodes: &[String],
 ) -> Result<VerifiedCapability, CapabilityError> {
     check_common(
         &claims,
@@ -504,6 +511,7 @@ fn check_claims(
         expected_aud,
         min_auth_epoch,
         revoked_jtis,
+        revoked_nodes,
     )?;
 
     if !claims.authorizes_binding(tenant, binding) {
@@ -529,13 +537,14 @@ fn check_claims(
 
 /// Every check after the signature that does not look at the resources:
 /// lifetime, expiry (skipped when `grace_accepted`), issue time, audience,
-/// auth epoch and revocation.
+/// auth epoch and revocation - of the `jti`, and of the node it names.
 fn check_common(
     claims: &CapabilityClaims,
     grace_accepted: bool,
     expected_aud: &str,
     min_auth_epoch: u64,
     revoked_jtis: &[String],
+    revoked_nodes: &[String],
 ) -> Result<(), CapabilityError> {
     let now = now_secs();
 
@@ -580,7 +589,30 @@ fn check_common(
         });
     }
 
+    if let Some(node) = revoked_node_of(&claims.sub, revoked_nodes) {
+        return Err(CapabilityError::NodeRevoked {
+            node: node.to_string(),
+        });
+    }
+
     Ok(())
+}
+
+/// The revoked node `sub` names, if it names one.
+///
+/// Matched by node id in any trust domain: this control plane issues only to
+/// its own, so a same-named node elsewhere is refused along with it rather
+/// than let through on a technicality.
+fn revoked_node_of<'a>(sub: &str, revoked_nodes: &'a [String]) -> Option<&'a str> {
+    if revoked_nodes.is_empty() {
+        return None;
+    }
+    let id = deis_identity::SpiffeId::parse(sub).ok()?;
+    let node = deis_identity::names::node_id_of(&id)?;
+    revoked_nodes
+        .iter()
+        .find(|revoked| revoked.as_str() == node)
+        .map(String::as_str)
 }
 
 /// A capability that passed every check but the resource one, handed back
@@ -612,8 +644,8 @@ impl VerifiedGrant {
 
 /// A reusable verifier for capability tokens.
 ///
-/// Bundles the key ring with the two revocation-state inputs
-/// (`min_auth_epoch` and `revoked_jtis`) and the T8 degraded-mode state
+/// Bundles the key ring with the revocation-state inputs
+/// (`min_auth_epoch`, `revoked_jtis` and `revoked_nodes`) and the T8 degraded-mode state
 /// (`last_sync`, `grace_max_secs`) so a service can construct one
 /// verifier at startup and reuse it for every request.
 #[derive(Debug, Clone)]
@@ -626,6 +658,8 @@ pub struct CapabilityVerifier {
     min_auth_epoch: u64,
     /// List of revoked JTIs (loaded from revocation feed).
     revoked_jtis: Vec<String>,
+    /// Node ids revoked as principals (loaded from revocation feed).
+    revoked_nodes: Vec<String>,
     /// Last successful revocation-list pull, as a monotonic instant.
     /// `None` means never synced → degraded from the start.
     last_sync: Option<Instant>,
@@ -664,6 +698,7 @@ impl CapabilityVerifier {
             keys,
             min_auth_epoch: 0,
             revoked_jtis: Vec::new(),
+            revoked_nodes: Vec::new(),
             last_sync: None,
             grace_max_secs: DEFAULT_GRACE_PERIOD_SECS,
             skew_secs: DEFAULT_DEGRADED_SKEW_SECS,
@@ -694,6 +729,7 @@ impl CapabilityVerifier {
         revocation::check_fresh(&list, now_secs(), self.last_list_issued_at)?;
         self.min_auth_epoch = self.min_auth_epoch.max(list.auth_epoch);
         self.revoked_jtis = list.revoked_jtis;
+        self.revoked_nodes = list.revoked_nodes;
         self.last_list_issued_at = list.issued_at;
         self.record_sync();
         Ok(())
@@ -769,6 +805,11 @@ impl CapabilityVerifier {
     /// Replace the revoked JTI list.
     pub fn set_revoked_jtis(&mut self, jtis: Vec<String>) {
         self.revoked_jtis = jtis;
+    }
+
+    /// Replace the list of nodes revoked as principals.
+    pub fn set_revoked_nodes(&mut self, nodes: Vec<String>) {
+        self.revoked_nodes = nodes;
     }
 
     /// Set the maximum grace period in seconds, silently capped at
@@ -849,6 +890,7 @@ impl CapabilityVerifier {
             binding,
             self.min_auth_epoch,
             &self.revoked_jtis,
+            &self.revoked_nodes,
         )
     }
 
@@ -861,8 +903,9 @@ impl CapabilityVerifier {
     ///    the control plane was last reachable), and
     /// 2. `now ≤ exp + grace_max_secs` (within the grace window).
     ///
-    /// Revocation (`jti` and `auth_epoch`, from the last list fetched) and
-    /// every other check still apply. Human / CLI tokens are never eligible
+    /// Revocation (`jti`, revoked node and `auth_epoch`, from the last list
+    /// fetched) and every other check still apply: a revoked node gets no
+    /// grace. Human / CLI tokens are never eligible
     /// for grace: their subject is not a node's name.
     pub fn verify_with_grace(
         &self,
@@ -886,6 +929,7 @@ impl CapabilityVerifier {
             binding,
             self.min_auth_epoch,
             &self.revoked_jtis,
+            &self.revoked_nodes,
         )?;
 
         if verified.grace_accepted {
@@ -921,6 +965,7 @@ impl CapabilityVerifier {
             expected_aud,
             self.min_auth_epoch,
             &self.revoked_jtis,
+            &self.revoked_nodes,
         )?;
 
         if grace_accepted {
@@ -1965,7 +2010,7 @@ mod tests {
             Err(CapabilityError::Revoked { .. })
         ));
 
-        let expired = make_node_token(&signing, -60);
+        let expired = make_node_token(&signing, -40);
         let expired_jti = decode(&expired, &signing.verifying_key()).unwrap().jti;
         verifier
             .apply_revocation_list(signed_list(&signing, 1, vec![expired_jti]))
@@ -1977,6 +2022,52 @@ mod tests {
             verifier.verify_with_grace(&expired, "store", TENANT, "kv"),
             Err(CapabilityError::Revoked { .. })
         ));
+    }
+
+    /// A revoked node is refused by name: a token minted after the list was
+    /// signed, which no jti on it can name, is refused as well, under T8
+    /// grace too - while another node's token is untouched.
+    #[test]
+    fn a_revoked_node_is_refused_whatever_token_it_presents() {
+        let (signing, verifying) = make_keypair();
+        let node_id = deis_identity::names::node_id_of(
+            &deis_identity::SpiffeId::parse(NODE_SUBJECT).unwrap(),
+        )
+        .unwrap()
+        .to_string();
+        let mut verifier = CapabilityVerifier::new(verifying);
+        let signed = revocation::sign(
+            &RevocationList::new("iss", 1, vec![]).with_revoked_nodes(vec![node_id.clone()]),
+            &signing,
+        );
+        verifier
+            .apply_revocation_list(
+                revocation::verify(&signed, &KeyRing::from_keys([signing.verifying_key()]))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let fresh = make_node_token(&signing, 600);
+        assert!(matches!(
+            verifier.verify_with_grace(&fresh, "store", TENANT, "kv"),
+            Err(CapabilityError::NodeRevoked { ref node }) if *node == node_id
+        ));
+        assert!(matches!(
+            verifier.verify_grant_with_grace(&fresh, "store"),
+            Err(CapabilityError::NodeRevoked { .. })
+        ));
+
+        let expired = make_node_token(&signing, -40);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(30));
+        verifier.set_pull_interval_secs(10);
+        assert!(verifier.is_degraded());
+        assert!(matches!(
+            verifier.verify_with_grace(&expired, "store", TENANT, "kv"),
+            Err(CapabilityError::NodeRevoked { .. })
+        ));
+
+        verifier.set_revoked_nodes(vec!["someone-else".into()]);
+        assert!(verifier.verify_with_grace(&fresh, "store", TENANT, "kv").is_ok());
     }
 
     /// Mass revocation: a list carrying a higher epoch refuses every token

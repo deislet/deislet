@@ -173,7 +173,7 @@ pub fn spawn_revocation_poller(
                         .map_err(|e| e.to_string())
                         .and_then(|list| {
                             let epoch = list.auth_epoch;
-                            let revoked = list.revoked_jtis.len();
+                            let revoked = list.revoked_jtis.len() + list.revoked_nodes.len();
                             verifier
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())

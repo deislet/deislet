@@ -205,6 +205,10 @@ fn map_capability_error(e: CapabilityError) -> Status {
             tracing::warn!("refused a storage call whose capability has been revoked");
             Status::permission_denied(e.to_string())
         }
+        CapabilityError::NodeRevoked { node } => {
+            tracing::warn!(node = %node, "refused a storage call from a revoked node");
+            Status::permission_denied(e.to_string())
+        }
         CapabilityError::NotYetValid { .. } => {
             tracing::warn!("refused a storage call whose capability is not yet valid");
             Status::unauthenticated(e.to_string())
