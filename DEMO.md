@@ -275,6 +275,7 @@ API key 能不能从控制面领到那张令牌。
 | | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
 | | 明文连 deis-store 的 gRPC 端口 | 连不上：deis-store 只在 TLS 上应答，出示的是机队签给它的 `spiffe://…/deislet/store/…` 证书，调用方拿控制面的根去验它。同一个问题经 `-cacert` 走 TLS 才答得出来 |
 | | 领两张存储 capability，先用其一问 `KvStore.Get`，再 `DELETE /api/v1/capabilities/<jti>` 吊销它 | 吊销前答得出来；吊销后一次轮询（30 秒）之内 deis-store 就拒它（`PermissionDenied`），旁边那张没吊销的照常被服务。deis-store 从机器通道拉的是控制面签过名的吊销名单，所以吊销不必等 15 分钟过期 |
+| | 吊销 `demo/production` 这个租户的全部 capability，之后每秒经节点各写一次 production 与 preview 的 KV | preview 在整个窗口里一次也没被拒：节点按租户逐个申领 capability，每张只点名一个租户，吊销一个环境收不走同一节点上另一个环境的存储。production 被拒一两次后又写得进去——deis-store 拒了节点出示的那张，节点从客户端底下听到拒绝，当场向控制面要一张新的，而不是等到它快过期（十来分钟）才换 |
 | | 不带 API key 打 `GET /api/apps/:app/environments/:env/storage-token` | 401，什么也拿不到；同一发带上 key 才拿到租户名、deis-store 地址与令牌本身（令牌不打印）。这张令牌绕过控制面直接对 deis-store 生效、而且不过期，所以它和部署走同一道门——这是「成功了算失败」的第三项 |
 | | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾碰不到控制面的能力签名密钥，它只拿到这一个租户的令牌 |
 | | `deis db query` 发一条数到二十亿的递归查询 | deis-store 在几秒内把它停下来，而不是跑到底；拒绝的话写在响应里（跟一个 SQL 拼写错一样），并且同时点出上限是多少、要改哪里。管的是这个租户的 SQL 能花多少，跟它能碰哪些数据是两件事 |

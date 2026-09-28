@@ -312,7 +312,7 @@ claim_port() {
 # Nothing about this is how a real installation gets its certificates. A real
 # one has a certificate authority with a life longer than one script run, and
 # `deis-identity` deliberately knows nothing about where the three files came
-# from. Two days of validity is chosen so a `.demo` directory left over from
+# from. Four days of validity is chosen so a `.demo` directory left over from
 # last week fails at load with something an operator can read, rather than at
 # a handshake days later.
 #

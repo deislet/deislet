@@ -384,6 +384,110 @@ check_a_revoked_capability_is_refused() {
   fi
 }
 
+# The node's own capabilities, as opposed to a person's. A node asks for one
+# per tenant it runs, so revoking one application environment takes back only
+# the tokens that name it: the other environment on the same node keeps its
+# storage throughout. And the node does not sit on a revoked token until it
+# falls due - deis-store refuses it, the node hears the refusal from under its
+# client and asks the control plane for a new one straight away - so the
+# revoked environment is serving again within one revocation poll and a
+# moment, not ten minutes later.
+check_a_tenant_revocation_spares_its_neighbours_and_heals() {
+  local title="revoking one tenant's capabilities spares the other tenant on the node, and the node replaces its own at once"
+  local key="revoke-tenant-probe-$$-${RANDOM}"
+  local headers="${LOG_DIR}/verify-revoke-tenant.headers"
+
+  put_as() {
+    env_request "$1" "$headers" "/api/kv/${key}" -X PUT --data-binary "$1" >/dev/null
+    http_status "$headers"
+  }
+
+  local before_live before_preview
+  before_live=$(put_as "$ENV_NAME")
+  before_preview=$(put_as "$PREVIEW_ENV_NAME")
+  if [ "$before_live" != "201" ] || [ "$before_preview" != "201" ]; then
+    fail_check "$title" "before any revocation a KV write answered ${before_live} in ${ENV_NAME} and ${before_preview} in ${PREVIEW_ENV_NAME}; both must be served first"
+    return
+  fi
+
+  local answer revoked
+  answer=$(control_answer POST     "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/capability-revocations" "$OPERATOR_TOKEN")
+  revoked=$(echo "$answer" | jq -r '.revoked | length' 2>/dev/null || echo 0)
+  if [ "${revoked:-0}" -lt 1 ]; then
+    fail_check "$title" "revoking ${APP_ID}.${ENV_NAME} took back nothing, so there is nothing to observe: $(echo "$answer" | head -c 200)"
+    return
+  fi
+
+  # One revocation poll (30s) for deis-store to learn of it, then the node's
+  # next write is refused and replaced. The preview is written every second
+  # of that window and must never be refused.
+  local waited=0 status_live status_preview live_refused=0 preview_refused=0 healed=""
+  while [ "$waited" -lt 100 ]; do
+    # The node renews on its own schedule too; one that happened to renew
+    # between the revocation and deis-store adopting it holds a token the
+    # revocation never named. Revoke once more so there is a refusal to see.
+    if [ "$waited" -eq 45 ] && [ "$live_refused" -eq 0 ]; then
+      control_answer POST \
+        "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/capability-revocations" \
+        "$OPERATOR_TOKEN" >/dev/null
+    fi
+    status_live=$(put_as "$ENV_NAME")
+    status_preview=$(put_as "$PREVIEW_ENV_NAME")
+    [ "$status_preview" = "201" ] || preview_refused=$((preview_refused + 1))
+    if [ "$status_live" = "201" ]; then
+      if [ "$live_refused" -gt 0 ]; then
+        healed=$waited
+        break
+      fi
+    else
+      live_refused=$((live_refused + 1))
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  # The revocation took the node's queue capability for this tenant too, and
+  # deis-queue adopts the list on its own 30-second poll. Once it surely has,
+  # send until the node has replaced that token as well, so what follows this
+  # check meets a node holding capabilities that are accepted everywhere.
+  local queue_refused=0 queue_status="" queue_healed=""
+  if [ -n "$healed" ]; then
+    [ "$waited" -lt 35 ] && sleep $((35 - waited))
+    local tries=0
+    while [ "$tries" -lt 30 ]; do
+      runtime_curl -s -o /dev/null -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+        -H 'content-type: application/json' \
+        -d "{\"key\":\"${key}-queue\",\"value\":\"after-revocation\"}" \
+        "$(runtime_data_url)/api/enqueue" || true
+      queue_status=$(http_status "$headers")
+      if [ "$queue_status" = "202" ]; then
+        queue_healed=yes
+        break
+      fi
+      queue_refused=$((queue_refused + 1))
+      sleep 1
+      tries=$((tries + 1))
+    done
+  fi
+
+  if [ -n "$healed" ] && [ "$preview_refused" -eq 0 ] && [ -n "$queue_healed" ]; then
+    pass_check "$title" \
+      "POST .../environments/${ENV_NAME}/capability-revocations took back ${revoked} capabilities; ${ENV_NAME}'s KV writes were refused ${live_refused} time(s) and served again ${healed}s after the revocation, while ${PREVIEW_ENV_NAME} on the same node was written every second of that window and never refused. Its queue sends were refused ${queue_refused} time(s) before the node replaced that token too"
+  elif [ "$preview_refused" -gt 0 ]; then
+    fail_check "$title" \
+      "revoking ${APP_ID}.${ENV_NAME} also refused ${PREVIEW_ENV_NAME}'s KV writes ${preview_refused} time(s) (last answer ${status_preview}): a node token names more than one tenant"
+  elif [ -n "$healed" ]; then
+    fail_check "$title" \
+      "${ENV_NAME}'s KV writes healed ${healed}s after the revocation, but its queue sends were still refused after ${queue_refused} tries (last answer ${queue_status}): the node did not replace its refused queue token"
+  elif [ "$live_refused" -eq 0 ]; then
+    fail_check "$title" \
+      "${ENV_NAME}'s KV writes were never refused in ${waited}s after its capabilities were revoked, so the node's token was not among them or deis-store never adopted the revocation"
+  else
+    fail_check "$title" \
+      "${ENV_NAME}'s KV writes were refused ${live_refused} time(s) and still not served ${waited}s after the revocation (last answer ${status_live}): the node did not replace the refused token"
+  fi
+}
+
 # ----------------------------------------------------------------------
 # The credential `deis kv`, `deis db` and `deis blob` act with
 # ----------------------------------------------------------------------
@@ -1050,6 +1154,7 @@ group_storage_checks=(
   check_storage_capability_token
   check_storage_serves_tls_only
   check_a_revoked_capability_is_refused
+  check_a_tenant_revocation_spares_its_neighbours_and_heals
   check_storage_token_route_requires_a_credential
   check_data_cli_reads_the_apps_write
   # What a tenant's SQL may cost, as opposed to what it may touch. Both go
