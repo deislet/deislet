@@ -56,14 +56,14 @@ the single most common misreading of this component:
 
 - **deis-proxy dials in.** It opens a bidirectional gRPC stream
   (`EstablishChannel`) and holds it: authenticate, register, heartbeat, receive
-  configuration and commands. Those open streams are what `/api/sessions`
+  configuration and commands. Those open streams are what `/api/platform/sessions`
   lists.
 - **A runtime node is dialled out to.** deis-control is the gRPC *client* of
   the node's own management service. What the node calls itself — its
   registration, its assignment list, its bundle download — is answered on
   the machine listener instead, where the node proves a certificate naming
   itself rather than a value copied into a file. The fleet those make up is
-  what `/api/runtime` lists.
+  what `/api/platform/runtime` lists.
 
 WebSocket is not used anywhere in this component. Earlier versions of this
 document described the node link as WebSocket; it is gRPC over HTTP/2.
@@ -103,8 +103,8 @@ two credentials*.
 |---|---|
 | `mod.rs` | routing and startup |
 | `catalog/` | apps, versions, environments, deployments, routes, secrets, assignments |
-| `apps.rs` | the runtime fleet (`/api/runtime`) |
-| `nodes.rs` | open gRPC control channels (`/api/sessions`) |
+| `apps.rs` | the runtime fleet (`/api/platform/runtime`) |
+| `nodes.rs` | open gRPC control channels (`/api/platform/sessions`) |
 | `registration.rs` | unused: a node used to put itself on the fleet list here; that RPC is `src/machine/service.rs`'s `Register` now |
 | `configs.rs`, `commands.rs`, `events.rs`, `metrics.rs` | operations |
 | `authz.rs` | API-key auth for humans (see *Security* below) |
@@ -150,7 +150,7 @@ stateDiagram-v2
 Three rules are worth reading off it. There is no arrow from `Connected` to
 `Active`: a heartbeat from a node that never registered is acknowledged and
 then ignored, so it is not counted among the live nodes by `src/metrics/` and
-not shown as active by `/api/sessions`. Nothing leaves `Disconnected`: a
+not shown as active by `/api/platform/sessions`. Nothing leaves `Disconnected`: a
 session whose stream closed stays closed, whatever arrives after it.
 
 And `Active` is a claim with an expiry date rather than a resting place.

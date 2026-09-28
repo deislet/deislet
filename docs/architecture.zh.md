@@ -226,17 +226,17 @@ deis-runtime 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪�
 
 | 对象 | 现状 |
 |---|---|
-| APP | 有。`apps` 表 + `/api/apps` |
+| APP | 有。`apps` 表 + `/api/v1/apps` |
 | ENVIRONMENT | 有。`environments` 表；名字必须满足 `is_valid_tenant_part`（不许含 `.` `/` `\`，半边不超 64 字节），否则存储租户会被拆成三段而全废 |
 | VERSION | 有。`versions` 表，写入后永不修改；包体存控制面本地，`bundle_sha` 是内容哈希 |
 | DEPLOYMENT | 有。`deployments` 表只追加；某环境的当前版本 = 该 env 下最新一行。schema-2 行同时固定 immutable environment snapshot identity |
-| ROUTE | 有，且被消费了。`routes` 表存 host + path_prefix + priority；`GET /api/routes` 给控制台看，另有一份给数据面看的路由表（多带环境名、所有存在的环境、整表版本号），deis-proxy 每 5 秒经机队通道的 `FetchRoutingTable` 拉一次并按它选应用，没配机队身份的 proxy 仍走 `GET /api/routing-table`（见 §4） |
+| ROUTE | 有，且被消费了。`routes` 表存 host + path_prefix + priority；`GET /api/platform/routes` 给控制台看，另有一份给数据面看的路由表（多带环境名、所有存在的环境、整表版本号），deis-proxy 每 5 秒经机队通道的 `FetchRoutingTable` 拉一次并按它选应用；没有机队身份的 proxy 拉不到（见 §4） |
 | SECRET | 有。AES-256-GCM immutable revision + 每环境/name head；主密钥从 `secret_key_file` 读。面板与 CLI 只能写、列 metadata 和删 head，明文读不回来 |
 | CRON | 有，且挂对了对象：调度器按 `(app_id, environment)` 维护，到点调某一个节点的 `Trigger.OnScheduled` |
 | ASSET | 有。打进包里，节点建内存索引，命中直接返回并带 ETag。同一份包里还带着这个站点自己的规则——`_redirects`、`_headers` 和「路径谁都没认领时答什么」，构建期解析、装载时编译（见 §4） |
 | BINDING / NAMESPACE | 控制面**没有**这张表，也不打算建——具名绑定是**包的属性**，`bindings` 块写在 manifest 里随版本走，形状由 `deis-bundle` 唯一定义。所以「一个应用一个环境只有一份 KV」这条限制早已不在，见 §8 |
 | ACCOUNT / API_TOKEN | 有。`accounts`（名字、角色、停用时刻）与 `api_tokens`（所属账号、来源、作用域、是否无作用域、最后使用与吊销时刻）。token 在库里只留密的那一半的 sha256，所以读到这两张表的人手上没有一把能用的钥匙 |
-| AUDIT_LOG | 有，且**只增不改**：全仓没有一处 UPDATE 或 DELETE 它，`DELETE /api/audit` 是 405（连没有作用域的那把 key 也一样）。改状态的调用和被拒的调用一样记，被拒的那条还记下「本来需要什么作用域」 |
+| AUDIT_LOG | 有，且**只增不改**：全仓没有一处 UPDATE 或 DELETE 它，`DELETE /api/v1/audit` 是 405（连没有作用域的那把 key 也一样）。改状态的调用和被拒的调用一样记，被拒的那条还记下「本来需要什么作用域」 |
 | RETIRED_APP_NAME | 有。删掉一个应用并不能删掉它在 deis-store / deis-queue 里的数据（两个服务都没有「丢掉一个租户」这个动作），所以名字被扣下而不是放回去：`retired_app_names` 记着它铺到过哪些租户，有人明确放出来之前，没有第二个应用能用这个名字接手那些数据 |
 
 ---
@@ -255,10 +255,10 @@ sequenceDiagram
 
     Dev->>CLI: deis deploy
     CLI->>CLI: 编译打包（函数 + 路由表 + 静态资产 → bundle.zip）
-    CLI->>R: POST /api/apps（不存在才建）
-    CLI->>R: POST /api/apps/{app}/versions（上传 zip）
+    CLI->>R: POST /api/v1/apps（不存在才建）
+    CLI->>R: POST /api/v1/apps/{app}/versions（上传 zip）
     R->>R: 算 sha256，建 VERSION v(N+1)
-    CLI->>R: POST /api/apps/{app}/environments（不存在才建）
+    CLI->>R: POST /api/v1/apps/{app}/environments（不存在才建）
     CLI->>R: POST .../deployments（先持久化 immutable plan）
     par PREPARE 全部冻结节点
         R->>X: ApplyDeployment(PREPARE, plan, generation, snapshot)

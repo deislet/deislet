@@ -17,7 +17,7 @@ deis-control supports full configuration version history tracking and rollback f
 Retrieve all configuration change history for a specified node.
 
 ```bash
-GET /api/configs/:node_id/history?limit=100
+GET /api/platform/configs/:node_id/history?limit=100
 ```
 
 **Query Parameters**:
@@ -55,7 +55,7 @@ GET /api/configs/:node_id/history?limit=100
 Retrieve all change history for a specific configuration key of a specified node.
 
 ```bash
-GET /api/configs/:node_id/:config_key/history?limit=50
+GET /api/platform/configs/:node_id/:config_key/history?limit=50
 ```
 
 **Query Parameters**:
@@ -86,7 +86,7 @@ GET /api/configs/:node_id/:config_key/history?limit=50
 Roll back a specified configuration key to a historical version.
 
 ```bash
-POST /api/configs/:node_id/:config_key/rollback
+POST /api/platform/configs/:node_id/:config_key/rollback
 Content-Type: application/json
 
 {
@@ -118,7 +118,7 @@ View all configuration history for a node to understand the change record:
 
 ```bash
 curl -H "X-API-Key: your-api-key" \
-  http://localhost:8080/api/configs/node-123/history?limit=20
+  http://localhost:8080/api/platform/configs/node-123/history?limit=20
 ```
 
 ### Use Case 2: Tracking a Specific Configuration
@@ -127,7 +127,7 @@ View the historical changes of a specific configuration key (e.g., `port`):
 
 ```bash
 curl -H "X-API-Key: your-api-key" \
-  http://localhost:8080/api/configs/node-123/port/history
+  http://localhost:8080/api/platform/configs/node-123/port/history
 ```
 
 ### Use Case 3: Rolling Back Erroneous Configuration
@@ -137,14 +137,14 @@ If a configuration error is discovered, you can quickly roll back to a previous 
 ```bash
 # 1. View history first to find the correct version timestamp
 curl -H "X-API-Key: your-api-key" \
-  http://localhost:8080/api/configs/node-123/port/history
+  http://localhost:8080/api/platform/configs/node-123/port/history
 
 # 2. Roll back to the specified version
 curl -X POST \
   -H "X-API-Key: your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"version_timestamp": "2025-01-16T11:00:00Z"}' \
-  http://localhost:8080/api/configs/node-123/port/rollback
+  http://localhost:8080/api/platform/configs/node-123/port/rollback
 ```
 
 ## Database Implementation

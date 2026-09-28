@@ -143,7 +143,7 @@ for two consecutive checks:
 | a revoked token is refused at its next call | and the caller cannot tell it from a token that never existed, while the control plane's log can |
 | the audit log names the secret that was written | its application, environment, author and source address — never the value |
 | a refused call is recorded as fully as an accepted one | with the scope that would have been enough |
-| no caller can erase a line of the audit log | `DELETE /api/audit` is 405 even to the unscoped key, and the line count does not move |
+| no caller can erase a line of the audit log | `DELETE /api/v1/audit` is 405 even to the unscoped key, and the line count does not move |
 | a certificate is obtained over ACME for the names the routing table carries | against a real ACME authority on loopback, and then served over TLS by deis-proxy |
 | the challenge path answers only what was published | a token nobody issued gets nothing |
 | a current certificate is not reissued, and a restart reuses the account | which is what keeps a restart loop from spending an issuance quota |

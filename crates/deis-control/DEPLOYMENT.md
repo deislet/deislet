@@ -709,10 +709,10 @@ fail=0
 
 # 1. Every version's bundle is on disk. A version whose file is missing
 #    answers 500 here, and no node can ever load it.
-for row in $(curl -sf -H "Authorization: Bearer $API" "$BASE/api/apps" \
-             | jq -r '.apps[].id'); do
-  for vid in $(curl -sf -H "Authorization: Bearer $API" "$BASE/api/apps/$row/versions" \
-               | jq -r '.versions[].id'); do
+for row in $(curl -sf -H "Authorization: Bearer $API" "$BASE/api/v1/apps" \
+             | jq -r '.items[].id'); do
+  for vid in $(curl -sf -H "Authorization: Bearer $API" "$BASE/api/v1/apps/$row/versions" \
+               | jq -r '.items[].id'); do
     code=$(curl -s -o /dev/null -w '%{http_code}' \
            --cert "$CERT" --key "$KEY" --cacert "$CA" \
            "$MACHINE_BASE/api/apps/$row/versions/$vid/bundle")
@@ -725,7 +725,7 @@ done
 code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
        -H "Authorization: Bearer $API" -H 'content-type: application/json' \
        -d '{"value":"readiness-probe"}' \
-       "$BASE/api/apps/<app>/environments/<env>/secrets/DEIS_READINESS")
+       "$BASE/api/v1/apps/<app>/environments/<env>/secrets/DEIS_READINESS")
 # 503 here is a missing or unreadable secret_key_file; 500 is a master key
 # that does not decrypt what is already in the database, which is the shape
 # of a restore that took the database from one host and the key from another.
@@ -740,7 +740,7 @@ throwaway one, and delete the probe secret afterwards:
 
 ```bash
 curl -s -X DELETE -H "Authorization: Bearer $API" \
-  "$BASE/api/apps/<app>/environments/<env>/secrets/DEIS_READINESS"
+  "$BASE/api/v1/apps/<app>/environments/<env>/secrets/DEIS_READINESS"
 ```
 
 ---
