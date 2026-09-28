@@ -134,7 +134,7 @@ canonical lowercase UUIDv7. Anything else - a UUIDv4, an uppercase spelling,
 two occurrences, free text - is discarded and a fresh id is minted, and the
 minted id is what the handlers see and what comes back. Nothing a caller
 sends is ever echoed unchecked. This holds on the legacy tree too: the long
-operations under `/api/migrations`, `/api/restores` and the provider catalog
+operations under `/api/restores` and the provider catalog
 used to parse the inbound header themselves and answer `400` to a malformed
 one, and now proceed under a minted id like every other route.
 
@@ -288,7 +288,7 @@ them with the same name or with `*`.
 | Mint a storage token | `storage:<app>/<env>`, exactly named |
 | Read a provider deployment or rollback operation through `GET /api/v1/operations/{operation_id}` | `read:<app>/<env>` - read from the operation's record, as the scoped `getProviderDeployment` demands |
 | Cancel a provider deployment or rollback, through its scoped route or through `POST /api/v1/operations/{operation_id}/cancel` | `deploy:<app>/<env>` - for the generic route, read from the operation's record |
-| Accounts, tokens, audit, hostname grants, providers, every other operation read and cancel, identity migration, backend restores, retired apps, `DELETE /api/v1/apps/{app_id}`, `GET /api/v1/deployment-plans/{id}` | `admin:*/*` |
+| Accounts, tokens, audit, hostname grants, providers, every other operation read and cancel, backend restores, retired apps, `DELETE /api/v1/apps/{app_id}`, `GET /api/v1/deployment-plans/{id}` | `admin:*/*` |
 | Platform: sessions, events, metrics, node configuration and commands, `GET /api/platform/routes`, `GET /api/platform/runtime/{node}/status` | `read:*/*`, and `admin:*/*` for the writes (configuration, commands) |
 | `GET /api/platform/runtime` | any scope at all - it is the fleet's health, which `deis status` prints |
 | `DELETE /api/platform/runtime/{node}/apps/{app_id}` | `deploy:<app>/<env>` with `?environment=<env>`; without it the call takes *every* environment off the node, so it demands `deploy:<app>/*` |
@@ -505,8 +505,7 @@ The schema is
 ## Idempotency
 
 Some mutations are expensive, external, or both: sealing a provider
-credential, installing a driver release, starting an identity migration or a
-backend restore. Those **require** an `Idempotency-Key` request header, and
+credential, installing a driver release, starting a backend restore. Those **require** an `Idempotency-Key` request header, and
 answer `428` with `precondition-required` without one.
 
 ```http
@@ -532,8 +531,7 @@ Rules:
 
 The routes that require a key are listed with it in the reference below:
 every provider credential, driver-release, installation, target and
-target-grant mutation, `POST /api/v1/apps/{application_name}/identity-migration`,
-`POST /api/v1/backend-restores`, `POST /api/v1/operations/{operation_id}/cancel`
+target-grant mutation, `POST /api/v1/backend-restores`, `POST /api/v1/operations/{operation_id}/cancel`
 and `POST` on the app-scoped provider deployments. No other route reads the
 header today; sending one there is harmless and ignored.
 
@@ -565,8 +563,7 @@ If-Match: "7"
 - Not one strong quoted number: `400`.
 
 `If-Match` is required on every provider record mutation (disable, enable,
-delete, revoke, rotate), on starting an identity migration, and on cancelling
-an operation. Which ones is recorded per operation in the reference below,
+delete, revoke, rotate) and on cancelling an operation. Which ones is recorded per operation in the reference below,
 and in the OpenAPI document.
 
 Two notes on the edges of this:
@@ -586,7 +583,7 @@ A mutation that cannot finish inside the request answers `202 Accepted` with
 a `Location` header and a record to poll. There are two kinds, and they are
 not interchangeable.
 
-**Product operations** - identity migration, backend restore, provider
+**Product operations** - backend restore, provider
 deployment, operation cancellation. The answer is a `ProductOperation`
 (schema:
 [`contracts/v1/operation.schema.json`](../../contracts/v1/operation.schema.json)),
@@ -2387,29 +2384,11 @@ Example answer (`200`, `ControlListPage_ProviderTarget`):
 - **200** `ProviderTarget` with `ETag` - The target, now enabled.
 - **Refusals** `400`, `401`, `403`, `404`, `409`, `412`, `428` - see [Errors](#errors).
 
-### Long operations, identity migration and backend restores
+### Long operations and backend restores
 
 The long-running work of the platform and the record that tracks it. A
 `ProductOperation` is the same shape whichever mutation produced it; see
 [Long operations](#long-operations) for how to poll and cancel one.
-
-#### `GET /api/v1/apps/{application_name}/identity-migration`
-
-`operationId: getIdentityMigration`. Legacy spelling `GET /api/apps/{application_name}/identity-migration`, deprecated.
-
-- **Path** `application_name` (string, required) - The application's id.
-- **200** `MigrationStatusResponse` - The migration's status.
-- **Refusals** `401`, `403`, `404` - see [Errors](#errors).
-
-#### `POST /api/v1/apps/{application_name}/identity-migration`
-
-`operationId: startIdentityMigration`. Legacy spelling `POST /api/apps/{application_name}/identity-migration`, deprecated.
-
-- **Path** `application_name` (string, required) - The application's id.
-- **Header** `Idempotency-Key` (string, required) - Replays of the same key return the same operation.
-- **Header** `If-Match` (string, required) - The application revision the caller expects.
-- **202** `ProductOperation` with `Location` - The migration was started or is already running; poll `Location`.
-- **Refusals** `400`, `401`, `403`, `404`, `409`, `412`, `428`, `503` - see [Errors](#errors).
 
 #### `POST /api/v1/backend-restores`
 
@@ -2465,7 +2444,7 @@ rather than from the path, exactly as the cancel below reads it:
 | `kind` | Scope |
 |---|---|
 | `deploy`, `rollback` (a provider workflow) | `read:<app>/<env>` of the application and environment in the record - what `getProviderDeployment` demands for the same workflow |
-| `migrate`, `restore`, anything else | `admin:*/*` |
+| `restore`, anything else | `admin:*/*` |
 
 A caller whose scope does not cover the operation is refused with `403`
 `insufficient-scope` whether or not the operation exists, and with the same
@@ -2488,7 +2467,7 @@ caller is read from the operation's record rather than from the path:
 | `kind` | Scope | What happens |
 |---|---|---|
 | `deploy`, `rollback` (a provider workflow) | `deploy:<app>/<env>` of the application and environment in the record | Exactly what `cancelProviderDeployment` does: `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic). `Location` is the scoped provider deployment, which the same credential can read. Terminal or already cancelling: `409` `operation-not-cancellable`. |
-| `migrate`, `restore` | `admin:*/*` | The operation's own controller stops it; `Location` is this operation. |
+| `restore` | `admin:*/*` | The operation's own controller stops it; `Location` is this operation. |
 | anything else | `admin:*/*` | `409`: this route has no cancellation controller for it. |
 
 A caller whose scope does not cover the operation is refused with `403`
@@ -2500,7 +2479,7 @@ ids it may not see. The exact demand is written to the server log with the
 request id.
 
 - **Path** `operation_id` (string, required) - The operation's canonical UUIDv7.
-- **Header** `Idempotency-Key` (string, optional) - For a provider `deploy` or `rollback` a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; without one a redelivered cancel finds nothing left to cancel and answers `409`. An identity migration or backend restore cancel is fenced by `If-Match` alone.
+- **Header** `Idempotency-Key` (string, optional) - For a provider `deploy` or `rollback` a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; without one a redelivered cancel finds nothing left to cancel and answers `409`. A backend restore cancel is fenced by `If-Match` alone.
 - **Header** `If-Match` (string, required) - The operation revision the caller expects.
 - **202** `ProductOperation` with `Location` - Cancellation was requested; poll `Location` (the scoped provider deployment for a provider `deploy` or `rollback`, this operation otherwise).
 - **Refusals** `400`, `401`, `403`, `404`, `409`, `412`, `428`, `503` - see [Errors](#errors). A terminal or already-cancelling provider operation answers `409` `operation-not-cancellable`.

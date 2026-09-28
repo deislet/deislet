@@ -18,8 +18,6 @@
     {"id": "provider-driver-release-envelope", "schema": "contracts/v1/provider-driver-release-envelope.schema.json"},
     {"id": "provider-driver-transparency-proof", "schema": "contracts/v1/provider-driver-transparency-proof.schema.json"},
     {"id": "provider-driver-process", "schema": "contracts/v1/provider-driver-process.schema.json"},
-    {"id": "identity-migration", "schema": "contracts/v1/identity-migration.schema.json"},
-    {"id": "backend-migration-evidence", "schema": "contracts/v1/backend-migration-evidence.schema.json"},
     {"id": "backend-restore-set", "schema": "contracts/v1/backend-restore-set.schema.json"},
     {"id": "backend-restore-report", "schema": "contracts/v1/backend-restore-report.schema.json"},
     {"id": "control-list-page", "schema": "contracts/v1/control-list-page.schema.json"},
@@ -30,9 +28,5 @@
   "requiredProviderOperations": [
     "preflight", "plan", "prepare", "upload", "verify", "activate",
     "observe", "rollback", "inspect", "reconcile", "delete", "cleanup"
-  ],
-  "identityMigrationPhases": [
-    "inventory", "allocate-canonical-ids", "dual-read", "copy-or-rename",
-    "verify", "cutover", "revoke-legacy-capabilities", "tombstone"
   ]
 }

@@ -12,7 +12,6 @@ pub mod grpc;
 pub mod headers;
 pub mod identity;
 pub mod metrics;
-pub mod migrations;
 pub mod nodes;
 pub mod openapi;
 pub mod operations;
@@ -149,9 +148,7 @@ pub async fn build_api_router(
         catalog: Arc::clone(&catalog_state.store),
     };
 
-    let migration_state =
-        migrations::MigrationApiState::new(Arc::clone(&catalog_state.store), &config);
-    migration_state.resume_on_start();
+    let operation_state = operations::OperationApiState::new(Arc::clone(&catalog_state.store));
     let restore_state = restores::RestoreApiState::new(
         Arc::clone(&catalog_state.store),
         &config,
@@ -192,7 +189,7 @@ pub async fn build_api_router(
         identity: identity_state,
         audit: audit_api_state,
         catalog: catalog_state.clone(),
-        migrations: migration_state,
+        operations: operation_state,
         restores: restore_state,
     };
 
@@ -271,7 +268,7 @@ struct HumanStates {
     identity: identity::IdentityApiState,
     audit: audit::AuditApiState,
     catalog: catalog::CatalogState,
-    migrations: migrations::MigrationApiState,
+    operations: operations::OperationApiState,
     restores: restores::RestoreApiState,
 }
 
@@ -308,11 +305,11 @@ fn product_router(prefix: &str, states: &HumanStates) -> Router {
         // log has no delete anywhere in this process.
         .route(&at("/audit"), get(audit::read_audit))
         .with_state(states.audit.clone())
-        // The catalog, the migrations and the restores bring their own
+        // The catalog, the operations and the restores bring their own
         // state, so they are merged as finished routers rather than threaded
         // through the chain above.
         .merge(catalog::router(prefix, states.catalog.clone()))
-        .merge(migrations::router(prefix, states.migrations.clone()))
+        .merge(operations::router(prefix, states.operations.clone()))
         .merge(restores::router(prefix, states.restores.clone()))
 }
 

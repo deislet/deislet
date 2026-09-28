@@ -1,8 +1,8 @@
 //! Durable planning for a coordinated embedded-backend restore.
 //!
 //! Planning is deliberately separate from execution.  Control validates and
-//! freezes the restore set, reserves the installation against identity
-//! migration, and creates the standard ProductOperation.  A topology driver
+//! freezes the restore set, reserves the installation against a second
+//! restore, and creates the standard ProductOperation.  A topology driver
 //! must later stage, quiesce, switch, verify, or roll back the physical data
 //! directories; this module never treats three file copies as success.
 
@@ -166,11 +166,6 @@ impl CatalogStore {
                     return Ok(existing);
                 }
 
-                if let Some(operation_id) = active_operation(&tx, OperationKind::Migrate)? {
-                    return Err(CatalogError::conflict(format!(
-                        "backend restore cannot overlap active identity migration operation {operation_id}"
-                    )));
-                }
                 if let Some(operation_id) = active_operation(&tx, OperationKind::Restore)? {
                     return Err(CatalogError::conflict(format!(
                         "installation already has active backend restore operation {operation_id}"
@@ -1178,7 +1173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_set_scope_and_concurrent_lifecycle_work_fail_closed() {
+    async fn a_restore_set_from_another_installation_is_refused() {
         let (_directory, store) = store().await;
         let mut wrong = restore_set(&store).await;
         wrong.scope.installation_id = CanonicalId::new_v7();
@@ -1189,22 +1184,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("not this organization")
-        );
-
-        store.create_app("shop").await.unwrap();
-        store
-            .create_environment("shop", "production")
-            .await
-            .unwrap();
-        let migration = store.plan_identity_migration("shop").await.unwrap();
-        let error = store
-            .plan_backend_restore(restore_set(&store).await, context("restore-set-key-003"))
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains(&migration.operation_id.to_string())
         );
     }
 

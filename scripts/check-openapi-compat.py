@@ -764,33 +764,21 @@ def self_check() -> None:
 # notice - has no subject yet. That is the only thing this list stands on,
 # and it goes away when v1 ships.
 #
-# Two kinds of entry have been here.
-#
-# The first was a response member that really is `null` on the wire and was
-# documented as though it never could be. Those eight are on `origin/main`
-# now, so the baseline carries them and the comparison no longer reports
-# them; they have been deleted, which is what this list is for.
-#
-# The second is what is here now: a response member that described a
-# credential this platform no longer has. The fleet-wide node key is gone -
-# it is not a field of any configuration struct, and a control plane whose
-# file still sets `node_preshared_keys` refuses to start - so "which of the
-# fleet's keys did this node prove" has no answer to report. Restoring the
-# members is not available; they would have to be filled with something
-# untrue. The same holds for the flat configuration-file API key: its
-# origin, `config`, is no longer a value the platform can answer with, so
-# the enum loses it. Removing a response property, or a value a response
-# enum may take, is refused on principle, so each removal is named here in
-# full: an entry that does not match a reported change exactly does
-# nothing, and a removal that is not listed is still refused.
+# What is here now is the identity migration's two routes. They moved data
+# from name-keyed tenants to canonical ids, and with no installation that
+# ever held name-keyed data there is nothing for them to move: the subsystem
+# behind them is gone, and restoring the routes would mean serving an
+# operation that cannot run. Each removal is named in full: an entry that
+# does not match a reported change exactly does nothing, and a removal that
+# is not listed is still refused.
 #
 # The list is meant to be emptied rather than grown. Once these are on
 # `origin/main` the baseline carries them and the comparison stops reporting
 # them, which the run says so that the entries can be deleted.
 PRERELEASE_CORRECTIONS = frozenset(
     {
-        "POST /api/v1/accounts/{account}/tokens 200 application/json.token.origin: "
-        "enum values removed: ['config']",
+        "GET /api/v1/apps/{application_name}/identity-migration: operation removed",
+        "POST /api/v1/apps/{application_name}/identity-migration: operation removed",
     }
 )
 

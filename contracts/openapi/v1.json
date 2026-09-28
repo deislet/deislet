@@ -99,7 +99,7 @@
             }
           }
         },
-        "description": "A component the request needs is not reachable: the secret store, the migration coordinator, a node's channel (`service-unavailable`, `backend-unavailable`). Retryable."
+        "description": "A component the request needs is not reachable: the secret store, the backend restore driver, a node's channel (`service-unavailable`, `backend-unavailable`). Retryable."
       },
       "Unauthenticated": {
         "content": {
@@ -478,239 +478,6 @@
         },
         "required": [
           "auth_epoch"
-        ],
-        "type": "object"
-      },
-      "BackendAttemptState": {
-        "enum": [
-          "acquiring",
-          "fenced",
-          "inspecting",
-          "captured",
-          "release-requested",
-          "released"
-        ],
-        "type": "string"
-      },
-      "BackendComponentEvidence": {
-        "properties": {
-          "component": {
-            "type": "string"
-          },
-          "digest": {
-            "$ref": "#/components/schemas/EvidenceDigest"
-          },
-          "itemCount": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "logicalBytes": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "orphanCount": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "uncheckedOrphanCount": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "component",
-          "itemCount",
-          "logicalBytes",
-          "digest",
-          "orphanCount",
-          "uncheckedOrphanCount"
-        ],
-        "type": "object"
-      },
-      "BackendFenceEvidence": {
-        "properties": {
-          "acquiredAt": {
-            "type": "string"
-          },
-          "backendIncarnationId": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "epoch": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "expectedApplicationRevision": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "migrationId": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "receiptDigest": {
-            "$ref": "#/components/schemas/EvidenceDigest"
-          }
-        },
-        "required": [
-          "backendIncarnationId",
-          "migrationId",
-          "expectedApplicationRevision",
-          "epoch",
-          "acquiredAt",
-          "receiptDigest"
-        ],
-        "type": "object"
-      },
-      "BackendMigrationAttempt": {
-        "description": "One backend/tenant row in Control's recovery journal.",
-        "properties": {
-          "acquiredAtUnixSeconds": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "attemptCount": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "backend": {
-            "type": "string"
-          },
-          "backendIncarnationId": {
-            "format": "uuid",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "createdAt": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "evidence": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/BackendMigrationEvidence"
-              }
-            ]
-          },
-          "expectedApplicationRevision": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "fenceEpoch": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "lastErrorCode": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "lastErrorMessage": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "migrationId": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "receiptSha256": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "state": {
-            "$ref": "#/components/schemas/BackendAttemptState"
-          },
-          "targetEndpointSha256": {
-            "type": "string"
-          },
-          "tenant": {
-            "type": "string"
-          },
-          "updatedAt": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "migrationId",
-          "backend",
-          "tenant",
-          "expectedApplicationRevision",
-          "targetEndpointSha256",
-          "state",
-          "attemptCount",
-          "createdAt",
-          "updatedAt"
-        ],
-        "type": "object"
-      },
-      "BackendMigrationEvidence": {
-        "description": "The exact JSON shape governed by\n`contracts/v1/backend-migration-evidence.schema.json`.",
-        "properties": {
-          "$schema": {
-            "type": "string"
-          },
-          "authenticationDomain": {
-            "type": "string"
-          },
-          "backend": {
-            "type": "string"
-          },
-          "capturedAt": {
-            "type": "string"
-          },
-          "components": {
-            "items": {
-              "$ref": "#/components/schemas/BackendComponentEvidence"
-            },
-            "type": "array"
-          },
-          "fence": {
-            "$ref": "#/components/schemas/BackendFenceEvidence"
-          },
-          "schemaVersion": {
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "tenant": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "$schema",
-          "schemaVersion",
-          "backend",
-          "tenant",
-          "authenticationDomain",
-          "fence",
-          "components",
-          "capturedAt"
         ],
         "type": "object"
       },
@@ -5206,21 +4973,6 @@
         ],
         "type": "object"
       },
-      "EvidenceDigest": {
-        "properties": {
-          "algorithm": {
-            "type": "string"
-          },
-          "value": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "algorithm",
-          "value"
-        ],
-        "type": "object"
-      },
       "ExecuteCommandRequest": {
         "description": "A command to send down a node's control channel.",
         "properties": {
@@ -5404,19 +5156,6 @@
         ],
         "type": "object"
       },
-      "IdentityMigrationState": {
-        "description": "The states persisted by the identity-migration contract.",
-        "enum": [
-          "planned",
-          "running",
-          "waiting",
-          "verified",
-          "cutover",
-          "completed",
-          "failed"
-        ],
-        "type": "string"
-      },
       "MetricsSummaryResponse": {
         "description": "The JSON twin of the Prometheus exposition.",
         "properties": {
@@ -5450,88 +5189,6 @@
           "nodes",
           "system",
           "pagination"
-        ],
-        "type": "object"
-      },
-      "MigrationStatusResponse": {
-        "description": "A public status deliberately omits the fence token and every management\ncredential. The operation and migration IDs are stable polling handles.",
-        "properties": {
-          "attempts": {
-            "items": {
-              "$ref": "#/components/schemas/BackendMigrationAttempt"
-            },
-            "type": "array"
-          },
-          "blockingFindings": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "canonicalApplicationId": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "capturedComponents": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          },
-          "createdAtUnixSeconds": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "expectedApplicationRevision": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "legacyApplicationName": {
-            "type": "string"
-          },
-          "migrationId": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "operationId": {
-            "format": "uuid",
-            "type": "string"
-          },
-          "readyForCopy": {
-            "type": "boolean"
-          },
-          "recordRevision": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "schemaVersion": {
-            "format": "int32",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "state": {
-            "$ref": "#/components/schemas/IdentityMigrationState"
-          },
-          "updatedAtUnixSeconds": {
-            "format": "int64",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "schemaVersion",
-          "migrationId",
-          "operationId",
-          "state",
-          "legacyApplicationName",
-          "canonicalApplicationId",
-          "expectedApplicationRevision",
-          "recordRevision",
-          "attempts",
-          "capturedComponents",
-          "blockingFindings",
-          "readyForCopy",
-          "createdAtUnixSeconds",
-          "updatedAtUnixSeconds"
         ],
         "type": "object"
       },
@@ -6031,7 +5688,7 @@
             "type": "object"
           },
           "kind": {
-            "description": "What the operation does. The set is `deis_wire::OperationKind`, which is `contracts/v1/operation.schema.json`'s: an identity migration is `migrate`, a backend restore is `restore` and a provider deployment is `provider`.",
+            "description": "What the operation does. The set is `deis_wire::OperationKind`, which is `contracts/v1/operation.schema.json`'s: a backend restore is `restore` and a provider deployment is `provider`.",
             "enum": [
               "build",
               "provision",
@@ -12461,131 +12118,6 @@
         ]
       }
     },
-    "/api/v1/apps/{application_name}/identity-migration": {
-      "get": {
-        "operationId": "getIdentityMigration",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "application_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MigrationStatusResponse"
-                }
-              }
-            },
-            "description": "The migration's status."
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      },
-      "post": {
-        "operationId": "startIdentityMigration",
-        "parameters": [
-          {
-            "description": "The application's id.",
-            "in": "path",
-            "name": "application_name",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Required. Replays of the same key return the same operation.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "description": "Required: the application `revision` the caller expects, quoted, as `GET /api/v1/apps/{application_name}` reports it. A migration freezes an inventory of everything the application owns, so the caller says which revision it read that inventory at; the comparison happens inside the transaction that plans the migration, and a revision that has moved since is refused with 412 rather than snapshotted.",
-            "in": "header",
-            "name": "If-Match",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "202": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProductOperation"
-                }
-              }
-            },
-            "description": "The migration was started or is already running; poll `Location`.",
-            "headers": {
-              "Location": {
-                "description": "Where to poll the operation.",
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/BadRequest"
-          },
-          "401": {
-            "$ref": "#/components/responses/Unauthenticated"
-          },
-          "403": {
-            "$ref": "#/components/responses/Forbidden"
-          },
-          "404": {
-            "$ref": "#/components/responses/NotFound"
-          },
-          "409": {
-            "$ref": "#/components/responses/Conflict"
-          },
-          "412": {
-            "$ref": "#/components/responses/PreconditionFailed"
-          },
-          "428": {
-            "$ref": "#/components/responses/PreconditionRequired"
-          },
-          "500": {
-            "$ref": "#/components/responses/Internal"
-          },
-          "503": {
-            "$ref": "#/components/responses/ServiceUnavailable"
-          }
-        },
-        "tags": [
-          "product"
-        ]
-      }
-    },
     "/api/v1/audit": {
       "get": {
         "operationId": "listAuditLog",
@@ -13253,7 +12785,7 @@
                 }
               }
             },
-            "description": "The operation. What the route demands is read from the operation's record, not from the path: a provider `deploy` or `rollback` answers to `read:<app>/<env>` of the application and environment in its record, exactly as `getProviderDeployment` does; a `migrate` or `restore` operation, and any other kind, answers to `admin:*/*`. A caller whose scope does not cover the operation is refused with `403` `insufficient-scope` whether or not the operation exists, and with the same body either way.",
+            "description": "The operation. What the route demands is read from the operation's record, not from the path: a provider `deploy` or `rollback` answers to `read:<app>/<env>` of the application and environment in its record, exactly as `getProviderDeployment` does; a `restore` operation, and any other kind, answers to `admin:*/*`. A caller whose scope does not cover the operation is refused with `403` `insufficient-scope` whether or not the operation exists, and with the same body either way.",
             "headers": {
               "ETag": {
                 "description": "The resource revision, for `If-Match`.",
@@ -13298,7 +12830,7 @@
             }
           },
           {
-            "description": "Optional. For a provider `deploy` or `rollback` operation a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; without one a redelivered cancel finds nothing left to cancel and answers `409`. An identity migration or backend restore cancel is fenced by `If-Match` alone.",
+            "description": "Optional. For a provider `deploy` or `rollback` operation a replay of the same key by the same principal returns the same operation, exactly as on `cancelProviderDeployment`; without one a redelivered cancel finds nothing left to cancel and answers `409`. A backend restore cancel is fenced by `If-Match` alone.",
             "in": "header",
             "name": "Idempotency-Key",
             "required": false,
@@ -13325,7 +12857,7 @@
                 }
               }
             },
-            "description": "Cancellation was requested; poll `Location`. The route dispatches on the operation's `kind`. A provider `deploy` or `rollback` is stopped exactly as `cancelProviderDeployment` stops it - `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic) - and `Location` is the scoped provider deployment, which the same credential can read; it answers to `deploy:<app>/<env>` of the application and environment in the operation's record, and `409` `operation-not-cancellable` once terminal or already cancelling. A `migrate` or `restore` operation answers to `admin:*/*`, is stopped by its own controller, and `Location` is this operation. Any other kind is refused with `409`: this route has no cancellation controller for it.",
+            "description": "Cancellation was requested; poll `Location`. The route dispatches on the operation's `kind`. A provider `deploy` or `rollback` is stopped exactly as `cancelProviderDeployment` stops it - `cancelling` until in-flight provider work settles and reversible side effects are cleaned up, then `cancelled` (or `failed` with the cleanup diagnostic) - and `Location` is the scoped provider deployment, which the same credential can read; it answers to `deploy:<app>/<env>` of the application and environment in the operation's record, and `409` `operation-not-cancellable` once terminal or already cancelling. A `restore` operation answers to `admin:*/*`, is stopped by its own controller, and `Location` is this operation. Any other kind is refused with `409`: this route has no cancellation controller for it.",
             "headers": {
               "Location": {
                 "description": "Where to poll the operation: the scoped provider deployment for a provider `deploy` or `rollback`, this operation otherwise.",

@@ -84,12 +84,12 @@
 //! application and environment it is about - and therefore which scope may
 //! read or cancel it - is written in the operation record: the application
 //! and environment of a provider `deploy` or `rollback` (`read:<app>/<env>`
-//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for an
-//! identity migration, a backend restore, and every other kind. This gate
+//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for a
+//! backend restore and every other kind. This gate
 //! holds no catalog handle and reads no record, so the table marks both
 //! routes [`RecordClaim::OperationScope`], demands only that the caller hold
-//! *some* scope, and the handlers (`api::migrations::get_operation` and
-//! `api::migrations::cancel_operation`, through one shared check) load the
+//! *some* scope, and the handlers (`api::operations::get_operation` and
+//! `api::operations::cancel_operation`, through one shared check) load the
 //! record and check the caller against the exact demand before anything
 //! else, refusing with the same `insufficient-scope` 403 this gate would
 //! give and with one fixed body whether or not the id exists. The 403 is
@@ -191,12 +191,12 @@
 //! application and environment it is about - and therefore which scope may
 //! read or cancel it - is written in the operation record: the application
 //! and environment of a provider `deploy` or `rollback` (`read:<app>/<env>`
-//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for an
-//! identity migration, a backend restore, and every other kind. This gate
+//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for a
+//! backend restore and every other kind. This gate
 //! holds no catalog handle and reads no record, so the table marks both
 //! routes [`RecordClaim::OperationScope`], demands only that the caller hold
-//! *some* scope, and the handlers (`api::migrations::get_operation` and
-//! `api::migrations::cancel_operation`, through one shared check) load the
+//! *some* scope, and the handlers (`api::operations::get_operation` and
+//! `api::operations::cancel_operation`, through one shared check) load the
 //! record and check the caller against the exact demand before anything
 //! else, refusing with the same `insufficient-scope` 403 this gate would
 //! give and with one fixed body whether or not the id exists. The 403 is
@@ -577,24 +577,6 @@ fn classify_canonical(
             Requirement::new("app.delete", Verb::Admin, named(app), Resource::Every).changes_state()
         }
 
-        // Identity migration freezes every environment and reaches backend
-        // management services with credentials no application operator may
-        // hold. Both starting it and reading its cross-backend inventory are
-        // therefore platform-administrator operations over the whole app.
-        ["api", "apps", app, "identity-migration"] if !writing => Requirement::new(
-            "identity_migration.get",
-            Verb::Admin,
-            named(app),
-            Resource::Every,
-        ),
-        ["api", "apps", app, "identity-migration"] => Requirement::new(
-            "identity_migration.start",
-            Verb::Admin,
-            named(app),
-            Resource::Every,
-        )
-        .changes_state(),
-
         // A backend restore replaces the physical data incarnation for every
         // application on this installation. Its scope can therefore never be
         // narrowed to an application or environment credential.
@@ -869,10 +851,10 @@ fn classify_canonical(
         // `read:<app>/<env>` to read it, exactly as its scoped
         // `provider_deployment.get` route does, and `deploy:<app>/<env>` to
         // cancel it, exactly as `provider_deployment.cancel` does - and only
-        // a migration, a restore or a kind with no scope of its own answers
+        // a restore or a kind with no scope of its own answers
         // to `admin:*/*`. Which it is can only be read from the record, so
         // the gate asks for some scope - `Read` is what every scope grants -
-        // and the handlers in `api::migrations` load the record and refuse
+        // and the handlers in `api::operations` load the record and refuse
         // with `insufficient-scope` before they answer or act. See the
         // module header. The read changes nothing, so it is recorded only
         // when refused, like every other read.
@@ -2037,22 +2019,10 @@ mod tests {
             ("GET", "/api/apps/demo", "app.get", Verb::Read),
             ("DELETE", "/api/apps/demo", "app.delete", Verb::Admin),
             (
-                "GET",
-                "/api/apps/demo/identity-migration",
-                "identity_migration.get",
-                Verb::Admin,
-            ),
-            (
                 "POST",
                 "/api/operations/01990f44-1000-7000-8000-000000000040/cancel",
                 "operation.cancel",
                 Verb::Read,
-            ),
-            (
-                "POST",
-                "/api/apps/demo/identity-migration",
-                "identity_migration.start",
-                Verb::Admin,
             ),
             (
                 "GET",
@@ -3035,13 +3005,6 @@ mod tests {
                 "POST",
                 "/api/providers/targets/01990f44-1000-7000-8000-000000000040/enable",
                 AdministratorsAlready,
-            ),
-            // No body: the application is in the path and the demand is
-            // `admin` over it and every environment of it.
-            (
-                "POST",
-                "/api/apps/demo/identity-migration",
-                NothingTheUrlDoesNotAlreadyName,
             ),
             // The three that settle work already recorded. None of them
             // takes a body at all: `api::operations::cancel_provider_workflow`

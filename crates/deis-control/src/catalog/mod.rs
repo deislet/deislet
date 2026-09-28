@@ -28,14 +28,12 @@
 //!   cheap as a deploy.
 
 pub mod artifact;
-pub mod backend_migration;
 pub mod backend_restore;
 pub mod backend_restore_driver;
 pub mod bundle;
 pub mod compatibility;
 pub mod domains;
 pub mod idempotency;
-pub mod identity_migration;
 pub mod limits;
 pub mod model;
 pub mod operation;
@@ -53,11 +51,6 @@ pub mod secrets;
 pub mod store;
 
 pub use artifact::{ArtifactStore, StoredCanonicalArtifact};
-pub use backend_migration::{
-    BackendAttemptState, BackendMigrationAttempt, BackendMigrationEvidence,
-    IdentityMigrationCoordinator, IdentityMigrationRun, MigrationCoordinatorError,
-    summarize_identity_migration,
-};
 pub use bundle::{BundleStore, StoredBundle};
 pub use compatibility::{
     CompatibilityProfile, DeclaredCompatibility, declared_compatibility, describe_version,
@@ -68,12 +61,6 @@ pub use idempotency::{
     IdempotencyDigestKey, IdempotencyGuard, IdempotencyOutcome, IdempotencyScope, IdempotencyStore,
     IdempotentRequest, IdempotentResource, PendingIdempotencyRecord, StoredIdempotentResponse,
     complete_idempotency_record,
-};
-pub use identity_migration::{
-    CatalogBindingInventory, CatalogDeploymentInventory, CatalogEnvironmentInventory,
-    CatalogIdentityInventory, CatalogInventoryDigest, CatalogRouteInventory,
-    CatalogSecretInventory, CatalogVersionInventory, ComponentInventoryEvidence,
-    IdentityMigrationPlan, IdentityMigrationState, InventoryEvidenceState,
 };
 pub use limits::{DeclaredLimits, declared_limits};
 pub use model::{

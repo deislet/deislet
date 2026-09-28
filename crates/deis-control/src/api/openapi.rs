@@ -188,11 +188,9 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         crate::api::catalog::providers::list_provider_target_grant_history,
         crate::api::catalog::providers::get_provider_target_grant_history,
         crate::api::catalog::providers::provider_target_grant_history_audit,
-        // Identity migrations and long operations.
-        crate::api::migrations::get_migration,
-        crate::api::migrations::start_migration,
-        crate::api::migrations::get_operation,
-        crate::api::migrations::cancel_operation,
+        // Long operations.
+        crate::api::operations::get_operation,
+        crate::api::operations::cancel_operation,
         // Backend restores.
         crate::api::restores::get_installation,
         crate::api::restores::start_restore,
@@ -721,8 +719,8 @@ error_response!(
 );
 error_response!(
     ServiceUnavailable,
-    "A component the request needs is not reachable: the secret store, the migration \
-     coordinator, a node's channel (`service-unavailable`, `backend-unavailable`). \
+    "A component the request needs is not reachable: the secret store, the backend \
+     restore driver, a node's channel (`service-unavailable`, `backend-unavailable`). \
      Retryable."
 );
 error_response!(
@@ -813,8 +811,7 @@ impl PartialSchema for ProductOperationDocument {
             "kind",
             string_property(
                 "What the operation does. The set is `deis_wire::OperationKind`, which is \
-                 `contracts/v1/operation.schema.json`'s: an identity migration is `migrate`, \
-                 a backend restore is `restore` and a provider deployment is `provider`.",
+                 `contracts/v1/operation.schema.json`'s: a backend restore is `restore` and a provider deployment is `provider`.",
             )
             .enum_values(Some(
                 deis_wire::OperationKind::ALL.map(deis_wire::OperationKind::as_str),

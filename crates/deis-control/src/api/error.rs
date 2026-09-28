@@ -722,25 +722,6 @@ impl From<crate::catalog::CatalogError> for ApiError {
     }
 }
 
-impl From<crate::catalog::MigrationCoordinatorError> for ApiError {
-    fn from(err: crate::catalog::MigrationCoordinatorError) -> Self {
-        use crate::catalog::MigrationCoordinatorError;
-        match err {
-            MigrationCoordinatorError::Configuration(message) => ApiError::NotConfigured(message),
-            MigrationCoordinatorError::Catalog(error) => error.into(),
-            // The store or queue backend, not this process, is what failed;
-            // what it said names the backend and the tenant, so the log
-            // gets it and the envelope does not.
-            MigrationCoordinatorError::Backend { .. }
-            | MigrationCoordinatorError::Protocol { .. } => ApiError::opaque(
-                StatusCode::SERVICE_UNAVAILABLE,
-                codes::BACKEND_UNAVAILABLE,
-                err.to_string(),
-            ),
-        }
-    }
-}
-
 impl From<crate::catalog::BackendRestoreCoordinatorError> for ApiError {
     fn from(err: crate::catalog::BackendRestoreCoordinatorError) -> Self {
         use crate::catalog::BackendRestoreCoordinatorError;
@@ -1007,9 +988,7 @@ mod tests {
     /// 503. The legacy body still carries the sentence, byte for byte.
     #[test]
     fn every_backend_failure_is_opaque_and_keeps_its_text_for_the_log() {
-        use crate::catalog::{
-            BackendRestoreCoordinatorError, CatalogError, MigrationCoordinatorError,
-        };
+        use crate::catalog::{BackendRestoreCoordinatorError, CatalogError};
         use crate::command::ExecuteError;
         use crate::config_manager::PushError;
 
@@ -1022,15 +1001,6 @@ mod tests {
             (
                 CatalogError::Database(rusqlite::Error::QueryReturnedNoRows).into(),
                 "Query returned no rows",
-            ),
-            (
-                MigrationCoordinatorError::Backend {
-                    backend: "postgres".to_string(),
-                    tenant: "demo".to_string(),
-                    message: "dial tcp 10.0.0.7:5432: connection refused".to_string(),
-                }
-                .into(),
-                "10.0.0.7:5432",
             ),
             (
                 BackendRestoreCoordinatorError::Unknown(
@@ -1582,12 +1552,10 @@ mod tests {
 
     #[test]
     fn coordinator_backend_failures_name_the_backend_code() {
-        use crate::catalog::{BackendRestoreCoordinatorError, MigrationCoordinatorError};
-        let error = ApiError::from(MigrationCoordinatorError::Backend {
-            backend: "deis-store".to_string(),
-            tenant: "t".to_string(),
-            message: "gone".to_string(),
-        });
+        use crate::catalog::BackendRestoreCoordinatorError;
+        let error = ApiError::from(BackendRestoreCoordinatorError::Unknown(
+            "deis-store is gone".to_string(),
+        ));
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.code(), codes::BACKEND_UNAVAILABLE);
         let detail = error.into_detail();
@@ -1599,10 +1567,9 @@ mod tests {
                 .is_some_and(|text| text.contains("deis-store")),
             "the backend's name is for the log"
         );
-        let error = ApiError::from(BackendRestoreCoordinatorError::Unknown("?".to_string()));
-        assert_eq!(error.code(), codes::BACKEND_UNAVAILABLE);
-        assert_eq!(error.into_detail().message, OPAQUE_MESSAGE);
-        let error = ApiError::from(MigrationCoordinatorError::Configuration("k".to_string()));
+        let error = ApiError::from(BackendRestoreCoordinatorError::Configuration(
+            "k".to_string(),
+        ));
         assert_eq!(error.code(), codes::NOT_CONFIGURED);
     }
 }
