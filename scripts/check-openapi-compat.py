@@ -81,6 +81,7 @@ SECRET_NAME_ALLOWLIST = {
     ("SecretChangeResponse", "secret"),
     ("MintResponse", "secret"),
     ("StorageTokenResponse", "token"),
+    ("TelemetryTokenResponse", "token"),
     ("ControlListPage_SecretMeta", "items"),
     # A count of secrets removed with an application.
     ("DeletedApp", "secrets"),

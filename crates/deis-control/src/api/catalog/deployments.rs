@@ -2315,15 +2315,11 @@ mod tests {
 
     #[tokio::test]
     async fn queue_leases_drain_before_the_production_pointer_is_committed() {
-        use deis_queue::proto::queue::{
-            AckRequest, MessageHandle, PullRequest, SendRequest, queue_client::QueueClient,
-        };
+        use deis_queue::proto::queue::{AckRequest, MessageHandle, PullRequest, SendRequest};
 
         let h = harness_with_queue(true).await;
         let tenant = "demo.production";
-        let mut queue = QueueClient::connect(h.queue_endpoint.clone().unwrap())
-            .await
-            .unwrap();
+        let mut queue = h.queue_client().await;
         for body in ["old lease", "next generation"] {
             let mut request = tonic::Request::new(SendRequest {
                 queue_name: "jobs".to_string(),
@@ -3203,9 +3199,7 @@ mod tests {
 
     #[tokio::test]
     async fn standard_deploy_and_secret_rotation_append_atomic_snapshot_pointers() {
-        use deis_queue::proto::queue::{
-            AckRequest, MessageHandle, PullRequest, SendRequest, queue_client::QueueClient,
-        };
+        use deis_queue::proto::queue::{AckRequest, MessageHandle, PullRequest, SendRequest};
 
         let h = harness_with_queue(true).await;
         let declarations = deis_wire::EnvironmentDeclarations::new(
@@ -3286,9 +3280,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let mut queue = QueueClient::connect(h.queue_endpoint.clone().unwrap())
-            .await
-            .unwrap();
+        let mut queue = h.queue_client().await;
         let mut send = tonic::Request::new(SendRequest {
             queue_name: "jobs".to_string(),
             message_body: b"finish under the old secret".to_vec(),

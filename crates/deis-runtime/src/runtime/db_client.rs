@@ -18,9 +18,9 @@
 //! it back itself when it passes. A handle is owned by the tenant that opened
 //! it, checked on every use, and spent once the transaction ends.
 
+use super::bindings::CapabilityChannel;
 use super::bindings::StorageIdentity;
 use anyhow::Result;
-use tonic::transport::Channel;
 
 // Import generated proto code
 pub mod proto {
@@ -58,7 +58,7 @@ fn transaction_refusal(error: Option<String>) -> anyhow::Error {
 /// time lost its writes to a deadline it had not exceeded.
 #[derive(Clone)]
 pub struct DbClient {
-    client: DatabaseClient<Channel>,
+    client: DatabaseClient<CapabilityChannel>,
     identity: StorageIdentity,
 }
 
@@ -88,7 +88,8 @@ impl DbClient {
     /// [`super::kv_client::KvClient::connect_lazy`] for why bindings use this
     /// rather than connecting eagerly.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel = super::bindings::unary_channel(endpoint)?;
+        let channel =
+            super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Store, identity)?;
         let client = DatabaseClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);

@@ -20,7 +20,6 @@ pub mod pagination;
 pub mod paths;
 pub mod registration;
 pub mod restores;
-pub mod revocation;
 pub mod static_files;
 pub mod versioning;
 
@@ -153,7 +152,13 @@ pub async fn build_api_router(
     let migration_state =
         migrations::MigrationApiState::new(Arc::clone(&catalog_state.store), &config);
     migration_state.resume_on_start();
-    let restore_state = restores::RestoreApiState::new(Arc::clone(&catalog_state.store), &config);
+    let restore_state = restores::RestoreApiState::new(
+        Arc::clone(&catalog_state.store),
+        &config,
+        deis_runtime_manager
+            .machine_identity()
+            .map(deis_identity::ServiceTrust::from_identity),
+    );
     restore_state.resume_on_start();
 
     // One gate for the whole human surface. It resolves the credential into
@@ -218,23 +223,6 @@ pub async fn build_api_router(
         .route("/health", get(handle_health))
         .route("/deis.svg", get(static_files::serve_favicon))
         .route("/assets/*path", get(static_files::serve_assets))
-        .route(
-            "/capability/revocation-list",
-            get(revocation::revocation_list),
-        )
-        .with_state(revocation::RevocationState {
-            issuer: issuer.clone(),
-        })
-        // Public keys, for store and queue, which have no machine identity
-        // to fetch them over the machine channel with.
-        .merge(
-            Router::new()
-                .route(
-                    crate::capability_issuer::JWKS_ROUTE,
-                    get(crate::machine::listen::capability_jwks),
-                )
-                .with_state(issuer.clone()),
-        )
         .merge(protected_routes);
 
     // Cross-origin access to the human API, which is off unless the file
@@ -635,7 +623,11 @@ async fn build_catalog_state(
         );
     }
 
-    let storage = StorageWiring::from_config(config).with_issuer(issuer.clone());
+    let storage = StorageWiring::new(config, issuer.clone()).with_service_trust(
+        nodes
+            .machine_identity()
+            .map(deis_identity::ServiceTrust::from_identity),
+    );
     if storage.has_no_endpoints() {
         warn!(
             "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so every ctx.services.kv / database / blob / queue call an application makes answers \"service not available\" and declared queue consumers never start"
@@ -645,19 +637,6 @@ async fn build_catalog_state(
             store_endpoint = ?storage.store,
             queue_endpoint = ?storage.queue,
             "Storage addresses will be handed to nodes with every deployment"
-        );
-    }
-
-    // Which of the two modes this platform runs in is not something an
-    // operator can see from a deployment: both send the same message, and
-    // the difference only shows up as every storage call being refused.
-    if storage.mints_tokens() {
-        info!(
-            "Capability issuer is configured: every deployment carries Ed25519-signed capability tokens minted for its own tenant"
-        );
-    } else {
-        warn!(
-            "No capability issuer: deployments carry no storage capability token, so anything that can reach deis-store or deis-queue may name any tenant and be served"
         );
     }
 

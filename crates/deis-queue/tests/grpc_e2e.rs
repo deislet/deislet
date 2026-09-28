@@ -28,6 +28,8 @@ use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
 use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode as encode_capability};
+use deis_identity::{Protocol, ServiceKind};
+use deis_identity_test_pki::TestFleet;
 use deis_queue::config::Config;
 use deis_queue::proto::queue::{
     AbortConsumerGenerationRequest, AckRequest, ActivateConsumerGenerationRequest,
@@ -92,6 +94,8 @@ struct Harness {
     shutdown: Option<oneshot::Sender<()>>,
     /// The signing key every capability in this file is minted under.
     signing_key: ed25519_dalek::SigningKey,
+    /// The authority the server's certificate is issued by.
+    fleet: TestFleet,
 }
 
 impl Harness {
@@ -127,6 +131,8 @@ impl Harness {
         let listener = server::bind(&config).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (shutdown, rx) = oneshot::channel();
+        let fleet = TestFleet::new();
+        let identity = fleet.service_identity(ServiceKind::Queue);
         tokio::spawn(async move {
             server::serve(
                 config,
@@ -135,39 +141,44 @@ impl Harness {
                     let _ = rx.await;
                 },
                 keys,
+                identity,
             )
             .await
             .unwrap();
         });
         Self {
             _data: data,
-            endpoint: format!("http://{addr}"),
+            endpoint: format!("https://{addr}"),
             shutdown: Some(shutdown),
             signing_key,
+            fleet,
         }
     }
 
-    async fn client(&self) -> QueueClient<Channel> {
-        let channel = Channel::from_shared(self.endpoint.clone())
+    /// A channel that checks the far end is a queue of this fleet, the way
+    /// every real caller does.
+    async fn channel(&self) -> Channel {
+        tonic::transport::Endpoint::from_shared(self.endpoint.clone())
             .unwrap()
-            .connect()
+            .connect_with_connector(
+                self.fleet
+                    .service_trust()
+                    .dialler(ServiceKind::Queue, &[Protocol::Http2]),
+            )
             .await
-            .unwrap();
-        QueueClient::new(channel)
+            .unwrap()
+    }
+
+    async fn client(&self) -> QueueClient<Channel> {
+        QueueClient::new(self.channel().await)
             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
 
     async fn migration(&self) -> BackendMigrationClient<Channel> {
-        BackendMigrationClient::new(
-            Channel::from_shared(self.endpoint.clone())
-                .unwrap()
-                .connect()
-                .await
-                .unwrap(),
-        )
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+        BackendMigrationClient::new(self.channel().await)
+            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
 }
 
@@ -1760,7 +1771,15 @@ async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
     // the capability interceptor, which always enforces auth regardless of
     // bind address.
     let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
-    let result = server::serve(config, public, async {}, keys).await;
+    let fleet = TestFleet::new();
+    let result = server::serve(
+        config,
+        public,
+        async {},
+        keys,
+        fleet.service_identity(ServiceKind::Queue),
+    )
+    .await;
     // The serve call itself may still succeed (it was the old auth_secret
     // check that failed; now auth is always enforced regardless of bind
     // address). What matters is that the server starts and enforces

@@ -18,6 +18,7 @@ use deis_runtime::egress_proxy::{self, ProxyDecision};
 use deis_runtime::health::NodeHealth;
 use deis_runtime::logging::{LogBuffer, LogShipper, RuntimeLayer, ShipperConfig};
 use deis_runtime::runtime::{FetchPolicy, MetricShipper, MetricShipperConfig};
+use deis_runtime::telemetry::TelemetryCredential;
 
 // What this node accepts on its command line.
 //
@@ -367,6 +368,13 @@ async fn run(
     // assignment client and the bundle fetcher are built from, so both dial
     // with the one identity and a renewal reaches both.
     let machine_identity = load_machine_identity(&config)?;
+    // The same identity is what deis-store, deis-queue and deis-telemetry
+    // are checked against: every connection to them is TLS, and the far end
+    // must prove a certificate this fleet's authority issued for that kind of
+    // service before a capability is sent to it.
+    deis_runtime::runtime::service_tls::install(deis_identity::ServiceTrust::from_identity(
+        Arc::clone(&machine_identity),
+    ));
 
     // Initialize data storage (Single SQLite DB)
     let data_dir = &config.data_dir;
@@ -383,15 +391,23 @@ async fn run(
     let app_repo = Arc::new(AppRepo::new(&db_path).await?);
     info!("App repo initialized");
 
-    let log_shipper = LogShipper::new(log_buffer.clone(), ShipperConfig::from(&config.logging));
+    // One telemetry capability for all three shippers, kept current by the
+    // renewal task started below once the machine channel exists. Until then
+    // pushes queue; see `deis_runtime::telemetry`.
+    let telemetry_credential = TelemetryCredential::default();
+
+    let mut log_shipper_config = ShipperConfig::from(&config.logging);
+    log_shipper_config.credential = telemetry_credential.clone();
+    let log_shipper = LogShipper::new(log_buffer.clone(), log_shipper_config);
     log_shipper.start().await;
 
     // Counters are recorded by the isolates whether or not anyone ships them;
     // without this the node's request, error and execution-time numbers would
     // only ever exist in this process's memory and deis-telemetry would have
     // nothing to answer a dashboard with.
-    let metric_shipper =
-        MetricShipper::for_process(MetricShipperConfig::from(&config.logging), node_id.clone());
+    let mut metric_shipper_config = MetricShipperConfig::from(&config.logging);
+    metric_shipper_config.credential = telemetry_credential.clone();
+    let metric_shipper = MetricShipper::for_process(metric_shipper_config, node_id.clone());
     metric_shipper.start().await;
 
     // Where an application's `fetch()` may go. Deny by default; the operator's
@@ -562,9 +578,25 @@ async fn run(
         .and_then(AssignmentClient::machine_channel_client)
     {
         deployer.fetch_secrets_through(deis_runtime::deployment::SecretSource::new(
-            channel,
+            channel.clone(),
             node_id.clone(),
         ));
+
+        // The telemetry capability follows what this node runs: ingest for
+        // every application environment it serves, and for its own records.
+        let running = deployer.clone();
+        deis_runtime::telemetry::spawn_renewal(
+            telemetry_credential.clone(),
+            channel,
+            node_id.clone(),
+            move || {
+                running
+                    .running()
+                    .into_iter()
+                    .map(|(key, _)| key.tenant_id())
+                    .collect()
+            },
+        );
     }
 
     // Which door this node announces itself at is the configuration's to
@@ -590,6 +622,17 @@ async fn run(
         );
     }
 
+    // What this node needs to restart and keep serving while the control
+    // plane is unreachable, sealed under a key derived from its own private
+    // key. Only a node that asks a control plane has anything to keep.
+    let offline_cache = assignment_client.as_ref().map(|_| {
+        Arc::new(deis_runtime::deployment::offline_cache::OfflineCache::for_identity(
+            &config.data_dir,
+            &machine_identity,
+            node_id.clone(),
+        ))
+    });
+
     // Runs for the life of the process: it registers this node, keeps it
     // matching the control plane's assignment list, and reports readiness.
     let control_loop = tokio::spawn(deis_runtime::deployment::run_control_loop(
@@ -599,6 +642,7 @@ async fn run(
         health.clone(),
         std::time::Duration::from_secs(config.control.retry_interval_secs),
         std::time::Duration::from_secs(config.control.reconcile_interval_secs),
+        offline_cache,
     ));
 
     info!("====================================");

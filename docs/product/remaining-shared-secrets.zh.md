@@ -17,29 +17,15 @@
 
 | 凭证 | 在哪里 | 它开的是什么门 | 现在的形态 |
 |---|---|---|---|
-| `auth_secret`（deis-store） | `crates/deis-store/src/config.rs` | 节点对对象与 KV 存储的全部调用 | 全场一个值 |
-| `auth_secret`（deis-queue） | `crates/deis-queue/src/config.rs` | 队列的投递、领取与 fence 操作 | 全场一个值 |
-| `auth_secret`（deis-telemetry） | `crates/deis-telemetry/src/config.rs` | 日志、trace 与指标的写入 | 全场一个值 |
-| storage token | `deis_wire::conventions::storage_token`（HMAC-SHA256 派生） | 一个租户在存储上的读写 | 由上面的 `storage_auth_secret` 按租户派生；不过期、不可单独撤销，轮换等于一次性作废全部 |
 | `migration_admin_token` | `crates/deis-control/src/config.rs` 与 `deis-backend-migration` | 后端迁移与恢复的管理操作 | 独立的静态 token |
 | inspector 会话令牌 | `crates/deis-runtime/src/app/manager.rs` | 一个调试会话 | **不属于这一类**：节点自己铸造、驻留内存、会过期，与舰队无关。列在这里只是为了说明它为什么不该跟着一起删 |
 
-## 为什么这一轮不做
+deis-store 与 deis-queue 的 `auth_secret`（以及控制面的 `storage_auth_secret`、由它 HMAC 派生的 storage token）已经删掉：两者只认 control 用 Ed25519 签发、15 分钟过期、可按 `jti`/节点/租户吊销的 capability，公钥与签名吊销名单用各自的机器身份经 mTLS 从 machine channel 拉取；节点只能为分配给自己的租户申领。deis-telemetry 的 `auth_secret` 同样已经删掉：遥测只认 control 签发的 capability，写入用 `ingest`、读取用 `read`，都按租户限定，节点经机器通道申领、CLI 向 control 申领并记审计，没有不鉴权的模式。见 `docs/trust-boundaries.md` 的「Telemetry」一节。
 
-ADR-025 把这些划在 stage 5（data capability enforcement），而本轮的范围是节点与控制面之间的
-机器通道。硬把它们塞进来会同时改动三个额外 crate、三个 systemd 单元和存储契约，
-使这一批改动无法被单独评审、单独回滚。
+## 还剩下的怎么收
 
-## 做的时候要注意什么
-
-- **storage token 不是「再加一把钥匙」的问题**。它是从一个共享值 HMAC 派生的，所以它的
-  「按租户隔离」是真的（一个租户的 token 对另一个租户无用），但**撤销粒度是全部**：
-  换掉那个值，每个租户的 token 同时作废。真正的修法是短期、受众限定、绑定持有密钥的能力券
-  （ADR-025 M2），不是把这个值换成另一个值。
-- **三个 `auth_secret` 是三条独立的门**，不要合并成一个「服务密钥」再共享 —— 那只是把三个
-  全场通用值换成一个，范围更大。
-- 这三个服务各自的监听同样需要「谁在调用」的答案，而 `deis-identity` 已经能提供：它们要的是
-  同一套 `MachineIdentity` 与 SPIFFE 命名，不需要新机制。
+- `migration_admin_token` 与主密钥都是单机持有的静态值，不是全场共享的应用凭证；收敛它们要走
+  ADR-025 的后续阶段，不是把它们换成另一个静态值。
 - 动它们之前先看 `docs/adr/025-machine-identity-and-capabilities.md` 的非目标一节：
   那里明确禁止为 legacy 凭证发「按节点伪造的衍生 token」，这类捷径在这几处尤其诱人。
 

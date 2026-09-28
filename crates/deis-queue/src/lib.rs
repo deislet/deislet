@@ -79,24 +79,16 @@
 //! Every request names its tenant in the `x-deis-tenant` header. On its own
 //! that is a claim: the header says which queues the caller wants, not that
 //! the caller is entitled to them. What goes with the claim is a capability
-//! token in `x-deis-storage-token`,
-//! `base64(HMAC-SHA256(auth_secret, tenant))`, minted by deis-control from a
-//! secret this service is configured with - the same secret and the same
-//! token deis-store checks. The expected token is derived from the tenant
-//! *the request itself claims*, so a token that leaked out of one application
-//! reaches nothing in another. See [`auth`].
+//! in `Authorization: Bearer`, signed by deis-control with Ed25519 for the
+//! `queue` audience, naming the tenant and the `queue` binding, and valid for
+//! 15 minutes. It is checked against the keys this service reads from the
+//! control plane's machine channel under its own machine identity, and
+//! against the signed revocation list read the same way, so a token that
+//! leaked out of one application reaches nothing in another. See [`auth`].
 //!
-//! Two things follow, and they are deliberately different:
-//!
-//! * With no `auth_secret` and a **loopback** `listen`, the service runs as
-//!   it always has: the tenant header is believed, and what keeps one
-//!   tenant's messages away from an unrelated client is only that the client
-//!   cannot reach the port. This is the default single-box install, it is
-//!   supported, and the service says exactly this at startup at `warn`.
-//! * With no `auth_secret` and any **other** address, the service refuses to
-//!   start. A queue reachable from another host with nothing checking the
-//!   tenant header can be drained by anyone who can route to it, and a
-//!   drained message is one its owner never receives.
+//! There is no mode without the check and no loopback exception: whatever
+//! the address, every call carries a capability, and the listener speaks TLS
+//! only.
 //!
 //! The health service is answered without a token: it names no tenant and
 //! touches no message, and a liveness probe that needed a tenant credential

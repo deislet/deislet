@@ -98,6 +98,10 @@ trust_bundle = "/etc/deislet/pki/control-roots.pem"
 - 不信任反向代理注入的 principal header。TLS 可以在受控 sidecar 终止，但 sidecar 与服务间必须使用经过认证的 Unix socket 或再次 mTLS，并把已验证身份放入不可由普通客户端到达的协议字段。
 - bundle、assignment、routing、registration/renewal 和 Control-to-node management 均迁到 machine listener。公开应用 route 永不挂载这些路径。
 - runtime、proxy、store、queue 与 telemetry 的 management listener 与应用 data listener 分离。ADR-023/024 的迁移和恢复管理员调用使用各自 principal 与 operation capability，不再依赖长期静态管理员 bearer token。runtime 的应用 data listener 同样只接受互证 TLS：caller 必须持有本 installation 签发的 proxy 角色证书（URI SAN `deislet/proxy/...`），否则握手即断，无任何明文回落（2026-09 落地：`deis_runtime::dispatcher::DataPlaneAcceptor`，验收见 `crates/deis-runtime/tests/management_auth_test.rs` 与 `crates/deis-proxy/tests/upstream_mtls_test.rs`）。
+- store、queue 与 telemetry 持有各自的机器身份：`spiffe://<trust domain>/deislet/store/<id>`、`.../queue/<id>`、`.../telemetry/<id>`，由同一 installation CA 签发，配置在各自的 `[machine_identity]`；证书若命名其他角色则拒绝启动（2026-09 落地：`deis_identity::names`、`deis_capability::ServiceIdentityConfig`）。同一身份用于两处：
+  - 三者的 gRPC listener 只提供 TLS，出示自身证书（`deis_identity::accept_tls`），不存在明文 listener，bearer capability 不会以明文出现在网络上。listener 不要求客户端证书（人类 CLI 没有机器身份），调用权限仍由每次调用携带的 capability 决定。所有调用方按「角色」校验服务端：证书必须链到 fleet trust root，且命名所要访问的服务种类（`VerifyServerIsOfKind`），同一 CA 签给 queue 的证书不能冒充 store。runtime 与 Control 用自身机器身份的 trust root 与 trust domain 校验，CLI 用 `DEIS_SERVICES_CA` 或 `[services] ca` 指定的 root。
+  - capability JWKS 只挂在 Control 的 machine listener 上，human listener 不再提供；三者以 mTLS 拉取（`deis_capability::ControlClient`），出示自身证书，并要求对端证明同一 trust domain 的 Control 名称。`control_endpoint` 必须是 `https://`，非 loopback 的 `http://` 在启动时即被拒绝。
+  - 尚未实现：capability 与调用方证书的 `cnf` 绑定（本节的 TLS 只防止传输中被读取或被交给错误的机器，不防止被复制的 capability 在有效期内重放）。所有 Prometheus 端口（telemetry 的 `metrics_listen`，以及 store/queue 可选的 `metrics_listen`）都是明文 HTTP，因此只允许绑定 loopback IP，其他地址启动即拒绝。
 - Production 缺少独立 listener、client trust、server identity 或认证 Unix socket 时只进入 diagnostic/not-ready。Dev 可以由本地 ephemeral CA 自动配置，但仍经过相同 principal 与授权代码路径。
 
 ## Enrollment、证书续期与 Registration
@@ -115,7 +119,7 @@ Enrollment token 不是机器日常凭证，不能读取 assignment、bundle、r
 
 - 续期请求必须在 mTLS 下由当前 active principal 发起，同时以新私钥签署 CSR proof-of-possession。
 - 新证书保持同一 SPIFFE ID，记录 predecessor/successor 和新的 SPKI；旧、新证书只在有界 overlap 内同时有效。
-- 默认证书期限 30 分钟，production 最大值 24 小时。默认在已用三分之二寿命前续期，带抖动与退避；不能靠延长 leaf 寿命替代可靠续期和撤销。
+- 机器证书签发寿命不少于 72 小时（`deis_identity::MIN_CERTIFICATE_LIFETIME_SECS`）：节点在控制面失联期间最多靠已有材料运行 24 小时，其间证书无法续期，所以证书必须撑过这个窗口并留出事后续期的余量。更短的证书在加载时即被拒绝（启动与轮换都一样，轮换失败时保留正在使用的材料）；剩余不足 48 小时时每个检查周期都告警。默认在已用三分之二寿命前续期，带抖动与退避；不能靠延长 leaf 寿命替代可靠续期和撤销。
 - 已过期、suspended/revoked principal、旧 auth epoch、错误 kind/installation 或未经证明的新密钥不能续期。离线过期实例必须重新 enrollment，不能用过期证书自救。
 
 ### Registration
@@ -175,6 +179,12 @@ Capability 默认 5 分钟、最长 15 分钟，不使用长期 refresh token。
 
 当前 store/queue 的 `HMAC(shared_secret, tenant)` token 只隔离 tenant，任何取得根 secret 的进程可以铸造全部 tenant token，也不能表达 binding、operation、version、audience、expiry 或持有者。它必须迁移到上述 capability；地址与 token 放进 assignment 不等于授权完成。
 
+### 节点侧：自行申领、离线缓存
+
+- 部署消息（`ApplyDeployment` 与 assignment 的 `env`）不携带任何 capability 或 secret 值。节点以自己的证书身份经机器通道调用 `IssueCapability`，subject 是节点自身的 SPIFFE 名字，有效期 15 分钟；某个租户的存储客户端一建好就立即申领（不等一个续签周期），剩余 5 分钟时续签（`crates/deis-runtime/src/deployment/capability_renewer.rs`）。secret 值只经 snapshot + `FetchSecretValues` 取得；没有 `environment` 声明的 manifest 不绑定任何 secret，也不会收到任何 secret。
+- 节点在 `<data_dir>/offline-cache/state.bin` 保存离线缓存：最后一次完整的 assignment 列表、这些 deployment 按 revision 取得的 secret 值、以及当前持有的 capability。用节点私钥经 HKDF-SHA256 派生的密钥做 AES-256-GCM 封装，node id 作为附加数据；每次成功同步和每次续签后原子写入（0600 临时文件 → fsync → rename → fsync 目录）。只在启动时控制面不可达才读取；写入超过 24 小时的缓存整体拒绝，过期超过 24 小时的 capability 不再保留。私钥轮换后旧缓存无法打开，这是预期方向：缓存里只有节点能重新取得的东西（`crates/deis-runtime/src/deployment/offline_cache.rs`）。
+- FetchSecretValues 的审计 fail-closed：「已交付」审计行写不进去时，不返回任何 secret 值；内部错误同样写审计行。
+
 ## 密钥、证书与撤销生命周期
 
 - Platform root CA 默认离线；online intermediate、Control server cert、machine cert、capability issuer key 分开，权限与用途扩展不混用。
@@ -185,6 +195,18 @@ Capability 默认 5 分钟、最长 15 分钟，不使用长期 refresh token。
 - 所有时钟必须在配置容差内；默认允许的 token skew 不超过 30 秒。超界节点 not-ready，不能通过扩大 token 有效期掩盖。
 - backup 保存 CA/issuer 恢复所需的加密材料与 trust metadata，不保存节点私钥。恢复演练验证签发、撤销、bundle 轮换和旧 epoch 拒绝。
 
+### 实现现状：签发记录、吊销与 T8（2026-09）
+
+- **签发记录**：control 签出的每个 capability（节点经 `IssueCapability`、人类经 `/storage-token`、control 自己调 queue）在交出之前写入 `capability_issuances` 与 `capability_issuance_resources`（迁移 `0005_capability_issuances.sql`：`jti`、subject、node id、audience、`kid`、auth epoch、`iat`/`exp`、每个 tenant/binding/generation）；写不进去就不签发。这是本 ADR `machine_capability_issuances` 的第一步，尚无 `cnf` 与状态列。
+- **节点签发范围**：`IssueCapability` 只签节点实际运行的 tenant：audience 必须是按 tenant 校验 binding 的（store、queue、telemetry），每个 resource 的 tenant 必须来自 `deployments_visible_to(node)`，binding 必须属于该 audience，generation（若给出）必须是该 deployment 的 routing generation；telemetry 只签 `ingest`（节点运行的 tenant，外加总可申请的 `@platform`），任何 `read` 都拒绝；任何一条不满足就整体拒绝并写审计 `capability.issue`。`deployments_visible_to` 只把当前 assignment 给在 fleet 中的节点（已注册或静态配置），进行中的 plan 按 `target_ids`。
+- **吊销**：owner API 按 `jti`、按节点、按 tenant 吊销（从签发表找出仍可能被接受的 `jti`，写入 `capability_revocations`，带其 `exp`），或递增 `auth_epoch` 做批量吊销；另有解除节点吊销的入口；五个入口都是 `Verb::Admin`、全部写审计。
+- **按 principal 吊销节点**：只收回节点当时持有的 `jti` 撑不过它的下一次续签，所以按节点吊销同时把节点本身写进 `revoked_nodes`，直到管理员解除（`DELETE /api/v1/capabilities/revocations/nodes/{node_id}`）。期间 control 把它移出 fleet，machine channel 对它只接受注销，注册、assignment、路由表、secret、`IssueCapability` 一律 `PermissionDenied`（后两者写审计）；签名的吊销名单带上 `revoked_nodes`，校验方拒绝 `sub` 为该节点 SPIFFE 名的**任何** capability——吊销前刚签的、离线缓存里的、T8 宽限期内的过期 token 都在内。平台无法区分同一名字的不同证书，因此只应在被泄露的私钥再也证明不了这个名字（它持有的证书全部过期）之后解除，或换一个 node id 重建机器。
+- **吊销不殃及旁人**：节点按 tenant 逐个申请 store/queue capability，每个 token 只含一个 tenant，按 tenant 吊销只收回点名该 tenant 的 token。store、queue、telemetry 以 `Unauthenticated`/`PermissionDenied` 拒绝节点出示的 capability 时，节点立即重新申请（距上次签发至少 30 秒，防止无法靠续期修复的拒绝变成请求风暴），不再等到剩 5 分钟才换。节点的 telemetry capability 仍是覆盖其全部 tenant 的一个 token，吊销任一 tenant 会让该节点的推送短暂被拒，批次留在队列里，新 token 数秒内到达。
+- **吊销名单**：只在 machine listener 上提供（`/capability/revocation-list`），内容是未过期（含 120 秒余量，覆盖 T8 的 `exp ≥ last_sync − skew` 边界）的吊销 `jti`、全部被吊销的节点与当前 `auth_epoch`，**用签发密钥签名**（与 capability 同一 `v1.<payload>.<sig>` 格式，payload 带 `typ = "deis-revocation-list"`，二者互不可冒充）。store、queue、telemetry 用各自的 `[machine_identity]` 经 mTLS 从 machine channel 拉取（与拉 JWKS 同一个 `ControlClient`、同一个 `control_endpoint`，http 只允许 loopback），每 30 秒一次；校验方用同一 JWKS 验签，拒绝早于两分钟、来自未来或早于上一份的名单（防重放），epoch 只升不降。store 的 kv/sql/blob 共用一个校验器，同一份名单三者一起生效。
+- **T8 节点判定**：宽限只给 subject 为节点 SPIFFE 名（`spiffe://<trust domain>/deislet/node/<id>`，由 `deis-identity` 解析）的 capability，且 trust domain 必须与校验方自身 machine identity 的一致（store、queue、telemetry 启动时设置）。
+- **重启语义**：校验方在 control 不可达时重启，没有 last sync，也没有公钥（JWKS 不落盘），因此拒绝一切 capability，指标报告 degraded。不持久化 last sync：单独持久化它会让宽限期接受在那次同步里已被吊销的 capability。
+- **指标**：`deis_auth_degraded`、`deis_auth_degraded_since_seconds`、`deis_auth_grace_accepted_total`、`deis_auth_revocation_last_sync_seconds`，label `service`。
+
 ## Dual 到 Strict 的滚动顺序
 
 迁移可用性不能被描述为已经实现安全隔离。顺序固定为：
@@ -193,7 +215,7 @@ Capability 默认 5 分钟、最长 15 分钟，不使用长期 refresh token。
 2. **Dual trust bootstrap**：启用独立 machine listener、内部 CA、issuer 与 trust bundle；逐实例 enrollment。实例先能 mTLS 健康/续期，再承接业务。PSK 调用逐次记录 endpoint、peer、claimed ID 和时间，并令 production readiness 降级。
 3. **Read path enforcement**：按 `routing → bundle → assignments` 切换到 principal 授权。每一路只有在所有目标实例已用 mTLS 成功、负面测试通过且旧路径无调用超过至少两个 registration TTL 后，才关闭该 endpoint 的 PSK；一旦关闭不得按请求自动 downgrade。
 4. **Management enforcement**：Control-to-runtime/proxy/store/queue/telemetry 和 migration/restore 调用改为 mTLS + operation capability。先验证 PREPARE/ACTIVATE/ABORT、trigger、fence、inventory、release 与 status 的精确权限，再逐 endpoint 关闭 PSK/static admin token。
-5. **Data capability enforcement**：runtime 到 store/queue/telemetry 改为 cnf-bound 短期 capability；验证跨 tenant/binding/action/generation 与重放均拒绝后，移除 shared HMAC secret。
+5. **Data capability enforcement**：runtime 到 store/queue/telemetry 改为 cnf-bound 短期 capability；验证跨 tenant/binding/action/generation 与重放均拒绝后，移除 shared HMAC secret。telemetry 一侧已于 2026-09 落地（`cnf` 仍待 RB-2）：deis-telemetry 经 JWKS 校验 `aud=telemetry` 的 capability，`ingest` 与 `read` 两个 binding 互不蕴含，读取按租户过滤，保留租户 `@platform` 表示节点自身记录（写）或全平台（读）；节点经 `IssueCapability` 申领，人经 `telemetry-token` 路由申领并记审计；共享 secret 与不鉴权模式均已删除（`crates/deis-telemetry/src/auth.rs`）。
 6. **Strict**：配置、数据库、示例和启动参数不再接受 fleet PSK；删除 legacy listener/route 与代码，撤销并销毁旧值，保留不含 secret 的迁移审计。所有实例更新 trust 后才移除旧 CA/issuer key。
 
 Dual 阶段的 PSK 无法区分 principal，因此仍具有旧的横向权限，不能报告 `production-secure`。不能以“某个 claimed node 已迁移”为依据拒绝来自同一共享 PSK 的降级，因为 PSK 本身证明不了是谁；关闭必须按 endpoint/fleet readiness gate 原子进行。中途失败保持当前明确阶段，重试相同 operation，不反向打开已严格关闭的入口。

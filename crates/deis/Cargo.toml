@@ -84,3 +84,9 @@ deis-queue = { path = "../deis-queue" }
 # against the running service proves the two strings agree. Test-only - this
 # CLI does not link the collector's server, its database or its HTTP stack.
 deis-telemetry = { path = "../deis-telemetry" }
+# The authority the two servers above are issued certificates by: they serve
+# TLS only, and the clients under test check the certificate as a real CLI
+# does.
+deis-identity-test-pki = { path = "../deis-identity-test-pki" }
+# `ServiceIdentityConfig`, which the collector above is served with.
+deis-capability = { path = "../deis-capability", features = ["jwks-fetch"] }

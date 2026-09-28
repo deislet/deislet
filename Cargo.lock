@@ -2018,6 +2018,7 @@ dependencies = [
  "deis-bundle",
  "deis-capability",
  "deis-identity",
+ "deis-identity-test-pki",
  "deis-queue",
  "deis-telemetry",
  "deis-wire",
@@ -2230,6 +2231,7 @@ name = "deis-capability"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "deis-identity",
  "deis-wire",
  "ed25519-dalek",
  "reqwest",
@@ -2240,6 +2242,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -2317,6 +2320,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "deis-identity-test-pki",
+ "hkdf",
  "http",
  "hyper-util",
  "rustls",
@@ -2337,6 +2341,8 @@ version = "0.1.0"
 dependencies = [
  "deis-identity",
  "rcgen",
+ "tempfile",
+ "time",
 ]
 
 [[package]]
@@ -2434,6 +2440,8 @@ dependencies = [
  "clap 4.6.6",
  "deis-backend-migration",
  "deis-capability",
+ "deis-identity",
+ "deis-identity-test-pki",
  "deis-wire",
  "ed25519-dalek",
  "hex",
@@ -2447,6 +2455,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tonic",
@@ -2461,6 +2470,7 @@ dependencies = [
 name = "deis-runtime"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "arc-swap",
  "axum",
@@ -2532,6 +2542,8 @@ dependencies = [
  "clap 4.6.6",
  "deis-backend-migration",
  "deis-capability",
+ "deis-identity",
+ "deis-identity-test-pki",
  "deis-wire",
  "ed25519-dalek",
  "hex",
@@ -2545,6 +2557,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tonic",
@@ -2565,9 +2578,10 @@ dependencies = [
  "clap 4.6.6",
  "deis-backend-migration",
  "deis-capability",
+ "deis-identity",
+ "deis-identity-test-pki",
  "deis-wire",
  "ed25519-dalek",
- "hex",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
@@ -2578,6 +2592,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml",
  "tonic",

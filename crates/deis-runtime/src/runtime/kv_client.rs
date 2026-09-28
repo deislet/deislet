@@ -3,14 +3,14 @@
 //! Talks to deis-store, which partitions data by tenant -- one application in
 //! one environment. The tenant travels in the `x-deis-tenant` metadata header
 //! and the capability token that proves this node may act as it travels in
-//! `x-deis-storage-token` (both stamped by [`StorageIdentity`]), not in the
+//! `Authorization: Bearer` (both stamped by [`StorageIdentity`]), not in the
 //! proto messages, so one client speaks for exactly one environment of one
 //! application and a preview cannot read or overwrite what production
 //! stored.
 
+use super::bindings::CapabilityChannel;
 use super::bindings::StorageIdentity;
 use anyhow::Result;
-use tonic::transport::Channel;
 
 // Import generated proto code
 pub mod proto {
@@ -80,7 +80,7 @@ pub struct KvListPage {
 /// call would stall every other one the application had in flight.
 #[derive(Clone)]
 pub struct KvClient {
-    client: KvStoreClient<Channel>,
+    client: KvStoreClient<CapabilityChannel>,
     identity: StorageIdentity,
 }
 
@@ -115,7 +115,8 @@ impl KvClient {
     /// back. Only an address that is not a URL is refused here -- and it would
     /// never start working.
     pub(crate) fn connect_lazy(endpoint: &str, identity: &StorageIdentity) -> Result<Self> {
-        let channel = super::bindings::unary_channel(endpoint)?;
+        let channel =
+            super::bindings::unary_channel(endpoint, deis_identity::ServiceKind::Store, identity)?;
         let client = KvStoreClient::new(channel)
             .max_decoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(crate::MAX_GRPC_MESSAGE_BYTES);
@@ -377,6 +378,8 @@ mod tests {
             let listener = server::bind(&config).await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
             let (shutdown, rx) = oneshot::channel();
+            let identity = crate::runtime::test_store::fleet()
+                .service_identity(deis_identity::ServiceKind::Store);
             tokio::spawn(async move {
                 server::serve(
                     config,
@@ -385,13 +388,14 @@ mod tests {
                         let _ = rx.await;
                     },
                     deis_capability::KeyRing::from_keys([verifying_key]),
+                    identity,
                 )
                 .await
                 .expect("serve");
             });
             Self {
                 _data: data,
-                endpoint: format!("http://{addr}"),
+                endpoint: format!("https://{addr}"),
                 signing_key,
                 shutdown: Some(shutdown),
             }
@@ -758,10 +762,10 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_requires_a_token_refuses_a_client_without_one_and_serves_one_with_it() {
         // The whole delivery path in one test, over a real socket: the store
-        // holds the shared secret, the control plane would mint this token
-        // from it, and the client stamps it beside the tenant it claims.
-        // Asserting on the header alone would not catch the two halves
-        // computing different values.
+        // trusts the control plane's signing key, the control plane would sign
+        // this capability with it, and the client stamps it beside the tenant
+        // it claims. Asserting on the header alone would not catch the two
+        // halves disagreeing.
         let store = Store::start().await;
         let tenant = "demo.production";
         let token = store.capability_token_for(tenant);
@@ -770,7 +774,7 @@ mod tests {
         let error = unproven
             .set("k".to_string(), b"v".to_vec())
             .await
-            .expect_err("a store with an auth_secret must not serve an unproven call");
+            .expect_err("a store must not serve an unproven call");
         assert_eq!(
             refusal(&error),
             tonic::Code::Unauthenticated,
@@ -801,10 +805,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_token_minted_for_another_tenant_is_refused() {
-        // What makes a leaked token harmless elsewhere: the store recomputes
-        // the expected value from the tenant the call itself claims, so
-        // presenting production's token while naming the preview proves
-        // nothing.
+        // What makes a leaked token harmless elsewhere: the store checks the
+        // capability names the tenant the call itself claims, so presenting
+        // production's token while naming the preview proves nothing.
         let store = Store::start().await;
         let production_token = store.capability_token_for("demo.production");
 
@@ -816,23 +819,27 @@ mod tests {
         assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
     }
 
+    /// A token the store refuses is reported to the renewer from under the
+    /// client, so the node replaces it now rather than when it falls due.
     #[tokio::test]
-    async fn a_store_without_a_secret_serves_a_client_that_carries_a_token_anyway() {
-        // Why the node stamps the token unconditionally instead of behind a
-        // flag: a control plane that mints tokens and a store that does not
-        // check them is a legal intermediate state during a rollout, and it
-        // must keep working.
+    async fn a_refused_token_is_reported_to_the_renewer() {
+        use crate::deployment::capability_renewer;
         let store = Store::start().await;
-        let token = store.capability_token_for("demo.production");
+        let tenant = "kv-refused.production";
+        let wrong = store.capability_token_for("kv-refused.preview");
+        let identity = StorageIdentity::new(tenant, Some(&wrong)).expect("a legal tenant");
+        capability_renewer::register(tenant, "store", identity.token_lock());
+        let client = KvClient::connect_lazy(&store.endpoint, &identity).expect("client is built");
+        assert!(!capability_renewer::is_refused(tenant, "store"));
 
-        let client = store.binding("demo.production", Some(&token));
-        client
-            .set("k".to_string(), b"v".to_vec())
+        let error = client
+            .get("k".to_string())
             .await
-            .expect("a store with no auth_secret ignores the token it was handed");
-        assert_eq!(
-            client.get("k".to_string()).await.expect("read back"),
-            Some(b"v".to_vec())
+            .expect_err("a token naming another tenant is refused");
+        assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
+        assert!(
+            capability_renewer::is_refused(tenant, "store"),
+            "the refusal did not reach the renewer"
         );
     }
 

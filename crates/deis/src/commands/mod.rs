@@ -145,13 +145,13 @@ pub fn project_dir() -> Result<PathBuf> {
 
 /// Resolve every setting for a command running in the working directory.
 ///
-/// This is all a command that talks only to deis-telemetry needs. `deis
-/// logs`, `deis tail` and `deis trace` deliberately stop here: reading an
-/// application's logs or its invocation history is not a control-plane
-/// operation, and a checkout that has never had a control plane configured
-/// must still be able to look at what its application is doing.
+/// `deis logs`, `deis tail` and `deis trace` start here and then ask the
+/// control plane for the read capability deis-telemetry wants; see
+/// [`crate::platform::telemetry::TelemetryCredential`].
 pub fn resolve(overrides: &Overrides) -> Result<Settings> {
-    Settings::load(&project_dir()?, overrides)
+    let settings = Settings::load(&project_dir()?, overrides)?;
+    crate::platform::service_tls::configure(settings.services_ca());
+    Ok(settings)
 }
 
 /// Everything a command that talks to the control plane needs: the resolved

@@ -26,6 +26,7 @@ pub mod route_match;
 mod runtime_init;
 mod service_call;
 mod service_ops;
+pub mod service_tls;
 mod snapshot;
 mod tenant;
 #[cfg(test)]

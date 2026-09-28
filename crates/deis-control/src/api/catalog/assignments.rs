@@ -23,11 +23,11 @@
 //! reason of the control plane's own, so completeness is stated explicitly in
 //! [`ASSIGNMENTS_COMPLETE_HEADER`] rather than inferred from the array.
 //!
-//! **This response carries decrypted secret values.** It is one of exactly
-//! two places where they appear in the clear (the other is the
-//! `ApplyDeployment` push), which is why it is served on the machine
-//! channel (`deis.machine.MachineChannel`) with mutual TLS instead of
-//! behind the dashboard's API key. There is no anonymous case to handle
+//! **This response carries no secret value** - only each deployment's
+//! snapshot, which names the revisions a node then fetches through
+//! `FetchSecretValues`. It is still served on the machine channel
+//! (`deis.machine.MachineChannel`) with mutual TLS instead of behind the
+//! dashboard's API key, because it is the whole platform's topology. There is no anonymous case to handle
 //! here: a control plane with no machine identity answers 503 on a call
 //! into this handler (`machine::service` checks the peer certificate),
 //! so everything below is talking to a caller that proved its SPIFFE name.
@@ -100,17 +100,13 @@ pub struct AssignmentView {
     pub bundle_url: String,
     /// Digest the node must verify after downloading.
     pub bundle_sha: String,
-    /// Exactly what a push would have carried: the manifest's variables,
-    /// this environment's decrypted secrets, and the storage addresses.
+    /// Exactly what a push would have carried: the manifest's variables
+    /// and the storage addresses. Never a secret value or a credential.
     ///
     /// Without it a node that restarts comes back running the right code
-    /// with an empty environment - no secrets, and no address for
+    /// with an empty environment - no variables, and no address for
     /// deis-store or deis-queue - and stays that way until somebody
-    /// deploys again. Secrets are decrypted here, for this response only,
-    /// and are never stored or logged decrypted.
-    ///
-    /// This is why the endpoint authenticates the caller as a node: the
-    /// values in this map are the platform's secrets in the clear.
+    /// deploys again.
     pub env: BTreeMap<String, String>,
     /// What this version's manifest asked to be held to, exactly as the
     /// `ApplyDeployment` push carries it. Omitted when the application
@@ -338,7 +334,8 @@ pub(crate) async fn assignments_for(
     })
 }
 
-/// Where one deployment's secrets live, for a node that may read them.
+/// One deployment a node may act for: where its secrets live, and the
+/// storage tenant and generation a capability for it may name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VisibleDeployment {
     /// Primary key of the environment row: the half of a secret revision's
@@ -347,36 +344,66 @@ pub(crate) struct VisibleDeployment {
     /// `None` for a deployment that predates typed snapshots, which binds no
     /// secret revisions and so has nothing to fetch.
     pub snapshot_id: Option<String>,
+    /// `<app>.<environment>`, as `deis_wire::conventions::tenant_id` spells
+    /// it: the tenant a store, queue or telemetry capability names.
+    pub tenant: String,
+    /// The routing generation this deployment serves under.
+    pub routing_generation: String,
 }
 
-/// Which deployments `node_id` may read secret values for, keyed by id.
+/// Which deployments `node_id` may act for - read secret values of, and
+/// obtain capabilities for - keyed by id.
 ///
 /// The single place that decides it, so that a placement model narrows it
-/// here and nowhere else. Today every node runs every application, so this is
-/// every current assignment plus every in-flight plan that names this node as
-/// a target: a PREPARE push reaches the node before the deployment pointer is
-/// written, and the node fetches its secrets while preparing.
+/// here and nowhere else. Today every node of the fleet runs every
+/// application, so this is:
+///
+/// - every current assignment, **if `node_id` is in the fleet** - registered
+///   (with the name it proved) or configured. A machine this control plane
+///   has no record of is running nothing of ours and is owed nothing, even
+///   if it holds a certificate this fleet signed;
+/// - every in-flight plan that names `node_id` as a target: a PREPARE push
+///   reaches the node before the deployment pointer is written, and the node
+///   fetches its secrets while preparing. Plans freeze their targets, so a
+///   node that dropped out of the fleet mid-plan still finishes what it was
+///   sent.
 pub(crate) async fn deployments_visible_to(
     state: &CatalogState,
     node_id: &str,
 ) -> crate::catalog::CatalogResult<BTreeMap<String, VisibleDeployment>> {
     let mut visible = BTreeMap::new();
-    for assignment in state.store.list_assignments().await?.assignments {
-        visible.insert(
-            assignment.deployment_id,
-            VisibleDeployment {
-                env_id: assignment.environment_id,
-                snapshot_id: assignment.snapshot_id,
-            },
-        );
+    if state.nodes.node(node_id).is_some() {
+        for assignment in state.store.list_assignments().await?.assignments {
+            visible.insert(
+                assignment.deployment_id,
+                VisibleDeployment {
+                    env_id: assignment.environment_id,
+                    snapshot_id: assignment.snapshot_id,
+                    tenant: deis_wire::conventions::tenant_id(
+                        &assignment.app_id,
+                        &assignment.environment,
+                    ),
+                    routing_generation: assignment.routing_generation,
+                },
+            );
+        }
     }
     for plan in state.store.nonterminal_deployment_plans().await? {
-        if plan.target_ids.iter().any(|target| target == node_id) {
-            visible.entry(plan.id).or_insert(VisibleDeployment {
+        if !plan.target_ids.iter().any(|target| target == node_id)
+            || visible.contains_key(&plan.id)
+        {
+            continue;
+        }
+        let environment = state.store.get_environment_by_id(&plan.env_id).await?;
+        visible.insert(
+            plan.id,
+            VisibleDeployment {
                 env_id: plan.env_id,
                 snapshot_id: plan.snapshot_id,
-            });
-        }
+                tenant: deis_wire::conventions::tenant_id(&plan.app_id, &environment.name),
+                routing_generation: plan.routing_generation.to_string(),
+            },
+        );
     }
     Ok(visible)
 }

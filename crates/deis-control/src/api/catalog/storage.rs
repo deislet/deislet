@@ -119,14 +119,21 @@ pub async fn storage_token(
         "spiffe://deislet/human/{}",
         principal.account.as_deref().unwrap_or("unknown")
     );
-    let token = state
-        .issuer
-        .issue(AUD_STORE, &subject, resources_for_audience(&tenant, AUD_STORE))
-        .await;
-    let queue_token = state
-        .issuer
-        .issue(AUD_QUEUE, &subject, resources_for_audience(&tenant, AUD_QUEUE))
-        .await;
+    let issued = |aud: &'static str| {
+        let issuer = state.issuer.clone();
+        let subject = subject.clone();
+        let tenant = tenant.clone();
+        async move {
+            issuer
+                .issue(aud, &subject, resources_for_audience(&tenant, aud))
+                .await
+                .map_err(|error| {
+                    ApiError::InternalError(format!("the {aud} capability could not be issued: {error}"))
+                })
+        }
+    };
+    let token = issued(AUD_STORE).await?;
+    let queue_token = issued(AUD_QUEUE).await?;
 
     // The mint is also a row in the audit log, written by the gate that let
     // this call through (action `storage_token.mint`, recorded whatever the
@@ -155,7 +162,7 @@ pub async fn storage_token(
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        Harness, harness_with_storage, json, storage_wiring,
+        Harness, harness_with_storage, json, storage_wiring, storage_wiring_without_services,
     };
 
     use axum::http::StatusCode;
@@ -187,7 +194,7 @@ mod tests {
     /// can verify with the issuer's public key.
     #[tokio::test]
     async fn the_token_is_an_ed25519_capability() {
-        let h = platform(storage_wiring(false)).await;
+        let h = platform(storage_wiring()).await;
         let (status, body) = json(&h.router, "GET", ROUTE, serde_json::Value::Null).await;
 
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -234,7 +241,7 @@ mod tests {
     /// tenant, so the two environments of one app must not share one.
     #[tokio::test]
     async fn each_environment_gets_its_own_token() {
-        let h = platform(storage_wiring(false)).await;
+        let h = platform(storage_wiring()).await;
         json(
             &h.router,
             "POST",
@@ -259,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_platform_with_no_store_says_which_key_to_set() {
-        let h = platform(crate::delivery::StorageWiring::default()).await;
+        let h = platform(storage_wiring_without_services()).await;
         let (status, body) = json(&h.router, "GET", ROUTE, serde_json::Value::Null).await;
 
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -277,7 +284,7 @@ mod tests {
     /// credential for a tenant nobody deployed.
     #[tokio::test]
     async fn an_unknown_environment_is_not_minted_for() {
-        let h = platform(storage_wiring(false)).await;
+        let h = platform(storage_wiring()).await;
         let (status, _) = json(
             &h.router,
             "GET",

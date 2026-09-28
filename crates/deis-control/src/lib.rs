@@ -5,6 +5,7 @@ pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 pub mod api;
 pub mod audit;
 pub mod capability_issuer;
+pub mod capability_ledger;
 pub mod catalog;
 pub mod command;
 pub mod config;

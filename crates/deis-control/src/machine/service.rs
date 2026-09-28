@@ -31,13 +31,13 @@ use deis_wire::machine::{
     IssueCapabilityResponse, RegisterNodeRequest, RegisterNodeResponse,
 };
 use tonic::{Request, Response, Status};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::api::catalog::CatalogState;
 use crate::api::catalog::{assignments, routing_table};
 use crate::audit::{AuditRecord, AuditStore, Outcome as AuditOutcome};
 use crate::capability_issuer::CapabilityIssuer;
-use crate::machine::PeerIdentity;
+use crate::machine::{PeerIdentity, issuance};
 
 /// Serves the machine channel's RPCs.
 #[derive(Clone)]
@@ -91,6 +91,66 @@ impl MachineChannelService {
         status
     }
 
+    /// Write down a capability request that was not answered, and say so in
+    /// the service log. Returns the status so a call site can `return Err`
+    /// it. Issued capabilities are recorded in the issuance table instead.
+    async fn refuse_issuance(
+        &self,
+        proved: &SpiffeId,
+        audience: Option<&str>,
+        status: Status,
+    ) -> Status {
+        warn!(
+            proved = %proved,
+            audience = audience.unwrap_or(""),
+            reason = status.message(),
+            "Refused a node's request for a capability"
+        );
+        let http_status = grpc_http_status(status.code());
+        self.audit
+            .record(AuditRecord {
+                actor_kind: "machine".to_string(),
+                actor_account: Some(proved.to_string()),
+                actor_credential: None,
+                action: CAPABILITY_ISSUE_ACTION.to_string(),
+                app_id: None,
+                environment: None,
+                target: audience.map(str::to_string),
+                method: "GRPC".to_string(),
+                path: ISSUE_CAPABILITY_PATH.to_string(),
+                peer: None,
+                outcome: AuditOutcome::from_status(http_status),
+                status: http_status,
+                detail: Some(status.message().to_string()),
+                request_id: None,
+            })
+            .await;
+        status
+    }
+
+    /// Refuse a node revoked as a principal (see
+    /// [`crate::capability_ledger`]): it is answered nothing but its own
+    /// deregistration until an operator lifts the revocation. A ledger that
+    /// cannot be read refuses too - "could not tell" is not "not revoked".
+    async fn refuse_if_revoked(&self, node_id: &str) -> Result<(), Status> {
+        let Some(ledger) = self.issuer.ledger() else {
+            return Ok(());
+        };
+        match ledger.is_node_revoked(node_id).await {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                warn!(node = %node_id, "Refused a machine call from a revoked node");
+                Err(Status::permission_denied(format!(
+                    "node {node_id} has been revoked; an operator must lift the revocation \
+                     before it is answered again"
+                )))
+            }
+            Err(error) => Err(Status::unavailable(format!(
+                "could not tell whether node {node_id} is revoked: {error}"
+            ))),
+        }
+    }
+
     /// The name this caller proved, if the connection established one.
     ///
     /// `None` means the request did not arrive over a connection this
@@ -137,6 +197,21 @@ fn refuse_mismatch(kind: &str, proved: &SpiffeId, claimed: &str) -> Status {
 /// The path an audit line gives a secret fetch: the gRPC method, so the
 /// line reads like the HTTP ones beside it in the same table.
 const FETCH_SECRET_VALUES_PATH: &str = "/deis.machine.MachineChannel/FetchSecretValues";
+
+/// The path and action an audit line gives a refused capability request.
+const ISSUE_CAPABILITY_PATH: &str = "/deis.machine.MachineChannel/IssueCapability";
+const CAPABILITY_ISSUE_ACTION: &str = "capability.issue";
+
+/// The HTTP status an audit line records for a refusal with `code`.
+fn grpc_http_status(code: tonic::Code) -> u16 {
+    match code {
+        tonic::Code::InvalidArgument => 400,
+        tonic::Code::Unauthenticated => 401,
+        tonic::Code::PermissionDenied => 403,
+        tonic::Code::NotFound => 404,
+        _ => 500,
+    }
+}
 
 /// The action an audit line gives a secret fetch.
 const SECRET_FETCH_ACTION: &str = "secret.fetch";
@@ -186,6 +261,7 @@ impl MachineChannel for MachineChannelService {
             .filter(|node_id| *node_id == asked.node_id)
             .ok_or_else(|| refuse_mismatch("node", &proved, &asked.node_id))?
             .to_string();
+        self.refuse_if_revoked(&node_id).await?;
 
         let announced: crate::api::registration::RegisterRequest =
             serde_json::from_str(&asked.registration_json).map_err(|error| {
@@ -270,6 +346,7 @@ impl MachineChannel for MachineChannelService {
             Some(node_id) if node_id == claimed => {}
             _ => return Err(refuse_mismatch("node", &proved, claimed)),
         }
+        self.refuse_if_revoked(claimed).await?;
 
         let base = self.state.deliverer.machine_reconciliation_base_url();
         let answer = assignments::assignments_for(&self.state, claimed, &base)
@@ -304,6 +381,9 @@ impl MachineChannel for MachineChannelService {
         let proved = Self::caller(&request)
             .ok_or_else(no_proved_identity)?
             .clone();
+        if let Some(node_id) = names::node_id_of(&proved) {
+            self.refuse_if_revoked(node_id).await?;
+        }
         let asked = request.into_inner();
 
         // A proxy may say it has taken up a table it is already running, and
@@ -352,6 +432,9 @@ impl MachineChannel for MachineChannelService {
                 return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
             }
         };
+        if let Err(refusal) = self.refuse_if_revoked(&node_id).await {
+            return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
+        }
 
         let entries: Vec<deis_wire::conventions::SecretFetchEntry> =
             match serde_json::from_str(&request.get_ref().entries_json) {
@@ -373,11 +456,14 @@ impl MachineChannel for MachineChannelService {
 
         // The node's own name, from the certificate, decides what it may
         // read - never anything the request says about itself.
-        let visible = assignments::deployments_visible_to(&self.state, &node_id)
-            .await
-            .map_err(|error| {
-                Status::internal(format!("could not list visible deployments: {error:?}"))
-            })?;
+        let visible = match assignments::deployments_visible_to(&self.state, &node_id).await {
+            Ok(visible) => visible,
+            Err(error) => {
+                let refusal =
+                    Status::internal(format!("could not list visible deployments: {error:?}"));
+                return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
+            }
+        };
 
         // Every entry is checked before anything is decrypted, and one bad
         // entry refuses the whole request: a partial answer would let a
@@ -407,6 +493,7 @@ impl MachineChannel for MachineChannelService {
         }
 
         let mut values: BTreeMap<String, String> = BTreeMap::new();
+        let mut accepted = Vec::with_capacity(wanted.len());
         for (entry, env_id, snapshot_id, revisions) in wanted {
             let fetched = match self
                 .state
@@ -434,29 +521,50 @@ impl MachineChannel for MachineChannelService {
             };
             // Revision ids and a count, never a value.
             let revision_list = revisions.iter().cloned().collect::<Vec<_>>().join(",");
-            self.audit
-                .record(secret_fetch_record(
-                    &proved,
-                    Some(&entry.deployment_id),
-                    AuditOutcome::Accepted,
-                    200,
-                    format!("revisions={revision_list} count={}", fetched.len()),
-                ))
-                .await;
-            debug!(
-                node = %node_id,
-                deployment_id = %entry.deployment_id,
-                count = fetched.len(),
-                "A node fetched secret values over the machine channel"
-            );
+            accepted.push(secret_fetch_record(
+                &proved,
+                Some(&entry.deployment_id),
+                AuditOutcome::Accepted,
+                200,
+                format!("revisions={revision_list} count={}", fetched.len()),
+            ));
             for (revision, value) in fetched {
                 values.insert(format!("{}\x00{revision}", entry.deployment_id), value);
             }
         }
 
-        let values_json = serde_json::to_string(&values).map_err(|error| {
-            Status::internal(format!("could not encode secret values: {error}"))
-        })?;
+        let values_json = match serde_json::to_string(&values) {
+            Ok(json) => json,
+            Err(error) => {
+                let refusal = Status::internal(format!("could not encode secret values: {error}"));
+                return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
+            }
+        };
+
+        // Fail closed: a value leaves this process only once the row saying
+        // it did is durable. A fetch the audit log cannot show is the one
+        // thing this row exists to rule out, so an audit table that cannot
+        // be written means no values, not values and a log line.
+        for record in accepted {
+            let deployment_id = record.target.clone();
+            if let Err(error) = self.audit.try_record(record).await {
+                error!(
+                    proved = %proved,
+                    deployment_id = deployment_id.as_deref().unwrap_or(""),
+                    error = %error,
+                    "Withheld secret values from a node because the audit row for the fetch could not be written"
+                );
+                return Err(Status::unavailable(
+                    "the audit record for this secret fetch could not be written, so no value \
+                     is handed over; retry once the control plane's database accepts writes",
+                ));
+            }
+            debug!(
+                node = %node_id,
+                deployment_id = deployment_id.as_deref().unwrap_or(""),
+                "A node fetched secret values over the machine channel"
+            );
+        }
         Ok(Response::new(FetchSecretValuesResponse { values_json }))
     }
 
@@ -468,14 +576,20 @@ impl MachineChannel for MachineChannelService {
             .ok_or_else(no_proved_identity)?
             .clone();
         let claimed = &request.get_ref().node_id;
-        match names::node_id_of(&proved) {
-            Some(node_id) if node_id == claimed => {}
-            _ => return Err(refuse_mismatch("node", &proved, claimed)),
+        let node_id = match names::node_id_of(&proved) {
+            Some(node_id) if node_id == claimed => node_id.to_string(),
+            _ => {
+                let refusal = refuse_mismatch("node", &proved, claimed);
+                return Err(self.refuse_issuance(&proved, None, refusal).await);
+            }
+        };
+        if let Err(refusal) = self.refuse_if_revoked(&node_id).await {
+            return Err(self.refuse_issuance(&proved, None, refusal).await);
         }
 
         let asked = request.into_inner();
+        let audience = asked.audience.as_str();
 
-        // Parse the requested resources from JSON.
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct ResourceRequest {
@@ -484,38 +598,61 @@ impl MachineChannel for MachineChannelService {
             #[serde(default)]
             generation: Option<String>,
         }
+        let resources: Vec<deis_capability::CapabilityResource> =
+            match serde_json::from_str::<Vec<ResourceRequest>>(&asked.resources_json) {
+                Ok(requested) => requested
+                    .into_iter()
+                    .map(|r| deis_capability::CapabilityResource {
+                        tenant: r.tenant,
+                        binding: r.binding,
+                        generation: r.generation,
+                    })
+                    .collect(),
+                Err(error) => {
+                    let refusal = Status::invalid_argument(format!(
+                        "resources_json could not be parsed: {error}"
+                    ));
+                    return Err(self.refuse_issuance(&proved, Some(audience), refusal).await);
+                }
+            };
 
-        let resource_requests: Vec<ResourceRequest> = serde_json::from_str(&asked.resources_json)
-            .map_err(|error| {
-            Status::invalid_argument(format!("resources_json could not be parsed: {error}"))
-        })?;
-
-        let resources: Vec<deis_capability::CapabilityResource> = resource_requests
-            .into_iter()
-            .map(|r| deis_capability::CapabilityResource {
-                tenant: r.tenant,
-                binding: r.binding,
-                generation: r.generation,
-            })
-            .collect();
-
-        if resources.is_empty() {
-            return Err(Status::invalid_argument(
-                "at least one resource must be requested",
-            ));
+        // What this node runs, from its proved name - never from anything
+        // the request says about itself.
+        let visible = match assignments::deployments_visible_to(&self.state, &node_id).await {
+            Ok(visible) => visible,
+            Err(error) => {
+                let refusal =
+                    Status::internal(format!("could not list visible deployments: {error:?}"));
+                return Err(self.refuse_issuance(&proved, Some(audience), refusal).await);
+            }
+        };
+        if let Err(reason) = issuance::authorize(&node_id, audience, &resources, &visible) {
+            let refusal = if resources.is_empty() {
+                Status::invalid_argument(reason)
+            } else {
+                Status::permission_denied(reason)
+            };
+            return Err(self.refuse_issuance(&proved, Some(audience), refusal).await);
         }
 
-        let capability_token = self
+        let capability_token = match self
             .issuer
-            .issue(&asked.audience, &proved.to_string(), resources)
-            .await;
+            .issue(audience, proved.as_str(), resources)
+            .await
+        {
+            Ok(token) => token,
+            Err(error) => {
+                let refusal =
+                    Status::internal(format!("the capability could not be issued: {error}"));
+                return Err(self.refuse_issuance(&proved, Some(audience), refusal).await);
+            }
+        };
 
         debug!(
             node = %proved,
-            audience = %asked.audience,
-            "Issued capability token"
+            audience = %audience,
+            "Issued a capability; it is in the issuance table under its jti"
         );
-
         Ok(Response::new(IssueCapabilityResponse { capability_token }))
     }
 }
@@ -546,7 +683,9 @@ mod tests {
     }
 
     fn make_service(state: CatalogState) -> MachineChannelService {
-        let issuer = CapabilityIssuer::for_test("spiffe://deislet/control/test");
+        // The harness's issuer, which records into the harness's database,
+        // so a test can read back what was issued.
+        let issuer = state.issuer.clone();
         MachineChannelService::new(state, issuer)
     }
 
@@ -1002,6 +1141,80 @@ mod tests {
         }
     }
 
+    /// Run `sql` against the catalog's database, for a test that has to
+    /// break it.
+    async fn break_database(state: &CatalogState, sql: &'static str) {
+        state
+            .store
+            .database()
+            .with_connection(move |conn| {
+                conn.execute_batch(sql)?;
+                Ok::<(), crate::database::DatabaseError>(())
+            })
+            .await
+            .expect("the statement runs");
+    }
+
+    /// A value leaves only once its audit row is durable. With the audit
+    /// table refusing writes, the node gets no values at all.
+    #[tokio::test]
+    async fn no_secret_value_is_handed_over_without_its_audit_row() {
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+        break_database(
+            &h.state,
+            "CREATE TRIGGER refuse_audit BEFORE INSERT ON audit_log \
+             BEGIN SELECT RAISE(ABORT, 'audit is read-only'); END;",
+        )
+        .await;
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect_err("values were handed over with no audit row");
+        assert_eq!(refusal.code(), tonic::Code::Unavailable);
+        assert!(
+            !refusal.message().contains("first-value"),
+            "{}",
+            refusal.message()
+        );
+    }
+
+    /// A fetch the control plane could not serve is still a fetch someone
+    /// asked for, and is written down like a refusal.
+    #[tokio::test]
+    async fn an_internal_failure_is_written_to_the_audit_log() {
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+        break_database(
+            &h.state,
+            "ALTER TABLE deployment_plans RENAME TO deployment_plans_gone;",
+        )
+        .await;
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect_err("a broken catalog answered");
+        assert_eq!(refusal.code(), tonic::Code::Internal);
+
+        let lines = secret_fetch_lines(&h.state).await;
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+        assert_eq!(lines[0].status, 500);
+        assert_eq!(
+            lines[0].actor_account.as_deref(),
+            Some(node("runtime-test").to_string().as_str())
+        );
+    }
+
     /// The node the answer is for comes from the certificate: claiming
     /// another node's id is refused, and a deployment in flight only to
     /// another node is not visible to this one.
@@ -1084,5 +1297,263 @@ mod tests {
             .await
             .expect_err("a node fetched secrets of a plan that does not target it");
         assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+    }
+
+    // -----------------------------------------------------------------------
+    // IssueCapability: only for what the node runs.
+    // -----------------------------------------------------------------------
+
+    fn capability_request(
+        node_id: &str,
+        audience: &str,
+        resources: &[deis_capability::CapabilityResource],
+    ) -> IssueCapabilityRequest {
+        IssueCapabilityRequest {
+            node_id: node_id.to_string(),
+            audience: audience.to_string(),
+            resources_json: serde_json::to_string(resources).unwrap(),
+        }
+    }
+
+    async fn issuance_refusals(state: &CatalogState) -> Vec<crate::audit::AuditEntry> {
+        AuditStore::new(state.store.database())
+            .query_page(
+                crate::audit::AuditQuery {
+                    action: Some(CAPABILITY_ISSUE_ACTION.to_string()),
+                    ..Default::default()
+                },
+                100,
+                None,
+            )
+            .await
+            .expect("the audit log reads")
+            .items
+    }
+
+    async fn issued_jtis(state: &CatalogState) -> Vec<(String, String)> {
+        state
+            .store
+            .database()
+            .with_connection(|conn| {
+                let mut statement = conn
+                    .prepare("SELECT jti, subject FROM capability_issuances ORDER BY issued_at")?;
+                let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(crate::database::DatabaseError::from)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// A node running `demo` in production is issued store and queue
+    /// capabilities for it, each written to the issuance table under the
+    /// name the node proved.
+    #[tokio::test]
+    async fn a_node_is_issued_a_capability_for_what_it_runs_and_it_is_recorded() {
+        use deis_capability::{AUD_QUEUE, AUD_STORE, resources_for_audience};
+        let h = harness(true).await;
+        deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+
+        for aud in [AUD_STORE, AUD_QUEUE] {
+            let answer = service
+                .issue_capability(from(
+                    &node("runtime-test"),
+                    capability_request(
+                        "runtime-test",
+                        aud,
+                        &resources_for_audience("demo.production", aud),
+                    ),
+                ))
+                .await
+                .expect("a node may have a capability for what it runs");
+            let claims = deis_capability::decode(
+                &answer.get_ref().capability_token,
+                &h.state.issuer.verifying_key().await,
+            )
+            .unwrap();
+            assert_eq!(claims.sub, node("runtime-test").to_string());
+            assert!(
+                claims.exp - claims.iat <= 15 * 60,
+                "a node capability lives at most fifteen minutes"
+            );
+        }
+        let issued = issued_jtis(&h.state).await;
+        assert_eq!(issued.len(), 2);
+        assert!(
+            issued
+                .iter()
+                .all(|(_, subject)| *subject == node("runtime-test").to_string())
+        );
+        assert!(issuance_refusals(&h.state).await.is_empty());
+    }
+
+    /// The property this whole check exists for: a node - compromised or
+    /// not - cannot mint access to a tenant it does not run, even alongside
+    /// one it does. The refusal is on the audit log under its proved name.
+    #[tokio::test]
+    async fn a_node_cannot_mint_for_a_tenant_it_does_not_run() {
+        use deis_capability::{AUD_STORE, resources_for_audience};
+        let h = harness(true).await;
+        deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+
+        let mut asked = resources_for_audience("demo.production", AUD_STORE);
+        asked.extend(resources_for_audience("victim.production", AUD_STORE));
+        let refusal = service
+            .issue_capability(from(
+                &node("runtime-test"),
+                capability_request("runtime-test", AUD_STORE, &asked),
+            ))
+            .await
+            .expect_err("a node minted a capability for a tenant it does not run");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        assert!(refusal.message().contains("victim.production"));
+        assert!(issued_jtis(&h.state).await.is_empty(), "nothing was issued");
+
+        let lines = issuance_refusals(&h.state).await;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].actor_account.as_deref(),
+            Some(node("runtime-test").to_string().as_str())
+        );
+        assert_eq!(lines[0].status, 403);
+    }
+
+    /// A machine with a certificate this fleet signed but no place in the
+    /// fleet runs nothing of ours, so it is owed nothing - and neither is a
+    /// node asking for an audience nothing checks per tenant.
+    #[tokio::test]
+    async fn a_node_outside_the_fleet_or_asking_for_an_unknown_audience_gets_nothing() {
+        use deis_capability::{AUD_STORE, resources_for_audience};
+        let h = harness(true).await;
+        deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+
+        let refusal = service
+            .issue_capability(from(
+                &node("runtime-stranger"),
+                capability_request(
+                    "runtime-stranger",
+                    AUD_STORE,
+                    &resources_for_audience("demo.production", AUD_STORE),
+                ),
+            ))
+            .await
+            .expect_err("a node outside the fleet was issued a capability");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        let refusal = service
+            .issue_capability(from(
+                &node("runtime-test"),
+                capability_request(
+                    "runtime-test",
+                    "telemetry.read",
+                    &resources_for_audience("demo.production", AUD_STORE),
+                ),
+            ))
+            .await
+            .expect_err("a node was issued a read capability");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        let refusal = service
+            .issue_capability(from(
+                &node("runtime-test"),
+                capability_request(
+                    "runtime-other",
+                    AUD_STORE,
+                    &resources_for_audience("demo.production", AUD_STORE),
+                ),
+            ))
+            .await
+            .expect_err("a node asked as another node");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        assert_eq!(issuance_refusals(&h.state).await.len(), 3);
+    }
+
+    /// Revoking a node outlasts the tokens it held: until the revocation is
+    /// lifted it gets no new capability, no secret and no assignment list,
+    /// and cannot register its way back - each refusal on the audit log
+    /// where the RPC keeps one. Lifting it restores issuance.
+    #[tokio::test]
+    async fn a_revoked_node_is_answered_nothing_until_it_is_lifted() {
+        use deis_capability::{AUD_STORE, resources_for_audience};
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+        let ask = || {
+            from(
+                &node("runtime-test"),
+                capability_request(
+                    "runtime-test",
+                    AUD_STORE,
+                    &resources_for_audience("demo.production", AUD_STORE),
+                ),
+            )
+        };
+        service
+            .issue_capability(ask())
+            .await
+            .expect("issued before revocation");
+
+        let ledger = h.state.issuer.ledger().expect("the harness keeps a ledger");
+        let revoked = ledger
+            .revoke(crate::capability_ledger::RevocationScope::Node(
+                "runtime-test".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revoked.len(), 1);
+
+        let refusal = service
+            .issue_capability(ask())
+            .await
+            .expect_err("a revoked node was issued a new capability");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            issued_jtis(&h.state).await.len(),
+            1,
+            "nothing new was issued"
+        );
+        assert_eq!(issuance_refusals(&h.state).await.len(), 1);
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect_err("a revoked node fetched secret values");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        assert_eq!(secret_fetch_lines(&h.state).await.len(), 1);
+
+        let refusal = service
+            .fetch_assignments(from(
+                &node("runtime-test"),
+                FetchAssignmentsRequest {
+                    node_id: "runtime-test".to_string(),
+                },
+            ))
+            .await
+            .expect_err("a revoked node read its assignments");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        let refusal = service
+            .register(from(
+                &node("runtime-test"),
+                RegisterNodeRequest {
+                    node_id: "runtime-test".to_string(),
+                    registration_json: "{}".to_string(),
+                },
+            ))
+            .await
+            .expect_err("a revoked node registered again");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        assert!(ledger.lift_node("runtime-test").await.unwrap());
+        service
+            .issue_capability(ask())
+            .await
+            .expect("issued again once lifted");
     }
 }

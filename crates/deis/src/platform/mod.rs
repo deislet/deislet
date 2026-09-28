@@ -5,6 +5,7 @@
 //! returns, so an added field there does not break an older CLI.
 
 pub mod queue;
+pub mod service_tls;
 pub mod storage;
 pub mod telemetry;
 
@@ -749,6 +750,22 @@ pub struct StorageCredentials {
     /// only its own audience, so the store token is refused there.
     #[serde(default)]
     pub queue_token: Option<String>,
+}
+
+/// A deis-telemetry read capability and the tenants it reads.
+#[derive(Deserialize)]
+pub struct TelemetryCredentials {
+    pub tenants: Vec<String>,
+    pub token: String,
+}
+
+/// Never derived: the token must not reach a log line.
+impl std::fmt::Debug for TelemetryCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryCredentials")
+            .field("tenants", &self.tenants)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What this credential can see of the runtime fleet.
@@ -2336,12 +2353,11 @@ impl Control {
     /// Served by `deis-control`'s
     /// `api::catalog::storage::storage_token`, behind the same API-key
     /// middleware as the deploy route and gated on the same application and
-    /// environment having to exist. The token is minted there rather than
-    /// this CLI being handed the shared `auth_secret`, which is the whole
-    /// point of a capability token: a leaked CLI credential still only ever
-    /// proves the holder may deploy and inspect *through the control plane's
-    /// own checks*, and never hands out the key every tenant's token is
-    /// derived from.
+    /// environment having to exist. The token is signed there, for 15
+    /// minutes, and recorded in the issuance table: a leaked CLI credential
+    /// still only ever proves the holder may deploy and inspect *through the
+    /// control plane's own checks*, and never hands out the key capabilities
+    /// are signed with.
     ///
     /// A control plane with no deis-store address
     /// answers 409 with a message naming the key to set, which the generic
@@ -2360,6 +2376,35 @@ impl Control {
             &format!("obtaining a storage capability token for {environment} of app {app_id}"),
         )
         .await
+    }
+
+    // ---- telemetry --------------------------------------------------------
+
+    /// A read capability for deis-telemetry: `deis logs`, `deis tail` and
+    /// `deis trace` present it on every call.
+    ///
+    /// Served by `deis-control`'s `api::catalog::telemetry`, gated on
+    /// `read` over exactly what is asked for - one environment, or every
+    /// environment of the application when `environment` is `None` - and
+    /// recorded in the audit log every time.
+    pub async fn telemetry_credentials(
+        &self,
+        app_id: &str,
+        environment: Option<&str>,
+    ) -> Result<TelemetryCredentials> {
+        let (path, what) = match environment {
+            Some(environment) => (
+                format!("/apps/{app_id}/environments/{environment}/telemetry-token"),
+                format!("obtaining a telemetry read capability for {environment} of app {app_id}"),
+            ),
+            None => (
+                format!("/apps/{app_id}/telemetry-token"),
+                format!(
+                    "obtaining a telemetry read capability for every environment of app {app_id}"
+                ),
+            ),
+        };
+        self.send(self.request(Method::GET, &path), &what).await
     }
 
     // ---- accounts, tokens and the audit log ---------------------------

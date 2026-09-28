@@ -18,12 +18,15 @@ changed with them: there is no anonymous path and no key shared through a
 configuration file any more - every caller presents a token, resolved against
 a hash in the control plane's database, and a control plane with no credential
 at all mints a one-time bootstrap token written to a file only its own host can
-read. What did not change: `storage_auth_secret` and the matching `auth_secret`
-on deis-store and deis-queue, the `auth_secret` shared between deis-telemetry
-and every node's `[logging]`, are still values copied between files, and whoever
-holds one holds everything it opens. A reader who concludes that everything
-moved to certificates will protect the wrong files, which is why this document
-says which is which before it says anything else.
+read. Telemetry moved too: deis-telemetry holds no secret and accepts only
+capabilities the control plane signed (see "Telemetry" below), and so do
+deis-store and deis-queue: each serves TLS with its own certificate and
+verifies short-lived capabilities against keys it reads from the control
+plane, with no value shared between files. What did not change: the
+migration admin tokens and the control plane's master key are still values
+held in files, and whoever holds one holds everything it opens. A reader who
+concludes that everything moved to certificates will protect the wrong files,
+which is why this document says which is which before it says anything else.
 
 ## How a process proves who it is
 
@@ -56,6 +59,9 @@ Nothing here issues, renews or revokes a certificate. That is the
 installation's own certificate authority, and `deis-identity` deliberately
 knows nothing about where the files came from. What the platform insists on is
 the shape of the name, not its issuer.
+What it can refuse is a name: a node revoked on the control plane is answered
+nothing on the machine channel, whatever certificate proves it, until the
+revocation is lifted (see "Taking capabilities back").
 
 ### Where each process is configured
 
@@ -73,9 +79,15 @@ demand a client certificate. Two sockets, and what is on them:
 
 **The control plane's machine listener** (`crates/deis-control/src/machine/listen.rs`)
 serves the gRPC service `deis.machine.MachineChannel` - `Register`,
-`Deregister`, `FetchAssignments`, `FetchRoutingTable` - the bundle download
-beside it over HTTP/1.1 (`versions::BUNDLE_ROUTE`), and the long-lived control
-channel `deis.control.ControlService/EstablishChannel`.
+`Deregister`, `FetchAssignments`, `FetchRoutingTable`, `FetchSecretValues`,
+`IssueCapability` - the bundle download beside it over HTTP/1.1
+(`versions::BUNDLE_ROUTE`), the long-lived control channel
+`deis.control.ControlService/EstablishChannel`, the signed capability
+revocation list (`/capability/revocation-list`), and the capability verifying
+keys as a JWKS document (`/.well-known/deis/capability-jwks.json`). The keys
+are public, but whoever answers for that document decides which capabilities
+deis-store, deis-queue and deis-telemetry honour, so it is served here and
+nowhere else: the human listener has neither it nor the revocation list.
 
 **A node's management listener** (`crates/deis-runtime/src/dispatcher/machine.rs`)
 serves `deis.management.RuntimeManagement` and `deis.trigger.Trigger`, and
@@ -83,10 +95,42 @@ admits exactly one name: the control plane this node was configured to expect.
 Every other certificate this fleet has ever signed is refused at the
 connection, node and proxy certificates included.
 
+**The data services** - deis-store, deis-queue and deis-telemetry - each hold a
+machine identity of their own under `[machine_identity]`:
+`spiffe://<trust domain>/deislet/store/<id>`, `.../queue/<id>` and
+`.../telemetry/<id>`, issued by the same authority as every other machine
+(`crates/deis-identity/src/names.rs`). A service refuses to start with a
+certificate naming any other kind of machine. The identity is used twice:
+
+* their gRPC listeners speak TLS only, presenting that certificate
+  (`deis_identity::accept_tls`, `crates/deis-identity/src/service.rs`). There is
+  no plaintext listener, so the bearer capability every call carries is never
+  readable on the wire. The listener asks the caller for no certificate - a
+  person's `deis kv` holds none - and what the caller may do is decided by the
+  capability, per call. Every caller checks the far end by role: the
+  certificate must chain to the fleet's trust root and name the kind of
+  service it meant to reach (`VerifyServerIsOfKind`), so a queue's certificate,
+  signed by the same authority, does not answer for a store, and a machine that
+  merely holds a store's address gets a refused handshake instead of the
+  capability. Runtime nodes and the control plane check against their own
+  machine identity's root and trust domain; the CLI checks against the root
+  named by `DEIS_SERVICES_CA` or `[services] ca`.
+* they read the JWKS from the control plane's machine listener under mutual
+  TLS, proving that certificate and requiring the control plane's name in the
+  same trust domain (`deis_capability::ControlClient`). `control_endpoint` must
+  be `https://`; plain `http://` is refused at startup unless it names a
+  loopback address, where nothing on the network sits between the two
+  processes.
+
+Binding a capability to the caller's certificate (`cnf`) is not implemented,
+so a capability copied off a node still works from anywhere that can reach the
+service until it expires; the TLS above only keeps it from being read in
+transit or handed to the wrong machine.
+
 | A holder of | can do |
 |---|---|
-| the control plane's private key | Drive any node that has registered a name and a management address: `ApplyDeployment` (run a bundle of the caller's choosing under any tenant's identity, **with that environment's decrypted secrets carried in the same request**), `UnloadApp`, `GetStatus` (every tenant's applications and metrics on that node), `StartInspect`, `HealthCheck`, and the cron trigger `OnScheduled`. `PushConfig`, `UpdateApp` and `ExecuteCommand` exist on the wire and answer `unimplemented` (`crates/deis-runtime/src/management/service.rs`). This is the only way any node is dialled: `crates/deis-control/src/runtime_client/mod.rs` builds one channel, over mutual TLS, and a node that proved no name or reported no management address is not driven at all and says so. |
-| one node's private key | `Register` and `Deregister` **its own id only** - the id in the request is held against the id in the proved name and a mismatch is refused (`crates/deis-control/src/machine/service.rs`). `FetchAssignments` for its own id only, and that answer carries **every** environment's decrypted secrets, not that node's (see "What is not implemented"). `FetchRoutingTable`. The bundle download for any application and any version: the handler checks nothing about who is asking (`crates/deis-control/src/api/catalog/versions.rs`, `download_bundle`). And the control channel, for a place in the session list, heartbeats and whatever operator-issued command is addressed to the id it announced. |
+| the control plane's private key | Drive any node that has registered a name and a management address: `ApplyDeployment` (run a bundle of the caller's choosing under any tenant's identity; the request carries no secret value and no storage credential - the node fetches both itself, under its own name), `UnloadApp`, `GetStatus` (every tenant's applications and metrics on that node), `StartInspect`, `HealthCheck`, and the cron trigger `OnScheduled`. `PushConfig`, `UpdateApp` and `ExecuteCommand` exist on the wire and answer `unimplemented` (`crates/deis-runtime/src/management/service.rs`). This is the only way any node is dialled: `crates/deis-control/src/runtime_client/mod.rs` builds one channel, over mutual TLS, and a node that proved no name or reported no management address is not driven at all and says so. |
+| one node's private key | `Register` and `Deregister` **its own id only** - the id in the request is held against the id in the proved name and a mismatch is refused (`crates/deis-control/src/machine/service.rs`). `FetchAssignments` for its own id only; the answer carries no secret value. `FetchSecretValues` for the secret revisions of any deployment on that list - which is **every** environment's, not that node's (see "What is not implemented") - each fetch written to the audit log before any value is returned, and refused if the row cannot be written. `IssueCapability` in its own name, 15 minutes each, naming only tenants of deployments assigned to that node - one resource outside them refuses the whole request, and the refusal is written to the audit log (`crates/deis-control/src/machine/issuance.rs`); every capability issued is recorded in the issuance table. The revocation list. Whatever it fetched is also in its sealed offline cache (`<data_dir>/offline-cache/`, AES-256-GCM under a key derived from this private key), so the key opens that file too. `FetchRoutingTable`. The bundle download for any application and any version: the handler checks nothing about who is asking (`crates/deis-control/src/api/catalog/versions.rs`, `download_bundle`). And the control channel, for a place in the session list, heartbeats and whatever operator-issued command is addressed to the id it announced. |
 | one proxy's private key | `FetchRoutingTable`, and the control channel. Not `FetchAssignments`: a proxy name yields no node id, so the call is refused. The bundle download is not scoped either, so a proxy certificate reaches it too. |
 | an inspector session token, minted by `StartInspect` | A Chrome DevTools Protocol WebSocket **on the node's `management_listen`**, against a running isolate: full debugger access to a tenant's running code (`crates/deis-runtime/src/dispatcher/machine.rs`). The socket it used to live on - the data port - now admits only a proxy's certificate, so the token alone no longer reaches it: the caller proves the control plane's name first. |
 
@@ -140,10 +184,38 @@ one file.
 
 | Value | Held by | What holding it is worth |
 |---|---|---|
-| `storage_auth_secret` on deis-control, the identical `auth_secret` on deis-store and deis-queue | three processes, one value | The control plane mints `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant and writes it into that tenant's deployment; the backend recomputes the expected token from the tenant the call itself claims (`crates/deis-store/src/auth.rs`, `crates/deis-control/src/delivery/mod.rs`). The secret mints a token for **any** tenant, so holding it is holding every tenant's data in both backends. A token does not expire; the only lever is changing the secret, which invalidates every token at once. |
-| `auth_secret` on deis-telemetry, the identical `[logging] auth_secret` on **every node** | deis-telemetry and every runtime node | One token for the whole service - `base64(HMAC-SHA256(auth_secret, "deis-telemetry"))`, the subject fixed - so it says "the holder is part of this platform" and names no tenant (`crates/deis-telemetry/src/auth.rs`, `crates/deis-runtime/src/telemetry.rs`). Holding it is reading every application's logs, traces and metric series. This is the one shared value a node's own configuration file still carries. |
-| `store_migration_admin_token`, `queue_migration_admin_token`, `telemetry_migration_admin_token` | deis-control and the backend it names | Freeze and inventory any tenant in that backend. Each is independent of the others and must not equal that backend's `auth_secret` - deis-store refuses to start its management service if it does (`crates/deis-store/src/server.rs`). |
+| `store_migration_admin_token`, `queue_migration_admin_token`, `telemetry_migration_admin_token` | deis-control and the backend it names | Freeze and inventory any tenant in that backend. Each is independent of the others and of every other credential. |
 | the master key in `secret_key_file` | deis-control alone | Not shared between machines, but one key for every tenant: every environment's secrets in the database are encrypted with it (`crates/deis-control/src/catalog/secrets.rs`). The encrypted rows are worth nothing without it and everything with it. |
+
+## Telemetry
+
+deis-telemetry has no secret of its own and no mode without the check. Every
+push, query, follow stream and Prometheus scrape presents a capability with
+audience `telemetry`, verified against the keys the control plane publishes
+at `/.well-known/deis/capability-jwks.json` on its machine listener - read
+under mutual TLS with deis-telemetry's own `[machine_identity]` - with the
+same 15-minute ceiling, revocation list and T8 grace as deis-store and
+deis-queue (`crates/deis-telemetry/src/auth.rs`). A follow stream (`Tail`,
+`TailTraces`) is checked when it opens and ends with `Unauthenticated` when
+the capability it opened with expires; a revocation reaches an open stream at
+that point, not sooner. A capability's resources say
+what it may touch, one (tenant, binding) pair each:
+
+| Binding | Issued to | What it allows |
+|---|---|---|
+| `ingest` for `<app>.<env>` | a node, over the machine channel (`IssueCapability`), for each application environment it runs | Push that tenant's logs, traces and metric samples. A record for any tenant the capability does not name is refused and counted as rejected. It reads nothing. |
+| `ingest` for `@platform` | every node, whatever it runs | Push the node's own records - the ones with no application (process metrics, component log lines). |
+| `read` for `<app>.<env>` | a person, from `GET /api/v1/apps/{app}/environments/{env}/telemetry-token` (needs `read:{app}/{env}`) or `GET /api/v1/apps/{app}/telemetry-token` (needs `read:{app}/*`, every environment) | Query and follow that tenant's records and nothing else: a read must name an application the capability reaches, and whatever comes back is filtered to the tenants it names. It writes nothing. |
+| `read` for `@platform` | a person holding `read:*/*`, from `GET /api/platform/telemetry-token` | Read everything, every tenant and the nodes' own records. The Prometheus page is every series at once, so it accepts only this. |
+
+Every mint on the human side is recorded in the audit log whatever its
+outcome (`telemetry_token.mint`, `telemetry_token.mint_platform`), like the
+storage-token mint. What a compromised node can do here is what it can do
+with its capability: write the tenants it runs and its own records, and read
+nothing - `IssueCapability` refuses a node any `read` binding, and any tenant
+it does not run (`crates/deis-control/src/machine/issuance.rs`). A Prometheus server scraping the page needs a fresh platform read
+capability at least every 15 minutes (a `bearer_token_file` kept current by
+something holding `read:*/*`); there is no long-lived scrape credential.
 
 ## What the fleet-wide key was, and why it went
 
@@ -261,8 +333,9 @@ network - not by the absence of a published address:
 | Node `[machine_identity] management_listen` | The one machine this node's `[machine_identity]` names as its control plane, and nobody else this fleet has ever signed a certificate for - every other proved name is refused at the connection. |
 | Control plane's human listener (`bind_addr`, `port`) | The operators' network. Never the internet. It serves the dashboard and the API - every caller presents a token, and there is no anonymous path - plus a control channel that admits nobody. |
 | Control plane's `[machine]` listener | Machines holding a certificate this fleet signed. This is where the assignment list, the routing table and the bundle store live, so it must never be the internet either - the certificate demand is the authentication, not the containment. |
-| deis-store and deis-queue gRPC ports | Runtime nodes, the control plane and the operators' network only. Each binds loopback by default and refuses to start bound anywhere else with no `auth_secret`; the optional migration service shares the listener under its own independent token. |
-| deis-telemetry's gRPC port and its Prometheus port | The same set, and both count: one serves logs and traces, the other every application's metric series. |
+| deis-store and deis-queue gRPC ports (TLS only) | Runtime nodes, the control plane and the operators' network only. Each binds loopback by default; every call carries a capability whatever the address, and a plaintext caller gets no answer. The optional migration service shares the listener under its own independent token. |
+| deis-telemetry's gRPC port (TLS only) | The same set: it serves logs and traces. Every call presents a control-signed capability, and there is no mode without that check. |
+| Every Prometheus port: deis-telemetry's `metrics_listen`, and deis-store's and deis-queue's when set | This host only. They speak plain HTTP, so each service refuses to start unless the address is a loopback IP literal (`deis_capability::exposition::require_loopback`); scrape from the host or through a tunnel. deis-telemetry's also demands a platform-wide read capability on every scrape - the one bearer that reads every tenant's telemetry, which is why it never crosses a network in the clear. |
 | deis-proxy's listeners | The internet. This is the only one that belongs there. |
 
 A `[machine_identity]` private key is a credential like any other, whatever
@@ -281,13 +354,13 @@ Everything below is therefore the operator's to enforce:
 
 | File | Required |
 |---|---|
-| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `storage_auth_secret`, `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`, and names the `[machine]` identity files. The three migration values must be different from each other and from every other credential. |
+| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`, and names the `[machine]` identity files. The three migration values must be different from each other and from every other credential. |
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
 | The control plane's `<data_dir>/bootstrap.token` | `0600`, written by the control plane itself on a first start and deleted the moment the bootstrap token is used. Until then it is an operator credential - it exists to create the first owner account and nothing else - so treat it like one and do not let it out of the host. It is not part of a backup of the data directory: it is short-lived by design, and backing one up means carrying an unused way in. |
-| Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchAssignments` still answers with every environment's secrets. Issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. |
-| Every node's configuration | `0600`, owned by the node's service user. It no longer holds a fleet credential, but it is not free of secrets: `[logging] auth_secret` is deis-telemetry's own value, and the file also names the path of this node's private key and the one control plane this node obeys - which is what decides who may deploy to it. |
+| Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchSecretValues` still answers for every environment's secrets. Certificate issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. What the platform can do with a compromised node's name is revoke the node (see "Taking capabilities back"): the control plane then answers that name nothing and every verifier refuses its capabilities, whatever certificate proves it. |
+| Every node's configuration | `0600`, owned by the node's service user. It holds no shared credential - its telemetry capability is issued by the control plane at run time - but the file names the path of this node's private key and the one control plane this node obeys - which is what decides who may deploy to it. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same contents, same reasoning, on the one host that faces the internet. |
-| deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. They hold the application-data `auth_secret` and the independent `migration_admin_token`; possession of the latter can freeze and inventory any tenant in that backend. Never reuse one value for both domains. |
+| deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. They hold the independent `migration_admin_token` - possession of it can freeze and inventory any tenant in that backend - and name the service's `[machine_identity]` files. The private key is `0600` like every other machine's: whoever holds a store's key can answer for a store and collect the capabilities sent to it. |
 | `.demo/` written by `scripts/demo.sh` | The demo writes every configuration it generates, `state.env`, `secret.key` and every private key it mints as `0600`; `scripts/test-demo-witnesses.sh` holds it to that statically. Five of those files carry a credential value - `state.env`, `secret.key` and the store, queue and control-plane configurations - and the node's and the proxy's carry a path to a key file instead. It is still a workstation tool: it puts every process under one user, so the mode separates the demo from other accounts on the host and nothing else. Do not copy a `.demo/` configuration into a real deployment. |
 
 ## Rotating the credential
@@ -320,10 +393,19 @@ knowing:
   (`MachineIdentity::announce_expiry` / `report_expiry`). The threshold is a
   fraction of the certificate's own lifetime - `warn` at four fifths spent,
   `error` at nineteen twentieths - rather than a number of days, because this
-  platform is handed both two-day certificates and multi-year ones, and a
+  platform is handed both four-day certificates and multi-year ones, and a
   fixed threshold would either say nothing useful on one or fire on every
   correct startup on the other. A warning that fires when nothing is wrong is
-  how an operator learns to skip the one that matters.
+  how an operator learns to skip the one that matters. One absolute rule sits
+  beside the fractions: under 48 hours left always warns, because a 24 hour
+  control-plane outage starting then could outlast the certificate.
+- **A certificate must be issued for at least 72 hours.** A machine rides out
+  a control-plane outage of up to 24 hours on what it already holds, and
+  nothing can renew its certificate while the control plane is down. A
+  certificate issued for less (`not_after - not_before < 72h`) is refused when
+  it is loaded (`IdentityError::LifetimeTooShort`, checked in
+  `crates/deis-identity/src/material.rs`) - at startup, and on a rotation,
+  where the material already in force stays in use.
 - A re-read that fails leaves the material already in force in use, and says
   so at `warn`. If it keeps failing until the current certificate expires,
   every connection on the machine channel starts failing at once.
@@ -337,30 +419,112 @@ knowing:
 **The values that are still shared.** Each is a file edit plus a restart of
 whoever reads it, and each has its own blast radius:
 
-1. `storage_auth_secret` must change on deis-control and on deis-store and
-   deis-queue together. Every capability token in flight is derived from it,
-   so all of them are invalidated at the same instant; a node holding an old
-   token is refused until the control plane hands it a new one with its next
-   deployment.
-2. deis-telemetry's `auth_secret` must change on the collector and in every
-   node's `[logging] auth_secret` together. A node with the wrong value is not
-   refused at startup: it serves requests normally and every push is rejected,
-   so the symptom is empty `deis logs` and `deis trace` rather than a failure.
-3. Human credentials are tokens, resolved against hashes in the control
+1. Store and queue capabilities are not derived from a shared value any
+   more: each is signed by the control plane's issuer key, lives fifteen
+   minutes and is recorded in the issuance table. Withdrawing them is a call,
+   not a file edit - see "Taking capabilities back" below.
+2. Human credentials are tokens, resolved against hashes in the control
    plane's database, so there is no file-held key to rotate: withdrawing one
    is `deis token revoke`. An unused bootstrap token expires on its own, and a
    used one is already revoked. The count of unscoped credentials is reported
    at startup and is the number to drive to zero.
-4. The three migration admin tokens are independent of everything else by
+3. The three migration admin tokens are independent of everything else by
    design. Change one without touching the others.
-5. `secret_key_file` is not rotatable by editing a line: every secret in the
+4. `secret_key_file` is not rotatable by editing a line: every secret in the
    database is encrypted under it.
+
+## Taking capabilities back
+
+Every capability the control plane signs - for a node through
+`IssueCapability`, for an operator through `.../storage-token`, for its own
+calls to deis-queue - is written to the issuance table
+(`capability_issuances`: `jti`, subject, node id, audience, `kid`, epoch,
+issue and expiry time, and every tenant and binding it grants) before it is
+handed out, and not handed out if it cannot be (`crates/deis-control/src/capability_ledger.rs`).
+An administrator can revoke from that record, and every call is in the audit
+log:
+
+| Call | Revokes |
+|---|---|
+| `DELETE /api/v1/capabilities/{jti}` (`capability.revoke`) | one capability |
+| `POST /api/v1/capabilities/revocations/nodes/{node_id}` (`capability.revoke_node`) | the node itself, until lifted, and every unexpired capability issued to it (see below) |
+| `DELETE /api/v1/capabilities/revocations/nodes/{node_id}` (`capability.lift_node_revocation`) | nothing: lifts a node's revocation, so it may register and be issued capabilities again |
+| `POST /api/v1/apps/{app}/environments/{env}/capability-revocations` (`capability.revoke_tenant`) | every unexpired capability naming that tenant, whoever holds it |
+| `POST /api/v1/capabilities/auth-epoch` (`capability.auth_epoch.bump`) | every capability issued so far: the epoch floor rises |
+
+Verifiers learn of it from the revocation list: every revoked `jti` that
+could still be accepted, every revoked node, and the current auth epoch, **signed with the issuer
+key** in the capability wire format and served on the machine listener only.
+deis-store (for kv, sql and blob alike - one verifier behind all three),
+deis-queue and deis-telemetry poll it every 30 seconds over the machine
+channel - under mutual TLS with their own `[machine_identity]`, the same
+client and endpoint they read the JWKS with - check the signature
+against the same JWKS capabilities are checked against, and refuse a list
+that is older than two minutes, from the future, or older than the one they
+last adopted - so a list edited on the way, or an old one replayed, changes
+nothing. A revocation is therefore in force within one poll.
+
+A revocation costs nobody but whom it names. A node asks for its store and
+queue capabilities **one tenant at a time**, so each token names a single
+application environment and revoking a tenant takes back only the tokens
+naming it - never another tenant's storage on the same node
+(`crates/deis-runtime/src/deployment/capability_renewer.rs`). And a node
+does not sit on a revoked token until it falls due: when deis-store,
+deis-queue or deis-telemetry refuses the capability a call presented
+(`Unauthenticated` or `PermissionDenied`), the node asks for a new one at
+once, no sooner than 30 seconds after the refused one was issued. The node's
+telemetry capability is still one token for every tenant it runs, so a
+tenant revocation briefly refuses that node's pushes too; the shippers keep
+their batches queued and the replacement arrives within seconds.
+
+**Revoking a node** is for a compromised machine, and takes back the holder
+rather than the tokens it happens to hold. The node goes on the
+`revoked_nodes` table until an administrator lifts it, and from then on:
+the control plane takes it out of the fleet, and the machine channel answers
+it nothing but its own deregistration - no registration, assignment list,
+routing table, secret value or capability (`FetchSecretValues` and
+`IssueCapability` refusals are on the audit log); and the signed list names
+it, so deis-store, deis-queue and deis-telemetry refuse **every** capability
+whose subject is that node's SPIFFE name - one issued a moment before the
+revocation, one read back from its offline cache, an expired one offered
+under T8 grace - within one poll. A node listed in `deis_runtime_nodes`
+stays in the fleet listing until it is taken out of that file, but is
+answered nothing all the same. The platform cannot tell one certificate for
+a name from another, so lift a revocation only once the compromised key can
+no longer prove that name - every certificate it held has expired - or
+rebuild the machine under a new node id.
+
+Revoking a `jti` or a tenant, by contrast, does not stop a node asking
+again: a node still in the fleet and still running the tenant is issued a
+new capability straight away, which is what "that token leaked" wants. And
+no revocation reaches a verifier cut off from the control plane: in T8
+degraded mode a verifier enforces the last list it adopted.
+
+**T8 degraded mode.** A verifier that has not adopted a list for two poll
+intervals is degraded. Only then, and only for a capability whose subject is
+a runtime node's SPIFFE name (`spiffe://<trust domain>/deislet/node/<id>`,
+parsed by `deis-identity`), does it accept an expired capability - and only
+if it was still valid (give or take 30 seconds) when the last list arrived,
+is at most 24 hours past its expiry, and neither it nor its node is revoked
+by that list. Human
+capabilities never get grace. Each verifier exports `deis_auth_degraded`,
+`deis_auth_degraded_since_seconds`, `deis_auth_grace_accepted_total` and
+`deis_auth_revocation_last_sync_seconds` - deis-telemetry on its `/metrics`,
+deis-store and deis-queue on `metrics_listen` when it is set (loopback
+only, like every Prometheus port here).
+
+A verifier **restarted** while the control plane is unreachable has adopted
+no list and holds no keys (the JWKS is not persisted either), so it refuses
+every capability until the control plane is back: it reports itself degraded
+but has nothing to extend grace from. This is deliberate. Persisting the time
+of the last sync alone would let such a verifier accept expired capabilities
+without the revocations that came with that sync.
 
 **If a private key may have leaked**, rotating it is not enough on its own.
 Work out what the name on that certificate opened - the table under "What each
 proof opens" - and treat everything it reached as read. For a node's key that
-means every environment's secrets, because that is what its assignment list
-carries; for the control plane's key it means every node's management plane.
+means every environment's secrets, because its assignment list lets it fetch
+all of them, and its offline cache already holds the ones it fetched; for the control plane's key it means every node's management plane.
 
 ## What is not implemented
 
@@ -386,6 +550,16 @@ this release - no way to say that an application runs on some nodes and not
 others - so there is nothing for a filter to filter by. The bundle download is
 unscoped for the same reason: any machine that completes the handshake may
 download any version of any application.
+
+What a node can obtain on its own initiative is narrower than what it is
+handed. `FetchSecretValues` and `IssueCapability` both go through
+`deployments_visible_to` in the same file, the one function a placement model
+will narrow: today it admits every current assignment to a node that is in the
+fleet (registered with the name it proved, or configured) and nothing to one
+that is not, plus in-flight plans that name the node as a target. A node can
+therefore not mint a capability for a tenant nothing deployed, and a machine
+holding a certificate this fleet signed but not in the fleet gets no
+capability and no secret at all.
 
 So the shape of the risk changed and its size did not. A credential that named
 no machine became one that names exactly one and cannot be copied out of a

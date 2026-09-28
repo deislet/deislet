@@ -211,11 +211,14 @@ impl ClientCertVerifier for VerifyPeerIsOfKind {
 }
 
 /// What a [`ServiceKind`] reads as in a refusal.
-fn kind_label(kind: ServiceKind) -> String {
+pub(crate) fn kind_label(kind: ServiceKind) -> String {
     match kind {
         ServiceKind::Control => "a control plane".to_string(),
         ServiceKind::Node => "a runtime node".to_string(),
         ServiceKind::Proxy => "a proxy".to_string(),
+        ServiceKind::Store => "a deis-store".to_string(),
+        ServiceKind::Queue => "a deis-queue".to_string(),
+        ServiceKind::Telemetry => "a deis-telemetry".to_string(),
     }
 }
 
@@ -269,6 +272,124 @@ impl ServerCertVerifier for VerifyPeerIs {
             return Err(refuse(IdentityError::WrongPeer {
                 presented: name.to_string(),
                 expected: self.expected.to_string(),
+            }));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Checks the certificate a data service presents to a caller that dialled it
+/// by role rather than by name.
+///
+/// [`VerifyPeerIs`] wants the exact name of the one machine a caller meant to
+/// reach, which is what the machine channel has: one control plane, nodes it
+/// dials by the name they registered under. The data services are reached
+/// through an address the control plane hands out, and what a caller knows
+/// about the far end is its role - "a deis-store of this fleet" - not its id.
+/// So this accepts any certificate that chains to the trust root, carries one
+/// SPIFFE name, and names a machine of `kind`; a certificate our own
+/// authority signed for a queue, a node or a proxy is refused, so no other
+/// machine of this fleet can stand in for a store and collect the bearer
+/// capabilities sent to it.
+///
+/// `trust_domain` is checked when the caller knows it. A caller holding a
+/// machine identity always does (it is the domain of its own name); a person's
+/// CLI holding only the fleet's trust root does not, and relies on the root
+/// being this fleet's alone.
+#[derive(Debug)]
+pub struct VerifyServerIsOfKind {
+    roots: Arc<RootCertStore>,
+    kind: ServiceKind,
+    trust_domain: Option<String>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl VerifyServerIsOfKind {
+    pub fn new(
+        roots: Arc<RootCertStore>,
+        kind: ServiceKind,
+        trust_domain: Option<String>,
+        provider: Arc<CryptoProvider>,
+    ) -> Self {
+        Self {
+            roots,
+            kind,
+            trust_domain,
+            provider,
+        }
+    }
+}
+
+impl ServerCertVerifier for VerifyServerIsOfKind {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        let parsed = ParsedCertificate::try_from(end_entity)?;
+        verify_server_cert_signed_by_trust_anchor(
+            &parsed,
+            &self.roots,
+            intermediates,
+            now,
+            self.provider.signature_verification_algorithms.all,
+        )?;
+
+        let name = name_in_certificate(end_entity).map_err(refuse)?;
+        if let Some(expected) = &self.trust_domain
+            && name.trust_domain() != expected
+        {
+            return Err(refuse(IdentityError::WrongTrustDomain {
+                presented: name.to_string(),
+                presented_trust_domain: name.trust_domain().to_string(),
+                expected_trust_domain: expected.clone(),
+            }));
+        }
+        if names::service_kind(&name) != Some(self.kind) {
+            return Err(refuse(IdentityError::WrongServiceKind {
+                presented: name.to_string(),
+                presented_kind: names::service_kind(&name).map_or_else(
+                    || "a name this fleet does not issue".to_string(),
+                    kind_label,
+                ),
+                expected_kind: kind_label(self.kind),
             }));
         }
         Ok(ServerCertVerified::assertion())

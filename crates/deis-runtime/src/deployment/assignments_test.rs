@@ -714,6 +714,7 @@ async fn the_unreachable_reason_names_the_class_not_the_control_plane_address() 
             health_for_loop,
             Duration::from_secs(1),
             Duration::from_secs(60),
+            None,
         )
         .await;
     });
@@ -760,6 +761,7 @@ async fn without_a_control_plane_the_node_is_ready_on_what_it_has() {
         health.clone(),
         Duration::from_secs(1),
         Duration::from_secs(60),
+        None,
     )
     .await;
 
@@ -792,6 +794,7 @@ async fn a_refused_push_degrades_a_node_that_has_no_next_reconcile_pass() {
         health.clone(),
         Duration::from_secs(1),
         Duration::from_secs(60),
+        None,
     )
     .await;
     assert!(
@@ -2060,4 +2063,125 @@ mod secret_fetch {
         Reconciler::new(&client, &deployer).once().await.unwrap();
         assert_eq!(deployer.secrets.get().unwrap().cached_deployments(), 0);
     }
+}
+
+/// Run the control loop until `until` holds, then stop it.
+async fn run_loop_until(
+    client: AssignmentClient,
+    deployer: Arc<DeploymentManager>,
+    health: Arc<crate::health::NodeHealth>,
+    offline: Arc<super::super::offline_cache::OfflineCache>,
+    until: impl Fn() -> bool,
+) {
+    let task = tokio::spawn(run_control_loop(
+        Some(client),
+        None,
+        deployer,
+        health,
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        Some(offline),
+    ));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !until() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the control loop never got there");
+    task.abort();
+    let _ = task.await;
+}
+
+/// A node that restarts while its control plane is down comes back from its
+/// offline cache: the deployment as the last sync handed it over, not the
+/// bare record in its bundle store. With the cache tampered with, it falls
+/// back to the bundle store alone.
+#[tokio::test]
+async fn a_restart_with_the_control_plane_down_keeps_serving_from_the_offline_cache() {
+    use super::super::offline_cache::OfflineCache;
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = "offline-restart";
+    let key = AppKey::new(app, "production");
+    let (bytes, sha) = bundle(app);
+    let plane = ControlPlane::serving(&[(app, "v1", "/bundle")], bytes, &sha).await;
+    let mut line = plane.line(app, "production", "v1", &sha);
+    line["env"] = serde_json::json!({ "GREETING": "hello from the last sync" });
+    plane.now_assigns(serde_json::json!([line]));
+
+    let cache = || Arc::new(OfflineCache::new(dir.path().join("offline-cache"), [9; 32], "node-a"));
+
+    // First life: the control plane answers, and the sync is sealed.
+    {
+        let apps = Arc::new(ApplicationManager::new());
+        let deployer = deployer(dir.path(), apps.clone()).await;
+        let health = crate::health::NodeHealth::starting();
+        let offline = cache();
+        let written = offline.path();
+        run_loop_until(
+            client(&plane, "node-a"),
+            deployer,
+            health.clone(),
+            offline,
+            || written.exists() && health.is_healthy(),
+        )
+        .await;
+    }
+    let sealed = cache().load().unwrap().expect("the sync was written");
+    assert!(sealed.assignments_json.contains("hello from the last sync"));
+
+    // Second life: nothing answers.
+    let (installed, hosted) = restart_with_control_down(dir.path(), &key, false).await;
+    let installed = installed.expect("the assigned version is installed again");
+    assert_eq!(installed.version_id, "v1");
+    assert!(hosted, "an isolate serves it");
+    assert!(
+        installed.env_confirmed,
+        "restored from the offline cache, with the environment the last sync confirmed"
+    );
+
+    let (installed, _) = restart_with_control_down(dir.path(), &key, true).await;
+    let installed = installed.expect("the bundle store still brings the code back");
+    assert!(
+        !installed.env_confirmed,
+        "a tampered cache is not believed; the node falls back to its bundle store alone"
+    );
+}
+
+/// Start a node on `dir` whose control plane answers nothing, with the
+/// offline cache the test above sealed - flipped a bit first when `tamper` -
+/// and report what it ended up running for `key`.
+async fn restart_with_control_down(
+    dir: &std::path::Path,
+    key: &AppKey,
+    tamper: bool,
+) -> (Option<crate::app::InstalledVersion>, bool) {
+    use super::super::offline_cache::OfflineCache;
+    let cache = || Arc::new(OfflineCache::new(dir.join("offline-cache"), [9; 32], "node-a"));
+    if tamper {
+        let path = cache().path();
+        let mut raw = std::fs::read(&path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0x01;
+        std::fs::write(&path, raw).unwrap();
+    }
+    let apps = Arc::new(ApplicationManager::new());
+    let deployer = deployer(dir, apps.clone()).await;
+    let health = crate::health::NodeHealth::starting();
+    let watching = health.clone();
+    run_loop_until(
+        unreachable_client("https://127.0.0.1:1", "node-a"),
+        deployer,
+        health,
+        cache(),
+        move || {
+            matches!(
+                watching.snapshot(),
+                crate::health::Readiness::Degraded { .. }
+            )
+        },
+    )
+    .await;
+    (apps.installed_version(key), apps.is_hosted(key).await)
 }

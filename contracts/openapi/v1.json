@@ -466,6 +466,21 @@
         ],
         "type": "object"
       },
+      "AuthEpoch": {
+        "description": "The auth epoch after a bump.",
+        "properties": {
+          "auth_epoch": {
+            "description": "Every capability issued under a lower epoch is refused by every\nverifier once it adopts the next revocation list.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "auth_epoch"
+        ],
+        "type": "object"
+      },
       "BackendAttemptState": {
         "enum": [
           "acquiring",
@@ -1299,6 +1314,22 @@
           "validation",
           "attestations",
           "signatures"
+        ],
+        "type": "object"
+      },
+      "CapabilityRevocation": {
+        "description": "What a revocation took back.",
+        "properties": {
+          "revoked": {
+            "description": "Every capability revoked by this call, by `jti`. Only capabilities\nthat could still be accepted somewhere are listed; one that expired\nlong ago needs no revoking.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "revoked"
         ],
         "type": "object"
       },
@@ -7595,6 +7626,27 @@
         ],
         "type": "object"
       },
+      "TelemetryTokenResponse": {
+        "description": "A read credential for deis-telemetry.",
+        "properties": {
+          "tenants": {
+            "description": "The `<app>.<environment>` tenants the token reads, or `@platform` for\na token that reads everything.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token": {
+            "description": "The capability, for the `Authorization: Bearer` header on calls to\ndeis-telemetry. Valid for 15 minutes; it may query and follow, and\nmay not push.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenants",
+          "token"
+        ],
+        "type": "object"
+      },
       "TokenOrigin": {
         "description": "Where a credential came from.",
         "enum": [
@@ -9151,6 +9203,36 @@
         ]
       }
     },
+    "/api/platform/telemetry-token": {
+      "get": {
+        "operationId": "getPlatformTelemetryToken",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryTokenResponse"
+                }
+              }
+            },
+            "description": "A credential that reads every tenant's telemetry and the nodes' own."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Mint a telemetry read credential for the whole platform.",
+        "tags": [
+          "platform"
+        ]
+      }
+    },
     "/api/v1/accounts": {
       "get": {
         "description": "The unified list envelope, oldest account first. There is one scope\n(the whole installation) and no filter, so the cursor binding only has\nto name the sort.",
@@ -10174,6 +10256,60 @@
         ]
       }
     },
+    "/api/v1/apps/{app_id}/environments/{env_name}/capability-revocations": {
+      "post": {
+        "description": "Every unexpired capability that names this application environment,\nwhoever it was issued to - nodes, operators, the control plane itself.",
+        "operationId": "revokeTenantCapabilities",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityRevocation"
+                }
+              }
+            },
+            "description": "Every capability naming the tenant is revoked."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Revoke every capability for an environment's storage tenant.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
     "/api/v1/apps/{app_id}/environments/{env_name}/deployment": {
       "get": {
         "description": "The current version of an environment: the newest pointer row.",
@@ -11164,6 +11300,103 @@
           }
         },
         "summary": "Mint a storage credential for an environment.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/telemetry-token": {
+      "get": {
+        "operationId": "getEnvironmentTelemetryToken",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryTokenResponse"
+                }
+              }
+            },
+            "description": "A credential that reads this environment's telemetry."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Mint a telemetry read credential for one environment.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/telemetry-token": {
+      "get": {
+        "operationId": "getAppTelemetryToken",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelemetryTokenResponse"
+                }
+              }
+            },
+            "description": "A credential that reads the telemetry of every environment of the application."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Mint a telemetry read credential for every environment of an application.",
         "tags": [
           "product"
         ]
@@ -12593,6 +12826,160 @@
             "$ref": "#/components/responses/Internal"
           }
         },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/capabilities/auth-epoch": {
+      "post": {
+        "description": "Bumps the auth epoch. Every capability issued before this call is refused\nby every verifier once it adopts the next revocation list, whoever holds\nit; nodes obtain new ones on their next renewal, and every other holder\nhas to ask again.",
+        "operationId": "bumpAuthEpoch",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthEpoch"
+                }
+              }
+            },
+            "description": "The new auth epoch."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Revoke every capability issued so far.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/capabilities/revocations/nodes/{node_id}": {
+      "delete": {
+        "description": "The node may register and be issued capabilities again. The capabilities\nrevoked with it stay revoked. Answers 404 when the node is not revoked.",
+        "operationId": "liftNodeRevocation",
+        "parameters": [
+          {
+            "description": "The node's id, as its certificate names it.",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The node is no longer revoked; verifiers accept its new capabilities from their next poll."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Lift a node's revocation.",
+        "tags": [
+          "product"
+        ]
+      },
+      "post": {
+        "description": "Revokes every unexpired capability issued to the node with this id, and\nthe node itself until the revocation is lifted: it is taken out of the\nfleet, refused every machine-channel call and named on the revocation\nlist, so no capability issued to it is accepted anywhere. Answers 200\nwith an empty list when it holds no capability; revoking a node already\nrevoked is not an error.",
+        "operationId": "revokeNode",
+        "parameters": [
+          {
+            "description": "The node's id, as its certificate names it.",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityRevocation"
+                }
+              }
+            },
+            "description": "The node and every capability it held are revoked."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Revoke a node.",
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/capabilities/{jti}": {
+      "delete": {
+        "description": "Answers 404 when no capability with this `jti` was issued here, or it\nexpired long enough ago that nothing can accept it any more.",
+        "operationId": "revokeCapability",
+        "parameters": [
+          {
+            "description": "The capability's `jti`.",
+            "in": "path",
+            "name": "jti",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityRevocation"
+                }
+              }
+            },
+            "description": "The capability is revoked; verifiers refuse it within one poll."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Revoke one capability.",
         "tags": [
           "product"
         ]

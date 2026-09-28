@@ -707,9 +707,11 @@ fn refresh_interval(url: &str, answer: Result<RegisterAnswer, String>) -> Durati
 /// are kept apart rather than flattened into one transport failure:
 ///
 /// * `PERMISSION_DENIED` is [`RegistrationError::WrongMachine`]: the
-///   connection proved one name and the registration claimed another. Nothing
-///   is wrong with the network or the control plane, and retrying cannot help
-///   until a certificate or a `node_id` changes, so it says both names.
+///   connection proved one name and the registration claimed another, or the
+///   node it proved is revoked. Nothing is wrong with the network or the
+///   control plane, and retrying cannot help until a certificate or a
+///   `node_id` changes or the revocation is lifted, so it says both names and
+///   the control plane's reason.
 /// * `ALREADY_EXISTS` is the id-held-by-another-machine case, which the HTTP
 ///   route answers 409 for. It is carried as that same 409 so that one
 ///   condition reads as one thing in a log whichever door it arrived at: two
@@ -746,8 +748,9 @@ fn machine_failure(
                  the connection proved one machine and the registration claimed another. This \
                  node is not on the fleet list, so it is handed no deployment push and no cron \
                  occurrence, though it still serves what it already has. Either node_id is wrong \
-                 for the certificate in [machine_identity], or the certificate is the wrong \
-                 machine's"
+                 for the certificate in [machine_identity], the certificate is the wrong \
+                 machine's, or an operator has revoked this node on the control plane - the \
+                 message says which - and it stays off the fleet until that is lifted"
             );
             RegistrationError::WrongMachine {
                 url: url.to_string(),

@@ -31,8 +31,8 @@ use colored::Colorize;
 
 use crate::commands::{escape_control, escaped, resolve};
 use crate::platform::telemetry::{
-    self, Kind, OutcomeSelector, QueryTracesRequest, TailTracesRequest, TraceRecord, Traces,
-    expand_outcomes,
+    self, Kind, OutcomeSelector, QueryTracesRequest, TailTracesRequest, TelemetryCredential,
+    TraceRecord, Traces, expand_outcomes,
 };
 use crate::render::{Output, parse_since, timestamp_micros};
 use crate::settings::{Overrides, Settings};
@@ -147,7 +147,10 @@ async fn list(args: Args, output: Output) -> Result<()> {
         .map(|ms| (ms as i64).saturating_mul(1_000))
         .unwrap_or(0);
 
-    let mut traces = Traces::connect(&filters.endpoint).await?;
+    let credential =
+        TelemetryCredential::obtain(&settings, &filters.app, filters.environment.as_deref())
+            .await?;
+    let mut traces = Traces::connect(&filters.endpoint, credential).await?;
 
     let mut records: Vec<TraceRecord> = Vec::new();
     let mut cursor = String::new();
@@ -270,7 +273,10 @@ async fn follow(args: Args, output: Output) -> Result<()> {
     })?;
     let filters = filters(&args, &settings)?;
 
-    let mut traces = Traces::connect(&filters.endpoint).await?;
+    let credential =
+        TelemetryCredential::obtain(&settings, &filters.app, filters.environment.as_deref())
+            .await?;
+    let mut traces = Traces::connect(&filters.endpoint, credential).await?;
     let mut stream = traces
         .tail(TailTracesRequest {
             app_id: filters.app.clone(),

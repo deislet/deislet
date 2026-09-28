@@ -65,9 +65,10 @@ async fn main() -> Result<()> {
     let config = Config::load(&cli.config)?;
     match cli.command {
         None | Some(Command::Serve) => {
+            let (identity, control) = server::machine_identity(&config)?;
             let listener = server::bind(&config).await?;
-            let keys = capability_keys(&config);
-            server::serve(config, listener, server::shutdown_signal(), keys).await
+            let keys = capability_keys(control);
+            server::serve(config, listener, server::shutdown_signal(), keys, identity).await
         }
         Some(Command::Snapshot { out }) => {
             let manifest = snapshot::take(&config.data_dir, &out).with_context(|| {
@@ -127,15 +128,15 @@ async fn main() -> Result<()> {
 /// Starts empty and never blocks startup: the control plane may come up
 /// after this process, and until the first fetch lands every call is refused
 /// as signed by an unknown key - which is true - and the refresher retries.
-fn capability_keys(config: &Config) -> deis_capability::KeyRing {
+fn capability_keys(control: deis_capability::ControlClient) -> deis_capability::KeyRing {
     let keys = deis_capability::KeyRing::new();
     tracing::info!(
-        url = %config.capability_jwks_url,
+        control = ?control,
         "Fetching the control plane's capability verifying keys; calls are refused until they arrive"
     );
     deis_capability::fetch::spawn_refresher(
         keys.clone(),
-        config.capability_jwks_url.clone(),
+        control,
         deis_capability::fetch::RefreshPolicy::default(),
     );
     keys

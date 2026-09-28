@@ -13,12 +13,11 @@
 //!
 //! Every call carries the tenant in `x-deis-tenant` and, when one was
 //! handed to this session, the capability token that proves it may act as
-//! that tenant in `x-deis-storage-token` - the same two headers
+//! that tenant in `Authorization: Bearer` - the same two headers
 //! `deis-runtime` stamps for an application's own storage calls, spelled
 //! once in `deis_wire::conventions` so the three components that read and
 //! write them cannot drift apart. A session built with no token stamps only
-//! the tenant, which is exactly what a deis-store running with no
-//! `auth_secret` (the loopback default) accepts.
+//! the tenant, which deis-store refuses: every call needs a capability.
 //!
 //! # What is and is not implemented
 //!
@@ -877,7 +876,7 @@ fn lazy_channel(endpoint: &str, request_timeout: Option<Duration>) -> Result<Cha
     if let Some(timeout) = request_timeout {
         builder = builder.timeout(timeout);
     }
-    Ok(builder.connect_lazy())
+    super::service_tls::lazy(builder, endpoint, deis_identity::ServiceKind::Store)
 }
 
 #[cfg(test)]

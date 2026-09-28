@@ -2,13 +2,17 @@
 //! started against a temporary data directory on ephemeral ports, then driven
 //! through its own gRPC client and a plain HTTP scrape.
 
+mod support;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
 use deis_backend_migration::proto::{
     AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
 };
+use deis_capability::{TELEMETRY_INGEST, TELEMETRY_PLATFORM_TENANT, TELEMETRY_READ};
 use deis_telemetry::config::Config;
 use deis_telemetry::proto::log_service_client::LogServiceClient;
 use deis_telemetry::proto::metric_service_client::MetricServiceClient;
@@ -20,8 +24,10 @@ use deis_telemetry::proto::{
 };
 use deis_telemetry::server::{self, RunningServer};
 use deis_telemetry::{MAX_GRPC_MESSAGE_BYTES, now_us};
+use support::Bearer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tonic_health::pb::health_check_response::ServingStatus;
 use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
@@ -33,37 +39,87 @@ fn test_config(data_dir: &std::path::Path) -> Config {
         listen: "127.0.0.1:0".to_string(),
         metrics_listen: "127.0.0.1:0".to_string(),
         data_dir: data_dir.to_path_buf(),
+        machine_identity: test_identity(),
         query_default_limit: 100,
         query_max_limit: 500,
         ..Config::default()
     }
 }
 
-async fn channel(server: &RunningServer) -> Channel {
-    let endpoint = format!("http://{}", server.grpc_addr);
-    Channel::from_shared(endpoint)
+/// The one authority every server in this file is issued a certificate by.
+///
+/// A static, because a configuration outlives the call that builds it and the
+/// files have to outlive every server started from it.
+fn fleet() -> &'static deis_identity_test_pki::TestFleet {
+    static FLEET: std::sync::OnceLock<deis_identity_test_pki::TestFleet> =
+        std::sync::OnceLock::new();
+    FLEET.get_or_init(deis_identity_test_pki::TestFleet::new)
+}
+
+/// The `[machine_identity]` a test server is started with.
+fn test_identity() -> Option<deis_capability::ServiceIdentityConfig> {
+    let fleet = fleet();
+    let id = deis_identity::names::telemetry(&fleet.trust_domain, "test").unwrap();
+    let files = fleet.files_for("telemetry", &id);
+    Some(deis_capability::ServiceIdentityConfig {
+        certificate: files.certificate,
+        private_key: files.private_key,
+        trust_root: files.trust_root,
+        control_endpoint: "http://127.0.0.1:1".to_string(),
+        identity_reload_seconds: 60,
+    })
+}
+
+/// A channel to a test server's gRPC listener, checking the far end is a
+/// telemetry service of this fleet the way every real caller does.
+async fn tls_channel(addr: SocketAddr) -> Channel {
+    tonic::transport::Endpoint::from_shared(format!("https://{addr}"))
         .expect("endpoint must be a valid URI")
-        .connect()
+        .connect_with_connector(fleet().service_trust().dialler(
+            deis_identity::ServiceKind::Telemetry,
+            &[deis_identity::Protocol::Http2],
+        ))
         .await
         .expect("the gRPC listener must accept the connection")
 }
 
-async fn connect(server: &RunningServer) -> LogServiceClient<Channel> {
-    LogServiceClient::new(channel(server).await)
+async fn channel(server: &RunningServer) -> Channel {
+    tls_channel(server.grpc_addr).await
+}
+
+type Stamped = InterceptedService<Channel, Bearer>;
+
+/// A log client acting with `token`.
+async fn logs_as(server: &RunningServer, token: &str) -> LogServiceClient<Stamped> {
+    LogServiceClient::with_interceptor(channel(server).await, Bearer::new(token))
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
 }
 
-async fn connect_metrics(server: &RunningServer) -> MetricServiceClient<Channel> {
-    MetricServiceClient::new(channel(server).await)
+async fn metrics_as(server: &RunningServer, token: &str) -> MetricServiceClient<Stamped> {
+    MetricServiceClient::with_interceptor(channel(server).await, Bearer::new(token))
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
 }
 
-async fn connect_traces(server: &RunningServer) -> TraceServiceClient<Channel> {
-    TraceServiceClient::new(channel(server).await)
+async fn traces_as(server: &RunningServer, token: &str) -> TraceServiceClient<Stamped> {
+    TraceServiceClient::with_interceptor(channel(server).await, Bearer::new(token))
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+}
+
+/// Clients acting as an operator who may read everything and push for every
+/// test application, for the tests that are about something else.
+async fn connect(server: &RunningServer) -> LogServiceClient<Stamped> {
+    logs_as(server, &support::operator_token()).await
+}
+
+async fn connect_metrics(server: &RunningServer) -> MetricServiceClient<Stamped> {
+    metrics_as(server, &support::operator_token()).await
+}
+
+async fn connect_traces(server: &RunningServer) -> TraceServiceClient<Stamped> {
+    traces_as(server, &support::operator_token()).await
 }
 
 async fn connect_migration(server: &RunningServer) -> BackendMigrationClient<Channel> {
@@ -125,10 +181,12 @@ fn entry(app_id: &str, level: i32, message: &str, timestamp_us: i64) -> LogEntry
     }
 }
 
-/// Minimal HTTP/1.1 GET. `Connection: close` makes the server end the body,
-/// so reading to EOF is a deterministic way to know the response is complete.
+/// Minimal HTTP/1.1 GET, as an operator who may read everything.
+/// `Connection: close` makes the server end the body, so reading to EOF is a
+/// deterministic way to know the response is complete.
 async fn http_get(addr: SocketAddr, path: &str) -> String {
-    http_get_with(addr, path, &[]).await
+    let bearer = format!("Bearer {}", support::operator_token());
+    http_get_with(addr, path, &[("Authorization", bearer.as_str())]).await
 }
 
 /// The same, carrying extra request headers - which is how a scrape presents
@@ -158,7 +216,7 @@ async fn http_get_with(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -
 #[tokio::test]
 async fn push_query_and_tail_against_a_running_service() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
     let mut client = connect(&server).await;
@@ -282,7 +340,7 @@ async fn push_query_and_tail_against_a_running_service() {
 #[tokio::test]
 async fn queries_are_paginated_newest_first() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
     let mut client = connect(&server).await;
@@ -340,7 +398,7 @@ async fn queries_are_paginated_newest_first() {
 #[tokio::test]
 async fn metrics_are_stored_queryable_and_scrapable() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
     let metrics_addr = server.metrics_addr;
@@ -428,7 +486,7 @@ async fn metrics_are_stored_queryable_and_scrapable() {
 #[tokio::test]
 async fn a_batch_above_the_tonic_default_ceiling_is_accepted() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
     let mut client = connect(&server).await;
@@ -468,7 +526,7 @@ async fn stored_logs_survive_a_restart() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = test_config(dir.path());
 
-    let server = server::start(&config)
+    let server = server::start(&config, support::keys())
         .await
         .expect("the service must start");
     let mut client = connect(&server).await;
@@ -486,7 +544,7 @@ async fn stored_logs_survive_a_restart() {
         .expect("push must succeed");
     server.shutdown().await.expect("shutdown must succeed");
 
-    let server = server::start(&config)
+    let server = server::start(&config, support::keys())
         .await
         .expect("the service must start again on the same data dir");
     let mut client = connect(&server).await;
@@ -506,7 +564,7 @@ async fn stored_logs_survive_a_restart() {
 #[tokio::test]
 async fn failed_invocations_are_queryable_without_reading_a_log_line() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
     let mut traces = connect_traces(&server).await;
@@ -635,7 +693,7 @@ async fn a_pushed_histogram_is_scraped_as_a_histogram() {
     // scrape endpoint hands them back as unrelated gauges, `histogram_quantile`
     // has nothing to work with and there is still no p99.
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
     let mut client = connect_metrics(&server).await;
@@ -699,7 +757,7 @@ async fn stored_traces_survive_a_restart() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = test_config(dir.path());
 
-    let server = server::start(&config)
+    let server = server::start(&config, support::keys())
         .await
         .expect("the service must start");
     let mut traces = connect_traces(&server).await;
@@ -717,7 +775,7 @@ async fn stored_traces_survive_a_restart() {
         .expect("push_traces must succeed");
     server.shutdown().await.expect("shutdown must succeed");
 
-    let server = server::start(&config)
+    let server = server::start(&config, support::keys())
         .await
         .expect("the service must start again on the same data dir");
     let mut traces = connect_traces(&server).await;
@@ -733,274 +791,493 @@ async fn stored_traces_survive_a_restart() {
 
 // ---- the capability check, against a real process ----------------------
 
-/// Deterministic keypair for auth enforcement tests.
-use std::sync::OnceLock;
-fn test_keypair() -> &'static (ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey) {
-    static KEYPAIR: OnceLock<(ed25519_dalek::SigningKey, ed25519_dalek::VerifyingKey)> =
-        OnceLock::new();
-    KEYPAIR.get_or_init(|| {
-        let seed: [u8; 32] = [0x42; 32];
-        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-        let vk = sk.verifying_key();
-        (sk, vk)
-    })
-}
-
-/// Hex-encoded verifying key for use in config's `capability_public_key`.
-fn test_verifying_key_hex() -> &'static str {
-    static HEX: OnceLock<String> = OnceLock::new();
-    HEX.get_or_init(|| hex::encode(test_keypair().1.as_bytes()))
-}
-
-/// Create an Ed25519 capability token for the test keypair.
-fn cap_token(aud: &str) -> String {
-    let (sk, _) = test_keypair();
-    let claims = deis_capability::CapabilityClaims::new(
-        aud,
-        "spiffe://deis.test/control",
-        "spiffe://deis.test/node/test",
-        1u64,
-        std::time::Duration::from_secs(3600),
-        vec![deis_capability::CapabilityResource {
-            tenant: String::new(),
-            binding: String::new(),
-            generation: None,
-        }],
-    );
-    deis_capability::encode(&claims, sk)
-}
-
-/// Attach a Bearer capability token to an outgoing request.
-fn signed<T>(message: T, token: &str) -> tonic::Request<T> {
-    let mut request = tonic::Request::new(message);
-    request.metadata_mut().insert(
-        "authorization",
-        format!("Bearer {token}")
-            .parse()
-            .expect("a token is valid metadata"),
-    );
-    request
+/// A log entry of `app_id` in `environment`, as deis-runtime tags it.
+fn entry_in(app_id: &str, environment: &str, message: &str) -> LogEntry {
+    let mut entry = entry(app_id, 3, message, now_us());
+    entry
+        .fields
+        .insert("environment".to_string(), environment.to_string());
+    entry
 }
 
 #[tokio::test]
-async fn a_public_bind_with_no_secret_starts_non_enforcing() {
-    // With capability_public_key unset, auth is not enforced — that is the
-    // default for tests and single-box installs. The old loopback-only guard
-    // (refuse to serve non-loopback without auth_secret) is gone because
-    // capability_public_key is the single source of truth.
-    let dir = tempfile::tempdir().expect("temp dir");
-    for (grpc, metrics) in [
-        ("0.0.0.0:0", "127.0.0.1:0"),
-        ("127.0.0.1:0", "0.0.0.0:0"),
-        ("0.0.0.0:0", "0.0.0.0:0"),
-    ] {
-        let config = Config {
-            listen: grpc.to_string(),
-            metrics_listen: metrics.to_string(),
-            ..test_config(dir.path())
-        };
-        let server = server::start(&config)
-            .await
-            .expect("non-loopback bind without capability_public_key starts (auth non-enforcing)");
-        server.shutdown().await.expect("clean shutdown");
-    }
-}
-
-#[tokio::test]
-async fn a_public_bind_with_capability_key_starts_and_enforces() {
+async fn an_unauthenticated_call_is_refused_everywhere_but_health() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = Config {
+        // A public bind changes nothing: there is no mode without the check.
         listen: "0.0.0.0:0".to_string(),
-        capability_public_key: Some(test_verifying_key_hex().to_string()),
         ..test_config(dir.path())
     };
-    let server = server::start(&config)
-        .await
-        .expect("a configured capability_public_key is what makes a public bind serveable");
-
-    let mut client = connect(&server).await;
-    let status = client
-        .push_logs(PushLogsRequest {
-            entries: vec![entry("stranger", 3, "forged", now_us())],
-            ..Default::default()
-        })
-        .await
-        .expect_err("an unsigned push must be refused");
-    assert_eq!(status.code(), tonic::Code::Unauthenticated);
-
-    server.shutdown().await.expect("clean shutdown");
-}
-
-#[tokio::test]
-async fn with_capability_key_configured_only_signed_calls_are_served() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let config = Config {
-        capability_public_key: Some(test_verifying_key_hex().to_string()),
-        ..test_config(dir.path())
-    };
-    let server = server::start(&config)
+    let server = server::start(&config, support::keys())
         .await
         .expect("the service must start");
-    let good_push = cap_token("telemetry");
-    let good_read = cap_token("telemetry.read");
+    let grpc = SocketAddr::from(([127, 0, 0, 1], server.grpc_addr.port()));
+    let channel = tls_channel(grpc).await;
 
     // Liveness is deliberately outside the check: a probe that needs a
     // credential is a probe the control plane cannot make.
-    let mut health = HealthClient::new(channel(&server).await);
-    let status = health
+    let status = HealthClient::new(channel.clone())
         .check(HealthCheckRequest {
             service: "deis.telemetry.LogService".to_string(),
         })
         .await
         .expect("health must answer without a credential");
-    assert_eq!(
-        status.into_inner().status,
-        ServingStatus::Serving as i32,
-        "health must still report this process as serving"
-    );
+    assert_eq!(status.into_inner().status, ServingStatus::Serving as i32);
 
-    let mut logs = connect(&server).await;
-    // Forging an entry against somebody else's application: refused before
-    // anything is written.
-    for wrong in [None, Some("not-a-token".to_string())] {
-        let request = match &wrong {
-            Some(bad) => signed(
-                PushLogsRequest {
-                    entries: vec![entry(
-                        "someone-elses-bank",
-                        3,
-                        "forged by a stranger",
-                        now_us(),
-                    )],
-                    ..Default::default()
-                },
-                bad,
-            ),
-            None => tonic::Request::new(PushLogsRequest {
-                entries: vec![entry(
-                    "someone-elses-bank",
-                    3,
-                    "forged by a stranger",
-                    now_us(),
-                )],
-                ..Default::default()
-            }),
-        };
-        let status = logs
-            .push_logs(request)
-            .await
-            .expect_err("an unsigned or wrongly signed push must be refused");
-        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{wrong:?}");
-    }
-
-    // A valid token for the wrong audience should be PermissionDenied, not
-    // Unauthenticated — it is properly signed but not for this service.
-    {
-        let wrong_aud = cap_token("telemetry.wrong-audience");
-        let request = signed(
-            PushLogsRequest {
-                entries: vec![entry(
-                    "someone-elses-bank",
-                    3,
-                    "forged by a stranger",
-                    now_us(),
-                )],
-                ..Default::default()
-            },
-            &wrong_aud,
+    // No token, garbage, and a well-formed capability signed by a key the
+    // control plane never published.
+    let foreign = {
+        let claims = deis_capability::CapabilityClaims::new(
+            deis_capability::AUD_TELEMETRY,
+            "spiffe://deis.test/deislet/control/main",
+            "spiffe://deis.test/deislet/node/test",
+            1,
+            Duration::from_secs(900),
+            vec![],
         );
-        let status = logs
-            .push_logs(request)
+        deis_capability::encode(&claims, &ed25519_dalek::SigningKey::from_bytes(&[9; 32]))
+    };
+    for token in [None, Some("not-a-token".to_string()), Some(foreign)] {
+        let mut logs = match &token {
+            None => LogServiceClient::with_interceptor(channel.clone(), Bearer::new("")),
+            Some(token) => LogServiceClient::with_interceptor(channel.clone(), Bearer::new(token)),
+        };
+        let pushed = logs
+            .push_logs(PushLogsRequest {
+                entries: vec![entry("stranger", 3, "forged", now_us())],
+                ..Default::default()
+            })
             .await
-            .expect_err("a wrong-audience push must be refused");
-        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+            .expect_err("an unauthenticated push must be refused");
+        assert_eq!(pushed.code(), tonic::Code::Unauthenticated, "{token:?}");
+        let read = logs
+            .query(QueryRequest {
+                app_id: "stranger".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an unauthenticated query must be refused");
+        assert_eq!(read.code(), tonic::Code::Unauthenticated, "{token:?}");
     }
-
-    // Reading somebody else's logs: refused the same way.
-    let status = logs
-        .query(QueryRequest {
-            app_id: "someone-elses-bank".to_string(),
-            ..Default::default()
-        })
-        .await
-        .expect_err("an unsigned query must be refused");
-    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    let mut bare = LogServiceClient::new(channel.clone());
+    assert_eq!(
+        bare.tail(TailRequest::default())
+            .await
+            .expect_err("an unauthenticated tail must be refused")
+            .code(),
+        tonic::Code::Unauthenticated
+    );
 
     // Traces and metrics are behind the same door, not three separate ones.
-    let mut traces = connect_traces(&server).await;
     assert_eq!(
-        traces
+        TraceServiceClient::new(channel.clone())
             .query_traces(QueryTracesRequest::default())
             .await
-            .expect_err("an unsigned trace query must be refused")
+            .expect_err("an unauthenticated trace query must be refused")
             .code(),
         tonic::Code::Unauthenticated
     );
-    let mut metrics = connect_metrics(&server).await;
     assert_eq!(
-        metrics
-            .query_metrics(QueryMetricsRequest::default())
+        MetricServiceClient::new(channel.clone())
+            .push_metrics(PushMetricsRequest::default())
             .await
-            .expect_err("an unsigned metric query must be refused")
+            .expect_err("an unauthenticated metric push must be refused")
             .code(),
         tonic::Code::Unauthenticated
     );
 
-    // The platform's own call, carrying the token, is served as before.
-    let accepted = logs
-        .push_logs(signed(
-            PushLogsRequest {
-                entries: vec![entry("shop", 3, "a real line", now_us())],
-                ..Default::default()
-            },
-            &good_push,
-        ))
-        .await
-        .expect("a signed push must be served")
-        .into_inner();
-    assert_eq!(accepted.accepted_count, 1);
-    let found = logs
-        .query(signed(
-            QueryRequest {
-                app_id: "shop".to_string(),
-                ..Default::default()
-            },
-            &good_read,
-        ))
-        .await
-        .expect("a signed query must be served")
-        .into_inner();
-    assert_eq!(found.entries.len(), 1);
-    assert_eq!(found.entries[0].message, "a real line");
+    // And the scrape port.
+    let refused = http_get_with(server.metrics_addr, "/metrics", &[]).await;
+    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
+    assert!(
+        refused.to_ascii_lowercase().contains("www-authenticate"),
+        "the refusal must say which credential was wanted: {refused}"
+    );
+    assert!(
+        !refused.contains("deis_telemetry_uptime_seconds"),
+        "a refused scrape must not hand out the page anyway: {refused}"
+    );
 
     server.shutdown().await.expect("clean shutdown");
 }
 
 #[tokio::test]
-async fn a_scrape_needs_the_token_once_a_secret_is_configured() {
-    // The scrape page carries every application's metric series, so leaving
-    // this port open would publish half the data and call the service
-    // protected.
+async fn a_write_capability_cannot_read() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let config = Config {
-        capability_public_key: Some(test_verifying_key_hex().to_string()),
-        ..test_config(dir.path())
-    };
-    let server = server::start(&config)
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
-    let good_read = cap_token("telemetry.read");
+    let node = support::token(&[("shop.production", TELEMETRY_INGEST)]);
 
-    let refused = http_get(server.metrics_addr, "/metrics").await;
-    assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
-    assert!(
-        !refused.contains("deis_telemetry_uptime_seconds"),
-        "a refused scrape must not hand out the page anyway: {refused}"
+    let mut logs = logs_as(&server, &node).await;
+    let pushed = logs
+        .push_logs(PushLogsRequest {
+            entries: vec![entry("shop", 3, "shipped by a node", now_us())],
+            ..Default::default()
+        })
+        .await
+        .expect("an ingest capability may push its tenant")
+        .into_inner();
+    assert_eq!(pushed.accepted_count, 1);
+
+    for status in [
+        logs.query(QueryRequest {
+            app_id: "shop".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("an ingest capability must not query"),
+        logs.tail(TailRequest {
+            app_id: "shop".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("an ingest capability must not follow"),
+        traces_as(&server, &node)
+            .await
+            .query_traces(QueryTracesRequest {
+                app_id: "shop".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an ingest capability must not read traces"),
+        metrics_as(&server, &node)
+            .await
+            .query_metrics(QueryMetricsRequest {
+                app_id: "shop".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an ingest capability must not read metrics"),
+    ] {
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status:?}");
+    }
+
+    let bearer = format!("Bearer {node}");
+    let scrape = http_get_with(
+        server.metrics_addr,
+        "/metrics",
+        &[("Authorization", bearer.as_str())],
+    )
+    .await;
+    assert!(scrape.starts_with("HTTP/1.1 403"), "{scrape}");
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_read_capability_cannot_write() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()), support::keys())
+        .await
+        .expect("the service must start");
+    let reader = support::token(&[
+        ("shop.production", TELEMETRY_READ),
+        (TELEMETRY_PLATFORM_TENANT, TELEMETRY_READ),
+    ]);
+
+    let status = logs_as(&server, &reader)
+        .await
+        .push_logs(PushLogsRequest {
+            entries: vec![entry("shop", 3, "forged by a reader", now_us())],
+            ..Default::default()
+        })
+        .await
+        .expect_err("a read capability must not push");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    let status = traces_as(&server, &reader)
+        .await
+        .push_traces(PushTracesRequest {
+            records: vec![invocation("shop", OUTCOME_OK, "/", now_us())],
+            ..Default::default()
+        })
+        .await
+        .expect_err("a read capability must not push traces");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        server.store.partition_count().unwrap(),
+        0,
+        "nothing a refused push carried was written"
     );
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+/// A follow stream is authorised when it opens, and ends when the capability
+/// it opened with expires: a reader cannot outlive its credential by keeping
+/// one connection open.
+#[tokio::test]
+async fn a_follow_stream_ends_when_its_capability_expires() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()), support::keys())
+        .await
+        .expect("the service must start");
+    for traces in [false, true] {
+        let reader = support::token_as(
+            "spiffe://deis.test/human/someone",
+            &[("shop.production", TELEMETRY_READ)],
+            Duration::from_secs(2),
+        );
+        let ended = if traces {
+            let mut live = traces_as(&server, &reader)
+                .await
+                .tail_traces(TailTracesRequest {
+                    app_id: "shop".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("the reader may follow its own application")
+                .into_inner();
+            tokio::time::timeout(Duration::from_secs(10), live.message())
+                .await
+                .expect("the stream ends within its capability's lifetime")
+                .expect_err("the stream ends with a refusal, not a record")
+        } else {
+            let mut live = logs_as(&server, &reader)
+                .await
+                .tail(TailRequest {
+                    app_id: "shop".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("the reader may follow its own application")
+                .into_inner();
+            tokio::time::timeout(Duration::from_secs(10), live.message())
+                .await
+                .expect("the stream ends within its capability's lifetime")
+                .expect_err("the stream ends with a refusal, not a record")
+        };
+        assert_eq!(ended.code(), tonic::Code::Unauthenticated, "{ended:?}");
+        assert!(ended.message().contains("expired"), "{ended:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_read_capability_sees_only_its_own_tenant() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()), support::keys())
+        .await
+        .expect("the service must start");
+    let reader = support::token(&[("shop.production", TELEMETRY_READ)]);
+
+    // A follower opened before anything arrives sees only its tenant.
+    let mut follower = logs_as(&server, &reader).await;
+    let mut live = follower
+        .tail(TailRequest {
+            app_id: "shop".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("the reader may follow its own application")
+        .into_inner();
+
+    let node = support::token(&[
+        ("shop.production", TELEMETRY_INGEST),
+        ("shop.preview", TELEMETRY_INGEST),
+        ("bank.production", TELEMETRY_INGEST),
+    ]);
+    let pushed = logs_as(&server, &node)
+        .await
+        .push_logs(PushLogsRequest {
+            entries: vec![
+                entry_in("shop", "preview", "another environment"),
+                entry_in("bank", "production", "another application"),
+                entry_in("shop", "production", "mine"),
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("the node may push all three")
+        .into_inner();
+    assert_eq!(pushed.accepted_count, 3);
+    let seen = live.message().await.unwrap().expect("the follower's line");
+    assert_eq!(seen.message, "mine");
+
+    let mut logs = logs_as(&server, &reader).await;
+    let page = logs
+        .query(QueryRequest {
+            app_id: "shop".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("the reader may query its own application")
+        .into_inner();
+    let messages: Vec<&str> = page.entries.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(messages, ["mine"], "another environment's lines leaked");
+
+    for request in [
+        QueryRequest {
+            app_id: "bank".to_string(),
+            ..Default::default()
+        },
+        QueryRequest::default(),
+    ] {
+        let status = logs
+            .query(request.clone())
+            .await
+            .expect_err("a cross-tenant or unnamed read must be refused");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{request:?}");
+    }
+    let status = traces_as(&server, &reader)
+        .await
+        .query_traces(QueryTracesRequest {
+            app_id: "bank".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("a cross-tenant trace read must be refused");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+    // An operator holding the platform-wide read sees all three.
+    let all = connect(&server)
+        .await
+        .query(QueryRequest::default())
+        .await
+        .expect("the platform read may query everything")
+        .into_inner();
+    assert_eq!(all.entries.len(), 3);
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_node_may_push_only_what_it_runs_and_its_own_records() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()), support::keys())
+        .await
+        .expect("the service must start");
+    let node = support::token(&[
+        ("shop.production", TELEMETRY_INGEST),
+        (TELEMETRY_PLATFORM_TENANT, TELEMETRY_INGEST),
+    ]);
+
+    let pushed = logs_as(&server, &node)
+        .await
+        .push_logs(PushLogsRequest {
+            entries: vec![
+                entry("shop", 3, "an application this node runs", now_us()),
+                entry("bank", 3, "an application it does not", now_us()),
+                entry("", 3, "the node itself", now_us()),
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("a partly covered batch is answered")
+        .into_inner();
+    assert_eq!(pushed.accepted_count, 2);
+    assert_eq!(pushed.rejected_count, 1);
     assert!(
-        refused.to_ascii_lowercase().contains("www-authenticate"),
-        "the refusal must say which credential was wanted: {refused}"
+        pushed.error_message.contains("capability"),
+        "the node is told why: {}",
+        pushed.error_message
     );
+
+    let pushed = metrics_as(&server, &node)
+        .await
+        .push_metrics(PushMetricsRequest {
+            samples: vec![
+                MetricSample {
+                    name: "deis_runtime_isolates".to_string(),
+                    app_id: String::new(),
+                    labels: HashMap::new(),
+                    value: 3.0,
+                    timestamp_us: now_us(),
+                },
+                MetricSample {
+                    name: "requests".to_string(),
+                    app_id: "bank".to_string(),
+                    labels: HashMap::new(),
+                    value: 1.0,
+                    timestamp_us: now_us(),
+                },
+            ],
+            ..Default::default()
+        })
+        .await
+        .expect("a partly covered metric batch is answered")
+        .into_inner();
+    assert_eq!(pushed.accepted_count, 1);
+    assert_eq!(pushed.rejected_count, 1);
+
+    // The node's own line is the platform's: an operator sees it, a tenant's
+    // reader does not.
+    let all = connect(&server)
+        .await
+        .query(QueryRequest::default())
+        .await
+        .unwrap()
+        .into_inner();
+    let mut messages: Vec<&str> = all.entries.iter().map(|e| e.message.as_str()).collect();
+    messages.sort_unstable();
+    assert_eq!(
+        messages,
+        ["an application this node runs", "the node itself"]
+    );
+    let shop = logs_as(
+        &server,
+        &support::token(&[("shop.production", TELEMETRY_READ)]),
+    )
+    .await
+    .query(QueryRequest {
+        app_id: "shop".to_string(),
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(shop.entries.len(), 1);
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn an_expired_or_overlong_capability_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()), support::keys())
+        .await
+        .expect("the service must start");
+    let resources = [
+        ("shop.production", TELEMETRY_READ),
+        ("shop.production", TELEMETRY_INGEST),
+    ];
+
+    let expired = support::expired_token(&resources, Duration::from_secs(120));
+    let year = support::token_as(
+        "spiffe://deis.test/deislet/node/test",
+        &resources,
+        Duration::from_secs(365 * 24 * 3600),
+    );
+    for token in [expired, year] {
+        let mut logs = logs_as(&server, &token).await;
+        let status = logs
+            .push_logs(PushLogsRequest {
+                entries: vec![entry("shop", 3, "late", now_us())],
+                ..Default::default()
+            })
+            .await
+            .expect_err("an expired or overlong capability must not push");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+        let status = logs
+            .query(QueryRequest {
+                app_id: "shop".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an expired or overlong capability must not read");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated, "{status:?}");
+    }
+
+    server.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_scrape_needs_the_platform_read() {
+    // The scrape page carries every application's metric series at once, so
+    // only a capability that may read every tenant may have it.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()), support::keys())
+        .await
+        .expect("the service must start");
 
     let wrong = http_get_with(
         server.metrics_addr,
@@ -1010,14 +1287,30 @@ async fn a_scrape_needs_the_token_once_a_secret_is_configured() {
     .await;
     assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
 
-    // Both forms a caller may present it in: the platform's own header, and
-    // the bearer token a Prometheus scrape configuration produces.
-    let bearer = format!("Bearer {good_read}");
-    for header in [("Authorization", bearer.as_str())] {
-        let served = http_get_with(server.metrics_addr, "/metrics", &[header]).await;
-        assert!(served.starts_with("HTTP/1.1 200"), "{served}");
-        assert!(served.contains("deis_telemetry_uptime_seconds"), "{served}");
-    }
+    let narrow = format!(
+        "Bearer {}",
+        support::token(&[("shop.production", TELEMETRY_READ)])
+    );
+    let refused = http_get_with(
+        server.metrics_addr,
+        "/metrics",
+        &[("Authorization", narrow.as_str())],
+    )
+    .await;
+    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+
+    let platform = format!(
+        "Bearer {}",
+        support::token(&[(TELEMETRY_PLATFORM_TENANT, TELEMETRY_READ)])
+    );
+    let served = http_get_with(
+        server.metrics_addr,
+        "/metrics",
+        &[("Authorization", platform.as_str())],
+    )
+    .await;
+    assert!(served.starts_with("HTTP/1.1 200"), "{served}");
+    assert!(served.contains("deis_telemetry_uptime_seconds"), "{served}");
 
     server.shutdown().await.expect("clean shutdown");
 }
@@ -1034,7 +1327,7 @@ async fn a_flood_from_one_application_does_not_delete_a_co_tenants_live_lines() 
         tail_capacity: 8,
         ..test_config(dir.path())
     };
-    let server = server::start(&config)
+    let server = server::start(&config, support::keys())
         .await
         .expect("the service must start");
     let mut follower = connect(&server).await;
@@ -1089,7 +1382,7 @@ async fn a_page_of_big_lines_is_cut_by_bytes_and_pages_through() {
     // the whole retention window. The page has to stop early and hand back a
     // cursor, so whatever limit a client asks for pages through.
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
     let mut client = connect(&server).await;
@@ -1161,7 +1454,7 @@ async fn entries_older_than_the_retention_window_are_refused_not_partitioned() {
     // with three indexes each inside one write transaction, holding the single
     // writer against every other producer for as long as that takes.
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service must start");
     let mut client = connect(&server).await;
@@ -1221,7 +1514,9 @@ async fn migration_management_is_independently_authenticated_and_fences_only_its
         migration_admin_token: Some(TOKEN.to_string()),
         ..test_config(dir.path())
     };
-    let server = server::start(&config).await.expect("service must start");
+    let server = server::start(&config, support::keys())
+        .await
+        .expect("service must start");
     let mut logs = connect(&server).await;
     logs.push_logs(PushLogsRequest {
         entries: vec![entry("shop", 3, "before fence", now_us())],
@@ -1399,7 +1694,7 @@ async fn invalid_or_reused_migration_credentials_fail_before_creating_backend_st
             migration_admin_token: Some(migration_admin_token),
             ..test_config(dir.path())
         };
-        let error = match server::start(&config).await {
+        let error = match server::start(&config, support::keys()).await {
             Ok(server) => {
                 server.shutdown().await.unwrap();
                 panic!("invalid management credential must refuse startup")
@@ -1415,7 +1710,7 @@ async fn invalid_or_reused_migration_credentials_fail_before_creating_backend_st
 #[tokio::test]
 async fn migration_management_is_not_registered_by_default() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("ordinary telemetry service must start");
     let mut migration = connect_migration(&server).await;

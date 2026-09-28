@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use deis_wire::conventions::{DEFAULT_ENVIRONMENT, is_valid_tenant_part, tenant_id};
 
+use crate::auth::Owner;
 use crate::store::{LogRecord, MetricRecord, TraceRecord};
 
 /// Missing and empty environments from older producers mean production, the
@@ -36,16 +37,26 @@ pub(crate) fn from_parts(app_id: &str, environment: Option<&str>) -> Result<Stri
     Ok(tenant_id(app_id, environment))
 }
 
-pub(crate) fn log(record: &LogRecord) -> Result<String, String> {
-    from_parts(&record.app_id, Some(map_environment(&record.fields)))
+/// Whose a record is. No application at all means a node's own record, which
+/// belongs to the platform rather than to any tenant; anything else has to
+/// name a valid application environment.
+fn owner(app_id: &str, environment: Option<&str>) -> Result<Owner, String> {
+    if app_id.is_empty() {
+        return Ok(Owner::Platform);
+    }
+    from_parts(app_id, environment).map(Owner::Tenant)
 }
 
-pub(crate) fn metric(record: &MetricRecord) -> Result<String, String> {
-    from_parts(&record.app_id, Some(map_environment(&record.labels)))
+pub(crate) fn log(record: &LogRecord) -> Result<Owner, String> {
+    owner(&record.app_id, Some(map_environment(&record.fields)))
 }
 
-pub(crate) fn trace(record: &TraceRecord) -> Result<String, String> {
-    from_parts(&record.app_id, Some(&record.environment))
+pub(crate) fn metric(record: &MetricRecord) -> Result<Owner, String> {
+    owner(&record.app_id, Some(map_environment(&record.labels)))
+}
+
+pub(crate) fn trace(record: &TraceRecord) -> Result<Owner, String> {
+    owner(&record.app_id, Some(&record.environment))
 }
 
 #[cfg(test)]
@@ -63,5 +74,14 @@ mod tests {
         assert!(from_parts("shop.preview", Some("production")).is_err());
         assert!(from_parts("shop", Some("../../preview")).is_err());
         assert!(from_parts("", None).is_err());
+    }
+
+    #[test]
+    fn no_application_means_the_platform() {
+        assert_eq!(owner("", Some("production")).unwrap(), Owner::Platform);
+        assert_eq!(
+            owner("shop", None).unwrap(),
+            Owner::Tenant("shop.production".to_string())
+        );
     }
 }

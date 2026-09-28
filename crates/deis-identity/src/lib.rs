@@ -56,6 +56,7 @@ pub mod dial;
 mod error;
 mod material;
 pub mod names;
+pub mod service;
 mod spiffe;
 /// A certificate authority small enough to hand a test.
 ///
@@ -71,10 +72,13 @@ use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, ServerConfig};
 use tracing::{error, info, warn};
 
-pub use crate::cert::name_in_certificate;
+pub use crate::cert::{
+    EXPIRY_WARNING_SECS, MIN_CERTIFICATE_LIFETIME_SECS, Validity, name_in_certificate,
+};
 pub use crate::dial::Dialler;
 pub use crate::error::{FileRole, IdentityError};
 pub use crate::names::ServiceKind;
+pub use crate::service::{ServiceDialler, ServiceTrust, accept_tls};
 pub use crate::spiffe::{SpiffeId, SpiffeIdError, check_path_segment};
 
 use crate::material::Material;
@@ -112,7 +116,7 @@ impl Protocol {
     }
 
     /// The list rustls wants, in the caller's order of preference.
-    fn wire_names(protocols: &[Self]) -> Vec<Vec<u8>> {
+    pub(crate) fn wire_names(protocols: &[Self]) -> Vec<Vec<u8>> {
         protocols.iter().map(|p| p.wire_name().to_vec()).collect()
     }
 }
@@ -218,6 +222,28 @@ impl MachineIdentity {
             .unwrap_or(0)
     }
 
+    /// A 32-byte key for sealing this machine's own files at rest, derived
+    /// from the private key in force with HKDF-SHA256.
+    ///
+    /// `purpose` separates one use from another, so two files sealed for
+    /// different reasons never share a key. The private key never leaves this
+    /// crate; only what is derived from it does, and HKDF makes that one-way.
+    ///
+    /// A key rotation changes the answer. Whatever was sealed under the old
+    /// key can no longer be opened - which is the right direction for a file
+    /// that only ever holds what this machine can fetch again.
+    pub fn derive_local_key(&self, purpose: &[u8]) -> [u8; 32] {
+        let material = self.current.load();
+        let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(
+            Some(b"deislet/machine-local-key/v1"),
+            material.key.secret_der(),
+        );
+        let mut key = [0u8; 32];
+        hkdf.expand(purpose, &mut key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        key
+    }
+
     /// When the certificate currently in force stops being valid.
     pub fn validity(&self) -> crate::cert::Validity {
         self.current.load().validity
@@ -262,7 +288,7 @@ impl MachineIdentity {
     ///
     /// # Why the threshold is a fraction and not a number of days
     ///
-    /// Deislet is handed both two-day certificates (its own demo) and
+    /// Deislet is handed both four-day certificates (its own demo) and
     /// multi-year ones. A week's notice is early on one and already too late
     /// on the other, and a fixed threshold would either say nothing useful or
     /// fire on every correct startup - which teaches an operator that this
@@ -307,11 +333,12 @@ impl MachineIdentity {
                  restart"
             );
         }
-        // T8: the control-plane disconnect grace period needs at least 72 h
-        // of certificate validity.  If the certificate drops below 48 h it
-        // cannot survive a full 24 h grace window plus the TLS handshake
-        // skew, so the operator must be warned on every report cycle.
-        if remaining > 0 && remaining < 172_800 {
+        // A machine rides out a control-plane outage of up to 24 hours on
+        // what it holds, and certificates are issued for at least 72 (see
+        // `cert::MIN_CERTIFICATE_LIFETIME_SECS`). Below 48 hours left, an
+        // outage starting now could outlast the certificate, so this warns
+        // on every report cycle whatever fraction of the life that is.
+        if remaining > 0 && remaining < crate::cert::EXPIRY_WARNING_SECS {
             warn!(
                 identity = %id,
                 certificate = %certificate,
@@ -516,7 +543,7 @@ pub fn name_presented_by(
 /// Every configuration this crate builds is pinned to the provider that was in
 /// force when its material was loaded, so a provider installed later by another
 /// part of the process cannot silently change what a running listener accepts.
-fn default_provider() -> Arc<CryptoProvider> {
+pub(crate) fn default_provider() -> Arc<CryptoProvider> {
     if let Some(installed) = CryptoProvider::get_default() {
         return Arc::clone(installed);
     }

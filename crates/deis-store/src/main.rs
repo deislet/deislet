@@ -7,8 +7,10 @@
 //!
 //! Who a caller is allowed to be, it does check: a call carries a capability
 //! token for the tenant it names, an Ed25519-signed JCS-JWT verified against
-//! the control plane's published keys, fetched from its JWKS. Every call must present a valid token;
-//! there is no anonymous or loopback bypass. See [`deis_store::auth`].
+//! the control plane's published keys, read from its JWKS over the machine
+//! channel under mutual TLS. Every call must present a valid token; there is
+//! no anonymous or loopback bypass. See [`deis_store::auth`]. The listener
+//! itself speaks TLS only, with this store's own machine identity.
 //!
 //! Beside serving, the binary is also how a data directory is backed up and
 //! put back: `snapshot` and `restore`. Those are subcommands rather than RPCs
@@ -107,11 +109,12 @@ async fn main() -> Result<()> {
 }
 
 async fn serve(config: Config) -> Result<()> {
+    let (identity, control) = server::machine_identity(&config)?;
+
     let listener = server::bind(&config).await?;
+    let keys = capability_keys(control);
 
-    let keys = capability_keys(&config);
-
-    server::serve(config, listener, server::shutdown_signal(), keys).await
+    server::serve(config, listener, server::shutdown_signal(), keys, identity).await
 }
 
 /// The verifier's key ring, kept current from the control plane's JWKS.
@@ -119,15 +122,15 @@ async fn serve(config: Config) -> Result<()> {
 /// Starts empty and never blocks startup: the control plane may come up
 /// after this process, and until the first fetch lands every call is refused
 /// as signed by an unknown key - which is true - and the refresher retries.
-fn capability_keys(config: &Config) -> deis_capability::KeyRing {
+fn capability_keys(control: deis_capability::ControlClient) -> deis_capability::KeyRing {
     let keys = deis_capability::KeyRing::new();
     tracing::info!(
-        url = %config.capability_jwks_url,
+        control = ?control,
         "Fetching the control plane's capability verifying keys; calls are refused until they arrive"
     );
     deis_capability::fetch::spawn_refresher(
         keys.clone(),
-        config.capability_jwks_url.clone(),
+        control,
         deis_capability::fetch::RefreshPolicy::default(),
     );
     keys

@@ -363,20 +363,6 @@ pub const NODE_ID_HELD_BY_LIVE_CHANNEL: &str = "is held by a live channel";
 /// does not thereby print the credential.
 pub const STORAGE_TOKEN_HEADER: &str = "x-deis-storage-token";
 
-/// Deployment-env key carrying the storage capability token for the tenant a
-/// deployment belongs to.
-///
-/// Travels the same way as [`STORE_ENDPOINT_ENV`]: the control plane puts it
-/// in the `env` map of an `ApplyDeployment`, and deis-runtime lifts it back
-/// out before the application sees its own variables - an application that
-/// could read this value could mint calls as its own tenant directly against
-/// the storage port, bypassing every check the node makes on its behalf.
-pub const STORAGE_TOKEN_ENV: &str = "DEIS_STORAGE_TOKEN";
-
-/// Deployment-env key carrying the queue-specific capability token.
-/// Separate from STORAGE_TOKEN_ENV because queue requires `aud = "queue"`
-/// while store/DB/blob require `aud = "store"`.
-pub const QUEUE_TOKEN_ENV: &str = "DEIS_QUEUE_TOKEN";
 
 
 /// A single chunk plus its framing must never approach the ceiling, otherwise
@@ -405,7 +391,7 @@ mod tests {
         // They travel in the same map as an application's own variables, so
         // anything that is not a plain uppercase identifier would be a name a
         // handler could not read back.
-        for key in [STORE_ENDPOINT_ENV, QUEUE_ENDPOINT_ENV, STORAGE_TOKEN_ENV] {
+        for key in [STORE_ENDPOINT_ENV, QUEUE_ENDPOINT_ENV] {
             assert!(
                 key.starts_with("DEIS_")
                     && key

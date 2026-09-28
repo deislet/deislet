@@ -404,7 +404,6 @@ mod tests {
         let logging = LoggingConfig {
             enabled: true,
             endpoint: Some("http://127.0.0.1:8092".to_string()),
-            auth_secret: Some("shared-with-the-collector".to_string()),
             buffer_size: 1,
             flush_interval_secs: 9,
             batch_size: 8,
@@ -420,19 +419,8 @@ mod tests {
         assert_eq!(config.max_retries, 7);
         assert_eq!(config.max_pending_entries, 6);
         assert!(
-            config.credential.is_present(),
-            "a configured auth_secret has to become a token the shipper actually carries; \
-             without it deis-telemetry refuses every batch and the node retries forever"
-        );
-
-        let unauthenticated = ShipperConfig::from(&LoggingConfig {
-            auth_secret: None,
-            ..logging
-        });
-        assert!(
-            !unauthenticated.credential.is_present(),
-            "and no secret has to mean no header at all: an empty one is presented and refused \
-             where none is served by a collector that requires none"
+            !config.credential.is_present(),
+            "the credential comes from the control plane, never from the configuration"
         );
     }
 

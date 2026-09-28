@@ -39,9 +39,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod keys;
 #[cfg(feature = "jwks-fetch")]
+pub mod control;
+#[cfg(feature = "jwks-fetch")]
+pub mod exposition;
+#[cfg(feature = "jwks-fetch")]
 pub mod fetch;
+pub mod revocation;
+
+#[cfg(feature = "jwks-fetch")]
+pub use control::{ControlClient, ControlClientConfig, ControlClientError, ServiceIdentityConfig};
+
+/// Where the control plane serves its capability verifying keys as a JWKS
+/// document, on its machine channel.
+pub const JWKS_PATH: &str = "/.well-known/deis/capability-jwks.json";
 
 pub use keys::{Jwk, Jwks, JwksError, KeyRing, key_id};
+pub use revocation::{RevocationList, RevocationListError, SignedRevocationList};
+
+/// One verifier shared by every guard of a process, so the revocation poller
+/// feeds all of them at once. A `std` mutex because the guards run inside
+/// synchronous tonic interceptors.
+pub type SharedVerifier = Arc<std::sync::Mutex<CapabilityVerifier>>;
 
 // ---- audiences and bindings -----------------------------------------------
 
@@ -50,10 +68,40 @@ pub const AUD_STORE: &str = "store";
 /// Audience of a capability for deis-queue.
 pub const AUD_QUEUE: &str = "queue";
 
+/// Audience of a capability for deis-telemetry.
+pub const AUD_TELEMETRY: &str = "telemetry";
+
 /// The bindings deis-store serves, one per service; each verifies its own.
 pub const STORE_BINDINGS: &[&str] = &["kv", "sql", "blob"];
 /// The one binding deis-queue serves.
 pub const QUEUE_BINDINGS: &[&str] = &["queue"];
+
+/// The deis-telemetry binding that may push logs, traces and metric samples
+/// for its tenant. It reads nothing.
+pub const TELEMETRY_INGEST: &str = "ingest";
+/// The deis-telemetry binding that may query and follow its tenant's logs,
+/// traces and metric samples. It writes nothing.
+pub const TELEMETRY_READ: &str = "read";
+/// What a node's tenant resource for deis-telemetry names: a node ships, it
+/// never reads.
+pub const TELEMETRY_BINDINGS: &[&str] = &[TELEMETRY_INGEST];
+
+/// The tenant a deis-telemetry resource names when it is about the platform
+/// rather than about one application environment.
+///
+/// With [`TELEMETRY_INGEST`] it lets a node push its own, node-level records
+/// (the ones carrying no application); with [`TELEMETRY_READ`] it lets an
+/// operator read everything, every tenant's records and the platform's own.
+/// Never a real tenant: a tenant is always `<app>.<environment>`, and this
+/// has no `.`.
+pub const TELEMETRY_PLATFORM_TENANT: &str = "@platform";
+
+/// The longest a capability may be valid for, `exp - iat`, in seconds.
+///
+/// Every issuer mints 15-minute tokens (ADR-025); a verifier refuses anything
+/// that claims to last longer, so a token minted outside the control plane's
+/// rules - a year-long one, say - is refused however it was signed.
+pub const MAX_CAPABILITY_LIFETIME_SECS: u64 = 15 * 60;
 
 /// The bindings a capability for `aud` has to name so every service behind
 /// that audience accepts it, or `None` for an audience with no per-tenant
@@ -62,6 +110,7 @@ pub fn bindings_for_audience(aud: &str) -> Option<&'static [&'static str]> {
     match aud {
         AUD_STORE => Some(STORE_BINDINGS),
         AUD_QUEUE => Some(QUEUE_BINDINGS),
+        AUD_TELEMETRY => Some(TELEMETRY_BINDINGS),
         _ => None,
     }
 }
@@ -158,6 +207,11 @@ pub enum CapabilityError {
     /// The token's `jti` has been revoked.
     #[error("capability {jti} has been revoked")]
     Revoked { jti: String },
+
+    /// The token was issued to a node that has been revoked as a principal:
+    /// no capability naming it is accepted, whenever it was issued.
+    #[error("node {node} has been revoked; no capability issued to it is accepted")]
+    NodeRevoked { node: String },
 
     /// The payload did not deserialize to a valid capability.
     #[error("invalid capability claims: {0}")]
@@ -435,11 +489,12 @@ pub fn verify_for_request(
         binding,
         min_auth_epoch.unwrap_or(0),
         revoked_jtis.unwrap_or_default(),
+        &[],
     )
 }
 
-/// Every check after the signature: expiry (skipped when `grace_accepted`),
-/// issue time, audience, auth epoch, revocation, and the tenant + binding.
+/// Every check after the signature: the ones in [`check_common`], then the
+/// tenant + binding.
 fn check_claims(
     claims: CapabilityClaims,
     grace_accepted: bool,
@@ -448,42 +503,16 @@ fn check_claims(
     binding: &str,
     min_auth_epoch: u64,
     revoked_jtis: &[String],
+    revoked_nodes: &[String],
 ) -> Result<VerifiedCapability, CapabilityError> {
-    let now = now_secs();
-
-    if claims.is_expired() && !grace_accepted {
-        return Err(CapabilityError::Expired {
-            exp: claims.exp,
-            now,
-        });
-    }
-
-    if !grace_accepted && claims.is_not_yet_valid() {
-        return Err(CapabilityError::NotYetValid {
-            iat: claims.iat,
-            now,
-        });
-    }
-
-    if claims.aud != expected_aud {
-        return Err(CapabilityError::WrongAudience {
-            expected: expected_aud.to_string(),
-            got: claims.aud,
-        });
-    }
-
-    if claims.auth_epoch < min_auth_epoch {
-        return Err(CapabilityError::AuthEpochTooLow {
-            got: claims.auth_epoch,
-            minimum: min_auth_epoch,
-        });
-    }
-
-    if revoked_jtis.iter().any(|jti| *jti == claims.jti) {
-        return Err(CapabilityError::Revoked {
-            jti: claims.jti.clone(),
-        });
-    }
+    check_common(
+        &claims,
+        grace_accepted,
+        expected_aud,
+        min_auth_epoch,
+        revoked_jtis,
+        revoked_nodes,
+    )?;
 
     if !claims.authorizes_binding(tenant, binding) {
         if !claims.authorizes_tenant(tenant) {
@@ -506,12 +535,117 @@ fn check_claims(
     })
 }
 
+/// Every check after the signature that does not look at the resources:
+/// lifetime, expiry (skipped when `grace_accepted`), issue time, audience,
+/// auth epoch and revocation - of the `jti`, and of the node it names.
+fn check_common(
+    claims: &CapabilityClaims,
+    grace_accepted: bool,
+    expected_aud: &str,
+    min_auth_epoch: u64,
+    revoked_jtis: &[String],
+    revoked_nodes: &[String],
+) -> Result<(), CapabilityError> {
+    let now = now_secs();
+
+    let lifetime = claims.exp.saturating_sub(claims.iat);
+    if lifetime > MAX_CAPABILITY_LIFETIME_SECS {
+        return Err(CapabilityError::InvalidClaims(format!(
+            "lifetime {lifetime}s exceeds the maximum of {MAX_CAPABILITY_LIFETIME_SECS}s"
+        )));
+    }
+
+    if claims.is_expired() && !grace_accepted {
+        return Err(CapabilityError::Expired {
+            exp: claims.exp,
+            now,
+        });
+    }
+
+    if !grace_accepted && claims.is_not_yet_valid() {
+        return Err(CapabilityError::NotYetValid {
+            iat: claims.iat,
+            now,
+        });
+    }
+
+    if claims.aud != expected_aud {
+        return Err(CapabilityError::WrongAudience {
+            expected: expected_aud.to_string(),
+            got: claims.aud.clone(),
+        });
+    }
+
+    if claims.auth_epoch < min_auth_epoch {
+        return Err(CapabilityError::AuthEpochTooLow {
+            got: claims.auth_epoch,
+            minimum: min_auth_epoch,
+        });
+    }
+
+    if revoked_jtis.iter().any(|jti| *jti == claims.jti) {
+        return Err(CapabilityError::Revoked {
+            jti: claims.jti.clone(),
+        });
+    }
+
+    if let Some(node) = revoked_node_of(&claims.sub, revoked_nodes) {
+        return Err(CapabilityError::NodeRevoked {
+            node: node.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// The revoked node `sub` names, if it names one.
+///
+/// Matched by node id in any trust domain: this control plane issues only to
+/// its own, so a same-named node elsewhere is refused along with it rather
+/// than let through on a technicality.
+fn revoked_node_of<'a>(sub: &str, revoked_nodes: &'a [String]) -> Option<&'a str> {
+    if revoked_nodes.is_empty() {
+        return None;
+    }
+    let id = deis_identity::SpiffeId::parse(sub).ok()?;
+    let node = deis_identity::names::node_id_of(&id)?;
+    revoked_nodes
+        .iter()
+        .find(|revoked| revoked.as_str() == node)
+        .map(String::as_str)
+}
+
+/// A capability that passed every check but the resource one, handed back
+/// whole so a service whose calls are not about exactly one tenant can decide
+/// per record what the resources allow.
+#[derive(Debug, Clone)]
+pub struct VerifiedGrant {
+    /// The principal the capability was issued to.
+    pub sub: String,
+    /// Every (tenant, binding) pair it authorizes.
+    pub resources: Vec<CapabilityResource>,
+    /// `true` when accepted under T8 degraded-mode grace rules.
+    pub grace_accepted: bool,
+    /// Token expiry as Unix seconds.
+    pub exp: u64,
+}
+
+impl VerifiedGrant {
+    /// The tenants this grant names with `binding`.
+    pub fn tenants_with<'a>(&'a self, binding: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.resources
+            .iter()
+            .filter(move |r| r.binding == binding)
+            .map(|r| r.tenant.as_str())
+    }
+}
+
 // ---- verifier -------------------------------------------------------------
 
 /// A reusable verifier for capability tokens.
 ///
-/// Bundles the key ring with the two revocation-state inputs
-/// (`min_auth_epoch` and `revoked_jtis`) and the T8 degraded-mode state
+/// Bundles the key ring with the revocation-state inputs
+/// (`min_auth_epoch`, `revoked_jtis` and `revoked_nodes`) and the T8 degraded-mode state
 /// (`last_sync`, `grace_max_secs`) so a service can construct one
 /// verifier at startup and reuse it for every request.
 #[derive(Debug, Clone)]
@@ -524,6 +658,8 @@ pub struct CapabilityVerifier {
     min_auth_epoch: u64,
     /// List of revoked JTIs (loaded from revocation feed).
     revoked_jtis: Vec<String>,
+    /// Node ids revoked as principals (loaded from revocation feed).
+    revoked_nodes: Vec<String>,
     /// Last successful revocation-list pull, as a monotonic instant.
     /// `None` means never synced → degraded from the start.
     last_sync: Option<Instant>,
@@ -536,6 +672,15 @@ pub struct CapabilityVerifier {
     pull_interval_secs: u64,
     /// Total number of expired tokens accepted under T8 degraded-mode grace rules.
     grace_accepted_total: Arc<AtomicU64>,
+    /// The trust domain a node subject must be in to get T8 grace, when the
+    /// verifier knows its own; `None` accepts a node of any trust domain.
+    trust_domain: Option<String>,
+    /// `issued_at` of the last revocation list accepted, so an older one -
+    /// a replay - is refused.
+    last_list_issued_at: u64,
+    /// When this verifier was made: a verifier that has never synced has
+    /// been degraded since then.
+    created_at: Instant,
 }
 
 impl CapabilityVerifier {
@@ -553,12 +698,98 @@ impl CapabilityVerifier {
             keys,
             min_auth_epoch: 0,
             revoked_jtis: Vec::new(),
+            revoked_nodes: Vec::new(),
             last_sync: None,
             grace_max_secs: DEFAULT_GRACE_PERIOD_SECS,
             skew_secs: DEFAULT_DEGRADED_SKEW_SECS,
             pull_interval_secs: DEFAULT_PULL_INTERVAL_SECS,
             grace_accepted_total: Arc::new(AtomicU64::new(0)),
+            trust_domain: None,
+            last_list_issued_at: 0,
+            created_at: Instant::now(),
         }
+    }
+
+    /// Wrap this verifier for sharing between guards and the poller.
+    pub fn shared(self) -> SharedVerifier {
+        Arc::new(std::sync::Mutex::new(self))
+    }
+
+    /// Adopt a verified revocation list (see [`revocation::verify`]).
+    ///
+    /// Refuses a list that is stale - older than
+    /// [`revocation::MAX_LIST_AGE_SECS`], from the future, or older than the
+    /// last one accepted - and leaves everything as it was, including the
+    /// degraded-mode clock: a replayed list must not make a verifier cut off
+    /// from the control plane look in sync. The epoch floor only ever rises.
+    pub fn apply_revocation_list(
+        &mut self,
+        list: RevocationList,
+    ) -> Result<(), RevocationListError> {
+        revocation::check_fresh(&list, now_secs(), self.last_list_issued_at)?;
+        self.min_auth_epoch = self.min_auth_epoch.max(list.auth_epoch);
+        self.revoked_jtis = list.revoked_jtis;
+        self.revoked_nodes = list.revoked_nodes;
+        self.last_list_issued_at = list.issued_at;
+        self.record_sync();
+        Ok(())
+    }
+
+    /// The minimum auth epoch currently enforced.
+    pub fn min_auth_epoch(&self) -> u64 {
+        self.min_auth_epoch
+    }
+
+    /// When degraded mode began, as Unix seconds, or `None` when not
+    /// degraded. A verifier that has never synced has been degraded since it
+    /// was made.
+    pub fn degraded_since_unix(&self) -> Option<u64> {
+        if !self.is_degraded() {
+            return None;
+        }
+        let began = match self.last_sync {
+            Some(last) => last + Duration::from_secs(self.pull_interval_secs * DEGRADED_PULL_INTERVAL_FACTOR),
+            None => self.created_at,
+        };
+        Some(now_secs().saturating_sub(began.elapsed().as_secs()))
+    }
+
+    /// The T8 metrics in Prometheus text form, labelled with `service`, for
+    /// the process's own metrics endpoint.
+    pub fn render_metrics(&self, service: &str) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(768);
+        let label = format!("{{service=\"{service}\"}}");
+        let mut family = |name: &str, kind: &str, help: &str, value: u64| {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} {kind}");
+            let _ = writeln!(out, "{name}{label} {value}");
+        };
+        family(
+            "deis_auth_degraded",
+            "gauge",
+            "1 while this verifier has not fetched the control plane's revocation list for two poll intervals (T8 degraded mode)",
+            u64::from(self.is_degraded()),
+        );
+        family(
+            "deis_auth_degraded_since_seconds",
+            "gauge",
+            "Unix time degraded mode began, 0 when not degraded",
+            self.degraded_since_unix().unwrap_or(0),
+        );
+        family(
+            "deis_auth_grace_accepted_total",
+            "counter",
+            "Expired node capabilities accepted under T8 degraded-mode grace",
+            self.grace_accepted_total(),
+        );
+        family(
+            "deis_auth_revocation_last_sync_seconds",
+            "gauge",
+            "Unix time of the last revocation list accepted, 0 if none yet",
+            self.last_sync_unix().unwrap_or(0),
+        );
+        out
     }
 
     /// The key ring this verifier checks signatures against.
@@ -576,10 +807,20 @@ impl CapabilityVerifier {
         self.revoked_jtis = jtis;
     }
 
+    /// Replace the list of nodes revoked as principals.
+    pub fn set_revoked_nodes(&mut self, nodes: Vec<String>) {
+        self.revoked_nodes = nodes;
+    }
+
     /// Set the maximum grace period in seconds, silently capped at
     /// [`MAX_GRACE_PERIOD_SECS`] (24 hours).
     pub fn set_grace_max_secs(&mut self, secs: u64) {
         self.grace_max_secs = secs.min(MAX_GRACE_PERIOD_SECS);
+    }
+
+    /// Only grant T8 grace to nodes of `trust_domain` - this installation's.
+    pub fn set_trust_domain(&mut self, trust_domain: impl Into<String>) {
+        self.trust_domain = Some(trust_domain.into());
     }
 
     /// Set the revocation-list pull interval in seconds.
@@ -649,20 +890,23 @@ impl CapabilityVerifier {
             binding,
             self.min_auth_epoch,
             &self.revoked_jtis,
+            &self.revoked_nodes,
         )
     }
 
     /// Verify with T8 degraded-mode grace period.
     ///
-    /// When the token's `sub` identifies a node SPIFFE identity
-    /// (`spiffe://deislet/node/…`) and the verifier is in degraded mode,
-    /// expired tokens are accepted if:
+    /// When the token's `sub` is a runtime node's SPIFFE name
+    /// (`spiffe://<trust domain>/deislet/node/<id>`, see [`is_node_subject`])
+    /// and the verifier is in degraded mode, expired tokens are accepted if:
     /// 1. `exp ≥ last_sync_unix − skew_secs` (the token was still valid when
     ///    the control plane was last reachable), and
     /// 2. `now ≤ exp + grace_max_secs` (within the grace window).
     ///
-    /// Human / CLI tokens are never eligible for grace — their `sub` starts
-    /// with `spiffe://deislet/human/`.
+    /// Revocation (`jti`, revoked node and `auth_epoch`, from the last list
+    /// fetched) and every other check still apply: a revoked node gets no
+    /// grace. Human / CLI tokens are never eligible
+    /// for grace: their subject is not a node's name.
     pub fn verify_with_grace(
         &self,
         token: &str,
@@ -673,7 +917,7 @@ impl CapabilityVerifier {
         let claims = decode_with(token, &self.keys)?;
         let now = now_secs();
         let grace_accepted = claims.is_expired()
-            && is_node_subject(&claims.sub)
+            && is_node_subject(&claims.sub, self.trust_domain.as_deref())
             && self.is_degraded()
             && self.grace_applies(&claims, now);
 
@@ -685,12 +929,54 @@ impl CapabilityVerifier {
             binding,
             self.min_auth_epoch,
             &self.revoked_jtis,
+            &self.revoked_nodes,
         )?;
 
         if verified.grace_accepted {
             self.grace_accepted_total.fetch_add(1, Ordering::Relaxed);
         }
         Ok(verified)
+    }
+
+    /// Verify a token against an expected audience only, with the same T8
+    /// grace as [`Self::verify_with_grace`], and hand back its resources for
+    /// the caller to check.
+    ///
+    /// For a service whose one call can touch several tenants - a
+    /// deis-telemetry push carries every application on a node - and which
+    /// therefore cannot name the one tenant [`Self::verify_with_grace`]
+    /// needs. The caller must then refuse whatever the resources do not
+    /// name; an empty resource list authorizes nothing.
+    pub fn verify_grant_with_grace(
+        &self,
+        token: &str,
+        expected_aud: &str,
+    ) -> Result<VerifiedGrant, CapabilityError> {
+        let claims = decode_with(token, &self.keys)?;
+        let now = now_secs();
+        let grace_accepted = claims.is_expired()
+            && is_node_subject(&claims.sub, self.trust_domain.as_deref())
+            && self.is_degraded()
+            && self.grace_applies(&claims, now);
+
+        check_common(
+            &claims,
+            grace_accepted,
+            expected_aud,
+            self.min_auth_epoch,
+            &self.revoked_jtis,
+            &self.revoked_nodes,
+        )?;
+
+        if grace_accepted {
+            self.grace_accepted_total.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(VerifiedGrant {
+            sub: claims.sub,
+            resources: claims.resources,
+            grace_accepted,
+            exp: claims.exp,
+        })
     }
 
     /// Check whether the two grace-period conditions are satisfied.
@@ -712,11 +998,22 @@ impl CapabilityVerifier {
 
 // ---- helpers --------------------------------------------------------------
 
-/// Returns `true` if the subject identifies a node principal
-/// (SPIFFE `spiffe://deislet/node/…`).  Human and CLI tokens use
-/// `spiffe://deislet/human/…` and are excluded from T8 grace.
-fn is_node_subject(sub: &str) -> bool {
-    sub.starts_with("spiffe://deislet/node/")
+/// Returns `true` if the subject is a runtime node's SPIFFE name,
+/// `spiffe://<trust domain>/deislet/node/<id>` - and, when `trust_domain` is
+/// given, one in that trust domain.
+///
+/// Parsed with the same code every machine handshake uses, so what counts as
+/// a node here is exactly what the machine channel admits as one. Anything
+/// else - a human capability's subject, the control plane's own name, a name
+/// that does not parse - is not a node and gets no T8 grace.
+fn is_node_subject(sub: &str, trust_domain: Option<&str>) -> bool {
+    let Ok(id) = deis_identity::SpiffeId::parse(sub) else {
+        return false;
+    };
+    if trust_domain.is_some_and(|domain| id.trust_domain() != domain) {
+        return false;
+    }
+    deis_identity::names::service_kind(&id) == Some(deis_identity::ServiceKind::Node)
 }
 
 /// JCS-canonicalize the claims to deterministic bytes for signing.
@@ -920,7 +1217,11 @@ mod tests {
         let (signing, verifying) = make_keypair();
         let verifier = CapabilityVerifier::new(verifying);
         let tenant = "app.production";
-        for (aud, bindings) in [(AUD_STORE, STORE_BINDINGS), (AUD_QUEUE, QUEUE_BINDINGS)] {
+        for (aud, bindings) in [
+            (AUD_STORE, STORE_BINDINGS),
+            (AUD_QUEUE, QUEUE_BINDINGS),
+            (AUD_TELEMETRY, TELEMETRY_BINDINGS),
+        ] {
             let claims = CapabilityClaims::new(
                 aud,
                 "issuer",
@@ -940,7 +1241,7 @@ mod tests {
                 Err(CapabilityError::TenantNotAuthorized { .. })
             ));
         }
-        assert!(resources_for_audience(tenant, "telemetry").is_empty());
+        assert!(resources_for_audience(tenant, "telemetry.read").is_empty());
     }
 
     #[test]
@@ -989,6 +1290,82 @@ mod tests {
             result.is_ok(),
             "capability at the boundary should pass with clock skew tolerance: {result:?}"
         );
+    }
+
+    #[test]
+    fn a_lifetime_beyond_the_maximum_is_refused() {
+        let (signing, verifying) = make_keypair();
+        let mut claims = make_claims("store");
+        claims.exp = claims.iat + 365 * 24 * 3600;
+        let token = encode(&claims, &signing);
+        let verifier = CapabilityVerifier::new(verifying);
+
+        let result = verifier.verify(
+            &token,
+            "store",
+            "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002",
+            "kv",
+        );
+        assert!(
+            matches!(result, Err(CapabilityError::InvalidClaims(ref m)) if m.contains("lifetime")),
+            "a year-long token must be refused, got {result:?}"
+        );
+        let grant = verifier.verify_grant_with_grace(&token, "store");
+        assert!(
+            matches!(grant, Err(CapabilityError::InvalidClaims(_))),
+            "the grant path applies the same ceiling, got {grant:?}"
+        );
+
+        // Exactly the ceiling is what every issuer mints, and passes.
+        claims.exp = claims.iat + MAX_CAPABILITY_LIFETIME_SECS;
+        let token = encode(&claims, &signing);
+        assert!(verifier.verify_grant_with_grace(&token, "store").is_ok());
+    }
+
+    #[test]
+    fn a_grant_carries_every_resource_and_checks_everything_else() {
+        let (signing, verifying) = make_keypair();
+        let claims = CapabilityClaims::new(
+            AUD_TELEMETRY,
+            "spiffe://deislet/control/main",
+            "spiffe://deis.internal/deislet/node/n1",
+            1,
+            Duration::from_secs(900),
+            vec![
+                CapabilityResource {
+                    tenant: "shop.production".into(),
+                    binding: TELEMETRY_INGEST.into(),
+                    generation: None,
+                },
+                CapabilityResource {
+                    tenant: TELEMETRY_PLATFORM_TENANT.into(),
+                    binding: TELEMETRY_INGEST.into(),
+                    generation: None,
+                },
+            ],
+        );
+        let token = encode(&claims, &signing);
+        let mut verifier = CapabilityVerifier::new(verifying);
+
+        let grant = verifier
+            .verify_grant_with_grace(&token, AUD_TELEMETRY)
+            .expect("a well-formed telemetry capability");
+        assert_eq!(grant.sub, "spiffe://deis.internal/deislet/node/n1");
+        assert_eq!(
+            grant.tenants_with(TELEMETRY_INGEST).collect::<Vec<_>>(),
+            ["shop.production", TELEMETRY_PLATFORM_TENANT]
+        );
+        assert_eq!(grant.tenants_with(TELEMETRY_READ).count(), 0);
+
+        assert!(matches!(
+            verifier.verify_grant_with_grace(&token, AUD_STORE),
+            Err(CapabilityError::WrongAudience { .. })
+        ));
+        verifier.set_revoked_jtis(vec![claims.jti.clone()]);
+        assert!(matches!(
+            verifier.verify_grant_with_grace(&token, AUD_TELEMETRY),
+            Err(CapabilityError::Revoked { .. })
+        ));
     }
 
     #[test]
@@ -1318,6 +1695,13 @@ mod tests {
 
     // ---- T8 degraded-mode / grace-period tests ---------------------------
 
+    /// A node's name exactly as `deis_identity::names::node` spells it and
+    /// as `IssueCapability` puts it in `sub`: the name the node proved.
+    const NODE_SUBJECT: &str = "spiffe://deis.internal/deislet/node/n1";
+
+    /// What this check used to look for, and no node's name ever matched.
+    const LEGACY_SHAPE: &str = "spiffe://deislet/node/n1";
+
     /// Make a token for a node principal that expires in `offset_secs`
     /// (negative = already expired).
     fn make_node_token(
@@ -1331,7 +1715,7 @@ mod tests {
             aud: "store".into(),
             kid: String::new(),
             iss: "spiffe://deislet/control/main".into(),
-            sub: "spiffe://deislet/node/n1".into(),
+            sub: NODE_SUBJECT.into(),
             jti: uuid::Uuid::now_v7().to_string(),
             exp,
             iat,
@@ -1375,21 +1759,55 @@ mod tests {
     }
 
     #[test]
-    fn is_node_subject_identifies_node_spiffe() {
-        assert!(is_node_subject("spiffe://deislet/node/n1"));
-        assert!(is_node_subject("spiffe://deislet/node/runtime-42"));
+    fn is_node_subject_identifies_the_names_nodes_really_carry() {
+        let issued = deis_identity::names::node("deis.internal", "runtime-42").unwrap();
+        assert!(is_node_subject(issued.as_str(), None));
+        assert!(is_node_subject(NODE_SUBJECT, None));
+        assert!(is_node_subject("spiffe://prod.example/deislet/node/n1", None));
     }
 
     #[test]
     fn is_node_subject_rejects_human_spiffe() {
-        assert!(!is_node_subject("spiffe://deislet/human/root"));
-        assert!(!is_node_subject("spiffe://deislet/human/alice"));
+        assert!(!is_node_subject("spiffe://deislet/human/root", None));
+        assert!(!is_node_subject("spiffe://deislet/human/alice", None));
     }
 
     #[test]
     fn is_node_subject_rejects_arbitrary_sub() {
-        assert!(!is_node_subject("admin"));
-        assert!(!is_node_subject("spiffe://other/node/n1"));
+        assert!(!is_node_subject("admin", None));
+        // The shape this check used to look for, which no node carries.
+        assert!(!is_node_subject(LEGACY_SHAPE, None));
+        assert!(!is_node_subject("spiffe://deis.internal/deislet/control", None));
+        assert!(!is_node_subject("spiffe://deis.internal/deislet/proxy/p1", None));
+        assert!(!is_node_subject("spiffe://deis.internal/deislet/node/n1/extra", None));
+    }
+
+    #[test]
+    fn is_node_subject_holds_a_node_to_the_verifiers_trust_domain() {
+        assert!(is_node_subject(NODE_SUBJECT, Some("deis.internal")));
+        assert!(!is_node_subject(NODE_SUBJECT, Some("other.internal")));
+    }
+
+    /// The acceptance line for T8: a capability minted for a node as the
+    /// control plane really mints it gets grace in degraded mode, and one
+    /// from another trust domain does not once the verifier knows its own.
+    #[test]
+    fn grace_accepts_a_real_format_node_subject_and_only_in_its_trust_domain() {
+        let (signing, verifying) = make_keypair();
+        let token = make_node_token(&signing, -60);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(3600));
+        let tenant = "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002";
+        let accepted = verifier
+            .verify_with_grace(&token, "store", tenant, "kv")
+            .expect("an expired node capability in degraded mode");
+        assert!(accepted.grace_accepted);
+
+        verifier.set_trust_domain("other.internal");
+        assert!(matches!(
+            verifier.verify_with_grace(&token, "store", tenant, "kv"),
+            Err(CapabilityError::Expired { .. })
+        ));
     }
 
     #[test]
@@ -1423,7 +1841,7 @@ mod tests {
         match result {
             Ok(cap) => {
                 assert!(!cap.grace_accepted, "valid token must not be grace_accepted");
-                assert_eq!(cap.node_id, "spiffe://deislet/node/n1");
+                assert_eq!(cap.node_id, NODE_SUBJECT);
             }
             Err(e) => panic!("valid token should pass: {e}"),
         }
@@ -1452,7 +1870,7 @@ mod tests {
         match result {
             Ok(cap) => {
                 assert!(cap.grace_accepted, "expired node token in degraded mode must be grace_accepted");
-                assert_eq!(cap.node_id, "spiffe://deislet/node/n1");
+                assert_eq!(cap.node_id, NODE_SUBJECT);
             }
             Err(e) => panic!("grace should accept recently-expired node token: {e}"),
         }
@@ -1564,6 +1982,145 @@ mod tests {
             matches!(result, Err(CapabilityError::Expired { .. })),
             "token past grace window must be refused"
         );
+    }
+
+    fn signed_list(signing: &SigningKey, epoch: u64, jtis: Vec<String>) -> RevocationList {
+        let signed = revocation::sign(&RevocationList::new("iss", epoch, jtis), signing);
+        revocation::verify(&signed, &KeyRing::from_keys([signing.verifying_key()])).unwrap()
+    }
+
+    const TENANT: &str =
+        "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002";
+
+    /// A jti on the list is refused from the moment the list is adopted -
+    /// in normal mode and under T8 grace alike.
+    #[test]
+    fn a_jti_on_an_adopted_list_is_refused_even_under_grace() {
+        let (signing, verifying) = make_keypair();
+        let claims = make_claims("store");
+        let token = encode(&claims, &signing);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        assert!(verifier.verify_with_grace(&token, "store", TENANT, "kv").is_ok());
+
+        verifier
+            .apply_revocation_list(signed_list(&signing, 1, vec![claims.jti.clone()]))
+            .unwrap();
+        assert!(matches!(
+            verifier.verify_with_grace(&token, "store", TENANT, "kv"),
+            Err(CapabilityError::Revoked { .. })
+        ));
+
+        let expired = make_node_token(&signing, -40);
+        let expired_jti = decode(&expired, &signing.verifying_key()).unwrap().jti;
+        verifier
+            .apply_revocation_list(signed_list(&signing, 1, vec![expired_jti]))
+            .unwrap();
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(30));
+        verifier.set_pull_interval_secs(10);
+        assert!(verifier.is_degraded());
+        assert!(matches!(
+            verifier.verify_with_grace(&expired, "store", TENANT, "kv"),
+            Err(CapabilityError::Revoked { .. })
+        ));
+    }
+
+    /// A revoked node is refused by name: a token minted after the list was
+    /// signed, which no jti on it can name, is refused as well, under T8
+    /// grace too - while another node's token is untouched.
+    #[test]
+    fn a_revoked_node_is_refused_whatever_token_it_presents() {
+        let (signing, verifying) = make_keypair();
+        let node_id = deis_identity::names::node_id_of(
+            &deis_identity::SpiffeId::parse(NODE_SUBJECT).unwrap(),
+        )
+        .unwrap()
+        .to_string();
+        let mut verifier = CapabilityVerifier::new(verifying);
+        let signed = revocation::sign(
+            &RevocationList::new("iss", 1, vec![]).with_revoked_nodes(vec![node_id.clone()]),
+            &signing,
+        );
+        verifier
+            .apply_revocation_list(
+                revocation::verify(&signed, &KeyRing::from_keys([signing.verifying_key()]))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let fresh = make_node_token(&signing, 600);
+        assert!(matches!(
+            verifier.verify_with_grace(&fresh, "store", TENANT, "kv"),
+            Err(CapabilityError::NodeRevoked { ref node }) if *node == node_id
+        ));
+        assert!(matches!(
+            verifier.verify_grant_with_grace(&fresh, "store"),
+            Err(CapabilityError::NodeRevoked { .. })
+        ));
+
+        let expired = make_node_token(&signing, -40);
+        verifier.last_sync = Some(Instant::now() - Duration::from_secs(30));
+        verifier.set_pull_interval_secs(10);
+        assert!(verifier.is_degraded());
+        assert!(matches!(
+            verifier.verify_with_grace(&expired, "store", TENANT, "kv"),
+            Err(CapabilityError::NodeRevoked { .. })
+        ));
+
+        verifier.set_revoked_nodes(vec!["someone-else".into()]);
+        assert!(verifier.verify_with_grace(&fresh, "store", TENANT, "kv").is_ok());
+    }
+
+    /// Mass revocation: a list carrying a higher epoch refuses every token
+    /// minted under a lower one, and a later list cannot lower it again.
+    #[test]
+    fn an_epoch_bump_refuses_older_tokens_and_never_goes_back() {
+        let (signing, verifying) = make_keypair();
+        let old = encode(&make_claims("store"), &signing);
+        let mut verifier = CapabilityVerifier::new(verifying);
+        verifier.apply_revocation_list(signed_list(&signing, 2, vec![])).unwrap();
+        assert!(matches!(
+            verifier.verify_with_grace(&old, "store", TENANT, "kv"),
+            Err(CapabilityError::AuthEpochTooLow { got: 1, minimum: 2 })
+        ));
+        verifier.apply_revocation_list(signed_list(&signing, 1, vec![])).unwrap();
+        assert_eq!(verifier.min_auth_epoch(), 2);
+    }
+
+    /// A replayed list is refused and does not count as a sync, so it can
+    /// neither hide newer revocations nor mask an outage.
+    #[test]
+    fn a_stale_list_changes_nothing_and_does_not_count_as_a_sync() {
+        let (signing, verifying) = make_keypair();
+        let mut verifier = CapabilityVerifier::new(verifying);
+        let mut old = signed_list(&signing, 1, vec![]);
+        old.issued_at -= revocation::MAX_LIST_AGE_SECS + 10;
+        assert!(matches!(
+            verifier.apply_revocation_list(old),
+            Err(RevocationListError::Stale(_))
+        ));
+        assert!(verifier.last_sync.is_none());
+
+        let fresh = signed_list(&signing, 1, vec!["x".into()]);
+        let mut earlier = fresh.clone();
+        earlier.issued_at -= 5;
+        earlier.revoked_jtis.clear();
+        verifier.apply_revocation_list(fresh).unwrap();
+        assert!(verifier.apply_revocation_list(earlier).is_err());
+        assert_eq!(verifier.revoked_jtis, vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn the_metrics_say_whether_the_verifier_is_degraded() {
+        let (signing, verifying) = make_keypair();
+        let mut verifier = CapabilityVerifier::new(verifying);
+        let text = verifier.render_metrics("store");
+        assert!(text.contains("deis_auth_degraded{service=\"store\"} 1"), "{text}");
+        assert!(text.contains("# TYPE deis_auth_grace_accepted_total counter"));
+        verifier.apply_revocation_list(signed_list(&signing, 1, vec![])).unwrap();
+        let text = verifier.render_metrics("store");
+        assert!(text.contains("deis_auth_degraded{service=\"store\"} 0"), "{text}");
+        assert!(text.contains("deis_auth_degraded_since_seconds{service=\"store\"} 0"));
+        assert!(text.contains("deis_auth_grace_accepted_total{service=\"store\"} 0"));
     }
 
     #[test]

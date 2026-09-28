@@ -935,9 +935,10 @@ impl Default for ExecutionLimits {
 ///
 /// This section is what the metric and trace shippers are configured from as
 /// well: all three go to the same service over the same connection, so the
-/// address, the on/off switch and the credential are one decision. See
-/// `crate::runtime::MetricShipperConfig`.
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
+/// address and the on/off switch are one decision. The credential is not
+/// configured at all: it is issued by the control plane, see
+/// `crate::telemetry`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LoggingConfig {
     /// Whether to ship logs at all.
     #[serde(default)]
@@ -947,24 +948,6 @@ pub struct LoggingConfig {
     /// Required when `enabled` is true.
     #[serde(default)]
     pub endpoint: Option<String>,
-
-    /// The secret from which this node derives the Ed25519 signing key for
-    /// the capability token it presents on every log, trace and metric push.
-    ///
-    /// Unset means the node ships without a token. That is correct for the
-    /// single-box install, where deis-telemetry has no capability public key
-    /// either and therefore both of its listeners are on loopback -- it refuses
-    /// to start otherwise. Against any collector reachable from another host it
-    /// is fatal to observability and to nothing else: every push is refused
-    /// with `unauthenticated`, the node retries them for as long as it runs,
-    /// and `deis logs` and `deis trace` are empty for every application on it.
-    /// See [`crate::telemetry`].
-    ///
-    /// It is not refused at startup. A node that cannot ship telemetry has to
-    /// keep serving requests, so the mismatch is a warning when the shippers
-    /// start and a named error the first time a push is refused.
-    #[serde(default)]
-    pub auth_secret: Option<String>,
 
     /// How many entries the in-memory buffer holds before the oldest are
     /// dropped to make room.
@@ -1015,7 +998,6 @@ impl Default for LoggingConfig {
         Self {
             enabled: false,
             endpoint: None,
-            auth_secret: None,
             buffer_size: default_buffer_size(),
             flush_interval_secs: default_flush_interval_secs(),
             batch_size: default_batch_size(),
@@ -1257,10 +1239,6 @@ impl RuntimeConfig {
 
         if let Some(value) = env_var("DEIS_RUNTIME_LOGGING_ENDPOINT") {
             self.logging.endpoint = Some(value);
-        }
-
-        if let Some(value) = env_var("DEIS_RUNTIME_LOGGING_AUTH_SECRET") {
-            self.logging.auth_secret = Some(value);
         }
 
         if let Some(value) = env_var("DEIS_RUNTIME_LOGGING_BUFFER_SIZE") {
@@ -1984,26 +1962,6 @@ impl AssetsConfig {
         }
 
         Ok(())
-    }
-}
-
-/// Hand-written so dumping the configuration - in a startup line, in an error
-/// context - cannot print the telemetry secret.
-impl std::fmt::Debug for LoggingConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoggingConfig")
-            .field("enabled", &self.enabled)
-            .field("endpoint", &self.endpoint)
-            .field(
-                "auth_secret",
-                &self.auth_secret.as_ref().map(|_| "<redacted>"),
-            )
-            .field("buffer_size", &self.buffer_size)
-            .field("flush_interval_secs", &self.flush_interval_secs)
-            .field("batch_size", &self.batch_size)
-            .field("max_retries", &self.max_retries)
-            .field("max_pending_entries", &self.max_pending_entries)
-            .finish()
     }
 }
 

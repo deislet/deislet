@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use deis_backend_migration::{FenceError, TenantWriteFences, WritePermit};
 
+use crate::auth::{Owner, ReadScope, grant_of};
 use crate::identity;
 use crate::now_us;
 // The generated traits carry the same names as the types implementing them,
@@ -41,7 +42,7 @@ use crate::store::{
     MetricCursor, MetricFilter, MetricRecord, TelemetryStore, TraceCursor, TraceFilter,
     TraceRecord, day_of,
 };
-use crate::tail::{TailFilter, TailHub, TraceHub, TraceTailFilter};
+use crate::tail::{LiveFilter, TailFilter, TailHub, TraceHub, TraceTailFilter};
 
 /// Longest message body kept verbatim. Anything longer is stored cut short:
 /// a runaway `console.log` must not be able to bloat the database, and a
@@ -433,14 +434,25 @@ impl TraceService {
 /// only that tenant's records; the others keep flowing and are committed in
 /// the original single database transaction. Every returned permit must be
 /// moved into that blocking transaction so it remains held through commit.
+#[allow(clippy::result_large_err)] // tonic's service contract returns Status by value.
 async fn admit_records<T>(
     fences: &TenantWriteFences,
     records: &mut Vec<T>,
-    tenant_of: impl Fn(&T) -> Result<String, String>,
+    owner_of: impl Fn(&T) -> Result<Owner, String>,
 ) -> Result<(Vec<WritePermit>, usize, Option<String>), Status> {
+    // A node's own records belong to no tenant, so no tenant's fence holds
+    // them back.
+    let tenant_of = |record: &T| -> Result<Option<String>, Status> {
+        match owner_of(record).map_err(Status::internal)? {
+            Owner::Tenant(tenant) => Ok(Some(tenant)),
+            Owner::Platform => Ok(None),
+        }
+    };
     let mut tenants = BTreeSet::new();
     for record in records.iter() {
-        tenants.insert(tenant_of(record).map_err(Status::internal)?);
+        if let Some(tenant) = tenant_of(record)? {
+            tenants.insert(tenant);
+        }
     }
 
     let mut permits = Vec::with_capacity(tenants.len());
@@ -464,13 +476,55 @@ async fn admit_records<T>(
     let before = records.len();
     let mut admitted = Vec::with_capacity(before);
     for record in records.drain(..) {
-        let tenant = tenant_of(&record).map_err(Status::internal)?;
-        if !fenced.contains(&tenant) {
-            admitted.push(record);
+        match tenant_of(&record)? {
+            Some(tenant) if fenced.contains(&tenant) => {}
+            _ => admitted.push(record),
         }
     }
     *records = admitted;
     Ok((permits, before - records.len(), first_rejection))
+}
+
+/// Why a record the capability does not cover is dropped.
+const NOT_GRANTED: &str = "the presented capability does not allow pushing records of this \
+                           application environment";
+
+/// Whether a record whose owner resolved to `owner` may be handed to a reader
+/// holding `scope`. A record whose owner cannot be worked out is shown only
+/// to a reader who may see everything.
+fn visible(scope: &ReadScope, owner: Result<Owner, String>) -> bool {
+    match owner {
+        Ok(owner) => scope.admits(&owner),
+        Err(_) => matches!(scope, ReadScope::All),
+    }
+}
+
+/// A live filter narrowed to what the reader's capability may see. Applied
+/// before the caller's own filter, so a stream never carries a record the
+/// same reader could not have queried.
+struct Scoped<F> {
+    filter: F,
+    scope: ReadScope,
+}
+
+impl LiveFilter<LogRecord> for Scoped<TailFilter> {
+    fn matches(&self, record: &LogRecord) -> bool {
+        visible(&self.scope, identity::log(record)) && self.filter.matches(record)
+    }
+
+    fn describe(&self) -> String {
+        self.filter.describe()
+    }
+}
+
+impl LiveFilter<TraceRecord> for Scoped<TraceTailFilter> {
+    fn matches(&self, record: &TraceRecord) -> bool {
+        visible(&self.scope, identity::trace(record)) && self.filter.matches(record)
+    }
+
+    fn describe(&self) -> String {
+        self.filter.describe()
+    }
 }
 
 /// Run a blocking storage call off the reactor, and account for how it went.
@@ -706,6 +760,11 @@ fn optional(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+/// The same, borrowed, for checking a request before it is taken apart.
+fn optional_ref(value: &str) -> Option<&str> {
+    if value.is_empty() { None } else { Some(value) }
+}
+
 /// Turn a zero timestamp into "unbounded".
 fn optional_time(value: i64) -> Option<i64> {
     if value == 0 { None } else { Some(value) }
@@ -733,6 +792,8 @@ impl LogServiceRpc for LogService {
         &self,
         request: Request<PushLogsRequest>,
     ) -> Result<Response<PushLogsResponse>, Status> {
+        let grant = grant_of(&request)?;
+        let ingest = grant.ingest()?;
         let request = request.into_inner();
         ServiceStats::incr(&self.stats.log_pushes);
         let received = request.entries.len();
@@ -746,11 +807,17 @@ impl LogServiceRpc for LogService {
         let mut truncated = 0u64;
         let mut stamped = 0u64;
         let mut rejected = 0u64;
+        let mut not_granted = 0u64;
         let mut first_rejection: Option<String> = None;
         for entry in request.entries {
             match to_record(entry, &window, &mut truncated, &mut stamped) {
                 Ok(record) => match identity::log(&record) {
-                    Ok(_) => records.push(record),
+                    Ok(owner) if ingest.admits(&owner) => records.push(record),
+                    Ok(_) => {
+                        rejected += 1;
+                        not_granted += 1;
+                        first_rejection.get_or_insert_with(|| NOT_GRANTED.to_string());
+                    }
                     Err(reason) => {
                         rejected += 1;
                         first_rejection.get_or_insert(reason);
@@ -763,6 +830,14 @@ impl LogServiceRpc for LogService {
                     }
                 }
             }
+        }
+        if not_granted > 0 {
+            warn!(
+                not_granted,
+                principal = %grant.principal(),
+                "refused log records for application environments the pushing capability \
+                 does not name; a node is issued ingest only for what it runs"
+            );
         }
         let over_days = cap_distinct_days(&mut records, |record| day_of(record.timestamp_us));
         if over_days > 0 {
@@ -857,8 +932,10 @@ impl LogServiceRpc for LogService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
+        let scope = grant_of(&request)?.read_scope()?;
         let request = request.into_inner();
         ServiceStats::incr(&self.stats.log_queries);
+        scope.check_app(optional_ref(&request.app_id))?;
         check_window(request.start_us, request.end_us).map_err(Status::invalid_argument)?;
         let limit = self
             .limits
@@ -883,10 +960,15 @@ impl LogServiceRpc for LogService {
 
         let store = self.store.clone();
         let describe = format!("{filter:?}");
-        let page = blocking(&self.stats, Access::Read, "query logs", move || {
+        let mut page = blocking(&self.stats, Access::Read, "query logs", move || {
             store.query_logs(&filter, limit, cursor)
         })
         .await?;
+        // Filtered after the page is cut, so the cursor still walks the
+        // application's rows; a narrow reader may get a short page and a
+        // cursor to the next one.
+        page.records
+            .retain(|record| visible(&scope, identity::log(record)));
         if page.cut_by_bytes {
             self.note_page_cut("log", page.records.len(), limit, &describe);
         }
@@ -913,11 +995,14 @@ impl LogServiceRpc for LogService {
         &self,
         request: Request<TailRequest>,
     ) -> Result<Response<Self::TailStream>, Status> {
+        let grant = grant_of(&request)?;
+        let scope = grant.read_scope()?;
         let peer = request
             .remote_addr()
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| "unknown-peer".to_string());
         let request = request.into_inner();
+        scope.check_app(optional_ref(&request.app_id))?;
         let filter = TailFilter {
             app_id: optional(request.app_id),
             min_level: optional_level(request.min_level),
@@ -928,10 +1013,55 @@ impl LogServiceRpc for LogService {
             app_id = filter.app_id.as_deref().unwrap_or("*"),
             "opening a tail stream; only entries ingested from now on are streamed"
         );
-        let rx = self.hub.subscribe(label, filter);
+        let rx = self.hub.subscribe(label, Scoped { filter, scope });
         let stream = ReceiverStream::new(rx).map(|record| Ok(to_entry(&record)));
+        let stream = until_expiry(stream, grant.expires_at());
         Ok(Response::new(Box::pin(stream) as Self::TailStream))
     }
+}
+
+/// `items`, ended when the capability that opened the stream expires.
+///
+/// A follow stream is authorised once, when it opens, so without this a
+/// reader whose capability ran out - or was revoked and not renewed - would
+/// go on receiving lines for as long as the connection held. At `expires_at`
+/// the stream ends with `Unauthenticated`, which tells the reader to come
+/// back with a fresh capability rather than that the service went away.
+fn until_expiry<T, S>(items: S, expires_at: u64) -> ReceiverStream<Result<T, Status>>
+where
+    T: Send + 'static,
+    S: Stream<Item = Result<T, Status>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        let remaining = expires_at.saturating_sub(now_us().max(0) as u64 / 1_000_000);
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(remaining));
+        tokio::pin!(deadline);
+        tokio::pin!(items);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    let _ = tx
+                        .send(Err(Status::unauthenticated(
+                            "the capability this stream was opened with has expired; open it \
+                             again with a fresh one",
+                        )))
+                        .await;
+                    break;
+                }
+                _ = tx.closed() => break,
+                item = items.next() => match item {
+                    Some(item) => {
+                        if tx.send(item).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+    ReceiverStream::new(rx)
 }
 
 /// Why a trace record could not be stored.
@@ -1062,6 +1192,8 @@ impl TraceServiceRpc for TraceService {
         &self,
         request: Request<PushTracesRequest>,
     ) -> Result<Response<PushTracesResponse>, Status> {
+        let grant = grant_of(&request)?;
+        let ingest = grant.ingest()?;
         let request = request.into_inner();
         ServiceStats::incr(&self.stats.trace_pushes);
 
@@ -1097,11 +1229,17 @@ impl TraceServiceRpc for TraceService {
         let mut truncated = 0u64;
         let mut stamped = 0u64;
         let mut rejected = 0u64;
+        let mut not_granted = 0u64;
         let mut first_rejection: Option<String> = None;
         for record in request.records {
             match to_trace_record(record, &window, &mut truncated, &mut stamped) {
                 Ok(record) => match identity::trace(&record) {
-                    Ok(_) => records.push(record),
+                    Ok(owner) if ingest.admits(&owner) => records.push(record),
+                    Ok(_) => {
+                        rejected += 1;
+                        not_granted += 1;
+                        first_rejection.get_or_insert_with(|| NOT_GRANTED.to_string());
+                    }
                     Err(reason) => {
                         rejected += 1;
                         first_rejection.get_or_insert(reason);
@@ -1114,6 +1252,14 @@ impl TraceServiceRpc for TraceService {
                     }
                 }
             }
+        }
+        if not_granted > 0 {
+            warn!(
+                not_granted,
+                principal = %grant.principal(),
+                "refused trace records for application environments the pushing capability \
+                 does not name; a node is issued ingest only for what it runs"
+            );
         }
         let over_days = cap_distinct_days(&mut records, |record| day_of(record.started_us));
         if over_days > 0 {
@@ -1209,8 +1355,10 @@ impl TraceServiceRpc for TraceService {
         &self,
         request: Request<QueryTracesRequest>,
     ) -> Result<Response<QueryTracesResponse>, Status> {
+        let scope = grant_of(&request)?.read_scope()?;
         let request = request.into_inner();
         ServiceStats::incr(&self.stats.trace_queries);
+        scope.check_app(optional_ref(&request.app_id))?;
         check_window(request.start_us, request.end_us).map_err(Status::invalid_argument)?;
         if request.min_duration_us < 0 {
             return Err(Status::invalid_argument(format!(
@@ -1244,10 +1392,12 @@ impl TraceServiceRpc for TraceService {
 
         let store = self.store.clone();
         let describe = format!("{filter:?}");
-        let page = blocking(&self.stats, Access::Read, "query traces", move || {
+        let mut page = blocking(&self.stats, Access::Read, "query traces", move || {
             store.query_traces(&filter, limit, cursor)
         })
         .await?;
+        page.records
+            .retain(|record| visible(&scope, identity::trace(record)));
         if page.cut_by_bytes {
             self.note_page_cut("trace", page.records.len(), limit, &describe);
         }
@@ -1273,11 +1423,14 @@ impl TraceServiceRpc for TraceService {
         &self,
         request: Request<TailTracesRequest>,
     ) -> Result<Response<Self::TailTracesStream>, Status> {
+        let grant = grant_of(&request)?;
+        let scope = grant.read_scope()?;
         let peer = request
             .remote_addr()
             .map(|addr| addr.to_string())
             .unwrap_or_else(|| "unknown-peer".to_string());
         let request = request.into_inner();
+        scope.check_app(optional_ref(&request.app_id))?;
         let filter = TraceTailFilter {
             app_id: optional(request.app_id),
             environment: optional(request.environment),
@@ -1290,8 +1443,9 @@ impl TraceServiceRpc for TraceService {
             app_id = filter.app_id.as_deref().unwrap_or("*"),
             "opening a trace stream; only invocations recorded from now on are streamed"
         );
-        let rx = self.hub.subscribe(label, filter);
+        let rx = self.hub.subscribe(label, Scoped { filter, scope });
         let stream = ReceiverStream::new(rx).map(|record| Ok(to_proto_trace(&record)));
+        let stream = until_expiry(stream, grant.expires_at());
         Ok(Response::new(Box::pin(stream) as Self::TailTracesStream))
     }
 }
@@ -1302,6 +1456,8 @@ impl MetricServiceRpc for MetricService {
         &self,
         request: Request<PushMetricsRequest>,
     ) -> Result<Response<PushMetricsResponse>, Status> {
+        let grant = grant_of(&request)?;
+        let ingest = grant.ingest()?;
         let request = request.into_inner();
         ServiceStats::incr(&self.stats.metric_pushes);
         let received = request.samples.len();
@@ -1313,11 +1469,17 @@ impl MetricServiceRpc for MetricService {
         let window = Window::new(now_us(), self.retention.metric_days, "metric");
         let mut records = Vec::with_capacity(received);
         let mut rejected = 0u64;
+        let mut not_granted = 0u64;
         let mut first_rejection: Option<String> = None;
         for sample in request.samples {
             match to_metric_record(sample, &window) {
                 Ok(record) => match identity::metric(&record) {
-                    Ok(_) => records.push(record),
+                    Ok(owner) if ingest.admits(&owner) => records.push(record),
+                    Ok(_) => {
+                        rejected += 1;
+                        not_granted += 1;
+                        first_rejection.get_or_insert_with(|| NOT_GRANTED.to_string());
+                    }
                     Err(reason) => {
                         rejected += 1;
                         first_rejection.get_or_insert(reason);
@@ -1330,6 +1492,14 @@ impl MetricServiceRpc for MetricService {
                     }
                 }
             }
+        }
+        if not_granted > 0 {
+            warn!(
+                not_granted,
+                principal = %grant.principal(),
+                "refused metric records for application environments the pushing capability \
+                 does not name; a node is issued ingest only for what it runs"
+            );
         }
         let (permits, fenced, fence_rejection) =
             admit_records(&self.fences, &mut records, identity::metric).await?;
@@ -1386,8 +1556,10 @@ impl MetricServiceRpc for MetricService {
         &self,
         request: Request<QueryMetricsRequest>,
     ) -> Result<Response<QueryMetricsResponse>, Status> {
+        let scope = grant_of(&request)?.read_scope()?;
         let request = request.into_inner();
         ServiceStats::incr(&self.stats.metric_queries);
+        scope.check_app(optional_ref(&request.app_id))?;
         check_window(request.start_us, request.end_us).map_err(Status::invalid_argument)?;
         let limit = self
             .limits
@@ -1414,10 +1586,12 @@ impl MetricServiceRpc for MetricService {
 
         let store = self.store.clone();
         let describe = format!("{filter:?}");
-        let page = blocking(&self.stats, Access::Read, "query metrics", move || {
+        let mut page = blocking(&self.stats, Access::Read, "query metrics", move || {
             store.query_metrics(&filter, limit, cursor)
         })
         .await?;
+        page.records
+            .retain(|record| visible(&scope, identity::metric(record)));
         if page.cut_by_bytes {
             self.note_page_cut("metric", page.records.len(), limit, &describe);
         }

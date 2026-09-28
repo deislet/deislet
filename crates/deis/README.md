@@ -54,7 +54,13 @@ Three places, in this order of precedence:
 endpoint = "http://127.0.0.1:8085"
 
 [telemetry]
-endpoint = "http://127.0.0.1:8092"
+endpoint = "https://127.0.0.1:8092"
+
+# The authority deis-store, deis-queue and deis-telemetry certificates chain
+# to. A public certificate, so it is safe here; a relative path is read from
+# this directory.
+[services]
+ca = "deploy/ca.crt"
 
 [defaults]
 app = "shop"           # falls back to "name" in .config.json
@@ -66,9 +72,16 @@ environment = "production"
 | `control.endpoint` | `DEIS_CONTROL_ENDPOINT` |
 | `control.token` | `DEIS_CONTROL_TOKEN` |
 | `telemetry.endpoint` | `DEIS_TELEMETRY_ENDPOINT` |
-| telemetry auth secret (credentials file, per address - see below) | `DEIS_TELEMETRY_AUTH_SECRET` |
+| `services.ca` | `DEIS_SERVICES_CA` |
 | `defaults.app` | `DEIS_APP` |
 | `defaults.environment` | `DEIS_ENVIRONMENT` |
+
+deis-store, deis-queue and deis-telemetry serve TLS only. `deis kv`, `db`,
+`blob`, `queue`, `logs`, `tail` and `trace` check each server's certificate
+against `services.ca` and refuse one that does not chain to it or that names
+another kind of service, so the capability a command carries is never sent to
+the wrong machine or in the clear. An `http://` address is refused unless it
+is a loopback IP.
 
 ### The credential never goes in the project
 
@@ -86,13 +99,13 @@ address, so one machine can hold credentials for a staging and a production
 platform at once. `deis config list` shows every setting, where it came from,
 and which variable overrides it — it never prints the token itself.
 
-`deis logs`, `deis tail` and `deis trace` read deis-telemetry, which has a
-shared secret of its own (`auth_secret` in that service's configuration)
-rather than a control-plane token. It follows the same rule: never in the
-project file. Set `DEIS_TELEMETRY_AUTH_SECRET` to the same string, or put it
-in the credentials file under a `[telemetry."<address>"]` entry with an
-`auth_secret` key, keyed by the telemetry address exactly as control tokens
-are keyed by theirs.
+`deis logs`, `deis tail` and `deis trace` need nothing further. Each asks
+the control plane for a 15-minute read capability for the environment it is
+about (or every environment of the application, with `--all-environments`),
+gated on `read` over that same scope and recorded in the audit log, and
+presents it to deis-telemetry, which returns only those environments'
+records. So they need the control plane reachable and a control token, like
+every other command.
 
 ## Commands
 

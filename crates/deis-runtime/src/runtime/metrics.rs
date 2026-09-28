@@ -1110,9 +1110,9 @@ pub const TRACE_BUFFER_ENV: &str = "DEIS_TRACE_BUFFER";
 pub struct MetricShipperConfig {
     /// deis-telemetry address, e.g. `http://127.0.0.1:8092`.
     pub endpoint: Option<String>,
-    /// The capability token this node presents on every metric and trace push.
-    /// The same credential the log shipper carries, from the same setting:
-    /// one service, one connection, one secret. See [`crate::telemetry`].
+    /// The capability this node presents on every metric and trace push: the
+    /// same one the log shipper carries, kept current by the same renewal
+    /// task. See [`crate::telemetry`].
     pub credential: TelemetryCredential,
     /// Whether to push at all.
     pub enabled: bool,
@@ -1149,7 +1149,7 @@ impl From<&LoggingConfig> for MetricShipperConfig {
     fn from(config: &LoggingConfig) -> Self {
         Self {
             endpoint: config.endpoint.clone(),
-            credential: TelemetryCredential::from_secret(config.auth_secret.as_deref()),
+            credential: TelemetryCredential::default(),
             enabled: config.enabled,
             // Metrics are cumulative totals, not events, so they are pushed on
             // their own slower cadence than logs: a missed push costs nothing
@@ -1265,9 +1265,15 @@ impl MetricShipper {
         }
 
         let channel = match Endpoint::from_shared(endpoint.clone())
-            .map(|e| e.connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT))
-        {
-            Ok(builder) => builder.connect_lazy(),
+            .map_err(anyhow::Error::from)
+            .and_then(|e| {
+                crate::runtime::service_tls::lazy(
+                    e.connect_timeout(CONNECT_TIMEOUT).timeout(REQUEST_TIMEOUT),
+                    &endpoint,
+                    deis_identity::ServiceKind::Telemetry,
+                )
+            }) {
+            Ok(channel) => channel,
             Err(e) => {
                 error!(
                     %endpoint,
@@ -1445,21 +1451,27 @@ async fn push_once(
                 debug!(count, "Pushed metric samples to deis-telemetry");
             }
         }
-        Err(status) if status.code() == tonic::Code::Unauthenticated => error!(
-            count,
-            carrying_a_token = credential.is_present(),
-            error = %status.message(),
-            "deis-telemetry refused this node's metrics: a credential mismatch, not an outage. \
-             Retrying cannot fix it, and until it is fixed no counter and no latency bucket from \
-             this node reaches any dashboard. Set logging.auth_secret to the same value as \
-             deis-telemetry's auth_secret"
-        ),
-        Err(status) => warn!(
-            count,
-            error = %status,
-            "Pushing metrics to deis-telemetry failed; the counters are cumulative so nothing is \
-             lost, but dashboards will show a gap until the next push succeeds"
-        ),
+        Err(status) if status.code() == tonic::Code::Unauthenticated => {
+            credential.observe(&status);
+            error!(
+                count,
+                carrying_a_token = credential.is_present(),
+                error = %status.message(),
+                "deis-telemetry refused this node's metrics: this node has no telemetry capability \
+                 from the control plane yet, or the collector does not trust the control plane's \
+                 signing keys (check its [machine_identity] control_endpoint). The counters are cumulative, so the \
+                 next accepted push carries them"
+            )
+        }
+        Err(status) => {
+            credential.observe(&status);
+            warn!(
+                count,
+                error = %status,
+                "Pushing metrics to deis-telemetry failed; the counters are cumulative so nothing is \
+                 lost, but dashboards will show a gap until the next push succeeds"
+            )
+        }
     }
 }
 
@@ -1513,17 +1525,18 @@ async fn push_traces_once(
             // not also erase the evidence that traces were lost during it.
             recorder.restore_gaps(gaps);
             let returned = recorder.requeue(batch);
+            credential.observe(&status);
             if status.code() == tonic::Code::Unauthenticated {
                 error!(
                     count,
                     returned,
                     carrying_a_token = credential.is_present(),
                     error = %status.message(),
-                    "deis-telemetry refused this node's invocation traces: a credential \
-                     mismatch, not an outage. Retrying cannot fix it; the records queue until \
-                     the buffer fills and are then discarded, so `deis trace` will never show \
-                     an invocation this node served. Set logging.auth_secret to the same value \
-                     as deis-telemetry's auth_secret"
+                    "deis-telemetry refused this node's invocation traces: this node has no \
+                     telemetry capability from the control plane yet, or the collector does \
+                     not trust the control plane's signing keys (check its \
+                     [machine_identity] control_endpoint). The records queue until the buffer fills and are \
+                     then discarded"
                 );
             } else {
                 warn!(

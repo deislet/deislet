@@ -11,6 +11,7 @@
 //! handshake, by [`identity_acceptor`].
 
 pub mod accept;
+pub(crate) mod issuance;
 pub mod listen;
 pub mod service;
 

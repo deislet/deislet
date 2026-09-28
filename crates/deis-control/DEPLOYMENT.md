@@ -655,14 +655,13 @@ scrape_configs:
       credentials_file: /etc/prometheus/deis-control.token
 ```
 
-`deis-telemetry` exports on a port of its own, and its credential is not one
-of these: it has no accounts and no scopes. Its scrape carries
-`base64(HMAC-SHA256(auth_secret, "deis-telemetry"))`, the same one string
-every producer and every `deis logs` / `deis tail` / `deis trace` presents,
-and it is required only once `auth_secret` is set - which is required as soon
-as either of that service's addresses is not a loopback address. See
-`crates/deis-telemetry/deis-telemetry.example.toml`; `deis token create`
-mints nothing that service will accept.
+`deis-telemetry` exports on a port of its own and accepts only a capability
+this control plane signed that may read every tenant: mint one with
+`GET /api/platform/telemetry-token` using a token holding `read:*/*` (every
+mint is audited as `telemetry_token.mint_platform`). It lasts 15 minutes, so
+point Prometheus at a `credentials_file` that something holding that token
+refreshes more often than that. See
+`crates/deis-telemetry/deis-telemetry.example.toml`.
 
 Two series there are worth an alert on any installation:
 `deis_telemetry_store_writable` going to 0 means the collector is refusing

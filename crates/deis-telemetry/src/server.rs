@@ -29,14 +29,14 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
 use deis_backend_migration::{FenceError, MigrationAuth, TenantWriteFences};
-use hex;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::server::NamedService;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Server;
@@ -162,20 +162,58 @@ fn report_interrupt(result: std::io::Result<()>) {
     }
 }
 
-/// Start every part of the service against `config`.
-pub async fn start(config: &Config) -> Result<RunningServer> {
-    config.validate()?;
+/// This service's machine identity and its client for the control plane's
+/// machine channel, both from `[machine_identity]`.
+///
+/// Refused before anything is bound: a missing table, a certificate that
+/// does not name a telemetry service - which every caller would refuse, each
+/// with a handshake error of its own - and a control plane reached over
+/// plaintext off this host, which could hand this service any signing key.
+pub fn machine_identity(
+    config: &Config,
+) -> Result<(
+    Arc<deis_identity::MachineIdentity>,
+    deis_capability::ControlClient,
+)> {
+    let identity_config = config.machine_identity.as_ref().context(
+        "deis-telemetry serves only over TLS with its own machine identity, and this \
+         configuration has no [machine_identity] table; see deis-telemetry.example.toml",
+    )?;
+    let identity = identity_config
+        .load(deis_identity::ServiceKind::Telemetry)
+        .context("cannot load this telemetry service's machine identity")?;
+    let control = identity_config
+        .control_client(Arc::clone(&identity))
+        .context("cannot reach the control plane's machine channel as configured")?;
+    Ok((identity, control))
+}
 
-    // Parse the capability verifying key from config/environment.
-    // When no key is configured, capability auth is not enforced — this
-    // is the default for integration tests that predate mandatory auth.
-    let (verifying_key, enforcing) = load_verifying_key_optional(config);
-    if !enforcing {
-        warn!(
-            "No capability_public_key configured; telemetry auth is NOT enforcing. \
-             This is safe only when both listeners are bound to loopback."
-        );
-    }
+/// Connections on `listener`, each one past its TLS handshake.
+fn tls_incoming(
+    listener: TcpListener,
+    identity: Arc<deis_identity::MachineIdentity>,
+) -> impl tokio_stream::Stream<
+    Item = std::io::Result<
+        deis_wire::served::Served<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>,
+    >,
+> {
+    ReceiverStream::new(deis_identity::accept_tls(listener, identity)).map(|accepted| {
+        Ok(deis_wire::served::Served::new(
+            accepted.stream,
+            accepted.local_addr,
+            accepted.remote_addr,
+        ))
+    })
+}
+
+/// Start every part of the service against `config`.
+///
+/// `keys` is the control plane's key ring every capability is verified
+/// against; whoever keeps it current (the binary starts a JWKS refresher,
+/// tests fill it by hand) shares it with the guards here.
+pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<RunningServer> {
+    config.validate()?;
+    let (identity, control) = machine_identity(config)?;
 
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => Some(
@@ -249,14 +287,16 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
         .local_addr()
         .context("cannot read the Prometheus listener address")?;
 
-    // Build the capability verifier from the verifying key. Every call must
-    // present a valid Ed25519-signed capability token. There is no anonymous
-    // or loopback bypass.
-    let auth = TelemetryAuth::new(verifying_key, enforcing);
-    crate::auth::start_revocation_poller(auth.clone(), config.revocation_list_url.clone());
-    // Read off before the interceptor copies are handed to the tasks, so the
-    // startup line below can say which regime is in force.
-    let enforcing = auth.is_enforcing();
+    // Every call must present a capability minted by deis-control. There is
+    // no anonymous mode, no loopback bypass and no setting that turns this
+    // off.
+    let auth = TelemetryAuth::new(keys);
+    // T8 grace only for nodes of this installation's trust domain.
+    auth.verifier()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_trust_domain(identity.id().trust_domain());
+    deis_capability::fetch::poll_revocations(auth.verifier().clone(), "telemetry", control);
 
     let (shutdown, _) = watch::channel(false);
 
@@ -324,7 +364,7 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
             .add_service(trace_service)
             .add_service(metric_service)
             .add_optional_service(migration_service)
-            .serve_with_incoming_shutdown(TcpListenerStream::new(grpc_listener), grpc_shutdown)
+            .serve_with_incoming_shutdown(tls_incoming(grpc_listener, identity), grpc_shutdown)
             .await;
         match result {
             Ok(()) => info!("gRPC server stopped"),
@@ -339,7 +379,8 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
             store.clone(),
             Arc::clone(&stats),
             config.metrics_export_window_secs,
-        ),
+        )
+        .with_verifier(auth.verifier().clone()),
         auth,
     );
     let metrics_shutdown = subscribe(&shutdown);
@@ -384,7 +425,6 @@ pub async fn start(config: &Config) -> Result<RunningServer> {
     info!(
         %grpc_addr,
         %metrics_addr,
-        authenticated = enforcing,
         data_dir = %config.data_dir.display(),
         log_retention_days = config.log_retention_days,
         metric_retention_days = config.metric_retention_days,
@@ -681,50 +721,6 @@ async fn sweep_once(
             );
         }
     }
-}
-
-// ---- capability key helpers ----------------------------------------------
-
-/// Try to parse a capability verifying key from config and environment.
-///
-/// Returns a tuple of `(key, enforcing)`. When no key is configured, the
-/// returned key is a deterministic dummy suitable for a non-enforcing
-/// [`TelemetryAuth`].
-fn load_verifying_key_optional(config: &Config) -> (ed25519_dalek::VerifyingKey, bool) {
-    use ed25519_dalek::VerifyingKey;
-
-    if let Some(ref hex_key) = config.capability_public_key {
-        if let Ok(bytes) = hex::decode(hex_key) {
-            if let Ok(bytes) = bytes.try_into() {
-                if let Ok(vk) = VerifyingKey::from_bytes(&bytes) {
-                    return (vk, true);
-                }
-            }
-        }
-    }
-
-    if let Ok(hex_key) = std::env::var("DEIS_CAPABILITY_PUBLIC_KEY") {
-        if let Ok(bytes) = hex::decode(&hex_key) {
-            if let Ok(bytes) = bytes.try_into() {
-                if let Ok(vk) = VerifyingKey::from_bytes(&bytes) {
-                    return (vk, true);
-                }
-            }
-        }
-    }
-
-    // No key configured — use a deterministic dummy so that the
-    // TelemetryAuth can still be constructed even though it will never
-    // check anything (enforcing = false).
-    let dummy: [u8; 32] = [
-        0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00,
-    ];
-    (
-        VerifyingKey::from_bytes(&dummy).expect("dummy verifying key is valid"),
-        false,
-    )
 }
 
 #[cfg(test)]

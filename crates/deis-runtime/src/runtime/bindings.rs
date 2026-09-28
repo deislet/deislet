@@ -20,14 +20,14 @@
 //!
 //! # What proves a call may act as its tenant
 //!
-//! The same channel carries a capability token for this deployment's tenant,
-//! under [`STORAGE_TOKEN_KEY`]. It is lifted out of the map for a stronger
-//! reason than the addresses: it is a credential, and an application that
-//! could read it would be able to call the storage services directly as its
-//! own tenant. [`StorageIdentity`] is where it meets the tenant header --
-//! every storage client in this crate holds one and stamps both on every
-//! call, so a service configured with an `auth_secret` sees proof beside the
-//! claim rather than the claim alone.
+//! Not anything in that map. A capability for this deployment's tenant is
+//! something this node asks the control plane for itself, over the machine
+//! channel and under its own name (`crate::deployment::capability_renewer`),
+//! so nothing a deployment message carries can be replayed as access to a
+//! tenant. [`StorageIdentity`] is where it meets the tenant header -- every
+//! storage client in this crate holds one and stamps both on every call, and
+//! the renewer writes each fresh capability into the identities that asked
+//! for it.
 //!
 //! Both ends of that encoding live here, in one place, so the side that writes
 //! the map and the side that reads it cannot drift apart:
@@ -119,26 +119,6 @@ pub const QUEUE_ENDPOINT_KEY: &str = deis_wire::conventions::QUEUE_ENDPOINT_ENV;
 /// the first as well.
 pub const QUEUE_CONSUMERS_KEY: &str = "DEIS_QUEUE_CONSUMERS";
 
-/// Reserved deployment-env key holding this tenant's storage capability
-/// token, minted by deis-control from a secret the storage services share.
-///
-/// The name `DEIS_STORAGE_TOKEN` arrives under on the environment map.
-///
-/// Lifted out of the map with the rest of the wiring, and for a stronger
-/// reason than the addresses: an application that could read this value could
-/// call deis-store directly *as its own tenant*, bypassing every check this
-/// node makes on its behalf.
-pub const STORAGE_TOKEN_KEY: &str = deis_wire::conventions::STORAGE_TOKEN_ENV;
-
-/// The name `DEIS_QUEUE_TOKEN` arrives under on the environment map.
-///
-/// Lifted out of the map with the rest of the wiring, and for a stronger
-/// reason than the addresses: an application that could read this value could
-/// call deis-store and deis-queue directly *as its own tenant*, bypassing
-/// every check this node makes on its behalf, and one that could declare the
-/// key would be choosing the credential the node then presents for it.
-pub const QUEUE_TOKEN_KEY: &str = deis_wire::conventions::QUEUE_TOKEN_ENV;
-
 /// The name `env.ASSETS` is published under.
 ///
 /// Not an address and not a credential: it is the one *binding* that arrives
@@ -188,13 +168,11 @@ pub const CALLABLE_BY_KEY: &str = "DEIS_CALLABLE_BY";
 
 /// Every key this module claims. Anything spelled this way in a deployment's
 /// env map is platform wiring and is removed before the app sees the map.
-pub const RESERVED_ENV_KEYS: [&str; 9] = [
+pub const RESERVED_ENV_KEYS: [&str; 7] = [
     SERVICES_KEY,
     STORE_ENDPOINT_KEY,
     QUEUE_ENDPOINT_KEY,
     QUEUE_CONSUMERS_KEY,
-    STORAGE_TOKEN_KEY,
-    QUEUE_TOKEN_KEY,
     ASSETS_BINDING_KEY,
     BINDINGS_KEY,
     CALLABLE_BY_KEY,
@@ -394,13 +372,13 @@ pub struct ServiceWiring {
     pub declaration: ServiceDeclaration,
     pub endpoints: ServiceEndpoints,
     pub consumers: Vec<QueueConsumerSpec>,
-    /// This tenant's storage capability token, or `None` on a platform whose
-    /// control plane has no issuer configured. Carried here rather
-    /// than left in the env map because the map becomes `ctx.env`.
+    /// A store capability (`aud = "store"`) to start from, for an in-process
+    /// caller that already holds one. Never read from a deployment: a node's
+    /// clients start empty and are filled by the capability renewer, which
+    /// leaves a preset value alone until it has a fresher one.
     pub storage_token: Option<String>,
-    /// Queue-specific capability token (`aud = "queue"`). Separate from
-    /// `storage_token` because store (KV/SQL/blob) and queue require
-    /// different audience claims in their capability tokens.
+    /// The same for the queue (`aud = "queue"`), kept apart because the two
+    /// audiences are different capabilities.
     pub queue_token: Option<String>,
     /// The namespaces and the applications this version reaches by name,
     /// exactly as its manifest declared them.
@@ -452,8 +430,8 @@ impl ServiceWiring {
             endpoints,
             bindings: manifest.bindings.clone(),
             callable_by: manifest.callable_by.clone(),
-            // Not a manifest concept: it is minted per deployment by the
-            // control plane, so a caller that has one adds it afterwards.
+            // Not a manifest concept: the node asks for its own, see the
+            // field's documentation.
             storage_token: None,
             queue_token: None,
             consumers: manifest
@@ -478,8 +456,6 @@ impl ServiceWiring {
         let store = env.remove(STORE_ENDPOINT_KEY);
         let queue = env.remove(QUEUE_ENDPOINT_KEY);
         let consumers = env.remove(QUEUE_CONSUMERS_KEY).unwrap_or_default();
-        let storage_token = env.remove(STORAGE_TOKEN_KEY);
-        let queue_token = env.remove(QUEUE_TOKEN_KEY);
         let bindings = env.remove(BINDINGS_KEY).unwrap_or_default();
         let callable_by = env.remove(CALLABLE_BY_KEY).unwrap_or_default();
         // Nothing is read out of it -- the binding is built from the version's
@@ -496,8 +472,8 @@ impl ServiceWiring {
                 queue: non_empty(queue),
             },
             consumers: parse_consumers(&consumers),
-            storage_token: non_empty(storage_token),
-            queue_token: non_empty(queue_token),
+            storage_token: None,
+            queue_token: None,
             bindings: parse_bindings(&bindings),
             callable_by: callable_by
                 .split(',')
@@ -522,12 +498,6 @@ impl ServiceWiring {
         }
         if let Some(queue) = &self.endpoints.queue {
             env.insert(QUEUE_ENDPOINT_KEY.to_string(), queue.clone());
-        }
-        if let Some(token) = &self.storage_token {
-            env.insert(STORAGE_TOKEN_KEY.to_string(), token.clone());
-        }
-        if let Some(token) = &self.queue_token {
-            env.insert(QUEUE_TOKEN_KEY.to_string(), token.clone());
         }
         if !self.bindings.is_empty() {
             env.insert(BINDINGS_KEY.to_string(), encode_bindings(&self.bindings));
@@ -827,19 +797,33 @@ fn consumer_number(queue: &str, field: &str, value: Option<&str>) -> Option<u32>
 /// the channel is usable immediately and only attempts a connection when a
 /// call is made on it, retrying on the call after that. Only a malformed
 /// address fails here.
-fn lazy_channel(endpoint: &str, request_timeout: Option<Duration>) -> Result<Channel> {
+///
+/// The connection is TLS, checked against this node's installed trust as a
+/// service of `kind`; see [`super::service_tls`].
+fn lazy_channel(
+    endpoint: &str,
+    kind: deis_identity::ServiceKind,
+    request_timeout: Option<Duration>,
+) -> Result<Channel> {
     let mut builder = Endpoint::from_shared(endpoint.to_string())
         .with_context(|| format!("{endpoint:?} is not a usable gRPC address"))?
         .connect_timeout(CONNECT_TIMEOUT);
     if let Some(timeout) = request_timeout {
         builder = builder.timeout(timeout);
     }
-    Ok(builder.connect_lazy())
+    super::service_tls::lazy(builder, endpoint, kind)
 }
 
 /// A unary-call channel: bounded per call.
-pub(crate) fn unary_channel(endpoint: &str) -> Result<Channel> {
-    lazy_channel(endpoint, Some(REQUEST_TIMEOUT))
+pub(crate) fn unary_channel(
+    endpoint: &str,
+    kind: deis_identity::ServiceKind,
+    identity: &StorageIdentity,
+) -> Result<CapabilityChannel> {
+    Ok(CapabilityChannel::new(
+        lazy_channel(endpoint, kind, Some(REQUEST_TIMEOUT))?,
+        identity,
+    ))
 }
 
 /// A streaming channel: bounded only on the dial.
@@ -847,32 +831,116 @@ pub(crate) fn unary_channel(endpoint: &str) -> Result<Channel> {
 /// A blob download is a stream whose legitimate duration depends on the object
 /// size, so a per-call deadline would cut off large-but-healthy transfers. The
 /// blob client applies its own size ceiling instead.
-pub(crate) fn streaming_channel(endpoint: &str) -> Result<Channel> {
-    lazy_channel(endpoint, None)
+pub(crate) fn streaming_channel(
+    endpoint: &str,
+    kind: deis_identity::ServiceKind,
+    identity: &StorageIdentity,
+) -> Result<CapabilityChannel> {
+    Ok(CapabilityChannel::new(
+        lazy_channel(endpoint, kind, None)?,
+        identity,
+    ))
+}
+
+/// A channel to deis-store or deis-queue that tells the capability renewer
+/// when the service refuses the capability a call presented.
+///
+/// A revoked capability, or one issued under an auth epoch since bumped, is
+/// refused on every call until it is replaced; left to its schedule, the
+/// renewer would replace it only five minutes before it expires. Watching
+/// here, under every client rather than in each of their calls, means no
+/// call can forget to report it.
+///
+/// The service refuses a credential before it answers anything, so the
+/// refusal is a trailers-only response: its `grpc-status` is in the response
+/// headers, where this reads it, for unary and streaming calls alike.
+#[derive(Clone)]
+pub struct CapabilityChannel {
+    inner: Channel,
+    token: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+}
+
+impl CapabilityChannel {
+    fn new(inner: Channel, identity: &StorageIdentity) -> Self {
+        Self {
+            inner,
+            token: identity.token_lock(),
+        }
+    }
+}
+
+/// `grpc-status` values that refuse the credential itself.
+fn refuses_the_credential(headers: &tonic::codegen::http::HeaderMap) -> bool {
+    let unauthenticated = tonic::Code::Unauthenticated as i32;
+    let permission_denied = tonic::Code::PermissionDenied as i32;
+    headers
+        .get("grpc-status")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i32>().ok())
+        .is_some_and(|code| code == unauthenticated || code == permission_denied)
+}
+
+impl tower::Service<tonic::codegen::http::Request<tonic::body::BoxBody>> for CapabilityChannel {
+    type Response =
+        <Channel as tower::Service<tonic::codegen::http::Request<tonic::body::BoxBody>>>::Response;
+    type Error =
+        <Channel as tower::Service<tonic::codegen::http::Request<tonic::body::BoxBody>>>::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        tower::Service::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(
+        &mut self,
+        request: tonic::codegen::http::Request<tonic::body::BoxBody>,
+    ) -> Self::Future {
+        let presented = request
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::to_string);
+        let token = std::sync::Arc::clone(&self.token);
+        let response = tower::Service::call(&mut self.inner, request);
+        Box::pin(async move {
+            let response = response.await?;
+            if let Some(presented) = presented {
+                if refuses_the_credential(response.headers()) {
+                    crate::deployment::capability_renewer::refused(&token, &presented);
+                }
+            }
+            Ok(response)
+        })
+    }
 }
 
 /// Who a storage call says it is, and the proof that goes with the claim.
 ///
 /// The tenant header is a routing key: it says *which* namespace the call
 /// wants, and on its own it is only a claim - anything that can reach the
-/// storage port can name any tenant. The capability token is the proof, minted
-/// by deis-control for this one tenant and handed to this node with the
-/// deployment.
+/// storage port can name any tenant. The capability token is the proof,
+/// issued by deis-control to this node, under this node's name, for the
+/// tenants it runs.
 ///
 /// The two are stamped together, here, rather than in each of the four
 /// clients: a client that stamped one and forgot the other would either read
 /// another tenant's data or be refused on every call, and neither failure
 /// shows up until something is deployed against a store that checks.
 ///
-/// A node that holds no token stamps only the tenant, which is exactly what a
-/// deis-store or deis-queue with no `auth_secret` accepts. That is why nothing
-/// here is conditional on a feature or a mode: the same code is correct
-/// against both configurations.
+/// Until the first capability arrives a call stamps only the tenant and is
+/// refused by a verifying store, which is why the renewer is woken the moment
+/// an identity is registered rather than on its next tick.
 ///
 /// The token is held behind an [`Arc`]`<`[`RwLock`]`>` so that the node's
-/// background capability renewal loop can refresh it without rebuilding the
-/// isolate. [`StorageIdentity::new`] populates the lock from the initial
-/// value, and clones share it.
+/// background capability renewal loop can fill and refresh it without
+/// rebuilding the isolate. [`StorageIdentity::new`] populates the lock from
+/// the initial value, and clones share it.
 #[derive(Clone)]
 pub struct StorageIdentity {
     tenant: Tenant,
@@ -1022,9 +1090,9 @@ impl StorageIdentity {
         self.tenant.as_str()
     }
 
-    /// Whether this node was handed a credential for the tenant. False is
-    /// normal on a single-box install and fatal against a service that has an
-    /// `auth_secret`, so it is worth a log field wherever a client is built.
+    /// Whether this node holds a capability for the tenant yet. False until
+    /// the first `IssueCapability` answer lands, and every call made before
+    /// then is refused, so it is worth a log field wherever a client is built.
     pub fn is_proven(&self) -> bool {
         self.token.read().unwrap().as_ref().map_or(false, |t| !t.is_empty())
     }
@@ -1294,20 +1362,6 @@ impl AppServices {
             }
         }
 
-        if wiring.storage_token.is_none() && !services.is_empty() {
-            // Which of the two configurations this platform runs is not
-            // visible from a single call: a store with an auth_secret refuses
-            // every unproven call with Unauthenticated, and one without
-            // serves it.
-            tracing::debug!(
-                app_id = tenant,
-                "The deployment of {} carried no storage capability token, so its calls present \
-                 only the tenant they claim; that is what deis-store and deis-queue accept while \
-                 they have no auth_secret, and what they refuse once they have one",
-                tenant
-            );
-        }
-
         Ok(services)
     }
 
@@ -1411,19 +1465,14 @@ pub fn strip_reserved_env(env: &mut HashMap<String, String>) -> Vec<&'static str
 /// Afterwards the map is what `IsolateSpec::env` should carry: the runtime
 /// lifts the reserved keys back out before the app sees it.
 pub fn wire_deployment_env(manifest: &deis_bundle::Manifest, env: &mut HashMap<String, String>) {
-    // Read before the clear: the addresses and the token are the half of the
-    // wiring this node cannot recompute from the manifest.
+    // Read before the clear: the addresses are the half of the wiring this
+    // node cannot recompute from the manifest.
     let endpoints = ServiceEndpoints {
         store: non_empty(env.get(STORE_ENDPOINT_KEY).cloned()),
         queue: non_empty(env.get(QUEUE_ENDPOINT_KEY).cloned()),
     };
-    let storage_token = non_empty(env.get(STORAGE_TOKEN_KEY).cloned());
-    let queue_token = non_empty(env.get(QUEUE_TOKEN_KEY).cloned());
     strip_reserved_env(env);
-    let mut wiring = ServiceWiring::from_manifest(manifest, endpoints);
-    wiring.storage_token = storage_token;
-    wiring.queue_token = queue_token;
-    wiring.write_to_env(env);
+    ServiceWiring::from_manifest(manifest, endpoints).write_to_env(env);
 }
 
 /// Build a queue client for a poller, which needs one even when the app's own

@@ -801,3 +801,67 @@ async fn a_listener_is_told_when_there_is_new_material_to_present() {
     identity.reload().expect("a look at unchanged files");
     assert!(!renewals.has_changed().expect("the sender is alive"));
 }
+
+/// A certificate issued for less than 72 hours cannot ride out a 24 hour
+/// control-plane outage with room to renew afterwards, so it is refused when
+/// it is loaded - at startup, and on a rotation, where the material already
+/// in force stays.
+#[tokio::test]
+async fn a_certificate_issued_for_less_than_three_days_is_refused() {
+    const HOUR: u64 = 3600;
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let node_id = id("spiffe://deis.internal/deislet/node/short");
+
+    let short = ca.issue_for(&node_id, Duration::from_secs(48 * HOUR));
+    let files = write_files(directory.path(), "short", &short, &ca.root_pem);
+    let error = MachineIdentity::load(files.as_identity_files(), SERVES)
+        .expect_err("a two-day certificate was loaded");
+    assert!(
+        matches!(
+            error,
+            IdentityError::LifetimeTooShort {
+                lifetime_hours: 48,
+                minimum_hours: 72,
+                ..
+            }
+        ),
+        "expected a refusal about the lifetime, got {error}"
+    );
+
+    let enough = ca.issue_for(&node_id, Duration::from_secs(72 * HOUR));
+    let files = write_files(directory.path(), "enough", &enough, &ca.root_pem);
+    let node = MachineIdentity::load(files.as_identity_files(), SERVES)
+        .expect("a three-day certificate loads");
+    assert_eq!(node.validity().lifetime(), 72 * HOUR as i64);
+
+    // A rotation onto a short certificate keeps the working one.
+    let rotated = ca.issue_for(&node_id, Duration::from_secs(24 * HOUR));
+    std::fs::write(&files.certificate, &rotated.certificate_pem).expect("write certificate");
+    std::fs::write(&files.private_key, &rotated.key_pem).expect("write key");
+    let error = node.reload().expect_err("a one-day rotation was adopted");
+    assert!(matches!(error, IdentityError::LifetimeTooShort { .. }), "{error}");
+    assert_eq!(node.validity().lifetime(), 72 * HOUR as i64);
+}
+
+/// The key a machine seals its own files with is fixed by its private key
+/// and by the purpose it is asked for, and by nothing else.
+#[tokio::test]
+async fn a_local_key_follows_the_private_key_and_the_purpose() {
+    let ca = TestCa::new();
+    let directory = tempfile::tempdir().expect("a directory");
+    let node_id = id("spiffe://deis.internal/deislet/node/sealing");
+    let files = write_files(directory.path(), "node", &ca.issue(&node_id), &ca.root_pem);
+
+    let node = MachineIdentity::load(files.as_identity_files(), SERVES).expect("an identity");
+    let again = MachineIdentity::load(files.as_identity_files(), SERVES).expect("an identity");
+    assert_eq!(node.derive_local_key(b"a"), again.derive_local_key(b"a"));
+    assert_ne!(node.derive_local_key(b"a"), node.derive_local_key(b"b"));
+
+    let renewed = ca.issue(&node_id);
+    std::fs::write(&files.certificate, &renewed.certificate_pem).expect("write certificate");
+    std::fs::write(&files.private_key, &renewed.key_pem).expect("write key");
+    let before = node.derive_local_key(b"a");
+    node.reload().expect("the renewal loads");
+    assert_ne!(before, node.derive_local_key(b"a"), "a new key, a new seal");
+}

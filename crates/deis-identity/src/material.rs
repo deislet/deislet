@@ -26,11 +26,13 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use sha2::{Digest, Sha256};
 
 use crate::IdentityFiles;
-use crate::cert::{name_in_certificate, validity_of};
+use crate::cert::{MIN_CERTIFICATE_LIFETIME_SECS, name_in_certificate, validity_of};
 use crate::error::{FileRole, IdentityError};
 use crate::names::ServiceKind;
 use crate::spiffe::SpiffeId;
-use crate::verify::{VerifyPeerIs, VerifyPeerIsInTrustDomain, VerifyPeerIsOfKind};
+use crate::verify::{
+    VerifyPeerIs, VerifyPeerIsInTrustDomain, VerifyPeerIsOfKind, VerifyServerIsOfKind,
+};
 
 /// One consistent set of identity material, and the configurations built from
 /// it. Nothing in here is edited after it is built; a rotation produces a new
@@ -43,6 +45,10 @@ pub(crate) struct Material {
     pub(crate) key: PrivateKeyDer<'static>,
     pub(crate) roots: Arc<RootCertStore>,
     pub(crate) server: Arc<ServerConfig>,
+    /// A listener configuration that presents this certificate and asks the
+    /// caller for none - what a data service serves; see
+    /// [`crate::MachineIdentity::service_server_config`].
+    pub(crate) service_server: Arc<ServerConfig>,
     pub(crate) provider: Arc<CryptoProvider>,
     /// When the end-entity certificate in `chain` stops being valid.
     ///
@@ -90,6 +96,16 @@ impl Material {
         // The same certificate, read twice for two different questions: who
         // this machine is, and how long it may go on saying so.
         let validity = validity_of(&chain[0])?;
+        // Refused here rather than warned about later, because a rotation to
+        // a certificate this short is exactly as dangerous as starting on
+        // one - and refusing it keeps the material already in force.
+        if validity.lifetime() < MIN_CERTIFICATE_LIFETIME_SECS {
+            return Err(IdentityError::LifetimeTooShort {
+                path: files.certificate.clone(),
+                lifetime_hours: validity.lifetime() / 3600,
+                minimum_hours: MIN_CERTIFICATE_LIFETIME_SECS / 3600,
+            });
+        }
 
         let peer_verifier =
             WebPkiClientVerifier::builder_with_provider(Arc::clone(&roots), Arc::clone(&provider))
@@ -115,12 +131,21 @@ impl Material {
         // a field, and the builder chain has no step for it.
         server.alpn_protocols = serves.to_vec();
 
+        // The key was checked against the certificate by the build above, so
+        // this one cannot fail on a mismatch that one let through.
+        let mut service_server = ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(chain.clone(), key.clone_key())?;
+        service_server.alpn_protocols = serves.to_vec();
+
         Ok(Self {
             id,
             chain,
             key,
             roots,
             server: Arc::new(server),
+            service_server: Arc::new(service_server),
             provider,
             validity,
             digest,
@@ -189,6 +214,51 @@ impl Material {
         config.alpn_protocols = speaking.to_vec();
         Ok(Arc::new(config))
     }
+}
+
+impl Material {
+    /// A configuration for dialling a data service by role.
+    ///
+    /// Presents this machine's certificate, so a data service that starts
+    /// asking for one gets it without a change here, and verifies the far end
+    /// with [`VerifyServerIsOfKind`] against this machine's own trust root
+    /// and trust domain.
+    pub(crate) fn service_client_config(
+        &self,
+        kind: ServiceKind,
+        speaking: &[Vec<u8>],
+    ) -> Result<Arc<ClientConfig>, IdentityError> {
+        let verifier = VerifyServerIsOfKind::new(
+            Arc::clone(&self.roots),
+            kind,
+            Some(self.id.trust_domain().to_string()),
+            Arc::clone(&self.provider),
+        );
+        let mut config = ClientConfig::builder_with_provider(Arc::clone(&self.provider))
+            .with_safe_default_protocol_versions()?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_client_auth_cert(self.chain.clone(), self.key.clone_key())?;
+        config.alpn_protocols = speaking.to_vec();
+        Ok(Arc::new(config))
+    }
+}
+
+/// A trust root on its own, for a caller with no identity of its own to
+/// prove - a person's CLI - that still has to know it reached one of this
+/// fleet's data services.
+pub(crate) fn load_roots(path: &Path) -> Result<Arc<RootCertStore>, IdentityError> {
+    let pem = read(path, FileRole::TrustRoot)?;
+    let mut roots = RootCertStore::empty();
+    for anchor in certificates(&pem, path, FileRole::TrustRoot)? {
+        roots
+            .add(anchor)
+            .map_err(|source| IdentityError::UnusableTrustRoot {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
+    Ok(Arc::new(roots))
 }
 
 fn read(path: &Path, role: FileRole) -> Result<Vec<u8>, IdentityError> {

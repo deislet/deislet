@@ -57,7 +57,7 @@ check_kv_roundtrip() {
   # deis-store actually holds the right bytes.
   local tenant="${APP_ID}.${ENV_NAME}"
   local direct direct_value
-  direct=$(grpcurl -plaintext -max-time 5 \
+  direct=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" \
     -H "authorization: Bearer $(storage_token)" \
@@ -137,14 +137,14 @@ check_named_bindings_are_separate_namespaces() {
   local tenant token direct_hot direct_kv
   tenant="${APP_ID}.${ENV_NAME}"
   token=$(storage_token)
-  direct_hot=$(grpcurl -plaintext -max-time 5 \
+  direct_hot=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: HOT" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
     | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
-  direct_kv=$(grpcurl -plaintext -max-time 5 \
+  direct_kv=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: KV" \
@@ -182,7 +182,7 @@ check_a_binding_cannot_reach_another_tenant() {
   for hostile in ".." "a.b" "a@b" "../../etc" "$(printf 'x%.0s' $(seq 1 65))"; do
     total=$((total + 1))
     local answer
-    answer=$(grpcurl -plaintext -max-time 5 \
+    answer=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
       -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
       -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
       -H "x-deis-binding: ${hostile}" \
@@ -198,7 +198,7 @@ check_a_binding_cannot_reach_another_tenant() {
   # different token for a different binding. A call naming another tenant is
   # refused whatever binding it asks for.
   local cross
-  cross=$(grpcurl -plaintext -max-time 5 \
+  cross=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${CALLEE_APP_ID}.${ENV_NAME}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: HOT" \
@@ -267,7 +267,7 @@ check_storage_capability_token() {
 
   local tenant="${APP_ID}.${ENV_NAME}"
   local out rc
-  out=$(grpcurl -plaintext -max-time 5 \
+  out=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${tenant}" \
     -d "{\"key\":\"whatever-this-key-is-does-not-matter\"}" \
@@ -279,6 +279,308 @@ check_storage_capability_token() {
   else
     fail_check "$title" \
       "expected the call to be refused as Code: Unauthenticated with no token; deis-store answered: $(echo "$out" | tr '\n' ' ' | head -c 300)"
+  fi
+}
+
+# The transport under that token. deis-store serves TLS only, with a
+# certificate the fleet's authority issued for a store, so the capability a
+# call carries is never readable on the wire. A plaintext call is not
+# answered at all - there is no second listener that would take one - and a
+# client that trusts some other authority refuses the store's certificate
+# before it sends anything.
+check_storage_serves_tls_only() {
+  local title="deis-store answers only over TLS, with a certificate the fleet issued for a store"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is not installed, so this check could not be run"
+    return
+  fi
+
+  local tenant="${APP_ID}.${ENV_NAME}"
+  local plain plain_rc stranger stranger_rc
+  plain=$(grpcurl -plaintext -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -H "authorization: Bearer $(storage_token)" \
+    -d '{"key":"tls-only"}' \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1) && plain_rc=0 || plain_rc=$?
+  stranger=$(grpcurl -cacert "${PKI_DIR}/rogue-ca.crt" -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "x-deis-tenant: ${tenant}" \
+    -d '{"key":"tls-only"}' \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1) && stranger_rc=0 || stranger_rc=$?
+
+  if [ "$plain_rc" -ne 0 ] && ! echo "$plain" | grep -q 'Code:' \
+    && [ "$stranger_rc" -ne 0 ] && echo "$stranger" | grep -qi 'certificate'; then
+    pass_check "$title" \
+      "a plaintext KvStore.Get got no gRPC answer ($(echo "$plain" | tr '\n' ' ' | head -c 120)), and a client trusting another authority refused the store's certificate ($(echo "$stranger" | tr '\n' ' ' | head -c 120))"
+  else
+    fail_check "$title" \
+      "plaintext: rc=${plain_rc} $(echo "$plain" | tr '\n' ' ' | head -c 200); foreign authority: rc=${stranger_rc} $(echo "$stranger" | tr '\n' ' ' | head -c 200)"
+  fi
+}
+
+# Taking a capability back. The control plane records every capability it
+# signs; an administrator revokes one by its `jti`, and deis-store learns of
+# it from the revocation list it polls over the machine channel every 30
+# seconds. So a token that was served a moment ago is refused within one
+# poll, and a token minted beside it - not revoked - goes on working.
+check_a_revoked_capability_is_refused() {
+  local title="a revoked storage capability is refused within one poll, and only that one"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is not installed, so this check could not be run"
+    return
+  fi
+
+  local tenant="${APP_ID}.${ENV_NAME}"
+  local revoked kept jti answer
+  revoked=$(storage_token)
+  kept=$(storage_token)
+  jti=$(capability_jti "$revoked")
+  if [ -z "$revoked" ] || [ -z "$kept" ] || [ -z "$jti" ]; then
+    fail_check "$title" "the control plane did not mint two storage capabilities to compare (jti '${jti:-none}')"
+    return
+  fi
+
+  kv_get_as() {
+    grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
+      -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+      -H "x-deis-tenant: ${tenant}" \
+      -H "authorization: Bearer $1" \
+      -d '{"key":"revocation-probe"}' \
+      "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true
+  }
+
+  local before
+  before=$(kv_get_as "$revoked")
+  if echo "$before" | grep -q 'Code:'; then
+    fail_check "$title" "the capability was refused before it was revoked: $(echo "$before" | tr '\n' ' ' | head -c 200)"
+    return
+  fi
+
+  answer=$(control_answer DELETE "/api/v1/capabilities/${jti}" "$OPERATOR_TOKEN")
+  if ! echo "$answer" | jq -e --arg j "$jti" '.revoked | index($j)' >/dev/null 2>&1; then
+    fail_check "$title" "DELETE /api/v1/capabilities/${jti} did not report it revoked: $(echo "$answer" | head -c 200)"
+    return
+  fi
+
+  local after="" waited=0
+  while [ "$waited" -lt 45 ]; do
+    after=$(kv_get_as "$revoked")
+    echo "$after" | grep -q 'Code: PermissionDenied' && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  local still
+  still=$(kv_get_as "$kept")
+
+  if echo "$after" | grep -q 'Code: PermissionDenied' && ! echo "$still" | grep -q 'Code:'; then
+    pass_check "$title" \
+      "KvStore.Get with capability ${jti} was served, then DELETE /api/v1/capabilities/${jti} revoked it and ${waited}s later deis-store refused it: $(echo "$after" | grep -m1 'Message:' | sed 's/^ *//' | head -c 160). A capability minted beside it, not revoked, is still served"
+  else
+    fail_check "$title" \
+      "after ${waited}s the revoked capability got: $(echo "$after" | tr '\n' ' ' | head -c 200); the kept one got: $(echo "$still" | tr '\n' ' ' | head -c 200)"
+  fi
+}
+
+# The node's own capabilities, as opposed to a person's. A node asks for one
+# per tenant it runs, so revoking one application environment takes back only
+# the tokens that name it: the other environment on the same node keeps its
+# storage throughout. And the node does not sit on a revoked token until it
+# falls due - deis-store refuses it, the node hears the refusal from under its
+# client and asks the control plane for a new one straight away - so the
+# revoked environment is serving again within one revocation poll and a
+# moment, not ten minutes later.
+check_a_tenant_revocation_spares_its_neighbours_and_heals() {
+  local title="revoking one tenant's capabilities spares the other tenant on the node, and the node replaces its own at once"
+  local key="revoke-tenant-probe-$$-${RANDOM}"
+  local headers="${LOG_DIR}/verify-revoke-tenant.headers"
+
+  put_as() {
+    env_request "$1" "$headers" "/api/kv/${key}" -X PUT --data-binary "$1" >/dev/null
+    http_status "$headers"
+  }
+
+  local before_live before_preview
+  before_live=$(put_as "$ENV_NAME")
+  before_preview=$(put_as "$PREVIEW_ENV_NAME")
+  if [ "$before_live" != "201" ] || [ "$before_preview" != "201" ]; then
+    fail_check "$title" "before any revocation a KV write answered ${before_live} in ${ENV_NAME} and ${before_preview} in ${PREVIEW_ENV_NAME}; both must be served first"
+    return
+  fi
+
+  local answer revoked
+  answer=$(control_answer POST     "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/capability-revocations" "$OPERATOR_TOKEN")
+  revoked=$(echo "$answer" | jq -r '.revoked | length' 2>/dev/null || echo 0)
+  if [ "${revoked:-0}" -lt 1 ]; then
+    fail_check "$title" "revoking ${APP_ID}.${ENV_NAME} took back nothing, so there is nothing to observe: $(echo "$answer" | head -c 200)"
+    return
+  fi
+
+  # One revocation poll (30s) for deis-store to learn of it, then the node's
+  # next write is refused and replaced. The preview is written every second
+  # of that window and must never be refused.
+  local waited=0 status_live status_preview live_refused=0 preview_refused=0 healed=""
+  while [ "$waited" -lt 100 ]; do
+    # The node renews on its own schedule too; one that happened to renew
+    # between the revocation and deis-store adopting it holds a token the
+    # revocation never named. Revoke once more so there is a refusal to see.
+    if [ "$waited" -eq 45 ] && [ "$live_refused" -eq 0 ]; then
+      control_answer POST \
+        "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/capability-revocations" \
+        "$OPERATOR_TOKEN" >/dev/null
+    fi
+    status_live=$(put_as "$ENV_NAME")
+    status_preview=$(put_as "$PREVIEW_ENV_NAME")
+    [ "$status_preview" = "201" ] || preview_refused=$((preview_refused + 1))
+    if [ "$status_live" = "201" ]; then
+      if [ "$live_refused" -gt 0 ]; then
+        healed=$waited
+        break
+      fi
+    else
+      live_refused=$((live_refused + 1))
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  # The revocation took the node's queue capability for this tenant too, and
+  # deis-queue adopts the list on its own 30-second poll. Once it surely has,
+  # send until the node has replaced that token as well, so what follows this
+  # check meets a node holding capabilities that are accepted everywhere.
+  local queue_refused=0 queue_status="" queue_healed=""
+  if [ -n "$healed" ]; then
+    [ "$waited" -lt 35 ] && sleep $((35 - waited))
+    local tries=0
+    while [ "$tries" -lt 30 ]; do
+      runtime_curl -s -o /dev/null -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+        -H 'content-type: application/json' \
+        -d "{\"key\":\"${key}-queue\",\"value\":\"after-revocation\"}" \
+        "$(runtime_data_url)/api/enqueue" || true
+      queue_status=$(http_status "$headers")
+      if [ "$queue_status" = "202" ]; then
+        queue_healed=yes
+        break
+      fi
+      queue_refused=$((queue_refused + 1))
+      sleep 1
+      tries=$((tries + 1))
+    done
+  fi
+
+  if [ -n "$healed" ] && [ "$preview_refused" -eq 0 ] && [ -n "$queue_healed" ]; then
+    pass_check "$title" \
+      "POST .../environments/${ENV_NAME}/capability-revocations took back ${revoked} capabilities; ${ENV_NAME}'s KV writes were refused ${live_refused} time(s) and served again ${healed}s after the revocation, while ${PREVIEW_ENV_NAME} on the same node was written every second of that window and never refused. Its queue sends were refused ${queue_refused} time(s) before the node replaced that token too"
+  elif [ "$preview_refused" -gt 0 ]; then
+    fail_check "$title" \
+      "revoking ${APP_ID}.${ENV_NAME} also refused ${PREVIEW_ENV_NAME}'s KV writes ${preview_refused} time(s) (last answer ${status_preview}): a node token names more than one tenant"
+  elif [ -n "$healed" ]; then
+    fail_check "$title" \
+      "${ENV_NAME}'s KV writes healed ${healed}s after the revocation, but its queue sends were still refused after ${queue_refused} tries (last answer ${queue_status}): the node did not replace its refused queue token"
+  elif [ "$live_refused" -eq 0 ]; then
+    fail_check "$title" \
+      "${ENV_NAME}'s KV writes were never refused in ${waited}s after its capabilities were revoked, so the node's token was not among them or deis-store never adopted the revocation"
+  else
+    fail_check "$title" \
+      "${ENV_NAME}'s KV writes were refused ${live_refused} time(s) and still not served ${waited}s after the revocation (last answer ${status_live}): the node did not replace the refused token"
+  fi
+}
+
+# Revoking a node, as opposed to a tenant or a token: the holder, not what it
+# holds. A tenant revocation heals within seconds because the node simply
+# asks again; a node revocation must not, or it could not contain a
+# compromised machine. So after the node's writes start being refused they
+# have to stay refused past the point where a renewal would have healed them
+# (the node retries a refused token 30 seconds after it was issued, and
+# deis-store adopts a list every 30), and only lifting the revocation brings
+# the node back - registered again, issued capabilities again, serving both
+# environments and its queue again, so what follows meets a whole node.
+check_a_revoked_node_stays_cut_off_until_lifted() {
+  local title="revoking a node cuts it off until the revocation is lifted, however often it asks again"
+  local key="revoke-node-probe-$$-${RANDOM}"
+  local headers="${LOG_DIR}/verify-revoke-node.headers"
+  local path="/api/v1/capabilities/revocations/nodes/${NODE_ID}"
+
+  put_as() {
+    env_request "$1" "$headers" "/api/kv/${key}" -X PUT --data-binary "$1" >/dev/null
+    http_status "$headers"
+  }
+
+  local before
+  before=$(put_as "$ENV_NAME")
+  if [ "$before" != "201" ]; then
+    fail_check "$title" "before the revocation a KV write in ${ENV_NAME} answered ${before}; it must be served first"
+    return
+  fi
+
+  local answer
+  answer=$(control_answer POST "$path" "$OPERATOR_TOKEN")
+  if ! echo "$answer" | jq -e '.revoked | type == "array"' >/dev/null 2>&1; then
+    fail_check "$title" "POST ${path} did not answer a revocation: $(echo "$answer" | head -c 200)"
+    return
+  fi
+
+  # Refused within one poll and a moment.
+  local waited=0 status="" refused_at=""
+  while [ "$waited" -lt 60 ]; do
+    status=$(put_as "$ENV_NAME")
+    if [ "$status" != "201" ]; then
+      refused_at=$waited
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [ -z "$refused_at" ]; then
+    control_status DELETE "$path" "$OPERATOR_TOKEN" >/dev/null
+    fail_check "$title" "${ENV_NAME}'s KV writes were still served ${waited}s after ${NODE_ID} was revoked (last answer ${status})"
+    return
+  fi
+
+  # And still refused well past every renewal that could have healed it.
+  local held=0 served_while_revoked=0
+  while [ "$held" -lt 75 ]; do
+    status=$(put_as "$ENV_NAME")
+    [ "$status" = "201" ] && served_while_revoked=$((served_while_revoked + 1))
+    sleep 1
+    held=$((held + 1))
+  done
+
+  local lifted
+  lifted=$(control_status DELETE "$path" "$OPERATOR_TOKEN")
+
+  # Lifted: the node registers again on its own cadence, is issued new
+  # capabilities, and deis-store and deis-queue accept them.
+  local healed="" tries=0 live preview queue=""
+  while [ "$tries" -lt 180 ]; do
+    live=$(put_as "$ENV_NAME")
+    preview=$(put_as "$PREVIEW_ENV_NAME")
+    runtime_curl -s -o /dev/null -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+      -H 'content-type: application/json' \
+      -d "{\"key\":\"${key}-queue\",\"value\":\"after-lift\"}" \
+      "$(runtime_data_url)/api/enqueue" || true
+    queue=$(http_status "$headers")
+    if [ "$live" = "201" ] && [ "$preview" = "201" ] && [ "$queue" = "202" ]; then
+      healed=$tries
+      break
+    fi
+    sleep 1
+    tries=$((tries + 1))
+  done
+
+  if [ "$served_while_revoked" -eq 0 ] && [ "$lifted" = "204" ] && [ -n "$healed" ]; then
+    pass_check "$title" \
+      "POST ${path} revoked the node and ${refused_at}s later its KV writes were refused; they stayed refused for all ${held}s after that, though the node kept asking for new capabilities. DELETE ${path} answered 204 and ${healed}s later the node was serving ${ENV_NAME}, ${PREVIEW_ENV_NAME} and its queue again"
+  elif [ "$served_while_revoked" -gt 0 ]; then
+    fail_check "$title" \
+      "${ENV_NAME}'s KV writes were refused ${refused_at}s after ${NODE_ID} was revoked, but served ${served_while_revoked} time(s) in the ${held}s after that: the node got a capability that was accepted while it was revoked"
+  elif [ "$lifted" != "204" ]; then
+    fail_check "$title" "DELETE ${path} answered ${lifted:-nothing}, not 204"
+  else
+    fail_check "$title" \
+      "the revocation held, but ${tries}s after it was lifted the node answered ${live} in ${ENV_NAME}, ${preview} in ${PREVIEW_ENV_NAME} and ${queue} for a queue send: it did not come back"
   fi
 }
 
@@ -946,6 +1248,10 @@ group_storage_checks=(
   check_a_binding_cannot_reach_another_tenant
   check_cli_reads_a_named_binding
   check_storage_capability_token
+  check_storage_serves_tls_only
+  check_a_revoked_capability_is_refused
+  check_a_tenant_revocation_spares_its_neighbours_and_heals
+  check_a_revoked_node_stays_cut_off_until_lifted
   check_storage_token_route_requires_a_credential
   check_data_cli_reads_the_apps_write
   # What a tenant's SQL may cost, as opposed to what it may touch. Both go

@@ -74,9 +74,8 @@ pub struct ShipperConfig {
     /// `enabled = false` does, and is refused at startup when `enabled` is on.
     pub endpoint: Option<String>,
 
-    /// The capability token this node presents on every push, derived from
-    /// `logging.auth_secret`. Absent is correct against a collector that has
-    /// no `auth_secret`, and fatal to log delivery against one that has; see
+    /// The capability this node presents on every push. Empty until `main`
+    /// hands in the one the telemetry renewal task keeps current; see
     /// [`crate::telemetry`].
     pub credential: TelemetryCredential,
 
@@ -106,7 +105,7 @@ impl From<&LoggingConfig> for ShipperConfig {
     fn from(config: &LoggingConfig) -> Self {
         Self {
             endpoint: config.endpoint.clone(),
-            credential: TelemetryCredential::from_secret(config.auth_secret.as_deref()),
+            credential: TelemetryCredential::default(),
             flush_interval_secs: config.flush_interval_secs,
             batch_size: config.batch_size,
             max_retries: config.max_retries,
@@ -451,13 +450,17 @@ impl TelemetrySink {
     /// batch, not a shipper that never recovers.
     async fn client(&mut self) -> Result<&mut LogServiceClient<Channel>> {
         if self.client.is_none() {
-            let channel = Endpoint::from_shared(self.endpoint.clone())
+            let builder = Endpoint::from_shared(self.endpoint.clone())
                 .with_context(|| format!("{} is not a valid gRPC endpoint", self.endpoint))?
                 .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
-                .connect()
-                .await
-                .with_context(|| format!("connecting to deis-telemetry at {}", self.endpoint))?;
+                .timeout(REQUEST_TIMEOUT);
+            let channel = crate::runtime::service_tls::connect(
+                builder,
+                &self.endpoint,
+                deis_identity::ServiceKind::Telemetry,
+            )
+            .await
+            .with_context(|| format!("connecting to deis-telemetry at {}", self.endpoint))?;
 
             info!(endpoint = %self.endpoint, "Connected to deis-telemetry log service");
             self.client = Some(
@@ -503,21 +506,18 @@ impl LogSink for TelemetrySink {
                 // Drop the channel rather than reuse one the server may have
                 // closed; the next attempt dials again.
                 self.client = None;
+                self.credential.observe(&status);
                 if status.code() == tonic::Code::Unauthenticated {
-                    // Its own line, at error, because it is the one failure
-                    // here that no amount of retrying fixes and that looks
-                    // exactly like a transient outage from the outside: the
-                    // collector is up and answering, and every batch this node
-                    // ever produces will be refused until an operator changes
-                    // a setting.
+                    // Its own line, at error, because from the outside it
+                    // looks exactly like a transient outage: the collector is
+                    // up and answering, and it is refusing this node.
                     error!(
                         endpoint = %self.endpoint,
                         carrying_a_token = self.credential.is_present(),
-                        "deis-telemetry refused this node's logs: {}. This is a credential \
-                         mismatch and not an outage -- retrying cannot fix it, and until it is \
-                         fixed no line from any application on this node is queryable. Set \
-                         logging.auth_secret to the capability signing key secret configured \
-                         in deis-telemetry",
+                        "deis-telemetry refused this node's logs: {}. This node has no \
+                         telemetry capability from the control plane yet, or the collector \
+                         does not trust the control plane's signing keys (check its\
+                         [machine_identity] control_endpoint); the batch stays queued",
                         status.message()
                     );
                 }

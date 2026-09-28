@@ -312,7 +312,7 @@ claim_port() {
 # Nothing about this is how a real installation gets its certificates. A real
 # one has a certificate authority with a life longer than one script run, and
 # `deis-identity` deliberately knows nothing about where the three files came
-# from. Two days of validity is chosen so a `.demo` directory left over from
+# from. Four days of validity is chosen so a `.demo` directory left over from
 # last week fails at load with something an operator can read, rather than at
 # a handshake days later.
 #
@@ -336,7 +336,7 @@ mint_ca() {
   local prefix=$1
   local subject=$2
   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-    -keyout "${prefix}.key" -out "${prefix}.crt" -days 2 \
+    -keyout "${prefix}.key" -out "${prefix}.crt" -days 4 \
     -subj "/CN=${subject}" \
     -addext "basicConstraints=critical,CA:TRUE" \
     -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
@@ -371,7 +371,7 @@ subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid
 EXT
   openssl x509 -req -in "${leaf}.csr" -CA "${ca}.crt" -CAkey "${ca}.key" \
-    -CAcreateserial -days 2 -extfile "${leaf}.ext" -out "${leaf}.crt" \
+    -CAcreateserial -days 4 -extfile "${leaf}.ext" -out "${leaf}.crt" \
     >/dev/null 2>&1
   rm -f "${leaf}.csr" "${leaf}.ext"
 }
@@ -409,6 +409,18 @@ mint_fleet_identities() {
   # mutual TLS, as its colleague does.
   mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/proxy-restart" \
     "spiffe://${FLEET_TRUST_DOMAIN}/deislet/proxy/deis-proxy-demo-restart" "IP:127.0.0.1"
+
+  # The three data services. Each serves its gRPC listener over TLS with its
+  # own certificate, and proves the same one to the control plane when it
+  # reads the capability keys. The IP SAN is the harness concession above:
+  # grpcurl, which the storage and queue checks ask the services with, checks
+  # the address before anything reads the SPIFFE name.
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/store" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/store/deis-store-demo" "IP:127.0.0.1"
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/queue" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/queue/deis-queue-demo" "IP:127.0.0.1"
+  mint_leaf "${PKI_DIR}/ca" "${PKI_DIR}/telemetry" \
+    "spiffe://${FLEET_TRUST_DOMAIN}/deislet/telemetry/deis-telemetry-demo" "IP:127.0.0.1"
 
   # A second real machine of this fleet: the node that joins by registering,
   # which it can only do by proving a name of its own.
@@ -663,16 +675,6 @@ load_state() {
   source "$STATE_FILE"
 }
 
-# Bring up deis-telemetry, the service every other component reports to. It
-# is started before the control plane on purpose: it depends on nothing,
-# while every other component ships logs at it, so it should already be
-# listening when the rest come up. Its HTTP scrape endpoint is a real answer
-# and so a stronger readiness signal than a TCP probe.
-#
-# deis-store and deis-queue come up in start_storage_services, after the
-# control plane: they verify every call against the keys the control plane
-# publishes, and the address they fetch those from carries the port the
-# control plane ends up bound to.
 # Build every demo binary once, up front.
 #
 # The services are then launched as binaries rather than through `cargo run`,
@@ -700,11 +702,35 @@ build_binaries() {
   fi
 }
 
-start_data_plane() {
+# deis-store (KV/DB/Blob) and deis-queue, once the control plane is up.
+#
+# Neither has a secret of its own. Every call must carry an Ed25519
+# capability the control plane signed for the tenant, audience and binding it
+# names (crates/deis-store/src/auth.rs), and the keys it is checked against
+# are read from the control plane's JWKS on the machine channel - under
+# mutual TLS, each proving the certificate minted for it above - at startup,
+# every few minutes, and whenever a token names a key not yet seen, so a key
+# rotation needs nothing done here. The same certificate is what each serves
+# its gRPC listener with: there is no plaintext port. The signed revocation
+# list is polled from the same machine channel every 30 seconds.
+start_storage_services() {
+  local machine_url="https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
+
+  # deis-telemetry is in the same position: it holds no secret, verifies every
+  # push, query and scrape against the same published keys read the same way,
+  # serves TLS with its own certificate, and so comes up here too - before the
+  # node, which is the first thing to ship at it.
   cat > "$DEIS_TELEMETRY_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_TELEMETRY_PORT}"
 metrics_listen = "127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}"
 data_dir = "${DEMO_DIR}/deis-telemetry-data"
+
+# The gRPC listener speaks TLS only, presenting this certificate.
+[machine_identity]
+certificate = "${PKI_DIR}/telemetry.crt"
+private_key = "${PKI_DIR}/telemetry.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "${machine_url}"
 EOF
   chmod 600 "$DEIS_TELEMETRY_CONFIG"
 
@@ -713,39 +739,35 @@ EOF
     > "${LOG_DIR}/deis-telemetry.log" 2>&1 &
   DEIS_TELEMETRY_PID=$!
 
-  local rc=0
-  wait_for_service wait_for_http \
-    "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" "$DEIS_TELEMETRY_PID" 60 || rc=$?
-  report_service "Telemetry" "$rc" "${LOG_DIR}/deis-telemetry.log" \
+  # Any answer at all is ready: the scrape endpoint refuses a caller without
+  # a capability, which this probe is.
+  local telemetry_rc=0
+  wait_for_service wait_for_http_any \
+    "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" "$DEIS_TELEMETRY_PID" 60 || telemetry_rc=$?
+  report_service "Telemetry" "$telemetry_rc" "${LOG_DIR}/deis-telemetry.log" \
     "logs and metrics pushed at it are dropped"
-}
-
-# deis-store (KV/DB/Blob) and deis-queue, once the control plane is up.
-#
-# Neither has a secret of its own. Every call must carry an Ed25519
-# capability the control plane signed for the tenant, audience and binding it
-# names (crates/deis-store/src/auth.rs), and the keys it is checked against
-# are fetched from the control plane's JWKS at capability_jwks_url - at
-# startup, every few minutes, and whenever a token names a key not yet seen,
-# so a key rotation needs nothing done here. revocation_list_url is where
-# both poll for revoked tokens. Both default to the control plane's default
-# port, which this demo may not have been given, so both are spelled out.
-start_storage_services() {
-  local control_url="http://127.0.0.1:${DEIS_CONTROL_PORT}"
 
   cat > "$DEIS_STORE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_STORE_PORT}"
 data_dir = "${DEMO_DIR}/deis-store-data"
-capability_jwks_url = "${control_url}/.well-known/deis/capability-jwks.json"
-revocation_list_url = "${control_url}"
+
+[machine_identity]
+certificate = "${PKI_DIR}/store.crt"
+private_key = "${PKI_DIR}/store.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "${machine_url}"
 EOF
   chmod 600 "$DEIS_STORE_CONFIG"
 
   cat > "$DEIS_QUEUE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_QUEUE_PORT}"
 data_dir = "${DEMO_DIR}/deis-queue-data"
-capability_jwks_url = "${control_url}/.well-known/deis/capability-jwks.json"
-revocation_list_url = "${control_url}"
+
+[machine_identity]
+certificate = "${PKI_DIR}/queue.crt"
+private_key = "${PKI_DIR}/queue.key"
+trust_root = "${PKI_DIR}/ca.crt"
+control_endpoint = "${machine_url}"
 EOF
   chmod 600 "$DEIS_QUEUE_CONFIG"
 
@@ -1015,6 +1037,20 @@ control_api() {
   curl -s -H "Authorization: Bearer ${OPERATOR_TOKEN}" "$(control_url)$1" || true
 }
 
+# A deis-telemetry read capability, minted by the control plane for the
+# operator: for one environment of the demo application when given one, for
+# the whole platform (every tenant, and what the Prometheus page needs) when
+# given `--platform`. Empty when the control plane would not mint one.
+telemetry_token() {
+  local route
+  if [ "${1:-}" = "--platform" ]; then
+    route="/api/platform/telemetry-token"
+  else
+    route="/api/v1/apps/${APP_ID}/environments/${1:-$ENV_NAME}/telemetry-token"
+  fi
+  control_api "$route" | jq -r '.token // empty' 2>/dev/null || true
+}
+
 # Every item of one Control API list, whatever its size, as one JSON array.
 #
 # A list route answers one page at a time - at most 1000 items, 100 when no
@@ -1064,14 +1100,18 @@ control_list_all() {
 deis_cli_env() {
   DEIS_CLI_ENV=(
     "DEIS_CONTROL_ENDPOINT=$(control_url)"
-    "DEIS_TELEMETRY_ENDPOINT=http://127.0.0.1:${DEIS_TELEMETRY_PORT}"
+    "DEIS_TELEMETRY_ENDPOINT=https://127.0.0.1:${DEIS_TELEMETRY_PORT}"
     # Where deis-queue listens, for `deis queue dead-letters` and `deis queue
     # replay`. It is not fetched from the control plane the way deis-store's
     # address is - the storage-token route answers with the store's address
     # and the tenant's token, and that same token is what deis-queue checks -
     # so the CLI is told it here, exactly as a person would put it in
     # deis.toml under [queue].
-    "DEIS_QUEUE_ENDPOINT=http://127.0.0.1:${DEIS_QUEUE_PORT}"
+    "DEIS_QUEUE_ENDPOINT=https://127.0.0.1:${DEIS_QUEUE_PORT}"
+    # The authority deis-store, deis-queue and deis-telemetry certificates
+    # chain to. All three serve TLS only, and the CLI refuses a server whose
+    # certificate this authority did not issue for that kind of service.
+    "DEIS_SERVICES_CA=${PKI_DIR}/ca.crt"
     "DEIS_APP=${APP_ID}"
     "DEIS_ENVIRONMENT=${ENV_NAME}"
     "DEIS_CONFIG_HOME=${DEMO_DIR}/deis-config"
@@ -2397,6 +2437,19 @@ storage_token() {
   [ "${1:-store}" = "queue" ] && field=queue_token
   control_api "/api/v1/apps/${APP_ID}/environments/${ENV_NAME}/storage-token" \
     | jq -r --arg f "$field" '.[$f] // empty' 2>/dev/null || true
+}
+
+# The `jti` a capability carries, read off its claims without verifying them:
+# the caller is the one who asked for the token. Empty for anything that is
+# not a capability.
+capability_jti() {
+  local payload
+  payload=$(printf '%s' "${1:-}" | cut -d. -f2 | tr '_-' '/+')
+  case $(( ${#payload} % 4 )) in
+    2) payload="${payload}==" ;;
+    3) payload="${payload}=" ;;
+  esac
+  printf '%s' "$payload" | base64 -d 2>/dev/null | jq -r '.jti // empty' 2>/dev/null || true
 }
 
 # One request through deis-proxy for a host the catalog claims, with no

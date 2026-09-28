@@ -29,20 +29,20 @@
 //! deis-runtime does run production and preview environments of one
 //! application side by side, and it names them apart everywhere it stores
 //! data - the storage tenant is `demo.production`. It does not do that here.
-//! Unlike deis-store, this service partitions nothing: a composite key would
-//! cost the question people actually ask - "show me this application's logs",
-//! meaning all of its environments - and would buy no isolation, because
-//! anything holding this service's credential may name any `app_id` anyway.
-//! So the environment arrives as an ordinary structured field on a log entry,
-//! and as an ordinary label on a metric sample, and `app_id` stays the
-//! application.
+//! Unlike deis-store, this service partitions nothing on disk: a composite
+//! key would cost the question people actually ask - "show me this
+//! application's logs", meaning all of its environments. So the environment
+//! arrives as an ordinary structured field on a log entry, and as an ordinary
+//! label on a metric sample, and `app_id` stays the application. A record
+//! with no `app_id` at all is a node's own, and belongs to the platform.
 //!
-//! What it does protect is the channel. With an `auth_secret` configured,
-//! every call and every scrape must present a capability token, and with none
-//! configured the service refuses to bind anywhere but loopback rather than
-//! quietly publishing every application's logs, traces and metrics to the
-//! network. [`auth`] has the whole reasoning, including why the token names
-//! this service rather than a tenant.
+//! Who may write and read what is decided per record from the caller's
+//! capability, minted by deis-control and verified against its published
+//! keys on every call and every scrape. A node may push only the application
+//! environments it runs (plus its own node-level records); a reader sees only
+//! the environments its capability names, or everything when it holds the
+//! platform-wide read. There is no configuration in which the check is off.
+//! [`auth`] has the whole reasoning.
 //!
 //! The live side is shared out per application rather than first-come: one
 //! application logging in a loop cannot push a co-tenant's lines out of a
@@ -74,7 +74,7 @@
 //! [`stats::StoreHealth`].
 //!
 //! Layout:
-//! - [`auth`]    the capability token, and the refusal to serve unguarded
+//! - [`auth`]    the capability check, and what each binding may touch
 //! - [`store`]   SQLite: day-partitioned logs and traces, a metric time
 //!   series, retention
 //! - [`tail`]    live fan-out to `Tail` and `TailTraces` subscribers, each

@@ -131,7 +131,6 @@ start_demo() {
   DEIS_TELEMETRY_CONFIG="${DEMO_DIR}/deis-telemetry.toml"
 
   build_binaries
-  start_data_plane
   start_origin
   start_acme_ca
 
@@ -158,9 +157,11 @@ start_demo() {
     # control plane's own point of view. secret_key_file is required: it
     # encrypts environment secrets and the capability signing keys this
     # control plane keeps in its database, whose public halves deis-store and
-    # deis-queue fetch from its JWKS. store_endpoint / queue_endpoint are the
-    # addresses handed down to nodes with every deployment - a node never
-    # learns where storage lives from its own file.
+    # deis-queue read from its JWKS on the machine channel. store_endpoint /
+    # queue_endpoint are the addresses handed down to nodes with every
+    # deployment - a node never learns where storage lives from its own file -
+    # and are https://: both serve TLS only, and a node checks each
+    # certificate against the fleet's authority before a capability leaves it.
     cat > "$DEIS_CONTROL_CONFIG" <<EOF
 bind_addr = "0.0.0.0"
 port = ${DEIS_CONTROL_PORT}
@@ -185,8 +186,8 @@ deployment_target_abandon_after_secs = 120
 bundle_dir = "${DEMO_DIR}/bundles"
 public_base_url = "http://127.0.0.1:${DEIS_CONTROL_PORT}"
 secret_key_file = "${SECRET_KEY_FILE}"
-store_endpoint = "http://127.0.0.1:${DEIS_STORE_PORT}"
-queue_endpoint = "http://127.0.0.1:${DEIS_QUEUE_PORT}"
+store_endpoint = "https://127.0.0.1:${DEIS_STORE_PORT}"
+queue_endpoint = "https://127.0.0.1:${DEIS_QUEUE_PORT}"
 
 # The machine channel. Everything only Deislet's own processes call is served
 # here and nowhere else: the assignment list, which carries every environment's
@@ -249,7 +250,7 @@ data_dir = "${DEMO_DIR}/deis-runtime-data"
 
 [logging]
 enabled = true
-endpoint = "http://127.0.0.1:${DEIS_TELEMETRY_PORT}"
+endpoint = "https://127.0.0.1:${DEIS_TELEMETRY_PORT}"
 flush_interval_secs = 1
 
 [control]
@@ -413,8 +414,9 @@ EOF
   # credential.
   bootstrap_operator_session
 
-  # deis-store and deis-queue only now: the keys they verify every call
-  # against are fetched from this control plane, at the port it just bound.
+  # deis-telemetry, deis-store and deis-queue only now: the keys they verify
+  # every call against are fetched from this control plane, at the port it
+  # just bound.
   start_storage_services
 
   echo "🚀 Starting Runtime (HTTP: ${DEIS_RUNTIME_PORT})"

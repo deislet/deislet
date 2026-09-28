@@ -1,11 +1,19 @@
 //! Operator-facing configuration.
 //!
-//! Every call must carry an Ed25519-signed capability token in
-//! `Authorization: Bearer <token>`. Writes use `aud="telemetry"` and reads
-//! and scrapes use `aud="telemetry.read"`. The verifying key is configured
-//! via `capability_public_key` or fetched from the control plane.
+//! Every call must carry a capability minted by deis-control in
+//! `Authorization: Bearer <token>`; the verifying keys are fetched from the
+//! control plane's JWKS over its machine channel (`[machine_identity]`
+//! `control_endpoint`) and kept current. There is no setting that turns the
+//! check off. See [`crate::auth`].
 //!
 //! Health is public and optional migration management has its own credential.
+//!
+//! `[machine_identity]` is required to serve: the gRPC listener speaks TLS
+//! only, presenting this service's own certificate
+//! (`spiffe://<trust domain>/deislet/telemetry/<id>`), so a bearer capability
+//! is never readable on the wire and a caller that checks the certificate
+//! knows it reached a telemetry service. The table is optional to parse so
+//! that `snapshot` and `restore` work without it.
 
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -23,29 +31,34 @@ pub struct Config {
     /// Address the Prometheus text endpoint binds to. It is a separate port
     /// from `listen` so a scraper can be pointed at it without being given
     /// access to the ingest and query RPCs.
+    ///
+    /// Plaintext HTTP, so it must be a loopback IP address: anything else is
+    /// refused at startup. A scrape carries a read capability for every
+    /// tenant, which must not cross a network in the clear.
     #[serde(default = "default_metrics_listen")]
     pub metrics_listen: String,
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    /// The control plane's capability verifying key, in hex.
+    /// This service's machine identity and the control plane's machine
+    /// channel, where the capability JWKS is read from at startup (retried
+    /// until the control plane answers, refusing every call meanwhile), every
+    /// 5 minutes after that, and whenever a token names a key not yet held.
+    /// Required by `serve`; see the module note.
     ///
-    /// This is the Ed25519 public key that deis-control uses to sign
-    /// capability tokens.
+    /// The control plane's signed revocation list is polled from the same
+    /// endpoint every 30 seconds; its signature is checked against the same
+    /// keys before its revoked `jti`s and minimum `auth_epoch` are enforced
+    /// and the T8 degraded-mode clock is reset.
     #[serde(default)]
-    pub capability_public_key: Option<String>,
-    /// The control-plane URL for the T8 revocation-list endpoint.
-    ///
-    /// Defaults to `http://127.0.0.1:8100`.
-    #[serde(default = "default_revocation_list_url")]
-    pub revocation_list_url: String,
+    pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
     /// Independent bearer credential for the backend migration management
     /// RPCs. When absent those RPCs are not registered; ingest still opens
     /// and enforces the durable fence journal so removing this credential
     /// cannot bypass an already acquired fence.
     ///
-    /// This must not equal `auth_secret`: application telemetry callers must
-    /// never inherit authority to freeze, inventory or release a tenant.
+    /// Application telemetry callers never inherit authority to freeze,
+    /// inventory or release a tenant: this is a separate credential.
     #[serde(default)]
     pub migration_admin_token: Option<String>,
     /// How many days of logs to keep. Logs live in one table per UTC day;
@@ -142,18 +155,13 @@ fn default_metrics_export_window_secs() -> u64 {
     300
 }
 
-fn default_revocation_list_url() -> String {
-    "http://127.0.0.1:8100".to_string()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
-            capability_public_key: None,
-            revocation_list_url: default_revocation_list_url(),
+            machine_identity: None,
             migration_admin_token: None,
             log_retention_days: default_log_retention_days(),
             metric_retention_days: default_metric_retention_days(),
@@ -175,10 +183,6 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("metrics_listen", &self.metrics_listen)
             .field("data_dir", &self.data_dir)
-            .field(
-                "capability_public_key",
-                &self.capability_public_key.as_ref().map(|_| "<redacted>"),
-            )
             .field(
                 "migration_admin_token",
                 &self.migration_admin_token.as_ref().map(|_| "<redacted>"),
@@ -243,6 +247,8 @@ impl Config {
         if self.query_default_limit == 0 || self.query_max_limit == 0 {
             anyhow::bail!("query_default_limit and query_max_limit must be at least 1");
         }
+        deis_capability::exposition::require_loopback("metrics_listen", &self.metrics_listen)
+            .map_err(anyhow::Error::msg)?;
         if self.query_default_limit > self.query_max_limit {
             anyhow::bail!(
                 "query_default_limit ({}) must not exceed query_max_limit ({})",
@@ -274,7 +280,7 @@ mod tests {
         let config: Config = toml::from_str(
             r#"
             listen = "0.0.0.0:9000"
-            metrics_listen = "0.0.0.0:9001"
+            metrics_listen = "127.0.0.1:9001"
             data_dir = "/var/lib/deis-telemetry"
             log_retention_days = 3
             tail_capacity = 16
@@ -282,12 +288,40 @@ mod tests {
         )
         .expect("config must parse");
         assert_eq!(config.listen, "0.0.0.0:9000");
-        assert_eq!(config.metrics_listen, "0.0.0.0:9001");
+        assert_eq!(config.metrics_listen, "127.0.0.1:9001");
         assert_eq!(config.data_dir, PathBuf::from("/var/lib/deis-telemetry"));
         assert_eq!(config.log_retention_days, 3);
         assert_eq!(config.tail_capacity, 16);
         // Untouched fields keep their defaults.
         assert_eq!(config.query_default_limit, 100);
+        config
+            .validate()
+            .expect("a TLS listener may face the network");
+    }
+
+    /// The Prometheus port is plaintext and a scrape carries a read
+    /// capability for every tenant, so it is refused off loopback.
+    #[test]
+    fn a_metrics_listener_off_loopback_is_refused() {
+        for listen in ["0.0.0.0:9001", "192.168.1.10:9001", "localhost:9001"] {
+            let config: Config =
+                toml::from_str(&format!("metrics_listen = {listen:?}")).expect("config must parse");
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("metrics_listen"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_static_verifying_key_is_not_a_setting() {
+        // The keys come from the control plane's JWKS and nowhere else.
+        for removed in [
+            "capability_public_key = \"00\"",
+            "auth_secret = \"x\"",
+            "capability_jwks_url = \"http://127.0.0.1:8100\"",
+            "revocation_list_url = \"http://127.0.0.1:8100\"",
+        ] {
+            assert!(toml::from_str::<Config>(removed).is_err(), "{removed}");
+        }
     }
 
     #[test]
@@ -301,10 +335,9 @@ mod tests {
 
     #[test]
     fn credentials_are_parsed_but_never_printed_by_debug() {
-        let config: Config = toml::from_str(
-            "capability_public_key = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\nmigration_admin_token = \"migration-administrator-secret-000001\"",
-        )
-        .unwrap();
+        let config: Config =
+            toml::from_str("migration_admin_token = \"migration-administrator-secret-000001\"")
+                .unwrap();
         assert_eq!(
             config.migration_admin_token.as_deref(),
             Some("migration-administrator-secret-000001")

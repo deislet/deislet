@@ -273,6 +273,10 @@ API key 能不能从控制面领到那张令牌。
 | | 递归 grep 数据目录与全部日志 | 解开后的明文哪儿都没落下 |
 | 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
 | | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
+| | 明文连 deis-store 的 gRPC 端口 | 连不上：deis-store 只在 TLS 上应答，出示的是机队签给它的 `spiffe://…/deislet/store/…` 证书，调用方拿控制面的根去验它。同一个问题经 `-cacert` 走 TLS 才答得出来 |
+| | 领两张存储 capability，先用其一问 `KvStore.Get`，再 `DELETE /api/v1/capabilities/<jti>` 吊销它 | 吊销前答得出来；吊销后一次轮询（30 秒）之内 deis-store 就拒它（`PermissionDenied`），旁边那张没吊销的照常被服务。deis-store 从机器通道拉的是控制面签过名的吊销名单，所以吊销不必等 15 分钟过期 |
+| | 吊销 `demo/production` 这个租户的全部 capability，之后每秒经节点各写一次 production 与 preview 的 KV | preview 在整个窗口里一次也没被拒：节点按租户逐个申领 capability，每张只点名一个租户，吊销一个环境收不走同一节点上另一个环境的存储。production 被拒一两次后又写得进去——deis-store 拒了节点出示的那张，节点从客户端底下听到拒绝，当场向控制面要一张新的，而不是等到它快过期（十来分钟）才换 |
+| | 吊销节点本身（`POST /api/v1/capabilities/revocations/nodes/<node_id>`），之后每秒经节点写一次 production 的 KV，75 秒后再解除（`DELETE` 同一路径） | 一次轮询之内被拒，而且一直被拒：节点照样每 30 秒重新申领，可控制面对被吊销的节点什么都不答（注册、assignment、secret、新 capability），签名名单也按名字点了它，deis-store 拒绝一切签给它的 capability。只收回它手里那几张 `jti` 做不到这一点——下一次续签就回来了。解除后节点自己重新注册、领到新 capability，production、preview 与队列都恢复 |
 | | 不带 API key 打 `GET /api/apps/:app/environments/:env/storage-token` | 401，什么也拿不到；同一发带上 key 才拿到租户名、deis-store 地址与令牌本身（令牌不打印）。这张令牌绕过控制面直接对 deis-store 生效、而且不过期，所以它和部署走同一道门——这是「成功了算失败」的第三项 |
 | | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾碰不到控制面的能力签名密钥，它只拿到这一个租户的令牌 |
 | | `deis db query` 发一条数到二十亿的递归查询 | deis-store 在几秒内把它停下来，而不是跑到底；拒绝的话写在响应里（跟一个 SQL 拼写错一样），并且同时点出上限是多少、要改哪里。管的是这个租户的 SQL 能花多少，跟它能碰哪些数据是两件事 |
@@ -290,7 +294,7 @@ API key 能不能从控制面领到那张令牌。
 | | 一次 `send()` 交一整个数组 | 走的是一次 `SendBatch` 而不是 n 次 `Send`，回话里 `queued` 就是这一批的条数，消费端把这一批的每一条都写了出来 |
 | | 项目里写 `maxConcurrency` | 节点报出它同时**持有**这么多批，并且明说这不是并行：一个应用在一个环境里就一只 Isolate。这一项还会自己现发一条消息、等它被消费出来：那行日志是消费任务**起来的时候**写的，之后一直躺在文件里——先前把 deis-queue 杀掉、端口都空了，这一项照过不误（实测） |
 | | 消费函数处理不了的一条消息 | 进死信表，`deis queue dead-letters` 读得到（放弃的原因、试了几次），`deis queue replay` 放回去之后表里没有它了 |
-| | 不带凭据令牌直接问 deis-queue 自己的 `Queue/ListDeadLetters` | 被拒（`Code: Unauthenticated`），带错令牌同样被拒，带对的才被服务。上面那几项全是经节点走的，节点手里一直握着控制面发的令牌——所以 deis-queue 就算完全没配 `auth_secret`，它们也照样全绿。这一项是队列这一侧的「成功了反而算失败」（`crates/deis-queue/src/auth.rs`），和 deis-store 那条同形 |
+| | 不带凭据令牌直接问 deis-queue 自己的 `Queue/ListDeadLetters` | 被拒（`Code: Unauthenticated`），带错令牌同样被拒，带对的才被服务。上面那几项全是经节点走的，节点手里一直握着控制面发的令牌——所以 deis-queue 就算根本不校验令牌，它们也照样全绿。这一项是队列这一侧的「成功了反而算失败」（`crates/deis-queue/src/auth.rs`），和 deis-store 那条同形 |
 | cron | 等一个**这次 verify 开跑之后**才写下的 `cron:tick:<n>` | 控制面到点挑了一个节点触发，应用的 `_scheduled.ts` 真的跑了。判据有三条，缺一不算：计数器比这次开跑时读到的大、时间戳解析得出来且晚于这次自己取的时刻（所以上一次 verify 留下的值不算数）；`deis trace --kind cron` 里有节点自己报给 deis-telemetry 的 cron 调用（这条路不经 KV）；以及往 `cron:` 前缀 PUT 一发会被应用拒掉 403——读证据的这个端口不认凭据，它要是也能写，这份证据就等于没有 |
 | 应用间调用 | `demo` 经 AUTH 绑定调 `demo-auth` | 被调方跑的是它自己的 handler、答的是它自己的 202、看得见调用方发的 body 和头；它读到的 `x-deis-caller` 是 `demo.production`——而调用方在那个头里写的是别的名字，平台盖掉了。整条路上没有任何地址 |
 | | 同一个处理函数改打 `http://127.0.0.1:<节点端口>/api/call` | 打不通：那是被调方唯一能被 HTTP 到达的地址，出站策略拒绝它。所以上一行那次成功不是「fetch 换了个短名字」，是另一套机制——服务绑定里根本没有能放地址的字段 |
@@ -311,6 +315,7 @@ API key 能不能从控制面领到那张令牌。
 | | 往控制面直传一个写着不认识的 flag 的包 | 同样 400 并点名那个 flag。写错的开关被拒绝，而不是被忽略——被忽略的话，应用会以为自己拿到了一个其实没有的行为 |
 | 版本 | `deis deploy` v2 → `deis rollback` | 函数返回的标签和静态页面一起回到上一版。回滚不用报版本号：出事的人不该被要求先查一个号 |
 | 观测 | `LogService/Query` | 应用自己 `console.log` 的那行能从 deis-telemetry 按应用查回来，并带上是哪个环境写的 |
+| | 拿控制面为 `demo/production` 铸的遥测读 capability 去查 `demo-auth` 的日志，以及一条不点名应用的查询 | 两发都被拒（`PermissionDenied`），而不是答一页空的：所有租户的记录在同一个库里，挡在中间的只有 capability。同一个问题换成 `read:*/*` 操作员才领得到的平台读 capability 就答得出来，说明拒的是 capability 而不是查询本身 |
 | | `deis trace --follow` 开流 → 之后才发一个请求 | 跟到的那一行说的就是**这一次调用**（一次性探针路径确认）：方法、URL、状态码、耗时、判决、哪个节点。日志说应用讲了什么，trace 说平台决定了什么 |
 | | `deis tail` 开流 → 之后才发一个请求 | 跟到的是**开流之后**产生的那一行（用一次性探针名字确认），不是历史里捞的 |
 | 机队 | 控制面的 `/api/runtime` | 节点自己经机队通道（`deis.machine.MachineChannel/Register`，证明一张只属于这台机器的证书）登记上了；写在配置文件里的地址没有被节点自报的主机名覆盖掉 |
@@ -318,6 +323,7 @@ API key 能不能从控制面领到那张令牌。
 | | 登记、清单、路由表这三条路由改在**人用的那个监听口**上各发一次，带的是从前那把**部署用**的 API key | 三发都是 404，不是 401——不是「这把凭据不够格」，是这几条路由在这个口子上根本不存在：这个演示以前处处配置、现在哪儿都不配的那把机队共用密钥，也开不了一个不存在的路由。机队里没有多出任何 id，真正的节点仍然健康，而且是凭它证明的那个名字被认出来的 |
 | | 不带证书、以及带一张这支机队从没签过的证书，各去碰一次机队监听口 | 都连不上——一个只到握手就断了的连接，不是一个被业务逻辑拒绝的请求。同一条路径换成节点自己的证书能连上（答 404，因为探的是一个不存在的版本号），说明口子本身在应答，不通的是没有凭据或凭据不是这支机队签的那两种情况 |
 | | 拿一张**这支机队签的**、但名字属于另一台机器的证书，去请求本该属于真节点的 assignments | 被拒（`PermissionDenied`），回话点名了证书说自己是谁、以及它想冒充谁；换成真节点自己那张证书，同一条请求正常拿到数据。一张证书只能替它命名的那台机器说话，签发机构对不代表被冒名 |
+| | 节点用自己的证书经机队通道调 `IssueCapability`：为它在跑的 `demo.production` 要一张 store capability、为一个没部署在它上面的租户要一张、再为自己的租户要一张遥测读 | 只有第一张发得出来；为别的租户要的那张被拒（`PermissionDenied`）并记进审计日志（`capability.issue`）；遥测读也被拒——节点只推遥测、一条不读。所以一台被攻破的节点铸不出进入它不跑的租户的凭据 |
 | | `deis status` | 节点是健康的、问得到的，而且它自己报出正在服务哪些环境——「目录说该跑什么」与「节点说在跑什么」是两回事 |
 | 账号与作用域 | `deis token list` | 配置文件里那把 key 也在列，注明来源是配置文件、作用域是空的，并单独报出「当前还有几把无作用域的凭据」——那个数是运维要推到零的东西。key 本身不进库，进库的只有这条记录 |
 | | 一把只有 `deploy:demo/preview` 的 token 去部署两个环境 | 它自己那个环境部署得动，另一个 403；这把 token 去读别的环境的密钥、读审计日志、列凭据也一律 403 |
@@ -444,7 +450,10 @@ workspace 的 fmt / clippy / build / test，以及一次完整的 `start` → `v
 
 ```bash
 # 端口用启动输出里那行「Telemetry (gRPC)」的值，默认 8092；被占用时脚本会自动往后挪
-grpcurl -plaintext \
+# deis-telemetry 只认控制面签的 capability：先以操作员身份领一张这个环境的读 capability
+TOKEN=$(curl -s -H "Authorization: Bearer $DEIS_CONTROL_TOKEN" \
+  http://127.0.0.1:8085/api/v1/apps/demo/environments/production/telemetry-token | jq -r .token)
+grpcurl -cacert .demo/pki/ca.crt -H "authorization: Bearer $TOKEN" \
   -import-path crates/deis-telemetry/proto -proto telemetry.proto \
   -d '{"app_id":"demo","limit":5}' \
   127.0.0.1:8092 deis.telemetry.LogService/Query
@@ -460,7 +469,10 @@ grpcurl -plaintext \
 指标走同一个 `deis-telemetry`，从它的抓取端口看：
 
 ```bash
-curl -s http://127.0.0.1:8093/metrics | grep deis_runtime_
+# 抓取页要平台读 capability（`read:*/*` 才领得到，15 分钟过期）
+PLATFORM=$(curl -s -H "Authorization: Bearer $DEIS_CONTROL_TOKEN" \
+  http://127.0.0.1:8085/api/platform/telemetry-token | jq -r .token)
+curl -s -H "Authorization: Bearer $PLATFORM" http://127.0.0.1:8093/metrics | grep deis_runtime_
 ```
 
 ## 常用命令

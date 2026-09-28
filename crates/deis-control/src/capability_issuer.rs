@@ -30,16 +30,27 @@
 //!   accepted anywhere - not even under T8 degraded-mode grace.
 //!
 //! Every published key is served at [`JWKS_ROUTE`].
+//!
+//! # What was issued, and taking it back
+//!
+//! Every token is written to the issuance table
+//! ([`crate::capability_ledger`]) before it is handed out; a token that
+//! cannot be recorded is not issued. Revocation works from that record: by
+//! `jti`, by the node or tenant a token names, or wholesale by bumping the
+//! auth epoch. Verifiers learn both from the revocation list, which this
+//! issuer signs with its active key ([`CapabilityIssuer::revocation_list`]).
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use deis_capability::revocation::{self, RevocationList};
 use deis_capability::{CapabilityClaims, CapabilityResource, Jwks, encode, key_id};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::capability_ledger::CapabilityLedger;
 use crate::catalog::secrets::SecretCipher;
 use crate::database::{Database, DatabaseError};
 
@@ -50,10 +61,13 @@ pub const CAPABILITY_LIFETIME: Duration = Duration::from_secs(900); // 15 minute
 pub use deis_capability::{AUD_QUEUE, AUD_STORE};
 pub const AUD_TELEMETRY: &str = "telemetry";
 
-/// Where every published verifying key is served, as a JWKS document. On
-/// both listeners: store and queue have no machine identity and fetch it
-/// from the human one.
-pub const JWKS_ROUTE: &str = "/.well-known/deis/capability-jwks.json";
+/// Where every published verifying key is served, as a JWKS document: on
+/// the machine listener only, where deis-store, deis-queue and
+/// deis-telemetry read it under mutual TLS.
+pub const JWKS_ROUTE: &str = deis_capability::JWKS_PATH;
+
+/// Where the signed revocation list is served, on the machine listener only.
+pub use deis_capability::revocation::REVOCATION_LIST_PATH as REVOCATION_LIST_ROUTE;
 
 /// How often the rotation schedule is checked.
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(600);
@@ -110,6 +124,9 @@ pub struct CapabilityIssuer {
     /// for an in-memory issuer, which never rotates.
     vault: Option<Arc<SecretCipher>>,
     policy: RotationPolicy,
+    /// Where every issued token is recorded, and revocations kept. `None`
+    /// only for an in-memory test issuer that nothing revokes from.
+    ledger: Option<CapabilityLedger>,
 }
 
 /// What the issuer signs and publishes with.
@@ -158,6 +175,7 @@ impl CapabilityIssuer {
             issuer_id: issuer_id.to_string(),
             vault: None,
             policy: RotationPolicy::default(),
+            ledger: None,
         }
     }
 
@@ -200,7 +218,20 @@ impl CapabilityIssuer {
             issuer_id: issuer_id.to_string(),
             vault: Some(vault),
             policy: RotationPolicy::default(),
+            ledger: None,
         })
+    }
+
+    /// Record every token issued from now on in `db`'s issuance table, and
+    /// serve revocations from it.
+    pub fn with_ledger(mut self, db: Arc<Database>) -> Self {
+        self.ledger = Some(CapabilityLedger::new(db));
+        self
+    }
+
+    /// The issuance and revocation tables, when this issuer has them.
+    pub fn ledger(&self) -> Option<&CapabilityLedger> {
+        self.ledger.as_ref()
     }
 
     /// Replace the rotation schedule; tests use a short one.
@@ -209,23 +240,54 @@ impl CapabilityIssuer {
         self
     }
 
-    /// Issue a capability token for a node.
+    /// Issue a capability token, valid for [`CAPABILITY_LIFETIME`].
+    ///
+    /// Recorded in the issuance table before it is returned; if the record
+    /// cannot be written, nothing is issued - a token nobody can find is a
+    /// token nobody can revoke.
     pub async fn issue(
         &self,
         aud: &str,
         subject: &str,
         resources: Vec<CapabilityResource>,
-    ) -> String {
+    ) -> Result<String, IssuerError> {
+        let (token, claims) = {
+            let inner = self.inner.read().await;
+            let claims = CapabilityClaims::new(
+                aud,
+                &self.issuer_id,
+                subject,
+                inner.auth_epoch,
+                CAPABILITY_LIFETIME,
+                resources,
+            );
+            let token = encode(&claims, &inner.signing);
+            let claims = CapabilityClaims {
+                kid: key_id(&inner.signing.verifying_key()),
+                ..claims
+            };
+            (token, claims)
+        };
+        if let Some(ledger) = &self.ledger {
+            ledger.record(&claims).await?;
+        }
+        Ok(token)
+    }
+
+    /// The revocation list every verifier polls, signed with the active key:
+    /// the current auth epoch, every revoked capability that could still be
+    /// accepted somewhere, and every revoked node.
+    pub async fn revocation_list(&self) -> Result<String, IssuerError> {
+        let (revoked, revoked_nodes) = match &self.ledger {
+            Some(ledger) => (ledger.revoked_jtis().await?, ledger.revoked_nodes().await?),
+            None => (Vec::new(), Vec::new()),
+        };
         let inner = self.inner.read().await;
-        let claims = CapabilityClaims::new(
-            aud,
-            &self.issuer_id,
-            subject,
-            inner.auth_epoch,
-            CAPABILITY_LIFETIME,
-            resources,
-        );
-        encode(&claims, &inner.signing)
+        Ok(revocation::sign(
+            &RevocationList::new(&self.issuer_id, inner.auth_epoch, revoked)
+                .with_revoked_nodes(revoked_nodes),
+            &inner.signing,
+        ))
     }
 
     /// The key new tokens are signed with.
@@ -255,6 +317,16 @@ impl CapabilityIssuer {
             .await?;
         if let Some(state) = changed {
             self.install(state).await;
+        }
+        if let Some(ledger) = &self.ledger {
+            let (revocations, issuances) = ledger.prune().await?;
+            if revocations + issuances > 0 {
+                info!(
+                    revocations,
+                    issuances,
+                    "Pruned revocations no verifier can need and issuance records past retention"
+                );
+            }
         }
         Ok(())
     }
@@ -309,49 +381,52 @@ impl CapabilityIssuer {
         self.inner.read().await.auth_epoch
     }
 
-    /// Bump the auth epoch, forcing all existing tokens to become invalid.
-    /// Persisted to the database.
-    pub async fn bump_auth_epoch(&self, conn: &Connection) -> rusqlite::Result<u64> {
-        let now = now_secs();
+    /// Bump the auth epoch: every token issued so far is refused by every
+    /// verifier once it adopts the next revocation list, and every token
+    /// issued from now on carries the new epoch. Persisted, so it survives a
+    /// restart. Mass revocation - nodes renew, anything else has to ask again.
+    pub async fn bump_auth_epoch(&self) -> Result<u64, IssuerError> {
+        let epoch = match &self.ledger {
+            Some(ledger) => {
+                ledger
+                    .database()
+                    .with_connection(|conn| bump_epoch_on(conn).map_err(IssuerError::from))
+                    .await?
+            }
+            None => self.inner.read().await.auth_epoch + 1,
+        };
+        self.set_auth_epoch(epoch).await;
+        Ok(epoch)
+    }
 
-        conn.execute(
-            "INSERT OR REPLACE INTO capability_auth_epoch (id, epoch, created_at)
-             VALUES (1, COALESCE((SELECT epoch + 1 FROM capability_auth_epoch), 1), ?1)",
-            rusqlite::params![now],
-        )?;
+    /// [`Self::bump_auth_epoch`] on a bare connection, for tests.
+    #[doc(hidden)]
+    pub async fn bump_auth_epoch_on(&self, conn: &Connection) -> Result<u64, IssuerError> {
+        let epoch = bump_epoch_on(conn)?;
+        self.set_auth_epoch(epoch).await;
+        Ok(epoch)
+    }
 
-        let new_epoch: i64 = conn.query_row(
-            "SELECT epoch FROM capability_auth_epoch WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )?;
-
+    async fn set_auth_epoch(&self, epoch: u64) {
         let mut inner = self.inner.write().await;
-        inner.auth_epoch = new_epoch as u64;
-
-        info!(auth_epoch = new_epoch, "Auth epoch bumped");
-        Ok(new_epoch as u64)
+        inner.auth_epoch = epoch;
+        info!(auth_epoch = epoch, "Auth epoch bumped; every capability issued before now is refused once verifiers adopt the next revocation list");
     }
+}
 
-    /// Record a revoked jti so future verifications reject it.
-    pub fn record_revocation(&self, conn: &Connection, jti: &str) -> rusqlite::Result<()> {
-        let now = now_secs();
-        conn.execute(
-            "INSERT OR IGNORE INTO capability_revocations (jti, revoked_at) VALUES (?1, ?2)",
-            rusqlite::params![jti, now],
-        )?;
-        Ok(())
-    }
-
-    /// Prune revocations older than the maximum token lifetime.
-    pub fn prune_revocations(&self, conn: &Connection) -> rusqlite::Result<usize> {
-        let cutoff = now_secs().saturating_sub((CAPABILITY_LIFETIME.as_secs() + 60) as i64);
-        let removed = conn.execute(
-            "DELETE FROM capability_revocations WHERE revoked_at < ?1",
-            rusqlite::params![cutoff],
-        )?;
-        Ok(removed)
-    }
+/// Increment the stored epoch and return the new value.
+fn bump_epoch_on(conn: &Connection) -> rusqlite::Result<u64> {
+    conn.execute(
+        "INSERT OR REPLACE INTO capability_auth_epoch (id, epoch, created_at)
+         VALUES (1, COALESCE((SELECT epoch + 1 FROM capability_auth_epoch), 2), ?1)",
+        rusqlite::params![now_secs()],
+    )?;
+    let epoch: i64 = conn.query_row(
+        "SELECT epoch FROM capability_auth_epoch WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(epoch.max(0) as u64)
 }
 
 // ---- internal helpers ----------------------------------------------------
@@ -574,6 +649,7 @@ mod tests {
         issuer
             .issue(AUD_STORE, "spiffe://deislet/node/n1", resources_for_audience(TENANT, AUD_STORE))
             .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -684,7 +760,56 @@ mod tests {
         let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
 
         assert_eq!(issuer.auth_epoch().await, 1);
-        assert_eq!(issuer.bump_auth_epoch(&conn).await.unwrap(), 2);
-        assert_eq!(issuer.bump_auth_epoch(&conn).await.unwrap(), 3);
+        assert_eq!(issuer.bump_auth_epoch_on(&conn).await.unwrap(), 2);
+        assert_eq!(issuer.bump_auth_epoch_on(&conn).await.unwrap(), 3);
+        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        assert_eq!(restarted.auth_epoch().await, 3);
+    }
+
+    /// Every token is in the issuance table the moment it exists, and the
+    /// signed list carries what was revoked and the epoch, verifiable
+    /// against the published keys.
+    #[tokio::test]
+    async fn issued_tokens_are_recorded_and_the_list_is_signed() {
+        let db = Arc::new(Database::init(":memory:").await.unwrap());
+        let issuer = CapabilityIssuer::for_test(ISSUER).with_ledger(Arc::clone(&db));
+        let token = issuer
+            .issue(
+                AUD_STORE,
+                "spiffe://deis.internal/deislet/node/n1",
+                resources_for_audience(TENANT, AUD_STORE),
+            )
+            .await
+            .unwrap();
+        let claims = deis_capability::decode(&token, &issuer.verifying_key().await).unwrap();
+        let revoked = issuer
+            .ledger()
+            .unwrap()
+            .revoke(crate::capability_ledger::RevocationScope::Node("n1".into()))
+            .await
+            .unwrap();
+        assert_eq!(revoked, vec![claims.jti.clone()]);
+        let kid: String = db
+            .with_connection({
+                let jti = claims.jti.clone();
+                move |conn| {
+                    conn.query_row(
+                        "SELECT kid FROM capability_issuances WHERE jti = ?1",
+                        [jti],
+                        |row| row.get(0),
+                    )
+                    .map_err(DatabaseError::from)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(kid, claims.kid);
+
+        issuer.bump_auth_epoch().await.unwrap();
+        let ring = KeyRing::from_keys(issuer.published_keys().await);
+        let list = revocation::verify(&issuer.revocation_list().await.unwrap(), &ring).unwrap();
+        assert_eq!(list.revoked_jtis, vec![claims.jti]);
+        assert_eq!(list.revoked_nodes, vec!["n1"]);
+        assert_eq!(list.auth_epoch, 2);
     }
 }

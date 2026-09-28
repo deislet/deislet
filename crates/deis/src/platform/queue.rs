@@ -209,10 +209,13 @@ impl QueueSession {
     /// only from answering.
     pub fn connect(endpoint: &str, tenant: &str, token: Option<&str>) -> Result<Self> {
         let identity = Identity::new(tenant.to_string(), token)?;
-        let channel = checked_endpoint(endpoint)?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .connect_lazy();
+        let channel = super::service_tls::lazy(
+            checked_endpoint(endpoint)?
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT),
+            endpoint,
+            deis_identity::ServiceKind::Queue,
+        )?;
         Ok(Self {
             identity,
             queue: QueueClient::new(channel)
@@ -307,13 +310,13 @@ fn checked_endpoint(endpoint: &str) -> Result<Endpoint> {
     let uri: tonic::transport::Uri = endpoint.parse().map_err(|e| {
         anyhow!(
             "{endpoint:?} is not a usable address for deis-queue: {e}\nWrite it with a scheme, \
-             for example http://127.0.0.1:8091."
+             for example https://127.0.0.1:8091."
         )
     })?;
     if !matches!(uri.scheme_str(), Some("http") | Some("https")) {
         bail!(
             "{endpoint:?} is not a usable address for deis-queue: it names no http scheme. Write \
-             it as http://host:port, for example http://127.0.0.1:8091."
+             it as https://host:port, for example https://127.0.0.1:8091."
         );
     }
     Endpoint::from_shared(endpoint.to_string())
@@ -330,10 +333,10 @@ fn status_error(status: tonic::Status, doing: &str) -> anyhow::Error {
     if status.code() == tonic::Code::Unauthenticated {
         return anyhow!(
             "deis-queue refused this CLI's capability token while {doing}: {message}\nThe token \
-             is signed by the control plane and checked by deis-queue against the keys it fetches \
-             from `capability_jwks_url`; when that does not point at this control plane, or the \
-             fetch is failing (deis-queue logs it), every call from every node is being refused \
-             as well."
+             is signed by the control plane and checked by deis-queue against the keys it reads \
+             from the machine channel named by its `[machine_identity] control_endpoint`; when \
+             that does not point at this control plane, or the fetch is failing (deis-queue logs \
+             it), every call from every node is being refused as well."
         );
     }
     anyhow!("deis-queue refused the call while {doing}: {message}")
@@ -393,10 +396,10 @@ mod tests {
     fn an_address_without_a_scheme_is_refused_with_an_example() {
         // Caught here rather than at the first call: dialling a scheme-less
         // address fails with a transport error that never mentions the
-        // missing "http://", and this address is one a person types by hand.
+        // missing "https://", and this address is one a person types by hand.
         for written in ["127.0.0.1:8091", "grpc://127.0.0.1:8091"] {
             let error = checked_endpoint(written).unwrap_err().to_string();
-            assert!(error.contains("http://127.0.0.1:8091"), "{error}");
+            assert!(error.contains("https://127.0.0.1:8091"), "{error}");
         }
         checked_endpoint("http://127.0.0.1:8091").unwrap();
         checked_endpoint("https://queue.example").unwrap();
@@ -473,12 +476,22 @@ mod tests {
         // Bound before anything is spawned, so the port is known and no part
         // of this test has to wait for the server to come up.
         let listener = deis_queue::server::bind(&config).await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = format!("https://{}", listener.local_addr().unwrap());
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        // Served over TLS with a queue's certificate, as deis-queue is, and
+        // this CLI configured to trust the authority that issued it.
+        let fleet = crate::platform::service_tls::test_fleet();
+        let identity = fleet.service_identity(deis_identity::ServiceKind::Queue);
         let server = tokio::spawn(async move {
-            deis_queue::server::serve(config, listener, async {
-                let _ = stopped.await;
-            }, deis_capability::KeyRing::from_keys([verifying_key]))
+            deis_queue::server::serve(
+                config,
+                listener,
+                async {
+                    let _ = stopped.await;
+                },
+                deis_capability::KeyRing::from_keys([verifying_key]),
+                identity,
+            )
             .await
             .unwrap();
         });
@@ -511,7 +524,16 @@ mod tests {
                 .insert("authorization", bearer.parse().expect("valid metadata"));
             request
         }
-        let mut producer = QueueClient::connect(endpoint.clone()).await.unwrap();
+        let mut producer = QueueClient::new(
+            tonic::transport::Endpoint::from_shared(endpoint.clone())
+                .unwrap()
+                .connect_with_connector(fleet.service_trust().dialler(
+                    deis_identity::ServiceKind::Queue,
+                    &[deis_identity::Protocol::Http2],
+                ))
+                .await
+                .unwrap(),
+        );
         let id = producer
             .send(stamp(
                 &token,
@@ -646,6 +668,6 @@ mod tests {
             "listing the dead letters",
         )
         .to_string();
-        assert!(error.contains("capability_jwks_url"), "{error}");
+        assert!(error.contains("control_endpoint"), "{error}");
     }
 }

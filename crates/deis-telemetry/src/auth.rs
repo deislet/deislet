@@ -1,51 +1,59 @@
-//! Proving that a caller may talk to this service at all.
+//! Proving that a caller may talk to this service, and deciding what it may
+//! touch once it has.
 //!
-//! # The hole this closes
+//! # What a caller presents
 //!
-//! Until this existed the service believed everything it was told and asked
-//! nothing of anyone. Anything that could reach the gRPC port could read
-//! every application's logs and traces, and could push entries carrying any
-//! `app_id` it liked - so a stranger could both read an incident and write
-//! the record of it. Anything that could reach the Prometheus port could
-//! scrape every application's metric series the same way. What kept those
-//! ports private was that they were bound to loopback, which is a setting an
-//! operator can widen without realising it was the whole of the
-//! authorisation.
+//! A capability minted by deis-control, in `Authorization: Bearer <token>`,
+//! with audience [`AUD_TELEMETRY`]. It is verified against the control
+//! plane's published keys (its JWKS, kept current by a background refresher
+//! the binary starts, see `deis_capability::fetch`), so nothing that is not
+//! the control plane can mint one: there is no shared secret any node or CLI
+//! could derive a signing key from. There is no anonymous mode, no loopback
+//! bypass and no switch that turns the check off.
 //!
-//! What a caller now presents is an Ed25519-signed capability token in
-//! `Authorization: Bearer <token>`. For write operations (Push*) the
-//! audience must be `"telemetry"`; for read operations (Query*, Tail*) and
-//! Prometheus scrapes the audience must be `"telemetry.read"`.
+//! # What a capability allows
 //!
-//! There is no per-tenant check: the telemetry service does not partition by
-//! tenant id the way store and queue do. The capability authenticates the
-//! channel, not the tenant.
+//! Its resources, one (tenant, binding) pair each, read two ways:
 //!
-//! # Why one token and not one per tenant
+//! * [`TELEMETRY_INGEST`] may push records, and only records of the tenants
+//!   it names. A node is issued one for every application environment it
+//!   runs, plus [`TELEMETRY_PLATFORM_TENANT`] for its own node-level records
+//!   (the ones with no application). A record for any other tenant is refused
+//!   and counted as rejected; the rest of the batch is stored.
+//! * [`TELEMETRY_READ`] may query and follow, and sees only the tenants it
+//!   names. A read call has to name an application it may read, and whatever
+//!   comes back is filtered to the tenants named, so one environment's reader
+//!   does not see another's lines. `@platform` with this binding sees
+//!   everything - every tenant and the platform's own records - and is what
+//!   deis-control mints for an operator holding `read:*/*`. It is also what
+//!   the Prometheus scrape needs, because that page is every series at once.
 //!
-//! deis-store and deis-queue verify per-tenant because every storage or queue
-//! call is about exactly one tenant. Here it would not describe anything real:
-//!
-//! * a producer is a **node**, not an application. deis-runtime ships one
-//!   batch holding the lines of every application running on it, so there is
-//!   no single tenant for the call to claim;
-//! * a reader asks across applications - `Query` with no `app_id` is how an
-//!   operator looks at a node, and it is the useful question;
-//! * and this service keeps one application dimension on purpose (see the
-//!   crate documentation), so it has no (application, environment) tenant to
-//!   derive anything from in the first place.
+//! The two never stand in for each other: an ingest-only capability cannot
+//! read and a read-only one cannot write.
 //!
 //! # Where the check runs
 //!
-//! Once per surface, outside the handlers. On gRPC it is a tonic interceptor
-//! applied in [`crate::server`] to all three services at once, so no ingest
-//! or query path can forget it and a fourth service added later cannot become
-//! a fourth unguarded door - see `server::guarded`. On the scrape port it is
-//! one layer over the whole router in [`crate::http`], for the same reason.
+//! The token is verified once per call, outside the handlers: on gRPC by a
+//! tonic interceptor applied in [`crate::server`] to all three services at
+//! once, which leaves the verified [`Grant`] in the request's extensions; on
+//! the scrape port by one layer over the whole router in [`crate::http`].
+//! An interceptor cannot see which method it guards, so the per-binding and
+//! per-tenant decision is the handler's, through [`Grant::ingest`] and
+//! [`Grant::read_scope`] - a handler that does not ask gets no grant to act
+//! on, because [`grant_of`] refuses a request that carries none.
 
+// Every refusal here is a tonic `Status`, returned by value because that is
+// what the generated service traits and the interceptor contract take.
+#![allow(clippy::result_large_err)]
+
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use deis_capability::{CapabilityError, CapabilityVerifier, VerifiedCapability};
+use deis_capability::{
+    AUD_TELEMETRY, CapabilityError, CapabilityVerifier, KeyRing, TELEMETRY_INGEST,
+    SharedVerifier, TELEMETRY_PLATFORM_TENANT, TELEMETRY_READ, VerifiedGrant,
+};
+use deis_wire::conventions::tenant_id;
 use tonic::{Request, Status};
 
 /// The header carrying the capability token.
@@ -54,174 +62,281 @@ const AUTHORIZATION_HEADER: &str = "authorization";
 /// The scheme prefix on an `Authorization` value.
 const BEARER_PREFIX: &str = "bearer ";
 
+/// Whose a stored or arriving record is.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Owner {
+    /// A node's own record, about no application.
+    Platform,
+    /// One application environment, as `<app>.<environment>`.
+    Tenant(String),
+}
+
+/// The tenants one binding of a capability names.
+#[derive(Debug, Clone, Default)]
+struct Named {
+    platform: bool,
+    tenants: BTreeSet<String>,
+}
+
+impl Named {
+    fn of(grant: &VerifiedGrant, binding: &str) -> Self {
+        let mut named = Self::default();
+        for tenant in grant.tenants_with(binding) {
+            if tenant == TELEMETRY_PLATFORM_TENANT {
+                named.platform = true;
+            } else {
+                named.tenants.insert(tenant.to_string());
+            }
+        }
+        named
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.platform && self.tenants.is_empty()
+    }
+}
+
+/// What one verified caller may do. Left in the request extensions by the
+/// interceptor; handlers take it with [`grant_of`].
+#[derive(Debug, Clone)]
+pub struct Grant {
+    principal: String,
+    ingest: Named,
+    read: Named,
+    /// When the capability stops being valid, as Unix seconds. A stream
+    /// opened with it ends here: the check runs once, when the stream opens.
+    expires_at: u64,
+}
+
+impl Grant {
+    fn from_verified(verified: VerifiedGrant) -> Self {
+        Self {
+            ingest: Named::of(&verified, TELEMETRY_INGEST),
+            read: Named::of(&verified, TELEMETRY_READ),
+            principal: verified.sub,
+            expires_at: verified.exp,
+        }
+    }
+
+    /// When the capability expires, as Unix seconds.
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+
+    /// The principal the capability was issued to, for log lines.
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// What this caller may push, or a refusal when it may push nothing.
+    pub fn ingest(&self) -> Result<Ingest<'_>, Status> {
+        if self.ingest.is_empty() {
+            tracing::warn!(
+                principal = %self.principal,
+                "refused a telemetry push whose capability grants no ingest binding"
+            );
+            return Err(Status::permission_denied(
+                "this capability does not allow pushing telemetry",
+            ));
+        }
+        Ok(Ingest(&self.ingest))
+    }
+
+    /// What this caller may read, or a refusal when it may read nothing.
+    pub fn read_scope(&self) -> Result<ReadScope, Status> {
+        if self.read.platform {
+            return Ok(ReadScope::All);
+        }
+        if self.read.tenants.is_empty() {
+            tracing::warn!(
+                principal = %self.principal,
+                "refused a telemetry read whose capability grants no read binding"
+            );
+            return Err(Status::permission_denied(
+                "this capability does not allow reading telemetry",
+            ));
+        }
+        Ok(ReadScope::Tenants(Arc::new(self.read.tenants.clone())))
+    }
+}
+
+/// The ingest half of a [`Grant`].
+#[derive(Debug, Clone, Copy)]
+pub struct Ingest<'a>(&'a Named);
+
+impl Ingest<'_> {
+    /// Whether a record owned by `owner` may be stored.
+    pub fn admits(&self, owner: &Owner) -> bool {
+        match owner {
+            Owner::Platform => self.0.platform,
+            Owner::Tenant(tenant) => self.0.tenants.contains(tenant),
+        }
+    }
+}
+
+/// The read half of a [`Grant`]: which records a query or a stream may hand
+/// back.
+#[derive(Debug, Clone)]
+pub enum ReadScope {
+    /// Everything: every tenant and the platform's own records.
+    All,
+    /// These `<app>.<environment>` tenants and nothing else.
+    Tenants(Arc<BTreeSet<String>>),
+}
+
+impl ReadScope {
+    /// Whether a record owned by `owner` may be handed back.
+    pub fn admits(&self, owner: &Owner) -> bool {
+        match (self, owner) {
+            (Self::All, _) => true,
+            (Self::Tenants(_), Owner::Platform) => false,
+            (Self::Tenants(tenants), Owner::Tenant(tenant)) => tenants.contains(tenant),
+        }
+    }
+
+    /// Whether a record of `app_id` in `environment` may be handed back.
+    pub fn admits_parts(&self, app_id: &str, environment: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Tenants(tenants) => tenants.contains(&tenant_id(app_id, environment)),
+        }
+    }
+
+    /// Refuse a read that does not name an application this scope reaches.
+    ///
+    /// A narrow reader has to say which application it is asking about. The
+    /// records coming back are filtered anyway; refusing up front is what
+    /// makes asking about somebody else's application an error rather than
+    /// an empty page that looks like silence.
+    pub fn check_app(&self, app_id: Option<&str>) -> Result<(), Status> {
+        let Self::Tenants(tenants) = self else {
+            return Ok(());
+        };
+        let Some(app_id) = app_id else {
+            return Err(Status::permission_denied(
+                "this capability reads named applications only; set app_id",
+            ));
+        };
+        let reachable = tenants.iter().any(|tenant| {
+            deis_wire::conventions::split_tenant(tenant).is_some_and(|(app, _)| app == app_id)
+        });
+        if reachable {
+            Ok(())
+        } else {
+            tracing::warn!(
+                app_id,
+                "refused a telemetry read for an application its capability does not name"
+            );
+            Err(Status::permission_denied(format!(
+                "this capability does not allow reading telemetry of {app_id}"
+            )))
+        }
+    }
+}
+
+/// The grant the interceptor left on `request`, or a refusal when there is
+/// none - which only happens to a service registered without the
+/// interceptor, and that must fail closed.
+pub fn grant_of<T>(request: &Request<T>) -> Result<Grant, Status> {
+    request
+        .extensions()
+        .get::<Grant>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("no verified telemetry capability on this call"))
+}
+
 /// What the process checks on every call.
 ///
 /// Cheap to clone: the verifier is behind an `Arc`, so one instance guards
 /// the three gRPC services and the scrape endpoint.
-///
-/// When `enforcing` is `false`, every request passes through without
-/// inspection. This is the case when no `capability_public_key` is
-/// configured — useful for integration tests that predate mandatory
-/// capability auth.
 #[derive(Clone)]
 pub struct TelemetryAuth {
-    verifier: Arc<std::sync::RwLock<CapabilityVerifier>>,
-    enforcing: bool,
+    verifier: SharedVerifier,
 }
 
 impl TelemetryAuth {
-    /// Build a new interceptor from a verifying key.
-    ///
-    /// `enforcing` should be `false` only when no `capability_public_key`
-    /// is configured — the interceptor then lets every request through.
-    pub fn new(verifying_key: ed25519_dalek::VerifyingKey, enforcing: bool) -> Self {
+    /// Build a new interceptor over the control plane's key ring.
+    pub fn new(keys: KeyRing) -> Self {
         Self {
-            verifier: Arc::new(std::sync::RwLock::new(CapabilityVerifier::new(
-                verifying_key,
-            ))),
-            enforcing,
+            verifier: CapabilityVerifier::with_key_ring(keys).shared(),
         }
     }
 
-    /// Update the minimum accepted auth epoch.
-    pub fn set_min_auth_epoch(&self, epoch: u64) {
-        self.verifier
-            .write()
+    /// The verifier this guard checks against, shared with the revocation
+    /// poller and the `/metrics` export.
+    pub fn verifier(&self) -> &SharedVerifier {
+        &self.verifier
+    }
+
+    /// Verify one presented token.
+    fn verify(&self, token: Option<&str>) -> Result<Grant, CapabilityError> {
+        let token = token.ok_or_else(|| {
+            CapabilityError::ParseError(
+                "missing or malformed Authorization: Bearer <token> header".to_string(),
+            )
+        })?;
+        let verified = self
+            .verifier
+            .lock()
             .expect("lock poisoned")
-            .set_min_auth_epoch(epoch);
+            .verify_grant_with_grace(token, AUD_TELEMETRY)?;
+        Ok(Grant::from_verified(verified))
     }
 
-    /// Replace the revoked JTI list.
-    pub fn set_revoked_jtis(&self, jtis: Vec<String>) {
-        self.verifier
-            .write()
-            .expect("lock poisoned")
-            .set_revoked_jtis(jtis);
-    }
-
-    /// Record a successful revocation-list pull, resetting the T8
-    /// degraded-mode clock.
-    pub fn record_sync(&self) {
-        self.verifier
-            .write()
-            .expect("lock poisoned")
-            .record_sync();
-    }
-
-    /// Total number of expired tokens accepted under T8 degraded-mode grace
-    /// rules since this auth was created.
-    pub fn grace_accepted_total(&self) -> u64 {
-        self.verifier
-            .read()
-            .expect("lock poisoned")
-            .grace_accepted_total()
-    }
-
-    /// Seconds since the last successful revocation-list pull, or `None` if a
-    /// pull has never completed.
-    pub fn degraded_since_seconds(&self) -> Option<u64> {
-        self.verifier
-            .read()
-            .expect("lock poisoned")
-            .degraded_since_seconds()
-    }
-
-    /// Whether this service is enforcing capability checks.
-    pub fn is_enforcing(&self) -> bool {
-        self.enforcing
-    }
-
-    /// Extract the bearer token from the Authorization header.
-    fn token_from_request<T>(request: &Request<T>) -> Option<String> {
-        let value = request
-            .metadata()
-            .get(AUTHORIZATION_HEADER)
-            .and_then(|value| value.to_str().ok())?;
+    /// Extract the bearer token from an `Authorization` value.
+    fn bearer(value: Option<&str>) -> Option<&str> {
+        let value = value?;
         if value.len() > BEARER_PREFIX.len()
             && value[..BEARER_PREFIX.len()].eq_ignore_ascii_case(BEARER_PREFIX)
         {
-            Some(value[BEARER_PREFIX.len()..].trim().to_string())
+            Some(value[BEARER_PREFIX.len()..].trim())
         } else {
             None
         }
     }
 
-    /// Two accepted header forms because two kinds of caller ask:
-    /// - A platform component passes `Authorization: Bearer <token>`
-    /// - A Prometheus server configured with `bearer_token` sends the same
-    pub async fn verify_headers(
+    fn token_from_request<T>(request: &Request<T>) -> Option<&str> {
+        Self::bearer(
+            request
+                .metadata()
+                .get(AUTHORIZATION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        )
+    }
+
+    /// Verify the token on an HTTP request - the scrape port, where a
+    /// Prometheus server configured with `bearer_token` sends the same header
+    /// a platform component does.
+    pub fn verify_headers(
         &self,
         headers: &axum::http::HeaderMap,
-    ) -> Result<VerifiedCapability, CapabilityError> {
-        if !self.enforcing {
-            // Without a configured key, every scrape is accepted — this is
-            // the test and single-box default.
-            return Ok(VerifiedCapability {
-                node_id: "noop".to_string(),
-                canonical_tenant_id: "noop".to_string(),
-                binding: "noop".to_string(),
-                grace_accepted: false,
-                exp: u64::MAX,
-            });
-        }
-        let token = headers
-            .get(AUTHORIZATION_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| value.len() > BEARER_PREFIX.len())
-            .filter(|value| value[..BEARER_PREFIX.len()].eq_ignore_ascii_case(BEARER_PREFIX))
-            .map(|value| value[BEARER_PREFIX.len()..].trim())
-            .ok_or_else(|| {
-                CapabilityError::ParseError(
-                    "missing or malformed Authorization: Bearer <token> header".to_string(),
-                )
-            })?;
-
-        self.verifier
-            .read()
-            .expect("lock poisoned")
-            .verify_with_grace(token, "telemetry.read", "", "")
+    ) -> Result<Grant, CapabilityError> {
+        self.verify(Self::bearer(
+            headers
+                .get(AUTHORIZATION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+        ))
     }
 }
 
-/// Redacted on purpose. A derived `Debug` would put the expected token into
-/// every panic message and every log line that formats a service.
+/// Redacted on purpose: nothing about the verifier belongs in a log line.
 impl std::fmt::Debug for TelemetryAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TelemetryAuth")
-            .field("enforcing", &self.is_enforcing())
-            .finish()
+        f.debug_struct("TelemetryAuth").finish_non_exhaustive()
     }
 }
 
 /// Applied by [`crate::server`] to all three gRPC services, so the check runs
 /// before any handler and no path has to remember it.
 impl tonic::service::Interceptor for TelemetryAuth {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        if !self.enforcing {
-            return Ok(request);
-        }
-        let verifier = self.verifier.clone();
-        let token = Self::token_from_request(&request);
-
-        let v = verifier
-            .read()
-            .map_err(|_| Status::internal("lock poisoned"))?;
-        let t = token.as_deref().unwrap_or("");
-
-        // We cannot determine the gRPC method (PushLogs vs Query/Tail) from
-        // within a tonic interceptor because GrpcMethod is set by tonic's
-        // routing layer after the interceptor runs.  Try both audiences:
-        // "telemetry" (for push) first, then "telemetry.read" (for query/tail).
-        let result = v
-            .verify_with_grace(t, "telemetry", "", "")
-            .or_else(|_| v.verify_with_grace(t, "telemetry.read", "", ""));
-
-        match result {
-            Ok(verified) => {
+    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        match self.verify(Self::token_from_request(&request)) {
+            Ok(grant) => {
                 tracing::debug!(
-                    node_id = %verified.node_id,
+                    principal = %grant.principal(),
                     "telemetry capability verified"
                 );
+                request.extensions_mut().insert(grant);
                 Ok(request)
             }
             Err(e) => Err(map_capability_error(e)),
@@ -239,13 +354,14 @@ fn map_capability_error(e: CapabilityError) -> Status {
         CapabilityError::BadSignature(_) => {
             tracing::warn!(
                 "refused a telemetry call with a bad capability signature; either the token was \
-                 tampered with or this service no longer trusts the same signing key as \
-                 deis-control"
+                 tampered with or it was not signed by deis-control"
             );
             Status::unauthenticated(e.to_string())
         }
         CapabilityError::ParseError(_) => {
-            tracing::warn!("refused a telemetry call with an unparseable capability token");
+            tracing::warn!(
+                "refused a telemetry call with a missing or unparseable capability token"
+            );
             Status::unauthenticated(e.to_string())
         }
         CapabilityError::WrongAudience { .. } => {
@@ -278,104 +394,163 @@ fn map_capability_error(e: CapabilityError) -> Status {
             tracing::warn!("refused a telemetry call whose capability has been revoked");
             Status::permission_denied(e.to_string())
         }
+        CapabilityError::NodeRevoked { node } => {
+            tracing::warn!(node = %node, "refused a telemetry call from a revoked node");
+            Status::permission_denied(e.to_string())
+        }
         CapabilityError::NotYetValid { .. } => {
             tracing::warn!("refused a telemetry call whose capability is not yet valid");
             Status::unauthenticated(e.to_string())
         }
         CapabilityError::InvalidClaims(_) => {
             tracing::warn!("refused a telemetry call whose capability claims are invalid");
-            Status::invalid_argument(e.to_string())
+            Status::unauthenticated(e.to_string())
         }
         CapabilityError::UnknownKey { .. } => {
             tracing::warn!(
                 "refused a telemetry call whose capability names a signing key this service does \
-                 not hold"
+                 not hold; a refresh of the control plane's keys has been requested, so a token \
+                 from a newly rotated key is accepted once it lands"
             );
             Status::unauthenticated(e.to_string())
         }
     }
 }
 
-/// The JSON body returned by `GET /capability/revocation-list`.
-#[derive(Debug, serde::Deserialize)]
-struct RevocationListResponse {
-    auth_epoch: u64,
-    revoked_jtis: Vec<String>,
-}
-
-/// Start a background task that polls the control plane's revocation-list
-/// endpoint every 30 seconds, feeding the current `auth_epoch` and revoked
-/// JTIs into the verifier.  A successful poll calls [`TelemetryAuth::record_sync`]
-/// which resets the T8 degraded-mode clock.
-pub fn start_revocation_poller(auth: TelemetryAuth, revocation_list_url: String) {
-    let url = format!("{revocation_list_url}/capability/revocation-list");
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            match client.get(&url).send().await {
-                Ok(response) => match response.json::<RevocationListResponse>().await {
-                    Ok(body) => {
-                        auth.set_min_auth_epoch(body.auth_epoch);
-                        auth.set_revoked_jtis(body.revoked_jtis);
-                        auth.record_sync();
-                        tracing::debug!(
-                            auth_epoch = body.auth_epoch,
-                            "Refreshed revocation list from control plane"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to parse revocation-list response; will retry"
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        url = %url,
-                        "Failed to reach control-plane revocation-list endpoint; will retry"
-                    );
-                }
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn bearer_token_is_extracted_from_request() {
-        let mut request = Request::new(());
-        request.metadata_mut().insert(
-            AUTHORIZATION_HEADER,
-            "Bearer my-token-here".parse().unwrap(),
+    use deis_capability::{CapabilityClaims, CapabilityResource, encode};
+    use ed25519_dalek::SigningKey;
+    use std::time::Duration;
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn token(resources: &[(&str, &str)]) -> String {
+        let claims = CapabilityClaims::new(
+            AUD_TELEMETRY,
+            "spiffe://deis.test/deislet/control/main",
+            "spiffe://deis.test/deislet/node/n1",
+            1,
+            Duration::from_secs(900),
+            resources
+                .iter()
+                .map(|(tenant, binding)| CapabilityResource {
+                    tenant: tenant.to_string(),
+                    binding: binding.to_string(),
+                    generation: None,
+                })
+                .collect(),
         );
+        encode(&claims, &key())
+    }
+
+    fn auth() -> TelemetryAuth {
+        TelemetryAuth::new(KeyRing::from_keys([key().verifying_key()]))
+    }
+
+    fn call(token: Option<&str>) -> Result<Grant, Status> {
+        let mut request = Request::new(());
+        if let Some(token) = token {
+            request.metadata_mut().insert(
+                AUTHORIZATION_HEADER,
+                format!("Bearer {token}").parse().unwrap(),
+            );
+        }
+        let passed = tonic::service::Interceptor::call(&mut auth(), request)?;
+        grant_of(&passed)
+    }
+
+    fn tenant(name: &str) -> Owner {
+        Owner::Tenant(name.to_string())
+    }
+
+    #[test]
+    fn an_unauthenticated_call_is_refused() {
+        let status = call(None).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        let status = call(Some("v1.not.a-token")).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn an_ingest_capability_writes_its_tenants_and_reads_nothing() {
+        let grant = call(Some(&token(&[
+            ("shop.production", TELEMETRY_INGEST),
+            (TELEMETRY_PLATFORM_TENANT, TELEMETRY_INGEST),
+        ])))
+        .unwrap();
+        let ingest = grant.ingest().unwrap();
+        assert!(ingest.admits(&tenant("shop.production")));
+        assert!(ingest.admits(&Owner::Platform));
+        assert!(!ingest.admits(&tenant("bank.production")));
+        assert!(!ingest.admits(&tenant("shop.preview")));
         assert_eq!(
-            TelemetryAuth::token_from_request(&request).as_deref(),
-            Some("my-token-here")
+            grant.read_scope().unwrap_err().code(),
+            tonic::Code::PermissionDenied
         );
     }
 
     #[test]
-    fn bearer_prefix_is_case_insensitive() {
-        let mut request = Request::new(());
-        request.metadata_mut().insert(
-            AUTHORIZATION_HEADER,
-            "bearer my-token-here".parse().unwrap(),
+    fn a_read_capability_reads_its_tenants_and_writes_nothing() {
+        let grant = call(Some(&token(&[("shop.production", TELEMETRY_READ)]))).unwrap();
+        assert_eq!(
+            grant.ingest().unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+
+        let scope = grant.read_scope().unwrap();
+        assert!(scope.admits(&tenant("shop.production")));
+        assert!(!scope.admits(&tenant("shop.preview")));
+        assert!(!scope.admits(&Owner::Platform));
+        assert!(scope.check_app(Some("shop")).is_ok());
+        assert_eq!(
+            scope.check_app(Some("bank")).unwrap_err().code(),
+            tonic::Code::PermissionDenied
         );
         assert_eq!(
-            TelemetryAuth::token_from_request(&request).as_deref(),
-            Some("my-token-here")
+            scope.check_app(None).unwrap_err().code(),
+            tonic::Code::PermissionDenied
         );
     }
 
     #[test]
-    fn missing_authorization_returns_none() {
-        let request = Request::new(());
-        assert!(TelemetryAuth::token_from_request(&request).is_none());
+    fn the_platform_read_sees_everything() {
+        let grant = call(Some(&token(&[(TELEMETRY_PLATFORM_TENANT, TELEMETRY_READ)]))).unwrap();
+        let scope = grant.read_scope().unwrap();
+        assert!(matches!(scope, ReadScope::All));
+        assert!(scope.admits(&Owner::Platform));
+        assert!(scope.admits(&tenant("bank.production")));
+        assert!(scope.check_app(None).is_ok());
+    }
+
+    #[test]
+    fn a_capability_for_another_audience_is_refused() {
+        let claims = CapabilityClaims::new(
+            "store",
+            "spiffe://deis.test/deislet/control/main",
+            "spiffe://deis.test/deislet/node/n1",
+            1,
+            Duration::from_secs(900),
+            vec![],
+        );
+        let status = call(Some(&encode(&claims, &key()))).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn a_request_without_a_grant_fails_closed() {
+        let status = grant_of(&Request::new(())).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn bearer_prefix_is_case_insensitive_and_required() {
+        assert_eq!(TelemetryAuth::bearer(Some("bearer abc")), Some("abc"));
+        assert_eq!(TelemetryAuth::bearer(Some("Bearer abc")), Some("abc"));
+        assert_eq!(TelemetryAuth::bearer(Some("Basic dGVzdA==")), None);
+        assert_eq!(TelemetryAuth::bearer(None), None);
     }
 }

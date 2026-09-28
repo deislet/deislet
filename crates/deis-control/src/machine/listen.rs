@@ -69,9 +69,10 @@ pub fn load_identity(config: &MachineChannelConfig) -> anyhow::Result<Arc<Machin
 
 /// Serve every published capability verifying key as a JWKS document.
 ///
-/// Public keys only, so it needs no credential; it is on this listener for
-/// callers that hold a machine identity, and on the human one for store and
-/// queue, which do not.
+/// Public keys only, yet served here and nowhere else: whoever answers for
+/// this document decides which capabilities deis-store, deis-queue and
+/// deis-telemetry honour, so they read it under mutual TLS, proving their own
+/// machine identity and requiring this control plane's.
 pub async fn capability_jwks(State(issuer): State<CapabilityIssuer>) -> impl IntoResponse {
     (
         StatusCode::OK,
@@ -80,6 +81,36 @@ pub async fn capability_jwks(State(issuer): State<CapabilityIssuer>) -> impl Int
         [(axum::http::header::CACHE_CONTROL, "max-age=60")],
         axum::Json(issuer.jwks().await),
     )
+}
+
+/// Serve the revocation list, signed with the active capability key.
+///
+/// Signed fresh on every request: a verifier refuses a list older than a
+/// couple of poll intervals, which is what stops an old list being replayed
+/// to it. Here rather than on the human listener because a verifier's view of
+/// what is revoked must not be something any network path can edit - the
+/// signature is what guarantees that, and the handshake is a second layer.
+/// Any machine of the fleet may read it; it names `jti`s, never a secret.
+pub async fn revocation_list(State(issuer): State<CapabilityIssuer>) -> axum::response::Response {
+    match issuer.revocation_list().await {
+        Ok(signed_list) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            axum::Json(deis_capability::SignedRevocationList { signed_list }),
+        )
+            .into_response(),
+        Err(error) => {
+            error!(
+                %error,
+                "Could not build the revocation list; verifiers keep the list they last adopted and enter degraded mode if this persists"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the revocation list could not be read",
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Everything a machine may call, and nothing else.
@@ -112,6 +143,10 @@ pub fn router(
         .merge(
             Router::new()
                 .route(crate::capability_issuer::JWKS_ROUTE, get(capability_jwks))
+                .route(
+                    crate::capability_issuer::REVOCATION_LIST_ROUTE,
+                    get(revocation_list),
+                )
                 .with_state(issuer_for_key_endpoint),
         )
 }

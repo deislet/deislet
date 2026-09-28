@@ -417,8 +417,9 @@ node_grpc_status() {
 # a healthy process's log should be able to find out when somebody has to act,
 # rather than finding out when it has already become urgent.
 #
-# This demo's certificates are minted for two days, so none of them is close
-# enough to expiry for the warning to fire - which is the other half of the
+# This demo's certificates are minted for four days - the platform refuses a
+# machine certificate issued for under 72 hours, and warns once one has under
+# 48 left - so none of them is close enough to expiry for the warning to fire - which is the other half of the
 # rule and is checked here too. A threshold that fired on a certificate issued
 # minutes ago would teach an operator that these warnings are noise, on the
 # way to the one that is not.
@@ -445,7 +446,7 @@ check_every_process_says_when_its_certificate_runs_out() {
     | grep -oE 'remaining_secs=[0-9]+' | head -n 1 | cut -d= -f2)
 
   # And nothing is warning about it, because nothing should be: every
-  # certificate here was minted minutes ago for two days.
+  # certificate here was minted minutes ago for four days.
   local premature=0
   premature=$(cat "${LOG_DIR}/deis-control.log" "${LOG_DIR}/deis-runtime.log" \
     "${LOG_DIR}/deis_proxy_error.log" 2>/dev/null \
@@ -455,7 +456,7 @@ check_every_process_says_when_its_certificate_runs_out() {
     && [ "$named" -ge 1 ] && [ -n "$remaining" ] && [ "$remaining" -gt 0 ] \
     && [ "$premature" -eq 0 ]; then
     pass_check "$title" \
-      "the control plane, the node and the proxy each logged when their own certificate runs out at startup, and the control plane's line names spiffe://${FLEET_TRUST_DOMAIN}/deislet/control with ${remaining} second(s) left - so an operator reading a healthy process's log learns the date rather than learning it from every connection failing at once. None of the three warned, which is correct: these were minted minutes ago for two days, and a threshold that fired on a fresh certificate would teach an operator that this warning is noise"
+      "the control plane, the node and the proxy each logged when their own certificate runs out at startup, and the control plane's line names spiffe://${FLEET_TRUST_DOMAIN}/deislet/control with ${remaining} second(s) left - so an operator reading a healthy process's log learns the date rather than learning it from every connection failing at once. None of the three warned, which is correct: these were minted minutes ago for four days, and a threshold that fired on a fresh certificate would teach an operator that this warning is noise"
     return
   fi
 

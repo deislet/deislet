@@ -337,6 +337,10 @@ mod tests {
             },
             ..AppConfig::default()
         };
+        // A deployment's env carries no capability: the node holds one it
+        // asked for itself, which the renewer hands to every client built
+        // for the tenant.
+        store.hand_node_capability("kvtest.production");
         manager
             .load_app(key("kvtest"), code.to_string(), config, None)
             .await

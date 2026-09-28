@@ -171,6 +171,9 @@ sha2 = "0.10"
 hex = "0.4"
 ed25519-dalek = "2.2"
 deis-capability = { path = "../deis-capability" }
+# Seals the offline cache (`deployment::offline_cache`) under a key derived
+# from this node's own private key.
+aes-gcm = "0.10"
 
 # ZIP archive handling
 zip = "0.6"
@@ -216,6 +219,10 @@ deis-store = { path = "../deis-store" }
 # a push to the real collector proves the two strings agree. Test-only -- the
 # node does not link the collector's server, its database or its HTTP stack.
 deis-telemetry = { path = "../deis-telemetry" }
+# `ServiceIdentityConfig`, which the in-process collector above is served
+# with. The two data-service crates above already turn the feature on for
+# every test build; naming it here says the tests rely on it.
+deis-capability = { path = "../deis-capability", features = ["jwks-fetch"] }
 hyper = "1.7"
 tower = "0.5"
 tempfile = "3"

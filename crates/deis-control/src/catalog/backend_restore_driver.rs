@@ -59,6 +59,10 @@ pub struct BackendRestoreCoordinator {
     timeout: Duration,
     targets: Vec<VerificationTarget>,
     coordinator_id: CanonicalId,
+    /// What a backend's certificate is checked against when the endpoint is
+    /// `https://`, which it is for every real deis-store, deis-queue and
+    /// deis-telemetry: they serve TLS only.
+    service_trust: Option<deis_identity::ServiceTrust>,
 }
 
 impl BackendRestoreCoordinator {
@@ -158,7 +162,47 @@ impl BackendRestoreCoordinator {
             timeout: Duration::from_secs(config.backend_restore_driver_timeout_secs),
             targets,
             coordinator_id: CanonicalId::new_v7(),
+            service_trust: None,
         })
+    }
+
+    /// Check each backend's certificate against `trust` when verifying a
+    /// restore: this control plane's own machine identity.
+    pub fn with_service_trust(mut self, trust: Option<deis_identity::ServiceTrust>) -> Self {
+        self.service_trust = trust;
+        self
+    }
+
+    /// A connection to one backend's management service. An `https://`
+    /// endpoint is dialled only with a trust to check the certificate
+    /// against, and only a certificate naming that kind of backend is
+    /// accepted; plain `http://` is reachable only on loopback, which the
+    /// configuration check already requires of every endpoint.
+    async fn verification_channel(
+        &self,
+        target: &VerificationTarget,
+    ) -> Result<tonic::transport::Channel, String> {
+        let endpoint = tonic::transport::Endpoint::from_shared(target.endpoint.clone())
+            .map_err(|error| format!("{} endpoint is invalid: {error}", target.backend.as_str()))?;
+        if !target.endpoint.starts_with("https://") {
+            return endpoint.connect().await.map_err(|error| error.to_string());
+        }
+        let trust = self.service_trust.as_ref().ok_or_else(|| {
+            format!(
+                "{} is reached over TLS and this control plane has no machine identity to check \
+                 its certificate against",
+                target.backend.as_str()
+            )
+        })?;
+        let kind = match target.backend {
+            RestoreBackend::DeisStore => deis_identity::ServiceKind::Store,
+            RestoreBackend::DeisQueue => deis_identity::ServiceKind::Queue,
+            RestoreBackend::DeisTelemetry => deis_identity::ServiceKind::Telemetry,
+        };
+        endpoint
+            .connect_with_connector(trust.dialler(kind, &[deis_identity::Protocol::Http2]))
+            .await
+            .map_err(|error| error.to_string())
     }
 
     pub async fn coordinate(
@@ -522,23 +566,22 @@ impl BackendRestoreCoordinator {
                 BackendRestoreExecutionState::Succeeded => component.restored_incarnation_id,
                 BackendRestoreExecutionState::RolledBack => component.previous_incarnation_id,
             };
-            let mut client = tokio::time::timeout(
-                BACKEND_VERIFY_TIMEOUT,
-                BackendMigrationClient::connect(target.endpoint.clone()),
-            )
-            .await
-            .map_err(|_| {
-                format!(
-                    "{} verification connection timed out",
-                    target.backend.as_str()
-                )
-            })?
-            .map_err(|error| {
-                format!(
-                    "{} verification connection failed: {error}",
-                    target.backend.as_str()
-                )
-            })?;
+            let mut client =
+                tokio::time::timeout(BACKEND_VERIFY_TIMEOUT, self.verification_channel(target))
+                    .await
+                    .map_err(|_| {
+                        format!(
+                            "{} verification connection timed out",
+                            target.backend.as_str()
+                        )
+                    })?
+                    .map(BackendMigrationClient::new)
+                    .map_err(|error| {
+                        format!(
+                            "{} verification connection failed: {error}",
+                            target.backend.as_str()
+                        )
+                    })?;
             let mut request = Request::new(GetBackendInfoRequest {});
             let authorization = format!("Bearer {}", target.admin_token)
                 .parse()
@@ -878,6 +921,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             targets,
             coordinator_id,
+            service_trust: None,
         };
         let outcome = coordinator
             .accept_terminal_report(claimed.operation_id, report, operation.revision)

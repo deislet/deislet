@@ -29,7 +29,8 @@
 //! both of them.
 
 mod assignments;
-pub(crate) mod capability_renewer;
+pub mod capability_renewer;
+pub mod offline_cache;
 mod credential;
 mod fetch;
 mod registration;
@@ -490,6 +491,23 @@ impl DeploymentManager {
     pub fn retain_secrets(&self, deployment_ids: &std::collections::HashSet<String>) {
         if let Some(source) = self.secrets.get() {
             source.retain(deployment_ids);
+        }
+    }
+
+    /// Every secret value this node holds, by deployment and revision, for
+    /// the offline cache. Empty on a node with no secret source.
+    pub fn secret_values(&self) -> offline_cache::SecretValues {
+        self.secrets
+            .get()
+            .map(SecretSource::export)
+            .unwrap_or_default()
+    }
+
+    /// Take secret values back from the offline cache. Ignored on a node
+    /// with no secret source, which could not have written any.
+    pub fn restore_secret_values(&self, values: offline_cache::SecretValues) {
+        if let Some(source) = self.secrets.get() {
+            source.import(values);
         }
     }
 
@@ -955,6 +973,10 @@ impl DeploymentManager {
     /// A schema-2 application cannot reconstruct its immutable typed snapshot
     /// from the bundle alone and is not started at all until the control plane
     /// redelivers it.
+    ///
+    /// The control loop runs this after the offline cache
+    /// (`offline_cache`), which restores deployments whole; what the cache
+    /// already brought back is skipped here, so this covers only the rest.
     pub async fn recover_from_disk(&self) -> usize {
         let records = self.store.records().await;
         if records.is_empty() {
@@ -1027,7 +1049,7 @@ impl DeploymentManager {
                         "Recovered legacy {} version {} from this node's own disk because the control \
                          plane could not be reached; it is serving, but any secret this app \
                          declares is missing until the control plane redelivers, because \
-                         secret values are never written to disk, and it runs on this node's \
+                         the offline cache did not cover it, and it runs on this node's \
                          default ceilings rather than any narrower ones its manifest asked for",
                         record.app_id,
                         record.version_id

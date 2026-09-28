@@ -19,6 +19,7 @@
 pub mod apps;
 pub mod artifacts;
 pub mod assignments;
+pub mod capabilities;
 pub mod deployments;
 pub mod domains;
 pub mod environments;
@@ -27,6 +28,7 @@ pub mod routes;
 pub mod routing_table;
 pub mod secrets;
 pub mod storage;
+pub mod telemetry;
 pub mod versions;
 
 use std::sync::Arc;
@@ -236,9 +238,37 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
             &at("/apps/:app_id/environments/:env/storage-token"),
             get(storage::storage_token),
         )
+        // The read credential for deis-telemetry, at the breadth the path
+        // names; see `telemetry` for what each one needs.
+        .route(
+            &at("/apps/:app_id/environments/:env/telemetry-token"),
+            get(telemetry::environment_telemetry_token),
+        )
+        .route(
+            &at("/apps/:app_id/telemetry-token"),
+            get(telemetry::app_telemetry_token),
+        )
         .route(
             &at("/apps/:app_id/environments/:env/secrets/:name"),
             put(secrets::put_secret).delete(secrets::delete_secret),
+        )
+        // Taking capabilities back: one, a node's, a tenant's, or all of them
+        // by the auth epoch. See `capabilities` for what each reaches.
+        .route(
+            &at("/apps/:app_id/environments/:env/capability-revocations"),
+            post(capabilities::revoke_tenant_capabilities),
+        )
+        .route(
+            &at("/capabilities/auth-epoch"),
+            post(capabilities::bump_auth_epoch),
+        )
+        .route(
+            &at("/capabilities/revocations/nodes/:node_id"),
+            post(capabilities::revoke_node).delete(capabilities::lift_node_revocation),
+        )
+        .route(
+            &at("/capabilities/:jti"),
+            delete(capabilities::revoke_capability),
         )
         // Who may claim which hostname. Not under `/api/apps`, because a
         // hostname is not a name inside an application - it is the one
@@ -345,6 +375,10 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
 pub fn platform_router(prefix: &str, state: CatalogState) -> Router {
     Router::new()
         .route(&format!("{prefix}/routes"), get(routes::list_all_routes))
+        .route(
+            &format!("{prefix}/telemetry-token"),
+            get(telemetry::platform_telemetry_token),
+        )
         .with_state(state)
 }
 
@@ -408,6 +442,29 @@ pub(crate) mod tests {
         pub _runtime_shutdown: tokio::sync::oneshot::Sender<()>,
         pub _queue_dir: Option<tempfile::TempDir>,
         pub _queue_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        /// The authority the harness queue's certificate is issued by.
+        pub queue_fleet: Option<deis_identity_test_pki::TestFleet>,
+    }
+
+    impl Harness {
+        /// A client of the harness queue that checks its certificate the
+        /// way every real caller does.
+        pub(crate) async fn queue_client(
+            &self,
+        ) -> deis_queue::proto::queue::queue_client::QueueClient<tonic::transport::Channel>
+        {
+            let fleet = self.queue_fleet.as_ref().expect("a harness with a queue");
+            let channel =
+                tonic::transport::Endpoint::from_shared(self.queue_endpoint.clone().unwrap())
+                    .unwrap()
+                    .connect_with_connector(fleet.service_trust().dialler(
+                        deis_identity::ServiceKind::Queue,
+                        &[deis_identity::Protocol::Http2],
+                    ))
+                    .await
+                    .unwrap();
+            deis_queue::proto::queue::queue_client::QueueClient::new(channel)
+        }
     }
 
     struct PreparedRuntime;
@@ -518,7 +575,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn harness_with(secrets_ready: bool) -> Harness {
-        harness_with_storage(secrets_ready, storage_wiring(false)).await
+        harness_with_storage(secrets_ready, storage_wiring()).await
     }
 
     pub(crate) async fn harness_with_queue(secrets_ready: bool) -> Harness {
@@ -531,47 +588,73 @@ pub(crate) mod tests {
         .await
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let endpoint = format!("https://{}", listener.local_addr().unwrap());
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        // Served over TLS with a queue's certificate, as deis-queue is: the
+        // control plane's own calls refuse anything else.
+        let fleet = deis_identity_test_pki::TestFleet::new();
+        let queue_identity = fleet.service_identity(deis_identity::ServiceKind::Queue);
+        let control_identity = fleet.service_identity(deis_identity::ServiceKind::Control);
         tokio::spawn(async move {
+            let incoming = tokio_stream::StreamExt::map(
+                tokio_stream::wrappers::ReceiverStream::new(deis_identity::accept_tls(
+                    listener,
+                    queue_identity,
+                )),
+                |accepted| {
+                    Ok::<_, std::io::Error>(deis_wire::served::Served::new(
+                        accepted.stream,
+                        accepted.local_addr,
+                        accepted.remote_addr,
+                    ))
+                },
+            );
             tonic::transport::Server::builder()
                 .add_service(deis_queue::proto::queue::queue_server::QueueServer::new(
                     queue,
                 ))
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    async move {
-                        let _ = shutdown_rx.await;
-                    },
-                )
+                .serve_with_incoming_shutdown(incoming, async move {
+                    let _ = shutdown_rx.await;
+                })
                 .await
                 .unwrap();
         });
-        let storage = crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
-            queue_endpoint: Some(endpoint.clone()),
-            ..Default::default()
-        });
+        let storage = crate::delivery::StorageWiring::new(
+            &crate::config::ControlConfig {
+                queue_endpoint: Some(endpoint.clone()),
+                ..Default::default()
+            },
+            crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+        )
+        .with_service_trust(Some(deis_identity::ServiceTrust::from_identity(
+            control_identity,
+        )));
         let mut harness = harness_with_storage(secrets_ready, storage).await;
         harness.queue_endpoint = Some(endpoint);
         harness._queue_dir = Some(queue_dir);
         harness._queue_shutdown = Some(shutdown);
+        harness.queue_fleet = Some(fleet);
         harness
     }
 
     /// Wiring built the way the server builds it, so the harness cannot
     /// drift from the real assembly of a delivery.
-    pub(crate) fn storage_wiring(with_issuer: bool) -> crate::delivery::StorageWiring {
-        let wiring = crate::delivery::StorageWiring::from_config(&crate::config::ControlConfig {
-            store_endpoint: Some("http://127.0.0.1:8090".to_string()),
-            ..Default::default()
-        });
-        if with_issuer {
-            wiring.with_issuer(crate::capability_issuer::CapabilityIssuer::for_test(
-                "spiffe://deislet/control/test",
-            ))
-        } else {
-            wiring
-        }
+    pub(crate) fn storage_wiring() -> crate::delivery::StorageWiring {
+        crate::delivery::StorageWiring::new(
+            &crate::config::ControlConfig {
+                store_endpoint: Some("http://127.0.0.1:8090".to_string()),
+                ..Default::default()
+            },
+            crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+        )
+    }
+
+    /// The same issuer, and no storage service configured.
+    pub(crate) fn storage_wiring_without_services() -> crate::delivery::StorageWiring {
+        crate::delivery::StorageWiring::new(
+            &crate::config::ControlConfig::default(),
+            crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+        )
     }
 
     pub(crate) async fn harness_with_storage(
@@ -585,7 +668,7 @@ pub(crate) mod tests {
     /// that cannot acknowledge PREPARE. Used to prove a partial prepare never
     /// moves the production pointer.
     pub(crate) async fn harness_with_failed_runtime(secrets_ready: bool) -> Harness {
-        harness_with_storage_and_failed_runtime(secrets_ready, storage_wiring(false), true).await
+        harness_with_storage_and_failed_runtime(secrets_ready, storage_wiring(), true).await
     }
 
     async fn harness_with_storage_and_failed_runtime(
@@ -733,7 +816,9 @@ pub(crate) mod tests {
             .expect("the stand-in runtime node registers");
         let runtime_nodes_for_state = Arc::clone(&runtime_nodes);
         let sessions = Arc::new(SessionManager::new());
-        let issuer = CapabilityIssuer::ephemeral("spiffe://deislet/control/test").await;
+        let issuer = CapabilityIssuer::ephemeral("spiffe://deislet/control/test")
+            .await
+            .with_ledger(store.database());
         let state = CatalogState {
             store: Arc::clone(&store),
             bundles: Arc::new(BundleStore::new(bundle_dir.path())),
@@ -778,6 +863,7 @@ pub(crate) mod tests {
             _runtime_shutdown: runtime_shutdown,
             _queue_dir: None,
             _queue_shutdown: None,
+            queue_fleet: None,
             queue_endpoint: None,
             sessions,
         }
@@ -913,27 +999,21 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::CREATED);
     }
 
-    /// The assignment list is the one read API that answers with decrypted
-    /// secret values, which is the whole reason it is served nowhere a person
-    /// can reach.
-    ///
-    /// What this asserts is the positive half: the value really is in the
-    /// list, because a node that received the list without it would load the
-    /// application and run it misconfigured. The other half - who may ask for
-    /// it - is not assertable here any more and is not asserted twice: a
-    /// caller reaches this list only by completing a mutual-TLS handshake on
-    /// the machine listener and then proving the node id it asks about, which
-    /// `crate::machine::service` tests directly and `scripts/demo.sh` proves
-    /// against a running fleet with a real certificate issued for another
-    /// machine.
+    /// The assignment list carries no secret value. A node fetches the
+    /// values a deployment's snapshot binds through `FetchSecretValues`,
+    /// which checks and audits each fetch; a manifest with no `environment`
+    /// declarations binds none, so a stored secret stays in the catalog.
     #[tokio::test]
-    async fn the_assignment_list_carries_the_environments_decrypted_secret() {
+    async fn the_assignment_list_never_carries_a_secret_value() {
         let h = harness(true).await;
         let router = &h.router;
         deployed_app(router, "demo", Some(("API_KEY", "super-secret"))).await;
 
         let body = assignments_of(&h.state, "node-a").await;
-        assert_eq!(body[0]["env"]["API_KEY"], "super-secret");
+        assert!(
+            !body.to_string().contains("super-secret"),
+            "a secret value travelled in the assignment list: {body}"
+        );
     }
 
     /// The other half of deletion. Push cannot reach a node that is down, so

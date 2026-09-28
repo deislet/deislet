@@ -623,6 +623,13 @@ impl RuntimeNodeManager {
         self
     }
 
+    /// The identity this control plane proves on the machine channel, if it
+    /// was given one - also what it checks a data service's certificate
+    /// against when it calls deis-queue itself.
+    pub fn machine_identity(&self) -> Option<Arc<MachineIdentity>> {
+        self.identity.clone()
+    }
+
     /// Say once, in the log, how this control plane reaches the nodes it
     /// drives.
     ///

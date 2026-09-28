@@ -223,6 +223,25 @@ impl SecretSource {
         }
     }
 
+    /// Every cached value, for the offline cache to seal.
+    pub fn export(&self) -> HashMap<String, HashMap<String, String>> {
+        self.cache().values.clone()
+    }
+
+    /// Take values back from the offline cache, for a node starting while
+    /// the control plane is unreachable. A value already cached is kept:
+    /// revisions are immutable, so the two can only agree.
+    pub fn import(&self, values: HashMap<String, HashMap<String, String>>) {
+        let mut cache = self.cache();
+        for (deployment_id, revisions) in values {
+            for (revision, value) in revisions {
+                if cache.get(&deployment_id, &revision).is_none() {
+                    cache.insert(&deployment_id, revision, value);
+                }
+            }
+        }
+    }
+
     /// How many deployments have cached values. For tests.
     #[cfg(test)]
     pub(crate) fn cached_deployments(&self) -> usize {

@@ -115,34 +115,44 @@ impl Service<http::Uri> for Dialler {
             .client_config(&self.peer, &self.speaking)
             .map(TlsConnector::from)
             .map_err(|error| io::Error::other(error.to_string()));
-        Box::pin(async move {
-            let tls = config?;
-            let authority = uri.authority().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{uri} names no host to connect to"),
-                )
-            })?;
-            let port = authority.port_u16().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "{uri} names no port. This channel has no default port to fall back on: it \
-                         is not the web, and guessing 443 would dial whatever else happens to be \
-                         listening there"
-                    ),
-                )
-            })?;
-
-            let stream = TcpStream::connect((authority.host(), port)).await?;
-            // Nagle's algorithm holds a small write back waiting for a second
-            // one, which on an RPC channel means holding a request back
-            // waiting for a request that is not coming.
-            stream.set_nodelay(true)?;
-
-            let name = ServerName::try_from(UNCHECKED_HOST).expect("a constant, valid host name");
-            let tls = tls.connect(name, stream).await?;
-            Ok(TokioIo::new(tls))
-        })
+        Box::pin(connect(config, uri))
     }
+}
+
+/// Open a TCP connection to the host and port `uri` names and complete a TLS
+/// handshake over it with `config`.
+///
+/// Shared by [`Dialler`] and [`crate::ServiceDialler`], which differ only in
+/// how the configuration - and so the check of the far end - is built.
+pub(crate) async fn connect(
+    config: io::Result<TlsConnector>,
+    uri: http::Uri,
+) -> io::Result<TokioIo<tokio_rustls::client::TlsStream<TcpStream>>> {
+    let tls = config?;
+    let authority = uri.authority().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{uri} names no host to connect to"),
+        )
+    })?;
+    let port = authority.port_u16().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{uri} names no port. This channel has no default port to fall back on: it \
+                 is not the web, and guessing 443 would dial whatever else happens to be \
+                 listening there"
+            ),
+        )
+    })?;
+
+    let stream = TcpStream::connect((authority.host(), port)).await?;
+    // Nagle's algorithm holds a small write back waiting for a second
+    // one, which on an RPC channel means holding a request back
+    // waiting for a request that is not coming.
+    stream.set_nodelay(true)?;
+
+    let name = ServerName::try_from(UNCHECKED_HOST).expect("a constant, valid host name");
+    let tls = tls.connect(name, stream).await?;
+    Ok(TokioIo::new(tls))
 }

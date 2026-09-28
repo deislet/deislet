@@ -11,7 +11,7 @@
 //! control plane's JWKS, kept current by a background refresher the binary
 //! starts (see `deis_capability::fetch`); this module only reads them.
 
-use deis_capability::{CapabilityError, CapabilityVerifier, KeyRing, VerifiedCapability};
+use deis_capability::{CapabilityError, CapabilityVerifier, KeyRing, SharedVerifier, VerifiedCapability};
 use deis_wire::conventions::TENANT_HEADER;
 use tonic::{Request, Status};
 
@@ -29,60 +29,21 @@ const BEARER_PREFIX: &str = "bearer ";
 /// `block_on` panics when called from within a tokio runtime context.
 #[derive(Clone)]
 pub struct QueueAuth {
-    verifier: std::sync::Arc<std::sync::Mutex<CapabilityVerifier>>,
+    verifier: SharedVerifier,
 }
 
 impl QueueAuth {
     /// Build a new interceptor over the control plane's key ring.
     pub fn new(keys: KeyRing) -> Self {
         Self {
-            verifier: std::sync::Arc::new(std::sync::Mutex::new(
-                CapabilityVerifier::with_key_ring(keys),
-            )),
+            verifier: CapabilityVerifier::with_key_ring(keys).shared(),
         }
     }
 
-    /// Update the minimum accepted auth epoch.
-    pub fn set_min_auth_epoch(&self, epoch: u64) {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .set_min_auth_epoch(epoch);
-    }
-
-    /// Replace the revoked JTI list.
-    pub fn set_revoked_jtis(&self, jtis: Vec<String>) {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .set_revoked_jtis(jtis);
-    }
-
-    /// Record a successful revocation-list pull, resetting the T8
-    /// degraded-mode clock.
-    pub fn record_sync(&self) {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .record_sync();
-    }
-
-    /// Total number of expired tokens accepted under T8 degraded-mode grace
-    /// rules since this auth was created.
-    pub fn grace_accepted_total(&self) -> u64 {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .grace_accepted_total()
-    }
-
-    /// Seconds since the last successful revocation-list pull, or `None` if a
-    /// pull has never completed.
-    pub fn degraded_since_seconds(&self) -> Option<u64> {
-        self.verifier
-            .lock()
-            .expect("lock poisoned")
-            .degraded_since_seconds()
+    /// The verifier this guard checks against, shared with the revocation
+    /// poller and the metrics endpoint.
+    pub fn verifier(&self) -> &SharedVerifier {
+        &self.verifier
     }
 
     /// Whether this service is enforcing capability checks. Always true:
@@ -221,6 +182,10 @@ fn map_capability_error(e: CapabilityError) -> Status {
             tracing::warn!("refused a queue call whose capability has been revoked");
             Status::permission_denied(e.to_string())
         }
+        CapabilityError::NodeRevoked { node } => {
+            tracing::warn!(node = %node, "refused a queue call from a revoked node");
+            Status::permission_denied(e.to_string())
+        }
         CapabilityError::NotYetValid { .. } => {
             tracing::warn!("refused a queue call whose capability is not yet valid");
             Status::unauthenticated(e.to_string())
@@ -238,55 +203,6 @@ fn map_capability_error(e: CapabilityError) -> Status {
             Status::unauthenticated(e.to_string())
         }
     }
-}
-
-/// The JSON body returned by `GET /capability/revocation-list`.
-#[derive(Debug, serde::Deserialize)]
-struct RevocationListResponse {
-    auth_epoch: u64,
-    revoked_jtis: Vec<String>,
-}
-
-/// Start a background task that polls the control plane's revocation-list
-/// endpoint every 30 seconds, feeding the current `auth_epoch` and revoked
-/// JTIs into the verifier.  A successful poll calls [`QueueAuth::record_sync`]
-/// which resets the T8 degraded-mode clock.
-pub fn start_revocation_poller(auth: QueueAuth, revocation_list_url: String) {
-    let url = format!("{revocation_list_url}/capability/revocation-list");
-    tokio::spawn(async move {
-        let client = reqwest::Client::new();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            match client.get(&url).send().await {
-                Ok(response) => match response.json::<RevocationListResponse>().await {
-                    Ok(body) => {
-                        auth.set_min_auth_epoch(body.auth_epoch);
-                        auth.set_revoked_jtis(body.revoked_jtis);
-                        auth.record_sync();
-                        tracing::debug!(
-                            auth_epoch = body.auth_epoch,
-                            "Refreshed revocation list from control plane"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to parse revocation-list response; will retry"
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        url = %url,
-                        "Failed to reach control-plane revocation-list endpoint; will retry"
-                    );
-                }
-            }
-        }
-    });
 }
 
 #[cfg(test)]

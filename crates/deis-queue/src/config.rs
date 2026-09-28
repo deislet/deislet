@@ -2,7 +2,14 @@
 //!
 //! Every call must carry an Ed25519-signed capability token in
 //! `Authorization: Bearer <token>`. The verifying keys are fetched from the
-//! control plane's JWKS at `capability_jwks_url` and kept current.
+//! control plane's JWKS over its machine channel and kept current.
+//!
+//! `[machine_identity]` is required to serve: the gRPC listener speaks TLS
+//! only, presenting this queue's own certificate
+//! (`spiffe://<trust domain>/deislet/queue/<id>`), and the same identity is
+//! what the queue proves to the control plane when it reads the JWKS. The
+//! table is optional to parse so that `snapshot` and `restore` work without
+//! it.
 
 use crate::queue::QueueLimits;
 use serde::Deserialize;
@@ -22,24 +29,25 @@ pub struct Config {
     /// bypass.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Where the control plane publishes its capability verifying keys, as a
-    /// JWKS document.
+    /// This queue's machine identity and the control plane's machine
+    /// channel. Required by `serve`; see the module note.
     ///
-    /// Fetched at startup (retried with backoff until the control plane
-    /// answers, refusing every call meanwhile), every 5 minutes after that,
-    /// and whenever a token names a key this process does not hold yet - so
-    /// a control-plane key rotation needs nothing done here. Public keys
-    /// only: no credential is sent or needed.
+    /// The control plane's JWKS is read from `control_endpoint` at startup
+    /// (retried with backoff until the control plane answers, refusing every
+    /// call meanwhile), every 5 minutes after that, and whenever a token
+    /// names a key this process does not hold yet.
     ///
-    /// Defaults to the control plane's human API listener on its default
-    /// port.
-    #[serde(default = "default_capability_jwks_url")]
-    pub capability_jwks_url: String,
-    /// The control-plane URL for the T8 revocation-list endpoint.
-    ///
-    /// Defaults to `http://127.0.0.1:8100`.
-    #[serde(default = "default_revocation_list_url")]
-    pub revocation_list_url: String,
+    /// The control plane's signed revocation list is polled from the same
+    /// endpoint every 30 seconds; its signature is checked against the same
+    /// keys before its revoked `jti`s and minimum `auth_epoch` are enforced
+    /// and the T8 degraded-mode clock is reset.
+    #[serde(default)]
+    pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
+    /// Where to serve the capability verifier's Prometheus metrics at
+    /// `/metrics`. Not served when absent. Plaintext HTTP, so only a loopback
+    /// IP address is accepted; anything else refuses to start.
+    #[serde(default)]
+    pub metrics_listen: Option<String>,
     /// Independent credential for migration inventory and writer fencing.
     /// If absent, the management gRPC service does not exist; there is no
     /// loopback bypass and this must not reuse the application data secret.
@@ -170,20 +178,12 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
-fn default_capability_jwks_url() -> String {
-    "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json".to_string()
-}
-
-fn default_revocation_list_url() -> String {
-    "http://127.0.0.1:8100".to_string()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
-            capability_jwks_url: default_capability_jwks_url(),
-            revocation_list_url: default_revocation_list_url(),
+            machine_identity: None,
+            metrics_listen: None,
             migration_admin_token: None,
             data_dir: default_data_dir(),
             connections: default_connections(),
@@ -250,7 +250,7 @@ mod tests {
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
         assert_eq!(parsed.listen, defaults.listen);
-        assert_eq!(parsed.capability_jwks_url, defaults.capability_jwks_url);
+        assert_eq!(parsed.machine_identity, defaults.machine_identity);
         assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.connections, defaults.connections);
@@ -340,24 +340,25 @@ mod tests {
     }
 
     #[test]
-    fn the_jwks_url_is_read_from_a_file() {
+    fn the_machine_identity_table_is_read_from_a_file() {
         let parsed: Config = toml::from_str(
-            "capability_jwks_url = \"https://control.internal/.well-known/deis/capability-jwks.json\"\nmigration_admin_token = \"an-independent-migration-secret\"",
+            "migration_admin_token = \"an-independent-migration-secret\"\n\
+             [machine_identity]\n\
+             certificate = \"/etc/deis/queue.crt\"\n\
+             private_key = \"/etc/deis/queue.key\"\n\
+             trust_root = \"/etc/deis/ca.crt\"\n\
+             control_endpoint = \"https://control.internal:8101\"\n",
         )
         .unwrap();
         assert_eq!(
-            parsed.capability_jwks_url,
-            "https://control.internal/.well-known/deis/capability-jwks.json"
+            parsed.machine_identity.expect("the table").control_endpoint,
+            "https://control.internal:8101"
         );
         assert_eq!(
             parsed.migration_admin_token.as_deref(),
             Some("an-independent-migration-secret")
         );
-        // The control plane on this host by default.
-        assert_eq!(
-            Config::default().capability_jwks_url,
-            "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
-        );
+        assert!(Config::default().machine_identity.is_none());
     }
 
     #[test]

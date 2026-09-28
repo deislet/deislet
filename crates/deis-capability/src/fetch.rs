@@ -1,6 +1,8 @@
 //! Keeping a [`KeyRing`] in step with the control plane's published JWKS.
 //!
-//! A verifier starts with an empty ring and a URL. The refresher fetches the
+//! A verifier starts with an empty ring and a [`ControlClient`] for the
+//! control plane's machine channel, where the document is served at
+//! [`crate::JWKS_PATH`]. The refresher fetches the
 //! document at once (retrying with backoff until the control plane answers,
 //! so a verifier may start before it), then again on a fixed interval, and
 //! again whenever a token names a key the ring does not hold - rate limited,
@@ -16,6 +18,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
+use crate::control::ControlClient;
 use crate::keys::{Jwks, KeyRing};
 
 /// Timings of the refresher. The defaults suit production; tests shorten
@@ -47,32 +50,19 @@ impl Default for RefreshPolicy {
     }
 }
 
-/// Fetch and parse the JWKS at `url`.
+/// Fetch and parse the control plane's JWKS.
 pub async fn fetch_jwks(
-    client: &reqwest::Client,
-    url: &str,
+    client: &ControlClient,
 ) -> Result<Vec<ed25519_dalek::VerifyingKey>, String> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("answered {status}"));
-    }
-    let jwks: Jwks = response
-        .json()
-        .await
-        .map_err(|e| format!("body is not a JWKS document: {e}"))?;
+    let jwks: Jwks = client.get_json(crate::JWKS_PATH).await?;
     jwks.verifying_keys().map_err(|e| e.to_string())
 }
 
-/// Spawn the task that keeps `ring` current from `url`. Runs until the
-/// process exits.
+/// Spawn the task that keeps `ring` current from the control plane `client`
+/// reaches. Runs until the process exits.
 pub fn spawn_refresher(
     ring: KeyRing,
-    url: String,
+    client: ControlClient,
     policy: RefreshPolicy,
 ) -> tokio::task::JoinHandle<()> {
     let wanted = Arc::new(Notify::new());
@@ -80,25 +70,13 @@ pub fn spawn_refresher(
         let wanted = Arc::clone(&wanted);
         ring.on_unknown_kid(move |_| wanted.notify_one());
     }
+    let client = client.with_timeout(policy.request_timeout);
+    let url = client.url_of(crate::JWKS_PATH);
     tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .timeout(policy.request_timeout)
-            .build()
-        {
-            Ok(client) => client,
-            Err(error) => {
-                tracing::error!(
-                    %error,
-                    "Cannot build the HTTP client for the capability key refresher; no key will \
-                     ever be loaded and every capability will be refused"
-                );
-                return;
-            }
-        };
         let mut backoff = policy.initial_backoff;
         loop {
             let fetched_at = Instant::now();
-            let next = match fetch_jwks(&client, &url).await {
+            let next = match fetch_jwks(&client).await {
                 Ok(keys) => {
                     ring.replace(keys);
                     backoff = policy.initial_backoff;
@@ -132,6 +110,173 @@ pub fn spawn_refresher(
     })
 }
 
+/// Fetch one signed revocation list. The poller is handed one of these
+/// rather than a client so its tests can serve lists of their own making;
+/// every process reaches the control plane through
+/// [`control_revocation_source`].
+pub type RevocationSource = Box<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A [`RevocationSource`] reading the list from the control plane's machine
+/// channel through `client`: under mutual TLS with this service's identity,
+/// or plain HTTP only on loopback - the same rule, and the same client, the
+/// JWKS is fetched with. The list is signed either way; the channel is what
+/// keeps someone on the path from withholding every list to push a verifier
+/// into degraded mode on purpose.
+pub fn control_revocation_source(client: ControlClient) -> RevocationSource {
+    Box::new(move || {
+        let client = client.clone();
+        Box::pin(async move {
+            client
+                .get_json::<crate::SignedRevocationList>(crate::revocation::REVOCATION_LIST_PATH)
+                .await
+                .map(|body| body.signed_list)
+        })
+    })
+}
+
+/// Keep `verifier` in step with the control plane's revocation list.
+///
+/// Fetches at once, then every `interval`; after a failure retries sooner,
+/// backing off to `interval`. Every list is checked against the verifier's
+/// own key ring and for freshness before it is adopted, so a list that was
+/// tampered with, signed by anyone else or replayed is logged and ignored -
+/// it neither changes what is revoked nor resets the degraded-mode clock.
+///
+/// Entering and leaving T8 degraded mode are each logged once, at `warn` and
+/// `info`; `service` names this process in those lines.
+pub fn spawn_revocation_poller(
+    verifier: crate::SharedVerifier,
+    service: &'static str,
+    interval: Duration,
+    source: RevocationSource,
+) -> tokio::task::JoinHandle<()> {
+    {
+        let mut guard = verifier.lock().unwrap_or_else(|e| e.into_inner());
+        guard.set_pull_interval_secs(interval.as_secs().max(1));
+    }
+    tokio::spawn(async move {
+        let mut degraded = false;
+        let mut backoff = Duration::from_secs(1).min(interval);
+        loop {
+            let outcome = match source().await {
+                Ok(signed) => {
+                    let keys = verifier
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .key_ring()
+                        .clone();
+                    crate::revocation::verify(&signed, &keys)
+                        .map_err(|e| e.to_string())
+                        .and_then(|list| {
+                            let epoch = list.auth_epoch;
+                            let revoked = list.revoked_jtis.len() + list.revoked_nodes.len();
+                            verifier
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .apply_revocation_list(list)
+                                .map(|()| (epoch, revoked))
+                                .map_err(|e| e.to_string())
+                        })
+                }
+                Err(error) => Err(error),
+            };
+            let wait = match outcome {
+                Ok((auth_epoch, revoked)) => {
+                    tracing::debug!(service, auth_epoch, revoked, "Adopted the control plane's revocation list");
+                    backoff = Duration::from_secs(1).min(interval);
+                    interval
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        service,
+                        %error,
+                        "Could not adopt the control plane's revocation list; what was last \
+                         adopted stays in force"
+                    );
+                    let wait = backoff;
+                    backoff = (backoff * 2).min(interval);
+                    wait
+                }
+            };
+            let now_degraded = verifier
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_degraded();
+            if now_degraded && !degraded {
+                tracing::warn!(
+                    service,
+                    "Entered degraded mode: no revocation list for two poll intervals, so the \
+                     control plane is treated as unreachable. Expired node capabilities are \
+                     accepted for at most 24 hours past their expiry if they were valid when the \
+                     last list arrived; revocations made since are not known here"
+                );
+            } else if !now_degraded && degraded {
+                tracing::info!(service, "Left degraded mode: a fresh revocation list was adopted and expired capabilities are refused again");
+            }
+            degraded = now_degraded;
+            tokio::time::sleep(wait).await;
+        }
+    })
+}
+
+/// Poll the control plane's revocation list through `client` into
+/// `verifier` every [`crate::DEFAULT_PULL_INTERVAL_SECS`].
+///
+/// `client` is the one this service fetches the JWKS with, so a service that
+/// can verify capabilities at all can also learn which are revoked; until the
+/// first list arrives it reports itself degraded and grants no T8 grace.
+pub fn poll_revocations(
+    verifier: crate::SharedVerifier,
+    service: &'static str,
+    client: ControlClient,
+) -> tokio::task::JoinHandle<()> {
+    let client = client.with_timeout(RefreshPolicy::default().request_timeout);
+    spawn_revocation_poller(
+        verifier,
+        service,
+        Duration::from_secs(crate::DEFAULT_PULL_INTERVAL_SECS),
+        control_revocation_source(client),
+    )
+}
+
+/// [`poll_revocations`] from the control plane a service's
+/// `[machine_identity]` table names, proving `identity` - the certificate the
+/// service serves with, and the one its JWKS is fetched under.
+///
+/// Without a table nothing is polled and the refusal is logged: the verifier
+/// then reports itself degraded and grants no T8 grace. Only a test serves
+/// that way; every binary refuses to start without the table.
+///
+/// T8 grace is limited to nodes of `identity`'s own trust domain: a node
+/// name from another installation is never a node of this one.
+pub fn poll_revocations_for_service(
+    verifier: crate::SharedVerifier,
+    service: &'static str,
+    table: Option<&crate::ServiceIdentityConfig>,
+    identity: Arc<deis_identity::MachineIdentity>,
+) -> Result<(), crate::ControlClientError> {
+    verifier
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_trust_domain(identity.id().trust_domain());
+    match table {
+        Some(table) => {
+            poll_revocations(verifier, service, table.control_client(identity)?);
+        }
+        None => tracing::error!(
+            service,
+            "No [machine_identity] table, so the control plane's revocation list is not polled; \
+             this service reports itself degraded, refuses expired capabilities and enforces no \
+             revocation beyond what the tokens carry"
+        ),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,7 +304,7 @@ mod tests {
                 let _ = socket.write_all(response.as_bytes()).await;
             }
         });
-        format!("http://{addr}/jwks.json")
+        format!("http://{addr}")
     }
 
     async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
@@ -170,6 +315,105 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed out waiting for {what}");
+    }
+
+    /// A one-route HTTP server answering every request with whatever body
+    /// `served` holds at that moment.
+    async fn serve_text(served: Arc<Mutex<String>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let body = served.lock().unwrap().clone();
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}{}", crate::revocation::REVOCATION_LIST_PATH)
+    }
+
+    fn list_body(signed: String) -> String {
+        serde_json::to_string(&crate::SignedRevocationList {
+            signed_list: signed,
+        })
+        .unwrap()
+    }
+
+    /// The whole loop over a socket: a revoked jti is refused within one
+    /// poll, a list edited on the way is not adopted (what was adopted stays
+    /// in force), and an epoch bump refuses every older token.
+    #[tokio::test]
+    async fn the_poller_adopts_signed_lists_and_ignores_tampered_ones() {
+        use crate::revocation::{RevocationList, sign};
+        use crate::{AUD_STORE, CapabilityClaims, CapabilityError, CapabilityVerifier, encode};
+
+        let signing = SigningKey::from_bytes(&[3u8; 32]);
+        let tenant = "app.production";
+        let claims = CapabilityClaims::new(
+            AUD_STORE,
+            "iss",
+            "spiffe://deis.internal/deislet/node/n1",
+            1,
+            Duration::from_secs(900),
+            crate::resources_for_audience(tenant, AUD_STORE),
+        );
+        let token = encode(&claims, &signing);
+        let verifier = CapabilityVerifier::new(signing.verifying_key()).shared();
+        let check = |verifier: &crate::SharedVerifier| {
+            verifier
+                .lock()
+                .unwrap()
+                .verify_with_grace(&token, AUD_STORE, tenant, "kv")
+        };
+        assert!(check(&verifier).is_ok());
+
+        let served = Arc::new(Mutex::new(list_body(sign(
+            &RevocationList::new("iss", 1, vec![claims.jti.clone()]),
+            &signing,
+        ))));
+        let url = serve_text(Arc::clone(&served)).await;
+        spawn_revocation_poller(
+            Arc::clone(&verifier),
+            "test",
+            Duration::from_millis(100),
+            control_revocation_source(ControlClient::loopback(&url).unwrap()),
+        );
+        eventually("the revocation", || {
+            matches!(check(&verifier), Err(CapabilityError::Revoked { .. }))
+        })
+        .await;
+        assert!(!verifier.lock().unwrap().is_degraded());
+
+        // Someone on the path strips the revocation and rolls the epoch
+        // back, keeping the signature.
+        let genuine = sign(&RevocationList::new("iss", 1, vec![claims.jti.clone()]), &signing);
+        let (payload, signature) = crate::parse_token(&genuine).unwrap();
+        let mut edited: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        edited["revoked_jtis"] = serde_json::json!([]);
+        edited["auth_epoch"] = 0.into();
+        *served.lock().unwrap() = list_body(format!(
+            "v1.{}.{}",
+            crate::base64url(&serde_jcs::to_vec(&edited).unwrap()),
+            crate::base64url(&signature)
+        ));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            matches!(check(&verifier), Err(CapabilityError::Revoked { .. })),
+            "a tampered list was adopted"
+        );
+
+        // Mass revocation.
+        *served.lock().unwrap() = list_body(sign(&RevocationList::new("iss", 2, vec![]), &signing));
+        eventually("the epoch bump", || {
+            matches!(check(&verifier), Err(CapabilityError::AuthEpochTooLow { .. }))
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -186,7 +430,11 @@ mod tests {
             min_on_demand_gap: Duration::from_millis(300),
             ..RefreshPolicy::default()
         };
-        spawn_refresher(ring.clone(), url, policy);
+        spawn_refresher(
+            ring.clone(),
+            ControlClient::loopback(&url).expect("a loopback URL"),
+            policy,
+        );
         eventually("the first fetch", || ring.get(&key_id(&first)).is_some()).await;
 
         // Rotation on the control plane: a token naming the new key arrives.
