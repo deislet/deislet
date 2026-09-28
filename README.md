@@ -181,7 +181,6 @@ The libraries:
 | [`deis-capability`](crates/deis-capability) | The Ed25519-signed capability tokens the control plane mints and deis-store, deis-queue and deis-telemetry verify. |
 | [`deis-identity`](crates/deis-identity) | Machine identity: SPIFFE-named certificates and the mutual TLS every process-to-process channel runs on. [`deis-identity-test-pki`](crates/deis-identity-test-pki) is a certificate authority small enough for a test. |
 | [`deis-backend-topology`](crates/deis-backend-topology) | Coordinated snapshot and restore of deis-store, deis-queue and deis-telemetry. |
-| [`deis-backend-migration`](crates/deis-backend-migration) | The inventory and writer-fence contract the data services expose to the control plane. |
 
 Six crates carry a README of their own — `deis`, `deis-build`, `deis-control`,
 `deis-proxy`, `deis-runtime` and `deis-wire` — and `crates/deis-build/docs/`
