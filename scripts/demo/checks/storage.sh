@@ -488,6 +488,102 @@ check_a_tenant_revocation_spares_its_neighbours_and_heals() {
   fi
 }
 
+# Revoking a node, as opposed to a tenant or a token: the holder, not what it
+# holds. A tenant revocation heals within seconds because the node simply
+# asks again; a node revocation must not, or it could not contain a
+# compromised machine. So after the node's writes start being refused they
+# have to stay refused past the point where a renewal would have healed them
+# (the node retries a refused token 30 seconds after it was issued, and
+# deis-store adopts a list every 30), and only lifting the revocation brings
+# the node back - registered again, issued capabilities again, serving both
+# environments and its queue again, so what follows meets a whole node.
+check_a_revoked_node_stays_cut_off_until_lifted() {
+  local title="revoking a node cuts it off until the revocation is lifted, however often it asks again"
+  local key="revoke-node-probe-$$-${RANDOM}"
+  local headers="${LOG_DIR}/verify-revoke-node.headers"
+  local path="/api/v1/capabilities/revocations/nodes/${NODE_ID}"
+
+  put_as() {
+    env_request "$1" "$headers" "/api/kv/${key}" -X PUT --data-binary "$1" >/dev/null
+    http_status "$headers"
+  }
+
+  local before
+  before=$(put_as "$ENV_NAME")
+  if [ "$before" != "201" ]; then
+    fail_check "$title" "before the revocation a KV write in ${ENV_NAME} answered ${before}; it must be served first"
+    return
+  fi
+
+  local answer
+  answer=$(control_answer POST "$path" "$OPERATOR_TOKEN")
+  if ! echo "$answer" | jq -e '.revoked | type == "array"' >/dev/null 2>&1; then
+    fail_check "$title" "POST ${path} did not answer a revocation: $(echo "$answer" | head -c 200)"
+    return
+  fi
+
+  # Refused within one poll and a moment.
+  local waited=0 status="" refused_at=""
+  while [ "$waited" -lt 60 ]; do
+    status=$(put_as "$ENV_NAME")
+    if [ "$status" != "201" ]; then
+      refused_at=$waited
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if [ -z "$refused_at" ]; then
+    control_status DELETE "$path" "$OPERATOR_TOKEN" >/dev/null
+    fail_check "$title" "${ENV_NAME}'s KV writes were still served ${waited}s after ${NODE_ID} was revoked (last answer ${status})"
+    return
+  fi
+
+  # And still refused well past every renewal that could have healed it.
+  local held=0 served_while_revoked=0
+  while [ "$held" -lt 75 ]; do
+    status=$(put_as "$ENV_NAME")
+    [ "$status" = "201" ] && served_while_revoked=$((served_while_revoked + 1))
+    sleep 1
+    held=$((held + 1))
+  done
+
+  local lifted
+  lifted=$(control_status DELETE "$path" "$OPERATOR_TOKEN")
+
+  # Lifted: the node registers again on its own cadence, is issued new
+  # capabilities, and deis-store and deis-queue accept them.
+  local healed="" tries=0 live preview queue=""
+  while [ "$tries" -lt 180 ]; do
+    live=$(put_as "$ENV_NAME")
+    preview=$(put_as "$PREVIEW_ENV_NAME")
+    runtime_curl -s -o /dev/null -D "$headers" -X POST -H "x-deis-app-id: ${APP_ID}" \
+      -H 'content-type: application/json' \
+      -d "{\"key\":\"${key}-queue\",\"value\":\"after-lift\"}" \
+      "$(runtime_data_url)/api/enqueue" || true
+    queue=$(http_status "$headers")
+    if [ "$live" = "201" ] && [ "$preview" = "201" ] && [ "$queue" = "202" ]; then
+      healed=$tries
+      break
+    fi
+    sleep 1
+    tries=$((tries + 1))
+  done
+
+  if [ "$served_while_revoked" -eq 0 ] && [ "$lifted" = "204" ] && [ -n "$healed" ]; then
+    pass_check "$title" \
+      "POST ${path} revoked the node and ${refused_at}s later its KV writes were refused; they stayed refused for all ${held}s after that, though the node kept asking for new capabilities. DELETE ${path} answered 204 and ${healed}s later the node was serving ${ENV_NAME}, ${PREVIEW_ENV_NAME} and its queue again"
+  elif [ "$served_while_revoked" -gt 0 ]; then
+    fail_check "$title" \
+      "${ENV_NAME}'s KV writes were refused ${refused_at}s after ${NODE_ID} was revoked, but served ${served_while_revoked} time(s) in the ${held}s after that: the node got a capability that was accepted while it was revoked"
+  elif [ "$lifted" != "204" ]; then
+    fail_check "$title" "DELETE ${path} answered ${lifted:-nothing}, not 204"
+  else
+    fail_check "$title" \
+      "the revocation held, but ${tries}s after it was lifted the node answered ${live} in ${ENV_NAME}, ${preview} in ${PREVIEW_ENV_NAME} and ${queue} for a queue send: it did not come back"
+  fi
+}
+
 # ----------------------------------------------------------------------
 # The credential `deis kv`, `deis db` and `deis blob` act with
 # ----------------------------------------------------------------------
@@ -1155,6 +1251,7 @@ group_storage_checks=(
   check_storage_serves_tls_only
   check_a_revoked_capability_is_refused
   check_a_tenant_revocation_spares_its_neighbours_and_heals
+  check_a_revoked_node_stays_cut_off_until_lifted
   check_storage_token_route_requires_a_credential
   check_data_cli_reads_the_apps_write
   # What a tenant's SQL may cost, as opposed to what it may touch. Both go
