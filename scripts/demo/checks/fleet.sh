@@ -416,11 +416,9 @@ check_a_fleet_certificate_only_speaks_for_the_machine_it_names() {
   # And the same call made by the machine that certificate does name, so the
   # refusal above is about who asked rather than about the RPC being broken.
   #
-  # Only whether it was answered is kept. That answer carries this
-  # environment's decrypted secrets - it is the whole reason this channel
-  # exists - so writing it to a file under .demo/logs would put the secret on
-  # disk in the clear, which is what `check_no_secret_in_logs` is there to
-  # refuse. It caught exactly that when this check was first written.
+  # Only whether it was answered is kept: the answer names every deployment
+  # this node runs and the secret revisions it may fetch next, which is no
+  # business of a log file.
   local own="${LOG_DIR}/verify-machine-own.count"
   grpcurl -max-time 10 \
     -cacert "${PKI_DIR}/ca.crt" \
@@ -443,10 +441,58 @@ check_a_fleet_certificate_only_speaks_for_the_machine_it_names() {
     && printf '%s' "$told" | grep -q "deis-runtime-demo-99" \
     && printf '%s' "$told" | grep -q "${NODE_ID}"; then
     pass_check "$title" \
-      "a certificate this fleet really issued, naming deis-runtime-demo-99, asked for ${NODE_ID}'s assignment list - the answer that carries that environment's decrypted secrets - and was refused PermissionDenied: \"$(printf '%s' "$told" | head -c 160)\". The same call with ${NODE_ID}'s own certificate was answered. Under one shared fleet key this refusal could not be expressed at all: both callers would have presented the same credential"
+      "a certificate this fleet really issued, naming deis-runtime-demo-99, asked for ${NODE_ID}'s assignment list - the answer that decides which secrets and capabilities that node may fetch - and was refused PermissionDenied: \"$(printf '%s' "$told" | head -c 160)\". The same call with ${NODE_ID}'s own certificate was answered. Under one shared fleet key this refusal could not be expressed at all: both callers would have presented the same credential"
     else
     fail_check "$title" \
       "expected PermissionDenied naming both machines for the impostor (found ${refused} such line(s), message \"${told:-nothing}\") and an answer for ${NODE_ID}'s own certificate (found ${served} answer(s))"
+  fi
+}
+
+# What a node may be issued. A node asks IssueCapability in its own name, and
+# is given a capability only for tenants of deployments assigned to it: the
+# node running this demo gets one for ${APP_ID}.${ENV_NAME}, and the same
+# certificate asking for a tenant it does not run is refused - so a
+# compromised node cannot mint its way into another tenant's data. For
+# deis-telemetry it may push, never read. Each refusal is in the audit log.
+check_a_node_cannot_mint_for_a_tenant_it_does_not_run() {
+  local title="a node is issued capabilities only for the tenants it runs"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is not installed, so IssueCapability could not be called"
+    return
+  fi
+
+  issue_as_node() {
+    local audience=$1 tenant=$2 binding=$3
+    local resources
+    resources=$(jq -cn --arg t "$tenant" --arg b "$binding" '[{tenant: $t, binding: $b}]')
+    grpcurl -max-time 10 \
+      -cacert "${PKI_DIR}/ca.crt" \
+      -cert "${PKI_DIR}/node.crt" -key "${PKI_DIR}/node.key" \
+      -import-path "${ROOT_DIR}/crates/deis-wire/proto" -proto machine.proto \
+      -d "$(jq -cn --arg n "$NODE_ID" --arg a "$audience" --arg r "$resources" \
+        '{node_id: $n, audience: $a, resources_json: $r}')" \
+      "127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}" \
+      deis.machine.MachineChannel/IssueCapability 2>&1 || true
+  }
+
+  local own foreign read audited
+  own=$(issue_as_node store "${APP_ID}.${ENV_NAME}" kv)
+  foreign=$(issue_as_node store "not-deployed-here.${ENV_NAME}" kv)
+  read=$(issue_as_node telemetry "${APP_ID}.${ENV_NAME}" read)
+  audited=$(deis_cli audit --action capability.issue --limit 50 --json 2>/dev/null \
+    | jq -r '[.entries[]? | select(.detail // "" | contains("not-deployed-here"))] | length' 2>/dev/null || echo 0)
+
+  if echo "$own" | grep -q 'capabilityToken' \
+    && echo "$foreign" | grep -q 'Code: PermissionDenied' \
+    && echo "$foreign" | grep -q 'not-deployed-here' \
+    && echo "$read" | grep -q 'Code: PermissionDenied' \
+    && [ "${audited:-0}" -ge 1 ]; then
+    pass_check "$title" \
+      "${NODE_ID}'s own certificate was issued a store capability for ${APP_ID}.${ENV_NAME}, which it runs; asking for not-deployed-here.${ENV_NAME} was refused ($(echo "$foreign" | grep -m1 'Message:' | sed 's/^ *Message: *//' | head -c 140)) and written to the audit log as capability.issue; asking for a telemetry read of its own tenant was refused too - a node pushes telemetry and reads none"
+  else
+    fail_check "$title" \
+      "own tenant: $(echo "$own" | tr '\n' ' ' | head -c 120); foreign tenant: $(echo "$foreign" | tr '\n' ' ' | head -c 160); telemetry read: $(echo "$read" | tr '\n' ' ' | head -c 120); audited refusals: ${audited:-0}"
   fi
 }
 
@@ -468,5 +514,6 @@ group_fleet_checks=(
   # has no certificate to prove. It is not refused at a door, it never starts.
   check_a_process_with_no_certificate_refuses_to_start
   check_a_fleet_certificate_only_speaks_for_the_machine_it_names
+  check_a_node_cannot_mint_for_a_tenant_it_does_not_run
   check_cli_status
 )

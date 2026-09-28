@@ -2439,6 +2439,19 @@ storage_token() {
     | jq -r --arg f "$field" '.[$f] // empty' 2>/dev/null || true
 }
 
+# The `jti` a capability carries, read off its claims without verifying them:
+# the caller is the one who asked for the token. Empty for anything that is
+# not a capability.
+capability_jti() {
+  local payload
+  payload=$(printf '%s' "${1:-}" | cut -d. -f2 | tr '_-' '/+')
+  case $(( ${#payload} % 4 )) in
+    2) payload="${payload}==" ;;
+    3) payload="${payload}=" ;;
+  esac
+  printf '%s' "$payload" | base64 -d 2>/dev/null | jq -r '.jti // empty' 2>/dev/null || true
+}
+
 # One request through deis-proxy for a host the catalog claims, with no
 # `x-deis-app-id` on it. The absence is the point: with the header there is
 # nothing for a route to decide.

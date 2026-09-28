@@ -163,11 +163,53 @@ check_cli_tail() {
   fi
 }
 
+# What one environment's read capability reaches. deis-telemetry holds every
+# tenant's records in one store, so the capability is the only thing between
+# them: a reader minted for ${APP_ID}/${ENV_NAME} asking for another
+# application's logs is refused rather than answered with an empty page, and
+# so is a query that names no application at all. The same question asked
+# with the platform-wide capability an operator holding read:*/* gets is
+# answered, so the refusal is about the capability and not the query.
+check_a_telemetry_reader_sees_only_its_own_tenant() {
+  local title="a telemetry read capability for one environment cannot read another application"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is not installed, so this check could not be run"
+    return
+  fi
+
+  query_logs_as() {
+    grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 10 \
+      -H "authorization: Bearer $1" \
+      -import-path "${ROOT_DIR}/crates/deis-telemetry/proto" -proto telemetry.proto \
+      -d "$2" \
+      "127.0.0.1:${DEIS_TELEMETRY_PORT}" deis.telemetry.LogService/Query 2>&1 || true
+  }
+
+  local reader platform other unnamed operator
+  reader=$(telemetry_token "$ENV_NAME")
+  platform=$(telemetry_token --platform)
+  other=$(query_logs_as "$reader" "{\"app_id\":\"${CALLEE_APP_ID}\",\"limit\":5}")
+  unnamed=$(query_logs_as "$reader" '{"limit":5}')
+  operator=$(query_logs_as "$platform" "{\"app_id\":\"${CALLEE_APP_ID}\",\"limit\":5}")
+
+  if echo "$other" | grep -q 'Code: PermissionDenied' \
+    && echo "$unnamed" | grep -q 'Code: PermissionDenied' \
+    && [ -n "$platform" ] && ! echo "$operator" | grep -q 'Code:'; then
+    pass_check "$title" \
+      "the reader minted for ${APP_ID}/${ENV_NAME} asked for ${CALLEE_APP_ID}'s logs and was refused ($(echo "$other" | grep -m1 'Message:' | sed 's/^ *Message: *//' | head -c 120)); a query naming no application was refused too. The platform capability asked the same question and was answered"
+  else
+    fail_check "$title" \
+      "other application: $(echo "$other" | tr '\n' ' ' | head -c 160); no application: $(echo "$unnamed" | tr '\n' ' ' | head -c 120); platform: $(echo "$operator" | tr '\n' ' ' | head -c 120)"
+  fi
+}
+
 # The checks this group asks, in the order a run asks them, and the
 # heading `verify` prints before them.
 group_observability_label="observability"
 group_observability_checks=(
   check_telemetry_logs
+  check_a_telemetry_reader_sees_only_its_own_tenant
   check_cli_trace
   check_cli_tail
 )

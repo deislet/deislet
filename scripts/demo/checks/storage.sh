@@ -320,6 +320,70 @@ check_storage_serves_tls_only() {
   fi
 }
 
+# Taking a capability back. The control plane records every capability it
+# signs; an administrator revokes one by its `jti`, and deis-store learns of
+# it from the revocation list it polls over the machine channel every 30
+# seconds. So a token that was served a moment ago is refused within one
+# poll, and a token minted beside it - not revoked - goes on working.
+check_a_revoked_capability_is_refused() {
+  local title="a revoked storage capability is refused within one poll, and only that one"
+
+  if ! command -v grpcurl >/dev/null 2>&1; then
+    fail_check "$title" "grpcurl is not installed, so this check could not be run"
+    return
+  fi
+
+  local tenant="${APP_ID}.${ENV_NAME}"
+  local revoked kept jti answer
+  revoked=$(storage_token)
+  kept=$(storage_token)
+  jti=$(capability_jti "$revoked")
+  if [ -z "$revoked" ] || [ -z "$kept" ] || [ -z "$jti" ]; then
+    fail_check "$title" "the control plane did not mint two storage capabilities to compare (jti '${jti:-none}')"
+    return
+  fi
+
+  kv_get_as() {
+    grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
+      -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+      -H "x-deis-tenant: ${tenant}" \
+      -H "authorization: Bearer $1" \
+      -d '{"key":"revocation-probe"}' \
+      "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true
+  }
+
+  local before
+  before=$(kv_get_as "$revoked")
+  if echo "$before" | grep -q 'Code:'; then
+    fail_check "$title" "the capability was refused before it was revoked: $(echo "$before" | tr '\n' ' ' | head -c 200)"
+    return
+  fi
+
+  answer=$(control_answer DELETE "/api/v1/capabilities/${jti}" "$OPERATOR_TOKEN")
+  if ! echo "$answer" | jq -e --arg j "$jti" '.revoked | index($j)' >/dev/null 2>&1; then
+    fail_check "$title" "DELETE /api/v1/capabilities/${jti} did not report it revoked: $(echo "$answer" | head -c 200)"
+    return
+  fi
+
+  local after="" waited=0
+  while [ "$waited" -lt 45 ]; do
+    after=$(kv_get_as "$revoked")
+    echo "$after" | grep -q 'Code: PermissionDenied' && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+  local still
+  still=$(kv_get_as "$kept")
+
+  if echo "$after" | grep -q 'Code: PermissionDenied' && ! echo "$still" | grep -q 'Code:'; then
+    pass_check "$title" \
+      "KvStore.Get with capability ${jti} was served, then DELETE /api/v1/capabilities/${jti} revoked it and ${waited}s later deis-store refused it: $(echo "$after" | grep -m1 'Message:' | sed 's/^ *//' | head -c 160). A capability minted beside it, not revoked, is still served"
+  else
+    fail_check "$title" \
+      "after ${waited}s the revoked capability got: $(echo "$after" | tr '\n' ' ' | head -c 200); the kept one got: $(echo "$still" | tr '\n' ' ' | head -c 200)"
+  fi
+}
+
 # ----------------------------------------------------------------------
 # The credential `deis kv`, `deis db` and `deis blob` act with
 # ----------------------------------------------------------------------
@@ -985,6 +1049,7 @@ group_storage_checks=(
   check_cli_reads_a_named_binding
   check_storage_capability_token
   check_storage_serves_tls_only
+  check_a_revoked_capability_is_refused
   check_storage_token_route_requires_a_credential
   check_data_cli_reads_the_apps_write
   # What a tenant's SQL may cost, as opposed to what it may touch. Both go
