@@ -49,21 +49,12 @@ CONVENTIONS="${ROOT_DIR}/crates/deis-wire/src/conventions.rs"
 #
 # Each entry is a repository-relative path and needs a reason and a way out.
 #
-#   crates/deis-control/API_DOCUMENTATION.md
-#     The control plane's own HTTP reference. Its readers hold a curl command
-#     rather than a Rust crate, so the literal path is the content there, not a
-#     restatement of it. Retire this entry by adding one sentence to the "Node
-#     Endpoints" section naming NODE_REGISTRATION_ROUTE and
-#     NODE_ASSIGNMENTS_ROUTE as where those paths come from, and then deleting
-#     this line.
-#
 #   docs/implementation-plan.zh.md
 #     A dated record of decisions already taken. Its section 4 does name the
 #     constant; the security note further down restates the path in prose, and
 #     rewriting the prose of a record after the fact is its own kind of wrong.
 #     Retire this entry when that note is next revised.
 EXEMPT_FILES=(
-  "crates/deis-control/API_DOCUMENTATION.md"
   "docs/implementation-plan.zh.md"
 )
 

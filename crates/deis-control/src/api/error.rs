@@ -410,8 +410,8 @@ impl ApiError {
         ApiError::Detailed(Box::new(ErrorDetail::new(
             StatusCode::NOT_FOUND,
             codes::ROUTE_NOT_FOUND,
-            "No such endpoint. The API surface is listed in the component's \
-             API_DOCUMENTATION.md."
+            "No such endpoint. The API surface is the OpenAPI contract, \
+             contracts/openapi/v1.json."
                 .to_string(),
         )))
     }

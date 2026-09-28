@@ -372,7 +372,8 @@ async fn test_new_feature_api() {
 }
 ```
 
-5. Update API Documentation (`API_DOCUMENTATION.md`)
+5. Regenerate the OpenAPI contract and the console's client (see
+   [API_DOCUMENTATION.md](API_DOCUMENTATION.md#generating-a-client))
 
 ### 2. Add Database Table
 
@@ -567,7 +568,7 @@ criterion_main!(benches);
 
 ## 🆘 Getting Help
 
-- **Documentation**: [ARCHITECTURE.md](ARCHITECTURE.md), [API_DOCUMENTATION.md](API_DOCUMENTATION.md)
+- **Documentation**: [ARCHITECTURE.md](ARCHITECTURE.md), [API_DOCUMENTATION.md](API_DOCUMENTATION.md) (shared API rules; the endpoint reference is [`contracts/openapi/v1.json`](../../contracts/openapi/v1.json))
 - **Issue Tracker**: https://github.com/your-org/deis-control/issues
 - **Discussions**: https://github.com/your-org/deis-control/discussions
 - **Rust Community**: https://users.rust-lang.org/

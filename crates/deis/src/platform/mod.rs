@@ -3381,7 +3381,7 @@ mod surface_tests {
     const REQUEST: &str = "018f2518-7e38-7f80-8000-0000000000aa";
     /// What `deis-control`'s route fallback answers, byte for byte, for a
     /// path it has no route for - on every control plane there has been.
-    const ROUTE_FALLBACK: &str = r#"{"error":"Not Found","details":"No such endpoint. The API surface is listed in the component's API_DOCUMENTATION.md."}"#;
+    const ROUTE_FALLBACK: &str = r#"{"error":"Not Found","details":"No such endpoint. The API surface is the OpenAPI contract, contracts/openapi/v1.json."}"#;
 
     fn page(items: Vec<serde_json::Value>) -> serde_json::Value {
         let count = items.len();

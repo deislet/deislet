@@ -580,6 +580,7 @@ application), and then the scoping follows from it. See
   deploying the control plane, including the firewall rules this document sets
   the requirements for.
 - [crates/deis-control/API_DOCUMENTATION.md](../crates/deis-control/API_DOCUMENTATION.md) -
-  the HTTP API in detail.
+  the rules every HTTP route shares; the endpoint reference is
+  [contracts/openapi/v1.json](../contracts/openapi/v1.json).
 - [docs/architecture.zh.md](architecture.zh.md) - the design these boundaries
   fall out of.
