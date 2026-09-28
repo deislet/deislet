@@ -14,10 +14,10 @@ preflight, plan, prepare, upload, verify, activate and observe.
 | Build: bindings, queues and cron mapped onto `wrangler.toml` with `deis:unresolved/<kind>/<name>` placeholders | implemented, covered by local tests |
 | Payload delivery: CLI upload, control payload store, per-operation work directory re-verified against the digest | implemented, covered by local tests |
 | Driver: wrangler install, exit codes, namespaced resource creation, placeholder fill, first-deploy Worker creation, upload/activate, cron schedules and queue consumers (`triggers deploy`), rollback, delete/cleanup | implemented, tested against a fake `wrangler` that records its invocations and models the wrangler 4.129.0 behaviour the driver relies on (see below); the fake is written from wrangler's source, not recorded from a live account |
-| Control plane end to end: product API → provider deployment → signed driver release launched as a process → `wrangler` | covered by `crates/deis-control/src/api/catalog/cloudflare_e2e.rs` against the fake `wrangler`: the first deploy creates the Worker before uploading a version; resolved, namespaced `wrangler.toml`; cron schedule, queue consumer and workers.dev applied after activation; a second deploy reuses every resource; delete removes the Worker and keeps the data |
+| Control plane end to end: product API → provider deployment → signed driver release launched as a process → `wrangler` | covered by `crates/deis-control/src/api/catalog/cloudflare_e2e.rs` against the fake `wrangler`: the first deploy creates the Worker before uploading a version; resolved, namespaced `wrangler.toml`; cron schedule, queue consumer and workers.dev applied after activation; a second deploy reuses every resource; an undeploy removes the Worker and keeps the data, and one with purge consent destroys the data too |
 | Against a real Cloudflare account | **not yet verified**; run [`scripts/cloudflare-smoke.sh`](../../scripts/cloudflare-smoke.sh) |
 | Environment secrets and deployment-time config values handed from the control plane to the driver | implemented, covered by `cloudflare_e2e.rs` against the fake `wrangler`: the config value fills its `[vars]` placeholder, the bound secret reaches `wrangler versions upload` on stdin and never argv, a rotated secret reaches the next deployment, and a delivery the audit log cannot record does not happen (see [Secrets and config](#secrets-and-config)) |
-| Undeploying through the control plane | not done: the driver implements `delete` and `cleanup`, but the control plane has no product API that issues them, and it never passes the purge consent (`DEIS_PROVIDER_PURGE_DATA`) |
+| Undeploying through the control plane | implemented, covered by `cloudflare_e2e.rs` against the fake `wrangler`: `deis undeploy --target cloudflare` (`POST /api/v1/apps/{app}/environments/{env}/provider-undeployments`) removes the Worker and keeps the data; with `--purge-data <environment>` the environment's KV, D1, R2 and queue resources are destroyed too, and a consent naming another environment is refused (see [Undeploying](#undeploying)) |
 | D1 migrations before activate (ADR-008 T5-3) | not done |
 
 Until the smoke script has passed against a real account, treat Cloudflare
@@ -175,13 +175,34 @@ versions get preview URLs unless `preview_urls = false`.
 Every Cloudflare resource is namespaced by application and environment id, so
 two applications that both declare a KV binding `HOT` never share a namespace.
 `delete` removes the Worker. Data resources (KV, D1, R2, Queues) are
-destroyed only when the operator explicitly consents for that environment by
-setting `DEIS_PROVIDER_PURGE_DATA=<environment id>` for the driver process:
-with that consent, both `delete` (after removing the Worker) and `cleanup`
-(which refuses while the Worker still exists) purge the environment's
-resources. Without it, neither does. The exact naming and the consent
-mechanism are documented in the driver crate,
+destroyed only when the operator explicitly consents for that environment,
+which reaches the driver process as `DEIS_PROVIDER_PURGE_DATA=<environment
+id>`: with that consent, both `delete` (after removing the Worker) and
+`cleanup` (which refuses while the Worker still exists) purge the
+environment's resources. Without it, neither does. The exact naming and the
+consent mechanism are documented in the driver crate,
 `crates/deis-provider-driver-cloudflare`.
+
+## Undeploying
+
+`deis undeploy --target cloudflare` asks the control plane to take the
+environment's deployment down (`POST
+/api/v1/apps/{app}/environments/{env}/provider-undeployments`, which needs
+`deploy:<app>/<env>` like a deployment). The control plane records an
+`undeploy` operation - a product operation of kind `delete`, with its actor,
+on the audit log like every state change - whose one step runs the driver's
+`delete` against the exact desired state of the environment's latest
+provider deployment on the target. It needs no active target grant: revoking
+the grant must not strand what was deployed under it. It follows the same
+workflow rules as a deployment: one active workflow per environment and
+target, pollable and cancellable until the provider holds the call.
+
+The Worker is removed and the data is kept. To destroy the data as well, the
+request carries `"purgeData": {"environment": "<environment name>"}` (`deis
+undeploy --purge-data <environment>`); the name must be the environment in
+the request path, so a consent written for one environment can never be
+applied to another. The consent is recorded on the workflow (`purgeData`)
+and handed to the driver for that workflow's steps only.
 
 ## Verifying against a real account
 

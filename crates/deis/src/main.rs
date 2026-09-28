@@ -248,6 +248,29 @@ enum Commands {
         provider_target: Option<String>,
     },
 
+    /// Take an environment's deployment on a provider down.
+    Undeploy {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Where the deployment runs. Only a provider can be undeployed.
+        #[arg(long = "target", value_enum)]
+        deploy_target: commands::deploy::DeployTarget,
+
+        /// The provider target (name or id) to take the deployment down
+        /// from, when the environment has more than one of the chosen kind.
+        #[arg(long, value_name = "NAME_OR_ID")]
+        provider_target: Option<String>,
+
+        /// Also destroy the environment's provider data (KV, databases,
+        /// buckets, queues). Takes the environment's name again, as consent.
+        #[arg(long, value_name = "ENVIRONMENT")]
+        purge_data: Option<String>,
+    },
+
     /// List an application's versions and which environments run them.
     Versions {
         #[command(flatten)]
@@ -1328,6 +1351,26 @@ async fn run(cli: Cli) -> Result<()> {
             format,
             limit,
         } => commands::versions::execute(target.app, limit, format.into()).await,
+
+        Commands::Undeploy {
+            target,
+            format,
+            deploy_target,
+            provider_target,
+            purge_data,
+        } => {
+            commands::undeploy::execute(
+                commands::undeploy::Args {
+                    app: target.app,
+                    environment: target.environment,
+                    target: deploy_target,
+                    provider_target,
+                    purge_data,
+                },
+                format.into(),
+            )
+            .await
+        }
 
         Commands::Deployments {
             target,

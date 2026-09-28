@@ -37,9 +37,12 @@
 >   secret 头部的 revision），其摘要写进期望状态的 `plan.bindingSnapshotDigest`；dispatcher 把
 >   config 交给各步骤，只在 `upload` 这一步把快照绑定的那几个 secret revision 解密后经
 >   driver 进程环境交出，不经 argv，且审计行落盘之后才交出（审计写不进去就不交、等重试）。
-> - **未做：** D1 迁移（ADR-008 T5-3）；
->   control 没有下线（delete/cleanup）provider 部署的产品 API，也不传数据清除许可
->   `DEIS_PROVIDER_PURGE_DATA`，driver 侧的 delete/cleanup 目前只能直接调用 driver。
+> - **下线：** `deis undeploy --target cloudflare`（产品 API
+>   `POST /api/v1/apps/{app}/environments/{env}/provider-undeployments`）记录一个 `undeploy`
+>   操作，按该环境最近一次 provider 部署的期望状态执行 driver 的 `delete`：删掉 Worker、保留数据；
+>   只有请求里 `purgeData` 写明本环境名（`--purge-data <环境名>`）时，才把清除许可
+>   `DEIS_PROVIDER_PURGE_DATA` 交给 driver，连同 KV/D1/R2/队列一起删除。
+> - **未做：** D1 迁移（ADR-008 T5-3）。
 >
 > 相应地，本文表格里 Deislet 侧的若干数值上限已按共享标准收敛到与 Cloudflare 一致：KV key 512B、
 > metadata 1 KiB、TTL ≥ 60 秒、list 单页 1000；SQL 单值 2,000,000 字节、单条语句 100,000 字节；

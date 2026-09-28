@@ -21,6 +21,7 @@ pub mod status;
 pub mod targets;
 pub mod token;
 pub mod trace;
+pub mod undeploy;
 pub mod validate;
 pub mod versions;
 

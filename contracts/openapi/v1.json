@@ -2887,7 +2887,7 @@
                 },
                 "kind": {
                   "$ref": "#/components/schemas/ProviderWorkflowKind",
-                  "description": "`deploy` runs the seven standard steps; `rollback` runs `rollback`\nthen `observe` against the desired state of the deployment it names."
+                  "description": "`deploy` runs the seven standard steps; `rollback` runs `rollback`\nthen `observe` against the desired state of the deployment it names;\n`undeploy` runs `delete` against the desired state of the\nenvironment's latest deployment on the target."
                 },
                 "lastDispatchErrorCode": {
                   "type": [
@@ -2921,6 +2921,10 @@
                 "providerTargetId": {
                   "format": "uuid",
                   "type": "string"
+                },
+                "purgeData": {
+                  "description": "For an `undeploy` workflow: whether the operator consented to\ndestroying the environment's provider data along with the\ndeployment. Always `false` for any other kind.",
+                  "type": "boolean"
                 },
                 "rollbackOperationIds": {
                   "description": "Every rollback workflow that names this workflow as its source,\noldest first, whatever state each has reached.",
@@ -2960,6 +2964,7 @@
               "required": [
                 "operation",
                 "kind",
+                "purgeData",
                 "rollbackOperationIds",
                 "providerTargetId",
                 "targetRevision",
@@ -6035,7 +6040,7 @@
           },
           "kind": {
             "$ref": "#/components/schemas/ProviderWorkflowKind",
-            "description": "`deploy` runs the seven standard steps; `rollback` runs `rollback`\nthen `observe` against the desired state of the deployment it names."
+            "description": "`deploy` runs the seven standard steps; `rollback` runs `rollback`\nthen `observe` against the desired state of the deployment it names;\n`undeploy` runs `delete` against the desired state of the\nenvironment's latest deployment on the target."
           },
           "lastDispatchErrorCode": {
             "type": [
@@ -6069,6 +6074,10 @@
           "providerTargetId": {
             "format": "uuid",
             "type": "string"
+          },
+          "purgeData": {
+            "description": "For an `undeploy` workflow: whether the operator consented to\ndestroying the environment's provider data along with the\ndeployment. Always `false` for any other kind.",
+            "type": "boolean"
           },
           "rollbackOperationIds": {
             "description": "Every rollback workflow that names this workflow as its source,\noldest first, whatever state each has reached.",
@@ -6108,6 +6117,7 @@
         "required": [
           "operation",
           "kind",
+          "purgeData",
           "rollbackOperationIds",
           "providerTargetId",
           "targetRevision",
@@ -6746,7 +6756,8 @@
         "description": "Which step list a workflow journal runs.",
         "enum": [
           "deploy",
-          "rollback"
+          "rollback",
+          "undeploy"
         ],
         "type": "string"
       },
@@ -6774,6 +6785,20 @@
           "backendId",
           "name",
           "credential"
+        ],
+        "type": "object"
+      },
+      "PurgeDataConsent": {
+        "additionalProperties": false,
+        "description": "Consent to purge one environment's provider data. It must name the\nenvironment the request is for, so a consent written for one\nenvironment cannot be replayed against another.",
+        "properties": {
+          "environment": {
+            "description": "The environment's name, exactly as in the request path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment"
         ],
         "type": "object"
       },
@@ -7302,6 +7327,32 @@
           "bootstrap"
         ],
         "type": "string"
+      },
+      "UndeployProviderDeploymentRequest": {
+        "additionalProperties": false,
+        "description": "Taking an environment's provider deployment down.",
+        "properties": {
+          "providerTargetId": {
+            "description": "The target to take the deployment down from. May be left out when\nthe environment has provider deployments on exactly one target.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "purgeData": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PurgeDataConsent",
+                "description": "Consent to destroy the environment's provider data - KV namespaces,\ndatabases, buckets and queues - along with the deployment. Left out,\nonly the deployment is removed and the data is kept."
+              }
+            ]
+          }
+        },
+        "type": "object"
       },
       "UnloadRefused": {
         "description": "The unload was not sent, and why. Not the `ErrorBody` envelope: this\nanswer predates it and is kept byte for byte on every prefix.",
@@ -11093,6 +11144,97 @@
           },
           "500": {
             "$ref": "#/components/responses/Internal"
+          }
+        },
+        "tags": [
+          "product"
+        ]
+      }
+    },
+    "/api/v1/apps/{app_id}/environments/{env_name}/provider-undeployments": {
+      "post": {
+        "operationId": "undeployProviderDeployment",
+        "parameters": [
+          {
+            "description": "The application's id.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The environment's name.",
+            "in": "path",
+            "name": "env_name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required. Replays of the same key return the same operation.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UndeployProviderDeploymentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductOperation"
+                }
+              }
+            },
+            "description": "A new `undeploy` operation was recorded and will be driven; poll `Location`. Its workflow runs the driver's `delete` against the desired state of the environment's latest provider deployment on the target. The environment's provider data is destroyed only when `purgeData` names this environment; otherwise it is kept.",
+            "headers": {
+              "Location": {
+                "description": "Where to poll the new operation.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
           }
         },
         "tags": [

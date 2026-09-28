@@ -252,13 +252,13 @@ impl OperationAccess {
         match self {
             OperationAccess::Read => {
                 "this credential holds no scope over the operation named, if there is one: a \
-                 provider deploy or rollback answers to read:<app>/<env> of the application and \
-                 environment in its record, a backend restore to admin:*/*"
+                 provider deploy, rollback or undeploy answers to read:<app>/<env> of the \
+                 application and environment in its record, a backend restore to admin:*/*"
             }
             OperationAccess::Cancel => {
                 "this credential holds no scope over the operation named, if there is one: a \
-                 provider deploy or rollback answers to deploy:<app>/<env> of the application \
-                 and environment in its record, a backend restore to admin:*/*"
+                 provider deploy, rollback or undeploy answers to deploy:<app>/<env> of the \
+                 application and environment in its record, a backend restore to admin:*/*"
             }
         }
     }
@@ -273,7 +273,8 @@ impl OperationController {
     fn of(current: Option<&(ProductOperation, Option<OperationScopeNames>)>) -> Self {
         match current {
             Some((operation, names)) => match operation.kind {
-                OperationKind::Deploy | OperationKind::Rollback => names
+                // A provider workflow: deploy, rollback or undeploy.
+                OperationKind::Deploy | OperationKind::Rollback | OperationKind::Delete => names
                     .clone()
                     .map(OperationController::ProviderWorkflow)
                     .unwrap_or(OperationController::None),

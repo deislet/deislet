@@ -36,9 +36,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use deis_build_core::BindingKind;
 use deis_provider_driver::{
-    ArtifactVersionRef, CredentialMaterial, DriverOperation, DriverOrchestrationOutcome,
-    DriverOrchestrator, DriverOrchestratorConfig, DriverRequest, DriverWorkspaceRoot,
-    ExecutableProviderDriverConfig, ProviderNeutralPlan, ProviderTargetRef,
+    ArtifactVersionRef, CredentialMaterial, DriverOperation, DriverOrchestratorConfig,
+    DriverWorkspaceRoot, ExecutableProviderDriverConfig, ProviderTargetRef,
 };
 use deis_wire::{CanonicalId, OperationState};
 use serde_json::Value;
@@ -618,7 +617,7 @@ async fn deploy(
     setup: &ProviderSetup,
     artifact: &ArtifactVersionRef,
     key: &str,
-) -> OperationState {
+) -> Value {
     let (status, accepted) = post_with_key(
         harness,
         "/api/apps/shop/environments/production/provider-deployments",
@@ -631,6 +630,27 @@ async fn deploy(
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    drive_to_success(harness, setup, &accepted).await
+}
+
+/// Take `shop/production` down over the API, with `body` as the request,
+/// and drive the undeploy until it settles.
+async fn undeploy(harness: &Harness, setup: &ProviderSetup, key: &str, body: Value) -> Value {
+    let (status, accepted) = post_with_key(
+        harness,
+        "/api/apps/shop/environments/production/provider-undeployments",
+        key,
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    drive_to_success(harness, setup, &accepted).await
+}
+
+/// Drive the workflow of the `accepted` operation the way the background
+/// dispatcher does, until it settles, and read it back the way `deis`
+/// waits for it.
+async fn drive_to_success(harness: &Harness, setup: &ProviderSetup, accepted: &Value) -> Value {
     let operation_id: CanonicalId = accepted["operationId"].as_str().unwrap().parse().unwrap();
     for _ in 0..40 {
         let outcome = harness
@@ -658,7 +678,7 @@ async fn deploy(
                     .await
                     .unwrap();
                 panic!(
-                    "deployment is waiting on the provider at step {}: {:#?}",
+                    "the workflow is waiting on the provider at step {}: {:#?}",
                     workflow.next_step_index,
                     record.map(|record| (record.driver_error, record.contract_failure))
                 )
@@ -667,7 +687,6 @@ async fn deploy(
             | ProviderDeploymentDriveOutcome::Advanced(_) => {}
         }
     }
-    // Read back the way `deis deploy` waits for it.
     let (status, settled) = json(
         &harness.router,
         "GET",
@@ -679,7 +698,7 @@ async fn deploy(
     let state: OperationState =
         serde_json::from_value(settled["operation"]["state"].clone()).unwrap();
     assert_eq!(state, OperationState::Succeeded, "{settled:#}");
-    state
+    settled
 }
 
 #[tokio::test]
@@ -829,57 +848,69 @@ async fn deis_deploys_to_cloudflare_through_the_driver_process_and_deletes_the_w
     let second = fake.toml_seen_by_call(fake.call_index("versions upload", 1));
     assert_eq!(second, toml, "the re-deploy binds the same resources");
 
-    // ── delete: the Worker goes, the data stays without purge consent ──
-    let delete = DriverRequest {
-        schema_version: 1,
-        operation_id: CanonicalId::new_v7(),
-        operation: DriverOperation::Delete,
-        desired_state_digest: "c".repeat(64).parse().unwrap(),
-        application_id: setup.application_id,
-        environment_id: setup.environment_id,
-        target: setup.target.clone(),
-        artifact: None,
-        plan: ProviderNeutralPlan::default(),
-        rollback_target: None,
-        reconciles: None,
-    };
-    let operation_id = delete.operation_id;
-    harness
-        .state
-        .store
-        .begin_provider_driver_operation(
-            delete,
-            operation_context("cloudflare-e2e-delete", "POST\n/provider-operations\nv1"),
-        )
-        .await
-        .unwrap();
-    let driver = setup
-        .dispatcher
-        .driver_for_target(setup.target.provider_target_id)
-        .await
-        .unwrap();
-    let outcome = DriverOrchestrator::new(
-        harness.state.store.as_ref().clone(),
-        DriverOrchestratorConfig::default(),
+    // ── undeploy: the Worker goes, the data stays without purge consent ──
+    let undeployed = undeploy(
+        &harness,
+        &setup,
+        "cloudflare-e2e-undeploy-1",
+        serde_json::json!({}),
     )
-    .unwrap()
-    .execute(operation_id, CanonicalId::new_v7(), &driver)
-    .await
-    .unwrap();
-    assert!(
-        matches!(outcome, DriverOrchestrationOutcome::Succeeded(_)),
-        "{outcome:?}"
-    );
+    .await;
+    assert_eq!(undeployed["kind"], "undeploy", "{undeployed:#}");
+    assert_eq!(undeployed["purgeData"], false, "{undeployed:#}");
+    assert_eq!(undeployed["operation"]["kind"], "delete", "{undeployed:#}");
     assert_eq!(
         fake.calls(&format!("delete {worker}")),
         vec![format!("delete {worker} --force")]
     );
     assert!(!fake.account().join("workers").join(&worker).exists());
     assert!(!fake.account().join("schedules").join(&worker).exists());
-    assert_eq!(fake.names("kv"), vec![kv]);
-    assert_eq!(fake.names("d1"), vec![d1]);
-    assert_eq!(fake.names("r2"), vec![r2]);
-    assert_eq!(fake.names("queues"), vec![queue]);
+    assert_eq!(fake.names("kv"), vec![kv.clone()]);
+    assert_eq!(fake.names("d1"), vec![d1.clone()]);
+    assert_eq!(fake.names("r2"), vec![r2.clone()]);
+    assert_eq!(fake.names("queues"), vec![queue.clone()]);
+
+    // Consent to purge has to name this environment; one written for
+    // another is refused before anything is recorded.
+    let (status, refused) = post_with_key(
+        &harness,
+        "/api/apps/shop/environments/production/provider-undeployments",
+        "cloudflare-e2e-undeploy-elsewhere",
+        serde_json::json!({"purgeData": {"environment": "staging"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(fake.names("kv"), vec![kv.clone()]);
+
+    // ── undeploy with consent: the environment's data goes too ──
+    let purged = undeploy(
+        &harness,
+        &setup,
+        "cloudflare-e2e-undeploy-purge",
+        serde_json::json!({"purgeData": {"environment": "production"}}),
+    )
+    .await;
+    assert_eq!(purged["purgeData"], true, "{purged:#}");
+    for kind in ["kv", "d1", "r2", "queues"] {
+        assert!(
+            fake.names(kind).is_empty(),
+            "{kind}: {:?}",
+            fake.names(kind)
+        );
+    }
+    for deleted in [
+        "kv namespace delete".to_owned(),
+        format!("d1 delete {d1}"),
+        format!("r2 bucket delete {r2}"),
+        format!("queues delete {queue}"),
+    ] {
+        assert_eq!(
+            fake.calls(&deleted).len(),
+            1,
+            "{deleted}: {:?}",
+            fake.argv()
+        );
+    }
 }
 
 /// A secret delivery the audit log cannot record does not happen: the

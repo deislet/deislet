@@ -1,6 +1,8 @@
 //! What a provider driver process is handed besides its request: the
 //! deployment's config values, its secret values and, for an undeploy the
-//! operator consented to, permission to destroy the environment's data.
+//! operator consented to, permission to destroy the environment's data
+//! (`purgeData` on the workflow, handed over as consent naming exactly the
+//! workflow's own environment).
 //!
 //! The values come from the environment snapshot the workflow's plan binds
 //! (`bindingSnapshotDigest`) and from nowhere else. A snapshot names secret
@@ -97,6 +99,18 @@ impl OperationInputSource for CatalogOperationInputs {
                     .await?;
                 inputs = inputs.with_secrets(secrets);
             }
+        }
+        if facts.purge_data {
+            // Only an undeploy the operator consented to carries this, and
+            // the consent names the workflow's own environment: a driver
+            // destroys nothing of any other.
+            info!(
+                operation_id = %facts.workflow_operation_id,
+                child_operation_id = %request.operation_id,
+                environment_id = %facts.environment_id,
+                "Handing a provider driver the operator's consent to destroy this environment's provider data"
+            );
+            inputs = inputs.with_purge(facts.environment_id);
         }
         Ok(inputs)
     }

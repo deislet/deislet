@@ -139,6 +139,7 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         crate::api::catalog::providers::get_provider_deployment,
         crate::api::catalog::providers::cancel_provider_deployment,
         crate::api::catalog::providers::rollback_provider_deployment,
+        crate::api::catalog::providers::undeploy_provider_deployment,
         crate::api::catalog::routes::list_routes,
         crate::api::catalog::routes::create_route,
         crate::api::catalog::routes::update_route,

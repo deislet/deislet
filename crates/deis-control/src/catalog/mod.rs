@@ -83,12 +83,13 @@ pub use provider_deployment_reconciler::{
     ProviderDeploymentReconciler, ProviderDeploymentReconcilerConfig,
 };
 pub use provider_driver_operation::{
-    BoundEnvironmentSnapshot, OPERATION_NOT_CANCELLABLE, OPERATION_NOT_ROLLBACKABLE,
-    PROVIDER_DEPLOYMENT_STEPS, PROVIDER_ROLLBACK_STEPS, ProviderDeploymentCancellation,
-    ProviderDeploymentDriveOutcome, ProviderDeploymentSpec, ProviderDeploymentStep,
-    ProviderDeploymentWorkflow, ProviderDriverOperationRecord, ProviderEnvironmentSnapshot,
-    ProviderInstallation, ProviderInstallationSpec, ProviderRollbackSpec, ProviderStepInputFacts,
-    ProviderTarget, ProviderTargetSpec, ProviderWorkflowKind,
+    BoundEnvironmentSnapshot, NOTHING_TO_UNDEPLOY, OPERATION_NOT_CANCELLABLE,
+    OPERATION_NOT_ROLLBACKABLE, PROVIDER_DEPLOYMENT_STEPS, PROVIDER_ROLLBACK_STEPS,
+    PROVIDER_UNDEPLOY_STEPS, ProviderDeploymentCancellation, ProviderDeploymentDriveOutcome,
+    ProviderDeploymentSpec, ProviderDeploymentStep, ProviderDeploymentWorkflow,
+    ProviderDriverOperationRecord, ProviderEnvironmentSnapshot, ProviderInstallation,
+    ProviderInstallationSpec, ProviderRollbackSpec, ProviderStepInputFacts, ProviderTarget,
+    ProviderTargetSpec, ProviderUndeploySpec, ProviderWorkflowKind,
 };
 pub use provider_driver_release::{
     ProviderDriverDispatcher, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,

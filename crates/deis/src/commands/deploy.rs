@@ -37,7 +37,7 @@ pub enum DeployTarget {
 
 impl DeployTarget {
     /// The build target that produces this target's payload.
-    fn build_target(self) -> &'static str {
+    pub(crate) fn build_target(self) -> &'static str {
         match self {
             Self::Deislet => build::DEISLET_VENDOR,
             Self::Cloudflare => "cloudflare",
@@ -45,7 +45,7 @@ impl DeployTarget {
     }
 
     /// The provider backend id a provider target of this kind drives.
-    fn backend_id(self) -> &'static str {
+    pub(crate) fn backend_id(self) -> &'static str {
         match self {
             Self::Deislet => "deislet",
             Self::Cloudflare => "cloudflare-workers-pages",
@@ -489,7 +489,7 @@ async fn deploy_to_provider(
 
 /// Pick the one provider target of `target`'s kind this environment may
 /// deploy to, or the one `requested` names.
-fn choose_provider_target(
+pub(crate) fn choose_provider_target(
     grants: &[ProviderTargetGrant],
     target: DeployTarget,
     requested: Option<&str>,

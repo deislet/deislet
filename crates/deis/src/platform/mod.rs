@@ -488,11 +488,16 @@ pub struct ProviderDeploymentStep {
 pub struct ProviderDeployment {
     pub operation: ProviderOperationSummary,
     /// `deploy` runs the driver's standard steps; `rollback` restores the
-    /// deployment named by `rolled_back_from_operation_id`.
+    /// deployment named by `rolled_back_from_operation_id`; `undeploy` takes
+    /// the environment's deployment down.
     pub kind: String,
     /// For a rollback workflow, the succeeded deployment it restores.
     #[serde(default)]
     pub rolled_back_from_operation_id: Option<CanonicalId>,
+    /// For an undeploy workflow, whether the environment's provider data is
+    /// destroyed along with the deployment.
+    #[serde(default)]
+    pub purge_data: bool,
     /// Every rollback that names this workflow as its source, oldest first,
     /// whatever state each reached.
     #[serde(default)]
@@ -2158,6 +2163,62 @@ impl Control {
             })?
             .to_str()
             .context("reading the provider deployment Location")?;
+        if location != expected {
+            bail!(
+                "{what}: operation {} returned Location {location:?}, expected the scoped path \
+                 {expected:?}",
+                operation.operation_id
+            );
+        }
+        Ok(operation)
+    }
+
+    /// Ask the control plane to take an environment's provider deployment
+    /// down. `purge_environment`, when given, is the consent to destroy the
+    /// environment's provider data and must name `environment`.
+    pub async fn undeploy_provider_deployment(
+        &self,
+        app_id: &str,
+        environment: &str,
+        provider_target_id: Option<CanonicalId>,
+        purge_environment: Option<&str>,
+    ) -> Result<ProviderOperationSummary> {
+        let what = format!("taking down the provider deployment of {environment} of app {app_id}");
+        let mut body = serde_json::json!({});
+        if let Some(target) = provider_target_id {
+            body["providerTargetId"] = serde_json::to_value(target)?;
+        }
+        if let Some(purge) = purge_environment {
+            body["purgeData"] = serde_json::json!({ "environment": purge });
+        }
+        let (_, headers, operation) = self
+            .send_with_metadata::<ProviderOperationSummary>(
+                self.request(
+                    Method::POST,
+                    &format!("/apps/{app_id}/environments/{environment}/provider-undeployments"),
+                )
+                .header(IDEMPOTENCY_KEY, new_idempotency_key())
+                .json(&body),
+                &what,
+            )
+            .await?;
+        // As for a deployment: checked against the path this CLI would have
+        // built, never followed as an arbitrary URL.
+        let expected = format!(
+            "{}{}",
+            self.product_prefix(),
+            Self::provider_deployment_route(app_id, environment, operation.operation_id)
+        );
+        let location = headers
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{what}: operation {} was accepted without a Location to poll",
+                    operation.operation_id
+                )
+            })?
+            .to_str()
+            .context("reading the provider undeploy Location")?;
         if location != expected {
             bail!(
                 "{what}: operation {} returned Location {location:?}, expected the scoped path \

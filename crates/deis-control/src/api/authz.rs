@@ -1077,6 +1077,24 @@ fn classify_canonical(
             app,
             "environments",
             env,
+            "provider-undeployments",
+        ] if writing => Requirement::new(
+            "provider_deployment.undeploy",
+            // Takes the deployment down and, with the request's explicit
+            // consent naming this environment, destroys its provider data.
+            // The catalog independently requires a provider deployment of
+            // this canonical application/environment on the target.
+            Verb::Deploy,
+            named(app),
+            named(env),
+        )
+        .changes_state(),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
             "provider-deployments",
             operation_id,
         ] => Requirement::new(
@@ -2147,6 +2165,12 @@ mod tests {
                 Verb::Deploy,
             ),
             (
+                "POST",
+                "/api/apps/demo/environments/production/provider-undeployments",
+                "provider_deployment.undeploy",
+                Verb::Deploy,
+            ),
+            (
                 "GET",
                 "/api/apps/demo/environments/production/deployment-plans/plan-1",
                 "deployment.plan.get",
@@ -2885,6 +2909,15 @@ mod tests {
                 "/api/apps/demo/environments/production/provider-deployments",
                 AuthorisedByCatalog {
                     by: "catalog::provider_target_grant::active_provider_target_grant_tx",
+                },
+            ),
+            // The target named in the body has to be one this environment
+            // has a provider deployment on; nothing else is taken down.
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-undeployments",
+                AuthorisedByCatalog {
+                    by: "catalog::provider_driver_operation::latest_undeployable_workflow_tx",
                 },
             ),
             (

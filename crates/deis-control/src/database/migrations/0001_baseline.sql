@@ -712,13 +712,13 @@ CREATE TABLE provider_deployment_steps (
                                      CHECK(driver_operation IN
                                        ('preflight', 'plan', 'prepare', 'upload',
                                         'verify', 'activate', 'observe',
-                                        'rollback', 'cleanup')),
+                                        'rollback', 'delete', 'cleanup')),
             child_operation_id  TEXT NOT NULL UNIQUE
                                      REFERENCES provider_driver_operations(operation_id),
             created_at          INTEGER NOT NULL,
             PRIMARY KEY(parent_operation_id, sequence),
             CHECK((driver_operation = 'cleanup' AND sequence >= 1)
-               OR (sequence = 0 AND driver_operation IN ('preflight', 'rollback'))
+               OR (sequence = 0 AND driver_operation IN ('preflight', 'rollback', 'delete'))
                OR (sequence = 1 AND driver_operation IN ('plan', 'observe'))
                OR (sequence = 2 AND driver_operation = 'prepare')
                OR (sequence = 3 AND driver_operation = 'upload')
@@ -732,7 +732,7 @@ CREATE TABLE provider_deployment_workflows (
             operation_id               TEXT PRIMARY KEY
                                                 REFERENCES product_operations(operation_id),
             kind                       TEXT NOT NULL DEFAULT 'deploy'
-                                                CHECK(kind IN ('deploy', 'rollback')),
+                                                CHECK(kind IN ('deploy', 'rollback', 'undeploy')),
             application_id             TEXT NOT NULL,
             environment_id             TEXT NOT NULL,
             provider_target_id         TEXT NOT NULL REFERENCES provider_targets(target_id),
@@ -747,6 +747,9 @@ CREATE TABLE provider_deployment_workflows (
             desired_state_sha256       TEXT NOT NULL,
             desired_state_json         TEXT NOT NULL CHECK(json_valid(desired_state_json)),
             plan_json                  TEXT NOT NULL CHECK(json_valid(plan_json)),
+            purge_data                 INTEGER NOT NULL DEFAULT 0
+                                                CHECK(purge_data IN (0, 1)
+                                                      AND (purge_data = 0 OR kind = 'undeploy')),
             rolled_back_from_operation_id TEXT
                                                 CHECK(rolled_back_from_operation_id IS NULL OR
                                                   (length(rolled_back_from_operation_id) = 36
@@ -865,7 +868,8 @@ CREATE TABLE provider_deployment_workflows (
             CHECK((kind = 'rollback') = (rolled_back_from_operation_id IS NOT NULL)),
             CHECK((state = 'succeeded'
                     AND ((kind = 'deploy' AND next_step_index = 7)
-                      OR (kind = 'rollback' AND next_step_index = 2)))
+                      OR (kind = 'rollback' AND next_step_index = 2)
+                      OR (kind = 'undeploy' AND next_step_index = 1)))
                OR state != 'succeeded'),
             CHECK((cancel_requested_at IS NULL) = (cancel_actor_id IS NULL)),
             CHECK((cancel_idempotency_key_sha256 IS NULL)
@@ -2258,7 +2262,7 @@ CREATE TRIGGER trg_provider_deployment_target_grant_insert_v1
         BEFORE INSERT ON provider_deployment_workflows
         WHEN NEW.provider_target_grant_id IS NULL
           OR NEW.target_grant_revision IS NULL
-          OR NOT EXISTS (
+          OR (NEW.kind != 'undeploy' AND NOT EXISTS (
               SELECT 1 FROM provider_target_grants g
                WHERE g.grant_id = NEW.provider_target_grant_id
                  AND g.application_id = NEW.application_id
@@ -2266,7 +2270,17 @@ CREATE TRIGGER trg_provider_deployment_target_grant_insert_v1
                  AND g.provider_target_id = NEW.provider_target_id
                  AND g.status = 'active'
                  AND g.revision = NEW.target_grant_revision
-          )
+          ))
+          -- An undeploy repeats the pin of the deployment it takes down,
+          -- which may since have been revoked: the grant must still be this
+          -- environment's grant on this target, whatever its status.
+          OR (NEW.kind = 'undeploy' AND NOT EXISTS (
+              SELECT 1 FROM provider_target_grants g
+               WHERE g.grant_id = NEW.provider_target_grant_id
+                 AND g.application_id = NEW.application_id
+                 AND g.environment_id = NEW.environment_id
+                 AND g.provider_target_id = NEW.provider_target_id
+          ))
         BEGIN
             SELECT RAISE(ABORT, 'provider deployment requires an exact active target grant');
         END;

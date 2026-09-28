@@ -13,7 +13,8 @@ apart is the point:
   generated target-status JSON as the product documentation and Web console;
   it does not infer support from an adapter being present.
 - **A Deislet platform.** `deis deploy`, `deis versions`, `deis deployments`,
-  `deis provider-deployments`, `deis rollback`, `deis status`, `deis routes`,
+  `deis provider-deployments`, `deis undeploy`, `deis rollback`, `deis status`,
+  `deis routes`,
   `deis domains`,
   `deis secret`, `deis logs`, `deis tail`, `deis trace`,
   `deis kv`, `deis db` and `deis blob` talk to a `deis-control`; for logs and
@@ -196,6 +197,21 @@ driver, credential, target and grant is in
 [`docs/operations/cloudflare.md`](../../docs/operations/cloudflare.md). This
 path is verified against a fake `wrangler`, not yet a real account.
 
+The deployment-time `config` values in `.config.json` go with the request;
+secret values are set on the environment with `deis secret set` and reach the
+driver from the control plane, never from the CLI.
+
+### `deis undeploy [--target …] [--purge-data …]`
+
+Take the environment's deployment on the provider (`--target cloudflare`) down: the control plane
+records an `undeploy` operation that runs the driver's `delete` against the
+environment's latest provider deployment, and the command follows it until it
+settles. The Worker goes; the environment's provider data - KV namespaces,
+databases, buckets and queues - is kept. `--purge-data` destroys it too, and
+takes the environment's name again as the consent: a value naming any other
+environment is refused. `--provider-target` chooses the target when the
+environment has deployed to more than one.
+
 ### `deis targets list|inspect`
 
 Show each target's implementation-evidence maturity, whole-standard
@@ -228,8 +244,8 @@ provider's own cloud, not the pointer moves `deis deployments` lists. A
 provider deployment runs for as long as that cloud takes, so unlike a pointer
 move it can be asked to stop, and once finished it can be undone.
 
-- `list [--limit N]` prints them newest first: operation id, kind (`deploy` or
-  `rollback`), state, phase, progress, what a rollback was rolled back from,
+- `list [--limit N]` prints them newest first: operation id, kind (`deploy`,
+  `rollback` or `undeploy`), state, phase, progress, what a rollback was rolled back from,
   and when a cancel was requested. One request, so `--limit` is capped at
   1000 - one page of the list route - and the line under the table says how
   many rows are behind the ones printed, exactly as `deis deployments` does.

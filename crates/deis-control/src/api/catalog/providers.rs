@@ -54,7 +54,7 @@ use crate::{
         ProviderLifecycleResourceKind, ProviderRollbackSpec, ProviderTarget, ProviderTargetGrant,
         ProviderTargetGrantAuditEvent, ProviderTargetGrantHistoryFilter,
         ProviderTargetGrantMutationContext, ProviderTargetGrantSpec,
-        ProviderTargetGrantStatusFilter, ProviderTargetSpec, SecretsBackend,
+        ProviderTargetGrantStatusFilter, ProviderTargetSpec, ProviderUndeploySpec, SecretsBackend,
     },
     identity::Principal,
 };
@@ -167,6 +167,32 @@ pub struct BeginProviderDeploymentRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub config_values: BTreeMap<String, serde_json::Value>,
+}
+
+/// Taking an environment's provider deployment down.
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UndeployProviderDeploymentRequest {
+    /// The target to take the deployment down from. May be left out when
+    /// the environment has provider deployments on exactly one target.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = Uuid)]
+    pub provider_target_id: Option<CanonicalId>,
+    /// Consent to destroy the environment's provider data - KV namespaces,
+    /// databases, buckets and queues - along with the deployment. Left out,
+    /// only the deployment is removed and the data is kept.
+    #[serde(default)]
+    pub purge_data: Option<PurgeDataConsent>,
+}
+
+/// Consent to purge one environment's provider data. It must name the
+/// environment the request is for, so a consent written for one
+/// environment cannot be replayed against another.
+#[derive(Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PurgeDataConsent {
+    /// The environment's name, exactly as in the request path.
+    pub environment: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -2333,6 +2359,75 @@ pub async fn rollback_provider_deployment(
             context,
         )
         .await?;
+    let headers = operation_headers(paths, &operation, &app_id, &env_name)?;
+    Ok((StatusCode::ACCEPTED, headers, Json(operation)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/v1/apps/{app_id}/environments/{env_name}/provider-undeployments",
+    operation_id = "undeployProviderDeployment",
+    tag = "product",
+    params(("app_id" = String, Path, description = "The application's id."), ("env_name" = String, Path, description = "The environment's name."), ("Idempotency-Key" = String, Header, description = "Required. Replays of the same key return the same operation.")),
+    request_body = UndeployProviderDeploymentRequest,
+    responses(
+        (status = 202, description = "A new `undeploy` operation was recorded and will be driven; poll `Location`. Its workflow runs the driver's `delete` against the desired state of the environment's latest provider deployment on the target. The environment's provider data is destroyed only when `purgeData` names this environment; otherwise it is kept.", body = openapi::ProductOperationDocument, headers(("Location" = String, description = "Where to poll the new operation."))),
+        (status = 400, response = openapi::BadRequest),
+        (status = 403, response = openapi::Forbidden),
+        (status = 404, response = openapi::NotFound),
+        (status = 409, response = openapi::Conflict),
+        (status = 503, response = openapi::ServiceUnavailable),
+        (status = 401, response = openapi::Unauthenticated),
+    )
+)]
+pub async fn undeploy_provider_deployment(
+    State(state): State<CatalogState>,
+    Path((app_id, env_name)): Path<(String, String)>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    paths: ApiPaths,
+    Json(request): Json<UndeployProviderDeploymentRequest>,
+) -> ApiResult<(StatusCode, HeaderMap, Json<ProductOperation>)> {
+    let app = state.store.get_app(&app_id).await?;
+    let environment = state
+        .store
+        .get_environment(&app_id, &env_name)
+        .await?;
+    let purge_data = match request.purge_data {
+        None => false,
+        Some(consent) if consent.environment == env_name => true,
+        Some(_) => {
+            return Err(ApiError::from(CatalogError::invalid(
+                "purgeData.environment must name the environment being undeployed; consent to destroy one environment's data is never taken for another's",
+            )));
+        }
+    };
+    let context = operation_context(
+        &headers,
+        &principal,
+        &format!("/api/apps/{app_id}/environments/{env_name}/provider-undeployments"),
+    )?;
+    let operation = state
+        .store
+        .begin_provider_undeploy(
+            ProviderUndeploySpec {
+                application_id: app.canonical_id,
+                environment_id: environment.canonical_id,
+                provider_target_id: request.provider_target_id,
+                purge_data,
+            },
+            context,
+        )
+        .await?;
+    if purge_data {
+        tracing::warn!(
+            operation_id = %operation.operation_id,
+            app = %app_id,
+            environment = %env_name,
+            actor = %principal.account.as_deref().unwrap_or(""),
+            "Provider undeploy recorded with consent to destroy the environment's provider data"
+        );
+    }
     let headers = operation_headers(paths, &operation, &app_id, &env_name)?;
     Ok((StatusCode::ACCEPTED, headers, Json(operation)))
 }

@@ -216,6 +216,15 @@ pub const PROVIDER_DEPLOYMENT_STEPS: [DriverOperation; 7] = [
 pub const PROVIDER_ROLLBACK_STEPS: [DriverOperation; 2] =
     [DriverOperation::Rollback, DriverOperation::Observe];
 
+/// The undeploy path: ask the driver to take the deployment down. Whether the
+/// environment's provider data goes with it is the workflow's `purgeData`,
+/// handed to the driver as consent naming this environment.
+pub const PROVIDER_UNDEPLOY_STEPS: [DriverOperation; 1] = [DriverOperation::Delete];
+
+/// Structured code for an undeploy of an environment that has no provider
+/// deployment on the target to take down.
+pub const NOTHING_TO_UNDEPLOY: &str = "nothing-to-undeploy";
+
 /// Structured code for a cancel of an operation that is terminal or already
 /// cancelling. Spelled as a `<code>: ` message prefix, which the API lifts
 /// into the error envelope.
@@ -230,6 +239,7 @@ pub const OPERATION_NOT_ROLLBACKABLE: &str = "operation-not-rollbackable";
 pub enum ProviderWorkflowKind {
     Deploy,
     Rollback,
+    Undeploy,
 }
 
 impl ProviderWorkflowKind {
@@ -238,6 +248,7 @@ impl ProviderWorkflowKind {
         match self {
             Self::Deploy => "deploy",
             Self::Rollback => "rollback",
+            Self::Undeploy => "undeploy",
         }
     }
 
@@ -246,6 +257,7 @@ impl ProviderWorkflowKind {
         match value {
             "deploy" => Some(Self::Deploy),
             "rollback" => Some(Self::Rollback),
+            "undeploy" => Some(Self::Undeploy),
             _ => None,
         }
     }
@@ -256,6 +268,7 @@ impl ProviderWorkflowKind {
         match self {
             Self::Deploy => OperationKind::Deploy,
             Self::Rollback => OperationKind::Rollback,
+            Self::Undeploy => OperationKind::Delete,
         }
     }
 
@@ -266,6 +279,7 @@ impl ProviderWorkflowKind {
         match self {
             Self::Deploy => &PROVIDER_DEPLOYMENT_STEPS,
             Self::Rollback => &PROVIDER_ROLLBACK_STEPS,
+            Self::Undeploy => &PROVIDER_UNDEPLOY_STEPS,
         }
     }
 }
@@ -318,6 +332,9 @@ pub struct ProviderStepInputFacts {
     pub kind: ProviderWorkflowKind,
     pub application_id: CanonicalId,
     pub environment_id: CanonicalId,
+    /// Whether the workflow carries the operator's consent to destroy this
+    /// environment's provider data.
+    pub purge_data: bool,
     /// The snapshot the workflow's plan binds, with the catalog ids of its
     /// application and environment.
     pub snapshot: Option<BoundEnvironmentSnapshot>,
@@ -339,6 +356,22 @@ pub struct ProviderRollbackSpec {
     pub environment_id: CanonicalId,
     /// The succeeded `deploy` workflow whose provider deployment is restored.
     pub rolled_back_from_operation_id: CanonicalId,
+}
+
+/// Taking an environment's provider deployment down.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderUndeploySpec {
+    pub application_id: CanonicalId,
+    pub environment_id: CanonicalId,
+    /// The target to take the deployment down from. `None` means the one
+    /// target this environment has provider deployments on; an environment
+    /// with deployments on several must name one.
+    pub provider_target_id: Option<CanonicalId>,
+    /// The operator's consent to destroy the environment's provider data
+    /// (KV, databases, buckets, queues) along with the deployment. Without
+    /// it only the deployment itself is removed.
+    pub purge_data: bool,
 }
 
 /// A request to cancel one provider workflow.
@@ -374,11 +407,17 @@ pub struct ProviderDeploymentWorkflow {
     #[schema(value_type = crate::api::openapi::ProductOperationDocument)]
     pub operation: ProductOperation,
     /// `deploy` runs the seven standard steps; `rollback` runs `rollback`
-    /// then `observe` against the desired state of the deployment it names.
+    /// then `observe` against the desired state of the deployment it names;
+    /// `undeploy` runs `delete` against the desired state of the
+    /// environment's latest deployment on the target.
     pub kind: ProviderWorkflowKind,
     /// For a `rollback` workflow, the succeeded deployment it restores.
     #[schema(value_type = Option<String>, format = Uuid)]
     pub rolled_back_from_operation_id: Option<CanonicalId>,
+    /// For an `undeploy` workflow: whether the operator consented to
+    /// destroying the environment's provider data along with the
+    /// deployment. Always `false` for any other kind.
+    pub purge_data: bool,
     /// Every rollback workflow that names this workflow as its source,
     /// oldest first, whatever state each has reached.
     #[schema(value_type = Vec<String>)]
@@ -933,6 +972,7 @@ impl CatalogStore {
                         operation_id,
                         kind: ProviderWorkflowKind::Deploy,
                         rolled_back_from_operation_id: None,
+                        purge_data: false,
                         rollback_target: None,
                         organization_id: target.organization_id,
                         desired: &desired,
@@ -1066,6 +1106,7 @@ impl CatalogStore {
                         operation_id,
                         kind: ProviderWorkflowKind::Rollback,
                         rolled_back_from_operation_id: Some(source_id),
+                        purge_data: false,
                         rollback_target: Some(&rollback_target),
                         organization_id: target.organization_id,
                         desired: &desired,
@@ -1083,6 +1124,117 @@ impl CatalogStore {
                     provider_version_id = ?rollback_target.provider_version_id,
                     provider_target_id = %source.provider_target_id,
                     "Provider rollback recorded; the dispatcher will drive it"
+                );
+                transaction.commit()?;
+                Ok(operation)
+            })
+            .await
+    }
+
+    /// Start taking an environment's provider deployment down.
+    ///
+    /// The new `undeploy` operation runs the driver's `delete` against the
+    /// exact desired state of the environment's latest `deploy` or
+    /// `rollback` workflow on the target, whatever state that reached: a
+    /// deployment that failed half-way can have left a Worker behind, and a
+    /// `delete` of one that left nothing is a no-op to the provider.
+    /// Unlike a deployment it needs no active target grant - revoking the
+    /// grant must not strand what was deployed under it - but the target
+    /// and its installation must still be usable, because the driver runs
+    /// against them.
+    ///
+    /// `purge_data` is recorded on the workflow and handed to the driver as
+    /// consent naming this environment; without it the provider's data
+    /// resources are kept. Replays under the same actor, key and request
+    /// facts return the operation the first request created.
+    pub async fn begin_provider_undeploy(
+        &self,
+        spec: ProviderUndeploySpec,
+        context: OperationRequestContext,
+    ) -> CatalogResult<ProductOperation> {
+        let request_json = canonical_json(&spec, "provider undeploy request")?;
+        let request_digest = sha256_hex(request_json.as_bytes());
+        let context = context.for_request_fact("provider-undeploy-request-sha256", &request_digest);
+        let operation_id = CanonicalId::new_v7();
+        self.database()
+            .with_connection(move |connection| {
+                let transaction = connection.unchecked_transaction()?;
+                if let Some(existing_id) =
+                    find_operation_request_tx(&transaction, OperationKind::Delete, &context)?
+                {
+                    let existing = load_provider_deployment_workflow(&transaction, existing_id)?
+                        .ok_or_else(|| {
+                            CatalogError::conflict(format!(
+                                "undeploy operation {existing_id} is missing its provider workflow"
+                            ))
+                        })?;
+                    transaction.commit()?;
+                    return Ok(existing.operation);
+                }
+                let source_id = latest_undeployable_workflow_tx(
+                    &transaction,
+                    spec.application_id,
+                    spec.environment_id,
+                    spec.provider_target_id,
+                )?;
+                let source = load_provider_deployment_workflow(&transaction, source_id)?
+                    .ok_or_else(|| {
+                        CatalogError::conflict(format!(
+                            "provider deployment {source_id} is missing its workflow"
+                        ))
+                    })?;
+                let target =
+                    load_target(&transaction, source.provider_target_id)?.ok_or_else(|| {
+                        CatalogError::not_found(format!(
+                            "provider target {}",
+                            source.provider_target_id
+                        ))
+                    })?;
+                let validation_request = DriverRequest {
+                    schema_version: 1,
+                    operation_id: CanonicalId::new_v7(),
+                    operation: DriverOperation::Delete,
+                    desired_state_digest: source.desired_state_digest.clone(),
+                    application_id: spec.application_id,
+                    environment_id: spec.environment_id,
+                    target: provider_target_ref(&target),
+                    artifact: Some(source.artifact.clone()),
+                    plan: source.plan.clone(),
+                    rollback_target: None,
+                    reconciles: None,
+                };
+                validate_operation_target(&target, &validation_request)?;
+                resolve_application_environment(&transaction, &validation_request)?;
+                let (desired_state_json, plan_json): (String, String) = transaction.query_row(
+                    "SELECT desired_state_json, plan_json FROM provider_deployment_workflows
+                      WHERE operation_id = ?1",
+                    [source_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                let desired: ProviderDeploymentDesiredState =
+                    parse_json(&desired_state_json, "provider deployment desired state")?;
+                let operation = insert_provider_workflow_tx(
+                    &transaction,
+                    &ProviderWorkflowInsert {
+                        operation_id,
+                        kind: ProviderWorkflowKind::Undeploy,
+                        rolled_back_from_operation_id: None,
+                        purge_data: spec.purge_data,
+                        rollback_target: None,
+                        organization_id: target.organization_id,
+                        desired: &desired,
+                        desired_state_json: &desired_state_json,
+                        desired_state_digest: &source.desired_state_digest,
+                        plan_json: &plan_json,
+                    },
+                    &context,
+                )?;
+                info!(
+                    %operation_id,
+                    undeploys_operation_id = %source_id,
+                    provider_target_id = %source.provider_target_id,
+                    purge_data = spec.purge_data,
+                    "Provider undeploy recorded; the dispatcher will drive it"
                 );
                 transaction.commit()?;
                 Ok(operation)
@@ -1289,10 +1441,10 @@ impl CatalogStore {
     ) -> CatalogResult<Option<ProviderStepInputFacts>> {
         self.database()
             .with_connection(move |connection| {
-                let row: Option<(String, String, String, String, String)> = connection
+                let row: Option<(String, String, String, String, String, bool)> = connection
                     .query_row(
                         "SELECT w.operation_id, w.kind, w.application_id, w.environment_id,
-                                w.plan_json
+                                w.plan_json, w.purge_data
                            FROM provider_deployment_steps s
                            JOIN provider_deployment_workflows w
                              ON w.operation_id = s.parent_operation_id
@@ -1305,11 +1457,12 @@ impl CatalogStore {
                                 row.get(2)?,
                                 row.get(3)?,
                                 row.get(4)?,
+                                row.get(5)?,
                             ))
                         },
                     )
                     .optional()?;
-                let Some((workflow, kind, application, environment, plan_json)) = row
+                let Some((workflow, kind, application, environment, plan_json, purge_data)) = row
                 else {
                     return Ok(None);
                 };
@@ -1354,6 +1507,7 @@ impl CatalogStore {
                     kind,
                     application_id: parse_id(&application, "provider deployment application")?,
                     environment_id,
+                    purge_data: purge_data && kind == ProviderWorkflowKind::Undeploy,
                     snapshot,
                 }))
             })
@@ -2289,6 +2443,9 @@ struct ProviderWorkflowInsert<'a> {
     operation_id: CanonicalId,
     kind: ProviderWorkflowKind,
     rolled_back_from_operation_id: Option<CanonicalId>,
+    /// Consent to destroy the environment's provider data; only an undeploy
+    /// carries it.
+    purge_data: bool,
     /// For a rollback, the activation its first step restores; `None` for
     /// a deploy.
     rollback_target: Option<&'a DriverRollbackTarget>,
@@ -2297,6 +2454,50 @@ struct ProviderWorkflowInsert<'a> {
     desired_state_json: &'a str,
     desired_state_digest: &'a Sha256Digest,
     plan_json: &'a str,
+}
+
+/// The workflow an undeploy takes down: the newest `deploy` or `rollback`
+/// of this environment on `target_id`, or - with no target named - on the
+/// one target the environment has deployed to.
+fn latest_undeployable_workflow_tx(
+    connection: &Connection,
+    application_id: CanonicalId,
+    environment_id: CanonicalId,
+    target_id: Option<CanonicalId>,
+) -> CatalogResult<CanonicalId> {
+    let mut statement = connection.prepare(
+        "SELECT operation_id, provider_target_id FROM provider_deployment_workflows
+          WHERE application_id = ?1 AND environment_id = ?2
+            AND kind IN ('deploy', 'rollback')
+            AND (?3 IS NULL OR provider_target_id = ?3)
+          ORDER BY created_at DESC, operation_id DESC",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                application_id.to_string(),
+                environment_id.to_string(),
+                target_id.map(|id| id.to_string()),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some((latest, latest_target)) = rows.first() else {
+        return Err(CatalogError::conflict(format!(
+            "{NOTHING_TO_UNDEPLOY}: this environment has no provider deployment{} to take down",
+            if target_id.is_some() {
+                " on that target"
+            } else {
+                ""
+            }
+        )));
+    };
+    if target_id.is_none() && rows.iter().any(|(_, target)| target != latest_target) {
+        return Err(CatalogError::invalid(
+            "this environment has provider deployments on more than one target; name the one to take down with providerTargetId",
+        ));
+    }
+    parse_id(latest, "provider deployment operation")
 }
 
 /// Record `snapshot` in the table Deislet deployments record theirs in.
@@ -2407,10 +2608,10 @@ fn insert_provider_workflow_tx(
             target_revision, provider_target_grant_id, target_grant_revision,
             artifact_version_id, canonical_artifact_sha256,
             provider_payload_sha256, desired_state_sha256, desired_state_json,
-            plan_json, rolled_back_from_operation_id, state, next_step_index,
-            revision, created_at, updated_at)
+            plan_json, rolled_back_from_operation_id, purge_data, state,
+            next_step_index, revision, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                 ?13, ?14, ?15, 'queued', 0, 1, ?16, ?16)",
+                 ?13, ?14, ?15, ?17, 'queued', 0, 1, ?16, ?16)",
         params![
             operation_id.to_string(),
             insert.kind.as_str(),
@@ -2436,6 +2637,7 @@ fn insert_provider_workflow_tx(
                 .rolled_back_from_operation_id
                 .map(|id| id.to_string()),
             now,
+            insert.purge_data,
         ],
     )?;
     create_provider_deployment_step_tx(
@@ -2581,7 +2783,7 @@ fn sync_parent_provider_details_tx(
         "UPDATE product_operations
             SET child_operation_ids = ?2, provider_operations = ?3,
                 revision = revision + 1, updated_at = ?4
-          WHERE operation_id = ?1 AND kind IN ('deploy', 'rollback')",
+          WHERE operation_id = ?1 AND kind IN ('deploy', 'rollback', 'delete')",
         params![
             parent_operation_id.to_string(),
             child_json,
@@ -2606,7 +2808,8 @@ fn load_provider_deployment_workflow(
                     dispatch_not_before, dispatch_failure_count,
                     dispatch_failure_child_operation_id,
                     last_dispatch_error_code, last_dispatch_error_message,
-                    kind, rolled_back_from_operation_id, cancel_requested_at
+                    kind, rolled_back_from_operation_id, cancel_requested_at,
+                    purge_data
                FROM provider_deployment_workflows WHERE operation_id = ?1",
             [operation_id.to_string()],
             |row| {
@@ -2633,6 +2836,7 @@ fn load_provider_deployment_workflow(
                     row.get::<_, String>(19)?,
                     row.get::<_, Option<String>>(20)?,
                     row.get::<_, Option<i64>>(21)?,
+                    row.get::<_, bool>(22)?,
                 ))
             },
         )
@@ -2651,6 +2855,12 @@ fn load_provider_deployment_workflow(
     if (kind == ProviderWorkflowKind::Rollback) != rolled_back_from_operation_id.is_some() {
         return Err(CatalogError::invalid(
             "provider workflow kind and rollback source disagree",
+        ));
+    }
+    let purge_data = row.22;
+    if purge_data && kind != ProviderWorkflowKind::Undeploy {
+        return Err(CatalogError::invalid(
+            "only an undeploy workflow may carry consent to purge provider data",
         ));
     }
     let cancel_requested_at = row
@@ -2860,6 +3070,7 @@ fn load_provider_deployment_workflow(
         operation,
         kind,
         rolled_back_from_operation_id,
+        purge_data,
         rollback_operation_ids,
         cancel_requested_at,
         provider_target_id,
@@ -5537,6 +5748,7 @@ mod tests {
             DriverOperation::Upload
                 | DriverOperation::Activate
                 | DriverOperation::Rollback
+                | DriverOperation::Delete
                 | DriverOperation::Cleanup
         );
         DriverReceipt {
@@ -5557,8 +5769,10 @@ mod tests {
                     Some(DeploymentState::Active)
                 }
                 DriverOperation::Rollback => Some(DeploymentState::RolledBack),
-                DriverOperation::Cleanup => None,
-                _ => unreachable!("workflows use only the deploy, rollback and cleanup steps"),
+                DriverOperation::Delete | DriverOperation::Cleanup => None,
+                _ => unreachable!(
+                    "workflows use only the deploy, rollback, undeploy and cleanup steps"
+                ),
             },
             side_effect: if confirmed {
                 SideEffect::Confirmed
@@ -6069,6 +6283,168 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// An undeploy runs the driver's `delete` against the exact desired state
+    /// of the environment's latest deployment, needs no active grant, and
+    /// carries purge consent to the driver only when it was given.
+    #[tokio::test]
+    async fn an_undeploy_deletes_the_latest_deployment_and_carries_consent_only_when_given() {
+        let harness = harness().await;
+        let undeploy = |purge_data| ProviderUndeploySpec {
+            application_id: harness.application_id,
+            environment_id: harness.environment_id,
+            provider_target_id: None,
+            purge_data,
+        };
+        let nothing = harness
+            .store
+            .begin_provider_undeploy(undeploy(false), context("undeploy-before-any-deploy"))
+            .await
+            .unwrap_err();
+        assert!(
+            nothing.to_string().contains(NOTHING_TO_UNDEPLOY),
+            "{nothing}"
+        );
+
+        let deployed = harness
+            .store
+            .begin_provider_deployment(
+                ProviderDeploymentSpec {
+                    application_id: harness.application_id,
+                    environment_id: harness.environment_id,
+                    provider_target_id: harness.target.target_id,
+                    artifact: attach_cloudflare_artifact(&harness).await,
+                    plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
+                },
+                context("undeploy-source-deployment"),
+            )
+            .await
+            .unwrap();
+        let driver = SuccessfulDriver {
+            manifest: manifest(),
+            calls: Mutex::new(Vec::new()),
+        };
+        for _ in 0..PROVIDER_DEPLOYMENT_STEPS.len() {
+            harness
+                .store
+                .drive_provider_deployment_once_for_test(
+                    deployed.operation_id,
+                    CanonicalId::new_v7(),
+                    &driver,
+                    DriverOrchestratorConfig::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let source = harness
+            .store
+            .provider_deployment_workflow(deployed.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.operation.state, OperationState::Succeeded);
+        let deploy_step = source.steps[0].child_operation_id;
+        assert!(
+            !harness
+                .store
+                .provider_step_input_facts(deploy_step)
+                .await
+                .unwrap()
+                .unwrap()
+                .purge_data
+        );
+
+        // Revoking the grant must not strand what was deployed under it.
+        harness
+            .store
+            .revoke_provider_target_grant(
+                harness.grant.grant_id,
+                harness.grant.revision,
+                ProviderTargetGrantMutationContext {
+                    actor_subject: "account:provider-test-admin".to_owned(),
+                    idempotency_record: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let request_context = context("undeploy-with-purge");
+        let accepted = harness
+            .store
+            .begin_provider_undeploy(undeploy(true), request_context.clone())
+            .await
+            .unwrap();
+        assert_eq!(accepted.kind, OperationKind::Delete);
+        let replay = harness
+            .store
+            .begin_provider_undeploy(undeploy(true), request_context)
+            .await
+            .unwrap();
+        assert_eq!(replay.operation_id, accepted.operation_id);
+
+        let workflow = harness
+            .store
+            .provider_deployment_workflow(accepted.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(workflow.kind, ProviderWorkflowKind::Undeploy);
+        assert!(workflow.purge_data);
+        assert_eq!(workflow.desired_state_digest, source.desired_state_digest);
+        assert_eq!(workflow.artifact, source.artifact);
+        assert_eq!(workflow.steps.len(), 1);
+        assert_eq!(workflow.steps[0].operation, DriverOperation::Delete);
+        let facts = harness
+            .store
+            .provider_step_input_facts(workflow.steps[0].child_operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(facts.purge_data);
+        assert_eq!(facts.environment_id, harness.environment_id);
+
+        driver.calls.lock().unwrap().clear();
+        let outcome = harness
+            .store
+            .drive_provider_deployment_once_for_test(
+                accepted.operation_id,
+                CanonicalId::new_v7(),
+                &driver,
+                DriverOrchestratorConfig::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ProviderDeploymentDriveOutcome::Succeeded(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(*driver.calls.lock().unwrap(), [DriverOperation::Delete]);
+
+        // Without consent the workflow says so, and so do its step's inputs.
+        let kept = harness
+            .store
+            .begin_provider_undeploy(undeploy(false), context("undeploy-keeping-data"))
+            .await
+            .unwrap();
+        let kept = harness
+            .store
+            .provider_deployment_workflow(kept.operation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!kept.purge_data);
+        assert!(
+            !harness
+                .store
+                .provider_step_input_facts(kept.steps[0].child_operation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .purge_data
         );
     }
 
