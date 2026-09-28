@@ -68,6 +68,12 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
+        Self::with_assets(&[])
+    }
+
+    /// A harness whose artifact also carries these static assets under
+    /// `assets/`, as a build of a project with a public directory does.
+    fn with_assets(assets: &[deis_build_core::StaticAsset]) -> Self {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("account");
         fs::create_dir_all(state.join("fail")).unwrap();
@@ -80,11 +86,18 @@ impl Harness {
         let artifacts = deis_build_adapter_cloudflare::generate(
             &[("/".to_owned(), "./handlers/index.ts".to_owned())],
             &project(),
-            &[],
+            assets,
         )
         .expect("adapter generates the artifact");
         let artifact = root.path().join("artifact");
         fs::create_dir_all(&artifact).unwrap();
+        for asset in assets {
+            let path = artifact
+                .join(deis_build_adapter_cloudflare::ASSETS_DIR)
+                .join(&asset.path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "asset").unwrap();
+        }
         for (name, contents) in &artifacts.config_files {
             fs::write(artifact.join(name), contents).unwrap();
         }
@@ -856,6 +869,118 @@ async fn a_failed_triggers_step_is_reconciled_by_applying_it_again() {
         harness.account_file("schedules", &worker).as_deref(),
         Some("[\"*/5 * * * *\"]\n")
     );
+}
+
+#[tokio::test]
+async fn an_application_with_static_assets_activates_and_reconciles() {
+    // Real wrangler 4.129.0 refuses a `triggers deploy` whose `[assets]
+    // directory` does not exist, although it uploads nothing from it.
+    let harness = Harness::with_assets(&[deis_build_core::StaticAsset {
+        path: "css/app.css".to_owned(),
+        content_type: "text/css; charset=utf-8".to_owned(),
+    }]);
+    let worker = harness.scope().worker_name();
+    harness.run(DriverOperation::Prepare).await;
+    harness.run(DriverOperation::Upload).await;
+    let upload = fs::read_to_string(
+        harness
+            .state()
+            .join(format!("cwd.{}", harness.call_index("versions upload"))),
+    )
+    .unwrap();
+    assert!(upload.contains("[assets]"), "{upload}");
+
+    let receipt = harness.run(DriverOperation::Activate).await;
+    assert_eq!(receipt.deployment_state, Some(DeploymentState::Active));
+    assert_eq!(
+        harness.account_file("schedules", &worker).as_deref(),
+        Some("[\"*/5 * * * *\"]\n")
+    );
+    let triggers = fs::read_to_string(
+        harness
+            .state()
+            .join(format!("cwd.{}", harness.call_index("triggers deploy"))),
+    )
+    .unwrap();
+    assert!(triggers.contains("[assets]"), "{triggers}");
+
+    let mut request = harness.request(DriverOperation::Reconcile, DIGEST_A);
+    request.reconciles = Some(DriverReconcileContext {
+        operation: DriverOperation::Activate,
+    });
+    let receipt = harness.execute(&request).await.unwrap();
+    assert_eq!(receipt.deployment_state, Some(DeploymentState::Active));
+}
+
+#[tokio::test]
+async fn the_fake_refuses_a_missing_assets_directory_like_wrangler() {
+    let harness = Harness::new();
+    let dir = harness.root.path().join("direct");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"w\"\nmain = \"index.js\"\n\n[assets]\ndirectory = \"./assets\"\n",
+    )
+    .unwrap();
+    for args in [
+        &["triggers", "deploy"][..],
+        &["deploy", "--message", "m"],
+        &["versions", "upload", "--message", "m"],
+    ] {
+        let output = std::process::Command::new(harness.root.path().join("fake-wrangler"))
+            .args(args)
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("does not exist"), "{args:?}: {stderr}");
+    }
+}
+
+#[tokio::test]
+async fn uploaded_versions_have_no_preview_url() {
+    let harness = Harness::new();
+    let worker = harness.scope().worker_name();
+    harness.run(DriverOperation::Prepare).await;
+    harness.run(DriverOperation::Upload).await;
+    harness.run(DriverOperation::Activate).await;
+    assert!(harness.account_file("subdomain", &worker).is_some());
+    assert_eq!(harness.account_file("previews", &worker), None);
+    for prefix in ["deploy ", "versions upload", "triggers deploy"] {
+        let config = fs::read_to_string(
+            harness
+                .state()
+                .join(format!("cwd.{}", harness.call_index(prefix))),
+        )
+        .unwrap();
+        assert!(config.contains("preview_urls = false"), "{prefix}: {config}");
+    }
+}
+
+#[tokio::test]
+async fn reconciling_an_upload_whose_placeholder_never_created_the_worker_is_not_applied() {
+    let harness = Harness::new();
+    harness.run(DriverOperation::Prepare).await;
+    harness.inject_failure("deploy", 1, 10013, "temporary");
+    let error = harness.fail_with(DriverOperation::Upload).await;
+    assert_eq!(error.side_effect, SideEffect::Possible);
+    assert_eq!(error.next_action, DriverNextAction::Reconcile);
+    harness.clear_failure("deploy");
+
+    let mut request = harness.request(DriverOperation::Reconcile, DIGEST_A);
+    request.reconciles = Some(DriverReconcileContext {
+        operation: DriverOperation::Upload,
+    });
+    let error = harness.execute(&request).await.unwrap_err();
+    assert_eq!(error.code, "NOT_APPLIED");
+    assert_eq!(error.side_effect, SideEffect::None);
+    assert_eq!(error.next_action, DriverNextAction::Retry);
+
+    // The retried upload creates the Worker and uploads the version.
+    let receipt = harness.run(DriverOperation::Upload).await;
+    assert_eq!(receipt.deployment_state, Some(DeploymentState::Uploaded));
 }
 
 #[tokio::test]

@@ -18,7 +18,13 @@
 #     crons` is present, updateQueueConsumers, subdomainDeploy);
 #   * version ids are UUIDs, and `versions deploy` refuses anything else;
 #   * `deployments status` of a Worker that was never deployed is the
-#     code-less user error "The Worker <name> has no deployments.".
+#     code-less user error "The Worker <name> has no deployments.";
+#   * `deploy`, `versions upload` and `triggers deploy` all refuse a
+#     configuration whose `[assets] directory` does not exist
+#     (validateAssetsOptions, NonExistentAssetsDirError), before anything
+#     else - `triggers deploy` too, although it uploads no assets;
+#   * the workers.dev subdomain POST sends `previews_enabled` from
+#     `preview_urls`; left unset, the API default follows workers.dev.
 #
 # Account state:
 #
@@ -28,6 +34,7 @@
 #   $STATE/schedules/<name>   the cron list last applied (`crons = [...]`)
 #   $STATE/consumers/<name>   the queues this Worker consumes, one per line
 #   $STATE/subdomain/<name>   exists = the Worker is on workers.dev
+#   $STATE/previews/<name>    exists = its versions have preview URLs
 #
 # Invocation records:
 #
@@ -42,7 +49,7 @@
 set -u
 STATE="__STATE__"
 mkdir -p "$STATE/kv" "$STATE/d1" "$STATE/r2" "$STATE/queues" "$STATE/workers" "$STATE/versions" \
-  "$STATE/schedules" "$STATE/consumers" "$STATE/subdomain" "$STATE/fail"
+  "$STATE/schedules" "$STATE/consumers" "$STATE/subdomain" "$STATE/previews" "$STATE/fail"
 
 n=$(( $(cat "$STATE/count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$STATE/count"
@@ -88,6 +95,15 @@ toml_consumed_queues() {
   awk '/^\[/ { section = $0 } section == "[[queues.consumers]]" && /^queue = / { gsub(/^queue = "|"$/, ""); print }' wrangler.toml
 }
 
+# validateAssetsOptions: an `[assets] directory` must exist, relative to the
+# configuration file.
+check_assets_dir() {
+  local dir
+  dir="$(awk '/^\[/ { section = $0 } section == "[assets]" && /^directory = / { gsub(/^directory = "|"$/, ""); print; exit }' wrangler.toml)"
+  [ -z "$dir" ] || [ -d "$dir" ] \
+    || user_error "The directory specified by the \\\"assets.directory\\\" field in your configuration file does not exist: $PWD/$dir"
+}
+
 new_version_id() { printf '%08x-0000-4000-8000-%012x' "$n" "$n"; }
 
 # triggersDeploy: workers.dev unless `workers_dev = false`, schedules when
@@ -102,6 +118,13 @@ apply_triggers() { # worker
     rm -f "$STATE/subdomain/$name"
   else
     touch "$STATE/subdomain/$name"
+  fi
+  if grep -q '^preview_urls = false' wrangler.toml; then
+    rm -f "$STATE/previews/$name"
+  elif grep -q '^preview_urls = true' wrangler.toml || [ -e "$STATE/subdomain/$name" ]; then
+    touch "$STATE/previews/$name"
+  else
+    rm -f "$STATE/previews/$name"
   fi
   crons="$(toml_crons)"
   if [ -n "$crons" ]; then
@@ -176,6 +199,7 @@ case "$1 ${2:-} ${3:-}" in
     esac ;;
   "deploy "*)
     [ -f wrangler.toml ] || user_error "Missing entry-point to Worker script or to assets directory"
+    check_assets_dir
     main="$(sed -n 's/^main = "\(.*\)"$/\1/p' wrangler.toml | head -n1)"
     [ -f "$main" ] || user_error "The entry-point file at \\\"$main\\\" was not found."
     name="$(toml_name)"
@@ -190,11 +214,13 @@ case "$1 ${2:-} ${3:-}" in
     record "{\"type\":\"deploy\",\"version\":1,\"worker_name\":\"$name\",\"worker_tag\":\"tag-$name\",\"version_id\":\"$id\"}" ;;
   "triggers deploy"*)
     [ -f wrangler.toml ] || user_error "You need to provide a name when uploading a Worker Version."
+    check_assets_dir
     name="$(toml_name)"
     [ -e "$STATE/workers/$name" ] || fail 1 10007 "This Worker does not exist on your account."
     apply_triggers "$name" ;;
   "versions upload"*)
     [ -f wrangler.toml ] || user_error "Missing entry-point to Worker script or to assets directory"
+    check_assets_dir
     name="$(toml_name)"
     [ -e "$STATE/workers/$name" ] || user_error "You cannot upload a new version of a Worker that does not yet exist. Please run the \`deploy\` command first."
     msg="$(opt --message "$@")"
@@ -229,7 +255,7 @@ case "$1 ${2:-} ${3:-}" in
     printf '{"id": "dep-current", "versions": [{"version_id": "%s", "percentage": 100}]}\n' "$(cat "$STATE/workers/$name")" ;;
   "delete "*)
     [ -e "$STATE/workers/$2" ] || fail 1 10090 "This Worker does not exist on your account."
-    rm -f "$STATE/workers/$2" "$STATE/schedules/$2" "$STATE/consumers/$2" "$STATE/subdomain/$2"
+    rm -f "$STATE/workers/$2" "$STATE/schedules/$2" "$STATE/consumers/$2" "$STATE/subdomain/$2" "$STATE/previews/$2"
     rm -rf "$STATE/versions/$2"; echo "Successfully deleted $2" ;;
   *)
     echo "fake wrangler: unsupported command: $*" >&2

@@ -24,8 +24,10 @@
 //! but never detaches one the configuration no longer lists.
 //!
 //! The placeholder that creates a new Worker answers 503 and is deployed
-//! with `workers_dev = false`, so nothing is reachable before activate; its
-//! version is never the one `activate` deploys.
+//! with `workers_dev = false` and `preview_urls = false`, so nothing is
+//! reachable before activate; its version is never the one `activate`
+//! deploys. The rendered configuration also carries `preview_urls = false`,
+//! so an uploaded version has no preview URL before it is activated.
 //!
 //! Purge (only with `DEIS_CLOUDFLARE_PURGE_DATA=<environment id>`): every KV
 //! namespace and D1 database whose name carries this environment's scope
@@ -555,11 +557,17 @@ impl<'a, 'c> Op<'a, 'c> {
         }
     }
 
-    /// `wrangler triggers deploy` in a directory holding only the rendered
-    /// `wrangler.toml` (it reads the configuration, never the code).
+    /// `wrangler triggers deploy` in a directory holding the rendered
+    /// `wrangler.toml` (it reads the configuration, never the code) and, when
+    /// the configuration has `[assets]`, an empty assets directory: wrangler
+    /// validates that the directory exists before doing anything, but
+    /// uploads nothing from it here.
     async fn deploy_triggers(&self, rendered: &str) -> Result<(), OpError> {
         let dir = self.empty_dir()?;
         std::fs::write(dir.path().join(WRANGLER_TOML_FILE), rendered)?;
+        if let Some(assets) = artifact::assets_directory(rendered)? {
+            std::fs::create_dir_all(dir.path().join(assets))?;
+        }
         self.ctx
             .wrangler
             .run(
@@ -600,7 +608,7 @@ impl<'a, 'c> Op<'a, 'c> {
         std::fs::write(
             dir.path().join(WRANGLER_TOML_FILE),
             format!(
-                "name = \"{}\"\nmain = \"placeholder.js\"\ncompatibility_date = \"{PLACEHOLDER_COMPATIBILITY_DATE}\"\nworkers_dev = false\n",
+                "name = \"{}\"\nmain = \"placeholder.js\"\ncompatibility_date = \"{PLACEHOLDER_COMPATIBILITY_DATE}\"\nworkers_dev = false\npreview_urls = false\n",
                 self.worker()
             ),
         )?;
@@ -662,7 +670,21 @@ impl<'a, 'c> Op<'a, 'c> {
         match self.effective {
             DriverOperation::Upload => {
                 let message = self.upload_message();
-                let versions = self.list_versions().await?;
+                // A first upload whose placeholder deploy failed before the
+                // Worker existed left nothing behind.
+                let versions = match self.list_versions().await {
+                    Ok(versions) => versions,
+                    Err(OpError::Wrangler(error))
+                        if error
+                            .api_code()
+                            .is_some_and(|code| NOT_FOUND_CODES.contains(&code)) =>
+                    {
+                        return Err(not_applied(
+                            "the upload did not create the Worker, so it left no version",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
                 let found = versions
                     .iter()
                     .rev()
@@ -987,6 +1009,10 @@ impl<'a, 'c> Op<'a, 'c> {
         }
     }
 
+    /// The Worker's deployable versions. wrangler 4.129.0 lists only the 10
+    /// most recent (`VERSION_LIST_LIMIT`): a version followed by more than 10
+    /// further uploads before its verify or upload reconcile is not found
+    /// there, and those report it as missing.
     async fn list_versions(&self) -> Result<Vec<serde_json::Value>, OpError> {
         let worker = self.worker();
         let output = self

@@ -12,11 +12,13 @@
 //! resource section gets the resolved Cloudflare identifier or scoped name,
 //! queue consumers point at the scoped queue, and `[vars]` get their values.
 //! Any section that does not match the plan, and any placeholder left over,
-//! refuses the artifact - the driver never deploys a placeholder.
+//! refuses the artifact - the driver never deploys a placeholder. It also
+//! sets `preview_urls = false`: a version that is uploaded but not yet
+//! activated must not be reachable on a workers.dev preview URL.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use deis_build_core::{
     BINDING_PLAN_FORMAT, BINDING_PLAN_TARGET_CLOUDFLARE, BindingKind, PlannedBinding,
@@ -352,7 +354,13 @@ pub fn render_wrangler_toml(
         }
     }
 
+    // Uploaded versions stay private until activate moves traffic to them.
+    // Left unset, wrangler lets the API default decide, which follows the
+    // workers.dev route that activate enables.
+    doc["preview_urls"] = value(false);
+
     let rendered = doc.to_string();
+    assets_directory(&rendered)?;
     if let Some(placeholder) = find_placeholder(&rendered) {
         return Err(ArtifactError::Unresolved { placeholder });
     }
@@ -383,6 +391,37 @@ fn array_of_tables<'d>(
         item = item.as_table_like_mut()?.get_mut(key)?;
     }
     item.as_array_of_tables_mut()
+}
+
+/// The `[assets] directory` a rendered `wrangler.toml` names, relative to
+/// the file, if it has one. Only a plain relative path inside the artifact
+/// is accepted.
+pub fn assets_directory(rendered: &str) -> Result<Option<PathBuf>, ArtifactError> {
+    let doc: DocumentMut = rendered.parse().map_err(|error| ArtifactError::Invalid {
+        message: format!("{WRANGLER_TOML_FILE} is not valid TOML: {error}"),
+    })?;
+    let Some(assets) = doc.get("assets") else {
+        return Ok(None);
+    };
+    let directory = assets
+        .get("directory")
+        .and_then(Item::as_str)
+        .ok_or_else(|| ArtifactError::Invalid {
+            message: "[assets] has no directory".to_owned(),
+        })?;
+    let path = PathBuf::from(directory);
+    let inside = path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+        && path.components().any(|component| matches!(component, Component::Normal(_)));
+    if !inside {
+        return Err(ArtifactError::Invalid {
+            message: format!(
+                "[assets] directory {directory:?} is not a relative path inside the artifact"
+            ),
+        });
+    }
+    Ok(Some(path))
 }
 
 /// The first `deis:unresolved/...` token in `text`, if any, outside TOML
@@ -457,3 +496,25 @@ impl std::fmt::Display for ArtifactError {
 }
 
 impl std::error::Error for ArtifactError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assets_directory_accepts_only_a_path_inside_the_artifact() {
+        assert_eq!(assets_directory("name = \"w\"\n").unwrap(), None);
+        assert_eq!(
+            assets_directory("[assets]\ndirectory = \"./assets\"\n").unwrap(),
+            Some(PathBuf::from("./assets"))
+        );
+        for directory in ["../elsewhere", "/etc", "./a/../../b", ".", ""] {
+            let rendered = format!("[assets]\ndirectory = {directory:?}\n");
+            assert!(
+                assets_directory(&rendered).is_err(),
+                "{directory:?} must be refused"
+            );
+        }
+        assert!(assets_directory("[assets]\nbinding = \"ASSETS\"\n").is_err());
+    }
+}
