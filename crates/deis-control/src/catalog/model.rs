@@ -18,23 +18,17 @@ pub const MAX_SECRET_NAME_LEN: usize = 128;
 /// Longest accepted route path prefix.
 pub const MAX_PATH_PREFIX_LEN: usize = 512;
 
-/// An application. During the identity migration, `id` remains the legacy
-/// app name used by existing routes and tenants while `canonical_id` is the
-/// permanent product identity. New code must not derive authority or storage
-/// isolation from the display name.
-///
-/// The dumb services (deis-store, deis-queue) see a single opaque tenant id
-/// built from the pair by `deis_wire::conventions::tenant_id`, so a preview
-/// deployment cannot read or overwrite what production stored while those
-/// services still understand exactly one tenant dimension.
+/// An application. `id` is its name, used by routes, bundle paths and
+/// telemetry; `canonical_id` is the permanent product identity. Storage
+/// isolation comes from the canonical ids alone: deis-store and deis-queue
+/// key a tenant by `v1/<application id>/<environment id>`, so a preview
+/// cannot read or overwrite what production stored and a re-created
+/// application of the same name never sees the old one's data.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct App {
     pub id: String,
     #[schema(value_type = String, format = Uuid)]
     pub canonical_id: CanonicalId,
-    /// Monotonic catalog revision used to fence identity migration. It moves
-    /// whenever an environment, version, deployment, route or secret changes.
-    pub revision: i64,
     pub created_at: i64,
 }
 

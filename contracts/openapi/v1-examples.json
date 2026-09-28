@@ -32,8 +32,7 @@
       "body": {
         "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
         "created_at": 1767225600,
-        "id": "demo",
-        "revision": 1
+        "id": "demo"
       },
       "operationId": "createApp",
       "status": 201
@@ -155,8 +154,7 @@
           {
             "canonical_id": "018f2518-7e38-7f80-8000-000000000001",
             "created_at": 1767225600,
-            "id": "demo",
-            "revision": 1
+            "id": "demo"
           }
         ],
         "page": {

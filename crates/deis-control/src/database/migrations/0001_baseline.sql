@@ -1,22 +1,12 @@
 -- deis-control schema baseline (migration 0001).
-
 --
-
--- Curated from the `sqlite_master` export of the previous
-
--- `create_tables` convergence run on an empty database. Only
-
--- CREATE TABLE / CREATE INDEX / CREATE TRIGGER statements: no ALTER,
-
--- no historical columns, no compatibility CHECK values. This file is
-
--- frozen once the first release ships; later changes are new numbered
-
--- migrations. The text of every statement below is what SQLite stores
-
--- in `sqlite_master.sql`, which the golden schema test compares against
-
--- `golden_schema.snapshot.sql`.
+-- The whole schema of an empty control database: CREATE TABLE, CREATE
+-- INDEX and CREATE TRIGGER statements only, no ALTER, no historical
+-- columns. There is no installed base, so there is nothing to migrate from:
+-- until the first release ships this file is edited in place, and from
+-- then on every schema change is a new numbered migration. The text of each
+-- statement is what SQLite stores in `sqlite_master.sql`, which the golden
+-- schema test compares against.
 
 -- table accounts
 CREATE TABLE accounts (
@@ -114,8 +104,7 @@ CREATE TABLE api_tokens (
 -- table apps
 CREATE TABLE apps (
             id           TEXT PRIMARY KEY,
-            canonical_id TEXT,
-            revision     INTEGER NOT NULL DEFAULT 1,
+            canonical_id TEXT NOT NULL,
             created_at   INTEGER NOT NULL
         );
 
@@ -217,49 +206,6 @@ CREATE TABLE canonical_artifacts (
             record              TEXT NOT NULL,
             created_at          INTEGER NOT NULL,
             UNIQUE(app_id, artifact_sha256)
-        );
-
--- table canonical_binding_ids
-CREATE TABLE canonical_binding_ids (
-            binding_id                  TEXT PRIMARY KEY,
-            app_id                      TEXT NOT NULL,
-            canonical_application_id    TEXT NOT NULL,
-            env_id                      TEXT NOT NULL,
-            canonical_environment_id    TEXT NOT NULL,
-            legacy_name                 TEXT NOT NULL,
-            kind                        TEXT NOT NULL,
-            created_at                  INTEGER NOT NULL,
-            UNIQUE(canonical_environment_id, legacy_name),
-            CHECK(length(binding_id) = 36
-              AND lower(binding_id) = binding_id
-              AND substr(binding_id, 9, 1) = '-'
-              AND substr(binding_id, 14, 1) = '-'
-              AND substr(binding_id, 15, 1) = '7'
-              AND substr(binding_id, 19, 1) = '-'
-              AND substr(binding_id, 20, 1) GLOB '[89ab]'
-              AND substr(binding_id, 24, 1) = '-'
-              AND length(replace(binding_id, '-', '')) = 32
-              AND replace(binding_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(canonical_application_id) = 36
-              AND lower(canonical_application_id) = canonical_application_id
-              AND substr(canonical_application_id, 9, 1) = '-'
-              AND substr(canonical_application_id, 14, 1) = '-'
-              AND substr(canonical_application_id, 15, 1) = '7'
-              AND substr(canonical_application_id, 19, 1) = '-'
-              AND substr(canonical_application_id, 20, 1) GLOB '[89ab]'
-              AND substr(canonical_application_id, 24, 1) = '-'
-              AND length(replace(canonical_application_id, '-', '')) = 32
-              AND replace(canonical_application_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(canonical_environment_id) = 36
-              AND lower(canonical_environment_id) = canonical_environment_id
-              AND substr(canonical_environment_id, 9, 1) = '-'
-              AND substr(canonical_environment_id, 14, 1) = '-'
-              AND substr(canonical_environment_id, 15, 1) = '7'
-              AND substr(canonical_environment_id, 19, 1) = '-'
-              AND substr(canonical_environment_id, 20, 1) GLOB '[89ab]'
-              AND substr(canonical_environment_id, 24, 1) = '-'
-              AND length(replace(canonical_environment_id, '-', '')) = 32
-              AND replace(canonical_environment_id, '-', '') NOT GLOB '*[^0-9a-f]*')
         );
 
 -- table commands
@@ -398,7 +344,7 @@ CREATE TABLE deployment_target_observations (
 -- table deployments
 CREATE TABLE deployments (
             id           TEXT PRIMARY KEY,
-            canonical_id TEXT,
+            canonical_id TEXT NOT NULL,
             app_id       TEXT NOT NULL,
             env_id       TEXT NOT NULL REFERENCES environments(id),
             version_id   TEXT NOT NULL REFERENCES versions(id),
@@ -430,7 +376,7 @@ CREATE TABLE environment_binding_snapshots (
 -- table environments
 CREATE TABLE environments (
             id           TEXT PRIMARY KEY,
-            canonical_id TEXT,
+            canonical_id TEXT NOT NULL,
             app_id       TEXT NOT NULL REFERENCES apps(id),
             name         TEXT NOT NULL,
             created_at   INTEGER NOT NULL,
@@ -457,102 +403,6 @@ CREATE TABLE heartbeats (
             timestamp TEXT NOT NULL,
             latency_ms INTEGER,
             FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
-        );
-
--- table identity_migration_backend_attempts
-CREATE TABLE identity_migration_backend_attempts (
-            migration_id                  TEXT NOT NULL,
-            backend                       TEXT NOT NULL CHECK(length(backend) BETWEEN 1 AND 128),
-            tenant                        TEXT NOT NULL CHECK(length(tenant) BETWEEN 1 AND 256),
-            expected_application_revision INTEGER NOT NULL
-                                                    CHECK(expected_application_revision >= 1),
-            target_endpoint_sha256         TEXT NOT NULL
-                                                    CHECK(length(target_endpoint_sha256) = 64
-                                                      AND lower(target_endpoint_sha256) = target_endpoint_sha256
-                                                      AND target_endpoint_sha256 NOT GLOB '*[^0-9a-f]*'),
-            backend_incarnation_id         TEXT
-                CHECK(backend_incarnation_id IS NULL OR
-                      (length(backend_incarnation_id) = 36
-                       AND lower(backend_incarnation_id) = backend_incarnation_id
-                       AND substr(backend_incarnation_id, 9, 1) = '-'
-                       AND substr(backend_incarnation_id, 14, 1) = '-'
-                       AND substr(backend_incarnation_id, 15, 1) = '7'
-                       AND substr(backend_incarnation_id, 19, 1) = '-'
-                       AND substr(backend_incarnation_id, 20, 1) GLOB '[89ab]'
-                       AND substr(backend_incarnation_id, 24, 1) = '-'
-                       AND length(replace(backend_incarnation_id, '-', '')) = 32
-                       AND replace(backend_incarnation_id, '-', '') NOT GLOB '*[^0-9a-f]*')),
-            state                         TEXT NOT NULL
-                                                  CHECK(state IN
-                                                    ('acquiring', 'fenced', 'inspecting', 'captured',
-                                                     'release-requested', 'released')),
-            attempt_count                 INTEGER NOT NULL CHECK(attempt_count >= 1),
-            fence_epoch                   INTEGER CHECK(fence_epoch IS NULL OR fence_epoch >= 1),
-            acquired_at                   INTEGER,
-            receipt_sha256                TEXT
-                CHECK(receipt_sha256 IS NULL OR
-                      (length(receipt_sha256) = 64
-                       AND lower(receipt_sha256) = receipt_sha256
-                       AND receipt_sha256 NOT GLOB '*[^0-9a-f]*')),
-            evidence_json                 TEXT
-                CHECK(evidence_json IS NULL OR json_valid(evidence_json)),
-            last_error_code               TEXT,
-            last_error_message            TEXT,
-            created_at                    INTEGER NOT NULL,
-            updated_at                    INTEGER NOT NULL,
-            PRIMARY KEY(migration_id, backend, tenant),
-            FOREIGN KEY(migration_id) REFERENCES identity_migrations(migration_id)
-                ON DELETE RESTRICT
-        );
-
--- table identity_migrations
-CREATE TABLE identity_migrations (
-            migration_id                 TEXT PRIMARY KEY,
-            operation_id                 TEXT NOT NULL UNIQUE,
-            app_id                       TEXT NOT NULL,
-            canonical_application_id     TEXT NOT NULL,
-            state                        TEXT NOT NULL
-                                                 CHECK(state IN
-                                                   ('planned', 'running', 'waiting', 'verified',
-                                                    'cutover', 'completed', 'failed')),
-            record_revision              INTEGER NOT NULL CHECK(record_revision >= 1),
-            expected_application_revision INTEGER NOT NULL
-                                                   CHECK(expected_application_revision >= 1),
-            fence_token                  TEXT NOT NULL CHECK(length(fence_token) >= 32),
-            catalog_inventory            TEXT NOT NULL CHECK(json_valid(catalog_inventory)),
-            error_code                   TEXT,
-            created_at                   INTEGER NOT NULL,
-            updated_at                   INTEGER NOT NULL,
-            CHECK(length(migration_id) = 36
-              AND lower(migration_id) = migration_id
-              AND substr(migration_id, 9, 1) = '-'
-              AND substr(migration_id, 14, 1) = '-'
-              AND substr(migration_id, 15, 1) = '7'
-              AND substr(migration_id, 19, 1) = '-'
-              AND substr(migration_id, 20, 1) GLOB '[89ab]'
-              AND substr(migration_id, 24, 1) = '-'
-              AND length(replace(migration_id, '-', '')) = 32
-              AND replace(migration_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(operation_id) = 36
-              AND lower(operation_id) = operation_id
-              AND substr(operation_id, 9, 1) = '-'
-              AND substr(operation_id, 14, 1) = '-'
-              AND substr(operation_id, 15, 1) = '7'
-              AND substr(operation_id, 19, 1) = '-'
-              AND substr(operation_id, 20, 1) GLOB '[89ab]'
-              AND substr(operation_id, 24, 1) = '-'
-              AND length(replace(operation_id, '-', '')) = 32
-              AND replace(operation_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
-            CHECK(length(canonical_application_id) = 36
-              AND lower(canonical_application_id) = canonical_application_id
-              AND substr(canonical_application_id, 9, 1) = '-'
-              AND substr(canonical_application_id, 14, 1) = '-'
-              AND substr(canonical_application_id, 15, 1) = '7'
-              AND substr(canonical_application_id, 19, 1) = '-'
-              AND substr(canonical_application_id, 20, 1) GLOB '[89ab]'
-              AND substr(canonical_application_id, 24, 1) = '-'
-              AND length(replace(canonical_application_id, '-', '')) = 32
-              AND replace(canonical_application_id, '-', '') NOT GLOB '*[^0-9a-f]*')
         );
 
 -- table nodes
@@ -611,7 +461,7 @@ CREATE TABLE product_operations (
             operation_id             TEXT PRIMARY KEY,
             kind                     TEXT NOT NULL
                                       CHECK(kind IN ('build', 'provision', 'deploy', 'promote',
-                                                     'rollback', 'migrate', 'export', 'delete',
+                                                     'rollback', 'export', 'delete',
                                                      'restore', 'purge', 'provider')),
             organization_id          TEXT NOT NULL REFERENCES product_organizations(organization_id),
             application_id           TEXT,
@@ -1594,21 +1444,10 @@ CREATE TABLE secret_revisions (
             UNIQUE(env_id, name, revision_id)
         );
 
--- table secrets
-CREATE TABLE secrets (
-            id          TEXT PRIMARY KEY,
-            app_id      TEXT NOT NULL,
-            env_id      TEXT NOT NULL REFERENCES environments(id),
-            name        TEXT NOT NULL,
-            ciphertext  BLOB NOT NULL,
-            updated_at  INTEGER NOT NULL,
-            UNIQUE(env_id, name)
-        );
-
 -- table versions
 CREATE TABLE versions (
             id           TEXT PRIMARY KEY,
-            canonical_id TEXT,
+            canonical_id TEXT NOT NULL,
             app_id       TEXT NOT NULL REFERENCES apps(id),
             number       INTEGER NOT NULL,
             bundle_sha   TEXT NOT NULL,
@@ -1660,12 +1499,6 @@ CREATE INDEX idx_canonical_artifacts_app ON canonical_artifacts(app_id, created_
 
 -- index idx_canonical_artifacts_page_v1
 CREATE INDEX idx_canonical_artifacts_page_v1 ON canonical_artifacts(app_id, created_at DESC, id DESC);
-
--- index idx_canonical_binding_ids_app
-CREATE INDEX idx_canonical_binding_ids_app
-            ON canonical_binding_ids(
-                canonical_application_id, canonical_environment_id, legacy_name
-            );
 
 -- index idx_commands_created
 CREATE INDEX idx_commands_created ON commands(created_at);
@@ -1769,23 +1602,6 @@ CREATE INDEX idx_heartbeats_node ON heartbeats(node_id, timestamp);
 
 -- index idx_heartbeats_timestamp
 CREATE INDEX idx_heartbeats_timestamp ON heartbeats(timestamp);
-
--- index idx_identity_migration_backend_attempts_state
-CREATE INDEX idx_identity_migration_backend_attempts_state
-            ON identity_migration_backend_attempts(migration_id, state, updated_at);
-
--- index idx_identity_migrations_active_application
-CREATE UNIQUE INDEX idx_identity_migrations_active_application
-            ON identity_migrations(canonical_application_id)
-            WHERE state NOT IN ('completed', 'failed');
-
--- index idx_identity_migrations_legacy_name
-CREATE INDEX idx_identity_migrations_legacy_name
-            ON identity_migrations(app_id, created_at);
-
--- index idx_identity_migrations_state
-CREATE INDEX idx_identity_migrations_state
-            ON identity_migrations(state, updated_at);
 
 -- index idx_nodes_last_heartbeat
 CREATE INDEX idx_nodes_last_heartbeat ON nodes(last_heartbeat);
@@ -1958,9 +1774,6 @@ CREATE INDEX idx_secret_revision_destructions_env
 CREATE INDEX idx_secret_revisions_env_name
             ON secret_revisions(env_id, name, created_at DESC);
 
--- index idx_secrets_env
-CREATE INDEX idx_secrets_env ON secrets(env_id);
-
 -- index idx_versions_app
 CREATE INDEX idx_versions_app ON versions(app_id, number DESC);
 
@@ -2004,39 +1817,10 @@ CREATE TRIGGER trg_api_page_cursors_immutable_v1
             SELECT RAISE(ABORT, 'API page cursor is immutable');
         END;
 
--- trigger trg_apps_canonical_id
-CREATE TRIGGER trg_apps_canonical_id
-            AFTER INSERT ON apps
-            WHEN NEW.canonical_id IS NULL OR NEW.canonical_id = ''
-            BEGIN
-                UPDATE apps
-                SET canonical_id = (
-                    SELECT lower(
-                        substr(timestamp_hex, 1, 8) || '-' ||
-                        substr(timestamp_hex, 9, 4) || '-7' || random_a || '-' ||
-                        variant || random_b_head || '-' || random_b_tail
-                    )
-                    FROM (
-                        SELECT
-                            printf(
-                                '%012x',
-                                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
-                            ) AS timestamp_hex,
-                            substr(hex(randomblob(2)), 2, 3) AS random_a,
-                            substr('89ab', (random() & 3) + 1, 1) AS variant,
-                            substr(hex(randomblob(2)), 2, 3) AS random_b_head,
-                            hex(randomblob(6)) AS random_b_tail
-                    )
-                )
-                WHERE rowid = NEW.rowid;
-            END;
-
 -- trigger trg_apps_canonical_id_immutable_v1
 CREATE TRIGGER trg_apps_canonical_id_immutable_v1
             BEFORE UPDATE OF canonical_id ON apps
-            WHEN OLD.canonical_id IS NOT NULL
-             AND OLD.canonical_id != ''
-             AND NEW.canonical_id != OLD.canonical_id
+            WHEN NEW.canonical_id != OLD.canonical_id
             BEGIN
                 SELECT RAISE(ABORT, 'canonical_id is immutable once allocated');
             END;
@@ -2044,9 +1828,7 @@ CREATE TRIGGER trg_apps_canonical_id_immutable_v1
 -- trigger trg_apps_canonical_id_validate_insert_v1
 CREATE TRIGGER trg_apps_canonical_id_validate_insert_v1
             BEFORE INSERT ON apps
-            WHEN NEW.canonical_id IS NOT NULL
-             AND NEW.canonical_id != ''
-             AND NOT (
+            WHEN NOT (
                 length(NEW.canonical_id) = 36
                 AND lower(NEW.canonical_id) = NEW.canonical_id
                 AND substr(NEW.canonical_id, 9, 1) = '-'
@@ -2058,27 +1840,6 @@ CREATE TRIGGER trg_apps_canonical_id_validate_insert_v1
                 AND length(replace(NEW.canonical_id, '-', '')) = 32
                 AND replace(NEW.canonical_id, '-', '') NOT GLOB '*[^0-9a-f]*'
              )
-            BEGIN
-                SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
-            END;
-
--- trigger trg_apps_canonical_id_validate_update_v1
-CREATE TRIGGER trg_apps_canonical_id_validate_update_v1
-            BEFORE UPDATE OF canonical_id ON apps
-            WHEN NEW.canonical_id IS NULL
-              OR NEW.canonical_id = ''
-              OR NOT (
-                length(NEW.canonical_id) = 36
-                AND lower(NEW.canonical_id) = NEW.canonical_id
-                AND substr(NEW.canonical_id, 9, 1) = '-'
-                AND substr(NEW.canonical_id, 14, 1) = '-'
-                AND substr(NEW.canonical_id, 15, 1) = '7'
-                AND substr(NEW.canonical_id, 19, 1) = '-'
-                AND substr(NEW.canonical_id, 20, 1) GLOB '[89ab]'
-                AND substr(NEW.canonical_id, 24, 1) = '-'
-                AND length(replace(NEW.canonical_id, '-', '')) = 32
-                AND replace(NEW.canonical_id, '-', '') NOT GLOB '*[^0-9a-f]*'
-              )
             BEGIN
                 SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
             END;
@@ -2106,20 +1867,6 @@ CREATE TRIGGER trg_canonical_artifacts_immutable_v1
         BEFORE UPDATE ON canonical_artifacts
         BEGIN
             SELECT RAISE(ABORT, 'canonical artifact is immutable');
-        END;
-
--- trigger trg_canonical_binding_ids_immutable_delete_v1
-CREATE TRIGGER trg_canonical_binding_ids_immutable_delete_v1
-        BEFORE DELETE ON canonical_binding_ids
-        BEGIN
-            SELECT RAISE(ABORT, 'canonical binding identity is immutable');
-        END;
-
--- trigger trg_canonical_binding_ids_immutable_update_v1
-CREATE TRIGGER trg_canonical_binding_ids_immutable_update_v1
-        BEFORE UPDATE ON canonical_binding_ids
-        BEGIN
-            SELECT RAISE(ABORT, 'canonical binding identity is immutable');
         END;
 
 -- trigger trg_deployment_plan_lease_identity_insert_v1
@@ -2206,62 +1953,10 @@ CREATE TRIGGER trg_deployment_plans_immutable_v1
             SELECT RAISE(ABORT, 'deployment plan is immutable');
         END;
 
--- trigger trg_deployments_app_revision_delete_v1
-CREATE TRIGGER trg_deployments_app_revision_delete_v1
-            AFTER DELETE ON deployments
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-            END;
-
--- trigger trg_deployments_app_revision_insert_v1
-CREATE TRIGGER trg_deployments_app_revision_insert_v1
-            AFTER INSERT ON deployments
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = NEW.app_id;
-            END;
-
--- trigger trg_deployments_app_revision_update_v1
-CREATE TRIGGER trg_deployments_app_revision_update_v1
-            AFTER UPDATE ON deployments
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-                UPDATE apps SET revision = revision + 1
-                    WHERE id = NEW.app_id AND NEW.app_id != OLD.app_id;
-            END;
-
--- trigger trg_deployments_canonical_id
-CREATE TRIGGER trg_deployments_canonical_id
-            AFTER INSERT ON deployments
-            WHEN NEW.canonical_id IS NULL OR NEW.canonical_id = ''
-            BEGIN
-                UPDATE deployments
-                SET canonical_id = (
-                    SELECT lower(
-                        substr(timestamp_hex, 1, 8) || '-' ||
-                        substr(timestamp_hex, 9, 4) || '-7' || random_a || '-' ||
-                        variant || random_b_head || '-' || random_b_tail
-                    )
-                    FROM (
-                        SELECT
-                            printf(
-                                '%012x',
-                                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
-                            ) AS timestamp_hex,
-                            substr(hex(randomblob(2)), 2, 3) AS random_a,
-                            substr('89ab', (random() & 3) + 1, 1) AS variant,
-                            substr(hex(randomblob(2)), 2, 3) AS random_b_head,
-                            hex(randomblob(6)) AS random_b_tail
-                    )
-                )
-                WHERE rowid = NEW.rowid;
-            END;
-
 -- trigger trg_deployments_canonical_id_immutable_v1
 CREATE TRIGGER trg_deployments_canonical_id_immutable_v1
             BEFORE UPDATE OF canonical_id ON deployments
-            WHEN OLD.canonical_id IS NOT NULL
-             AND OLD.canonical_id != ''
-             AND NEW.canonical_id != OLD.canonical_id
+            WHEN NEW.canonical_id != OLD.canonical_id
             BEGIN
                 SELECT RAISE(ABORT, 'canonical_id is immutable once allocated');
             END;
@@ -2269,9 +1964,7 @@ CREATE TRIGGER trg_deployments_canonical_id_immutable_v1
 -- trigger trg_deployments_canonical_id_validate_insert_v1
 CREATE TRIGGER trg_deployments_canonical_id_validate_insert_v1
             BEFORE INSERT ON deployments
-            WHEN NEW.canonical_id IS NOT NULL
-             AND NEW.canonical_id != ''
-             AND NOT (
+            WHEN NOT (
                 length(NEW.canonical_id) = 36
                 AND lower(NEW.canonical_id) = NEW.canonical_id
                 AND substr(NEW.canonical_id, 9, 1) = '-'
@@ -2285,66 +1978,6 @@ CREATE TRIGGER trg_deployments_canonical_id_validate_insert_v1
              )
             BEGIN
                 SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
-            END;
-
--- trigger trg_deployments_canonical_id_validate_update_v1
-CREATE TRIGGER trg_deployments_canonical_id_validate_update_v1
-            BEFORE UPDATE OF canonical_id ON deployments
-            WHEN NEW.canonical_id IS NULL
-              OR NEW.canonical_id = ''
-              OR NOT (
-                length(NEW.canonical_id) = 36
-                AND lower(NEW.canonical_id) = NEW.canonical_id
-                AND substr(NEW.canonical_id, 9, 1) = '-'
-                AND substr(NEW.canonical_id, 14, 1) = '-'
-                AND substr(NEW.canonical_id, 15, 1) = '7'
-                AND substr(NEW.canonical_id, 19, 1) = '-'
-                AND substr(NEW.canonical_id, 20, 1) GLOB '[89ab]'
-                AND substr(NEW.canonical_id, 24, 1) = '-'
-                AND length(replace(NEW.canonical_id, '-', '')) = 32
-                AND replace(NEW.canonical_id, '-', '') NOT GLOB '*[^0-9a-f]*'
-              )
-            BEGIN
-                SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
-            END;
-
--- trigger trg_deployments_identity_migration_fence_delete_v1
-CREATE TRIGGER trg_deployments_identity_migration_fence_delete_v1
-            BEFORE DELETE ON deployments
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = OLD.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_deployments_identity_migration_fence_insert_v1
-CREATE TRIGGER trg_deployments_identity_migration_fence_insert_v1
-            BEFORE INSERT ON deployments
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = NEW.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_deployments_identity_migration_fence_update_v1
-CREATE TRIGGER trg_deployments_identity_migration_fence_update_v1
-            BEFORE UPDATE ON deployments
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id IN (OLD.app_id, NEW.app_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
             END;
 
 -- trigger trg_deployments_snapshot_insert_v1
@@ -2368,68 +2001,6 @@ CREATE TRIGGER trg_deployments_snapshot_update_v1
         BEGIN
             SELECT RAISE(ABORT, 'deployment snapshot selection is immutable');
         END;
-
--- trigger trg_environment_binding_snapshots_app_revision_delete_v1
-CREATE TRIGGER trg_environment_binding_snapshots_app_revision_delete_v1
-            AFTER DELETE ON environment_binding_snapshots
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-            END;
-
--- trigger trg_environment_binding_snapshots_app_revision_insert_v1
-CREATE TRIGGER trg_environment_binding_snapshots_app_revision_insert_v1
-            AFTER INSERT ON environment_binding_snapshots
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = NEW.app_id;
-            END;
-
--- trigger trg_environment_binding_snapshots_app_revision_update_v1
-CREATE TRIGGER trg_environment_binding_snapshots_app_revision_update_v1
-            AFTER UPDATE ON environment_binding_snapshots
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-                UPDATE apps SET revision = revision + 1
-                    WHERE id = NEW.app_id AND NEW.app_id != OLD.app_id;
-            END;
-
--- trigger trg_environment_binding_snapshots_identity_migration_fence_delete_v1
-CREATE TRIGGER trg_environment_binding_snapshots_identity_migration_fence_delete_v1
-            BEFORE DELETE ON environment_binding_snapshots
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = OLD.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_environment_binding_snapshots_identity_migration_fence_insert_v1
-CREATE TRIGGER trg_environment_binding_snapshots_identity_migration_fence_insert_v1
-            BEFORE INSERT ON environment_binding_snapshots
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = NEW.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_environment_binding_snapshots_identity_migration_fence_update_v1
-CREATE TRIGGER trg_environment_binding_snapshots_identity_migration_fence_update_v1
-            BEFORE UPDATE ON environment_binding_snapshots
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id IN (OLD.app_id, NEW.app_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
 
 -- trigger trg_environment_snapshots_immutable_v1
 CREATE TRIGGER trg_environment_snapshots_immutable_v1
@@ -2456,62 +2027,10 @@ CREATE TRIGGER trg_environment_snapshots_owner_insert_v1
             SELECT RAISE(ABORT, 'environment snapshot ownership or document identity mismatch');
         END;
 
--- trigger trg_environments_app_revision_delete_v1
-CREATE TRIGGER trg_environments_app_revision_delete_v1
-            AFTER DELETE ON environments
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-            END;
-
--- trigger trg_environments_app_revision_insert_v1
-CREATE TRIGGER trg_environments_app_revision_insert_v1
-            AFTER INSERT ON environments
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = NEW.app_id;
-            END;
-
--- trigger trg_environments_app_revision_update_v1
-CREATE TRIGGER trg_environments_app_revision_update_v1
-            AFTER UPDATE ON environments
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-                UPDATE apps SET revision = revision + 1
-                    WHERE id = NEW.app_id AND NEW.app_id != OLD.app_id;
-            END;
-
--- trigger trg_environments_canonical_id
-CREATE TRIGGER trg_environments_canonical_id
-            AFTER INSERT ON environments
-            WHEN NEW.canonical_id IS NULL OR NEW.canonical_id = ''
-            BEGIN
-                UPDATE environments
-                SET canonical_id = (
-                    SELECT lower(
-                        substr(timestamp_hex, 1, 8) || '-' ||
-                        substr(timestamp_hex, 9, 4) || '-7' || random_a || '-' ||
-                        variant || random_b_head || '-' || random_b_tail
-                    )
-                    FROM (
-                        SELECT
-                            printf(
-                                '%012x',
-                                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
-                            ) AS timestamp_hex,
-                            substr(hex(randomblob(2)), 2, 3) AS random_a,
-                            substr('89ab', (random() & 3) + 1, 1) AS variant,
-                            substr(hex(randomblob(2)), 2, 3) AS random_b_head,
-                            hex(randomblob(6)) AS random_b_tail
-                    )
-                )
-                WHERE rowid = NEW.rowid;
-            END;
-
 -- trigger trg_environments_canonical_id_immutable_v1
 CREATE TRIGGER trg_environments_canonical_id_immutable_v1
             BEFORE UPDATE OF canonical_id ON environments
-            WHEN OLD.canonical_id IS NOT NULL
-             AND OLD.canonical_id != ''
-             AND NEW.canonical_id != OLD.canonical_id
+            WHEN NEW.canonical_id != OLD.canonical_id
             BEGIN
                 SELECT RAISE(ABORT, 'canonical_id is immutable once allocated');
             END;
@@ -2519,9 +2038,7 @@ CREATE TRIGGER trg_environments_canonical_id_immutable_v1
 -- trigger trg_environments_canonical_id_validate_insert_v1
 CREATE TRIGGER trg_environments_canonical_id_validate_insert_v1
             BEFORE INSERT ON environments
-            WHEN NEW.canonical_id IS NOT NULL
-             AND NEW.canonical_id != ''
-             AND NOT (
+            WHEN NOT (
                 length(NEW.canonical_id) = 36
                 AND lower(NEW.canonical_id) = NEW.canonical_id
                 AND substr(NEW.canonical_id, 9, 1) = '-'
@@ -2536,132 +2053,6 @@ CREATE TRIGGER trg_environments_canonical_id_validate_insert_v1
             BEGIN
                 SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
             END;
-
--- trigger trg_environments_canonical_id_validate_update_v1
-CREATE TRIGGER trg_environments_canonical_id_validate_update_v1
-            BEFORE UPDATE OF canonical_id ON environments
-            WHEN NEW.canonical_id IS NULL
-              OR NEW.canonical_id = ''
-              OR NOT (
-                length(NEW.canonical_id) = 36
-                AND lower(NEW.canonical_id) = NEW.canonical_id
-                AND substr(NEW.canonical_id, 9, 1) = '-'
-                AND substr(NEW.canonical_id, 14, 1) = '-'
-                AND substr(NEW.canonical_id, 15, 1) = '7'
-                AND substr(NEW.canonical_id, 19, 1) = '-'
-                AND substr(NEW.canonical_id, 20, 1) GLOB '[89ab]'
-                AND substr(NEW.canonical_id, 24, 1) = '-'
-                AND length(replace(NEW.canonical_id, '-', '')) = 32
-                AND replace(NEW.canonical_id, '-', '') NOT GLOB '*[^0-9a-f]*'
-              )
-            BEGIN
-                SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
-            END;
-
--- trigger trg_environments_identity_migration_fence_delete_v1
-CREATE TRIGGER trg_environments_identity_migration_fence_delete_v1
-            BEFORE DELETE ON environments
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = OLD.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_environments_identity_migration_fence_insert_v1
-CREATE TRIGGER trg_environments_identity_migration_fence_insert_v1
-            BEFORE INSERT ON environments
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = NEW.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_environments_identity_migration_fence_update_v1
-CREATE TRIGGER trg_environments_identity_migration_fence_update_v1
-            BEFORE UPDATE ON environments
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id IN (OLD.app_id, NEW.app_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_identity_migration_apps_delete_fence_v1
-CREATE TRIGGER trg_identity_migration_apps_delete_fence_v1
-        BEFORE DELETE ON apps
-        WHEN EXISTS (
-            SELECT 1 FROM identity_migrations
-            WHERE canonical_application_id = OLD.canonical_id
-              AND state IN ('running', 'waiting', 'verified', 'cutover')
-        )
-        BEGIN
-            SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-        END;
-
--- trigger trg_identity_migrations_identity_immutable_v1
-CREATE TRIGGER trg_identity_migrations_identity_immutable_v1
-        BEFORE UPDATE OF migration_id, operation_id, app_id,
-                         canonical_application_id, created_at
-        ON identity_migrations
-        WHEN NEW.migration_id != OLD.migration_id
-          OR NEW.operation_id != OLD.operation_id
-          OR NEW.app_id != OLD.app_id
-          OR NEW.canonical_application_id != OLD.canonical_application_id
-          OR NEW.created_at != OLD.created_at
-        BEGIN
-            SELECT RAISE(ABORT, 'identity migration identity is immutable');
-        END;
-
--- trigger trg_legacy_secret_delete_head_v1
-CREATE TRIGGER trg_legacy_secret_delete_head_v1
-        AFTER DELETE ON secrets
-        BEGIN
-            DELETE FROM secret_heads
-             WHERE env_id = OLD.env_id
-               AND name = OLD.name
-               AND revision_id = OLD.id;
-        END;
-
--- trigger trg_legacy_secret_insert_revision_v1
-CREATE TRIGGER trg_legacy_secret_insert_revision_v1
-        AFTER INSERT ON secrets
-        BEGIN
-            INSERT OR IGNORE INTO secret_revisions
-                (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
-            VALUES
-                (NEW.id, NEW.app_id, NEW.env_id, NEW.name, NEW.ciphertext, 'legacy-name-v1', NEW.updated_at);
-            INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
-            VALUES (NEW.env_id, NEW.name, NEW.id, NEW.updated_at)
-            ON CONFLICT(env_id, name) DO UPDATE SET
-                revision_id = excluded.revision_id,
-                updated_at = excluded.updated_at;
-        END;
-
--- trigger trg_legacy_secret_update_revision_v1
-CREATE TRIGGER trg_legacy_secret_update_revision_v1
-        AFTER UPDATE ON secrets
-        BEGIN
-            INSERT OR IGNORE INTO secret_revisions
-                (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
-            VALUES
-                (NEW.id, NEW.app_id, NEW.env_id, NEW.name, NEW.ciphertext, 'legacy-name-v1', NEW.updated_at);
-            INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
-            VALUES (NEW.env_id, NEW.name, NEW.id, NEW.updated_at)
-            ON CONFLICT(env_id, name) DO UPDATE SET
-                revision_id = excluded.revision_id,
-                updated_at = excluded.updated_at;
-        END;
 
 -- trigger trg_product_installation_fenced_update_v1
 CREATE TRIGGER trg_product_installation_fenced_update_v1
@@ -3517,130 +2908,6 @@ CREATE TRIGGER trg_provider_targets_transparency_v1
             SELECT RAISE(ABORT, 'provider target has no transparent driver release authorization');
         END;
 
--- trigger trg_routes_app_revision_delete_v1
-CREATE TRIGGER trg_routes_app_revision_delete_v1
-            AFTER DELETE ON routes
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-            END;
-
--- trigger trg_routes_app_revision_insert_v1
-CREATE TRIGGER trg_routes_app_revision_insert_v1
-            AFTER INSERT ON routes
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = NEW.app_id;
-            END;
-
--- trigger trg_routes_app_revision_update_v1
-CREATE TRIGGER trg_routes_app_revision_update_v1
-            AFTER UPDATE ON routes
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-                UPDATE apps SET revision = revision + 1
-                    WHERE id = NEW.app_id AND NEW.app_id != OLD.app_id;
-            END;
-
--- trigger trg_routes_identity_migration_fence_delete_v1
-CREATE TRIGGER trg_routes_identity_migration_fence_delete_v1
-            BEFORE DELETE ON routes
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = OLD.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_routes_identity_migration_fence_insert_v1
-CREATE TRIGGER trg_routes_identity_migration_fence_insert_v1
-            BEFORE INSERT ON routes
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = NEW.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_routes_identity_migration_fence_update_v1
-CREATE TRIGGER trg_routes_identity_migration_fence_update_v1
-            BEFORE UPDATE ON routes
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id IN (OLD.app_id, NEW.app_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_secret_heads_app_revision_delete_v1
-CREATE TRIGGER trg_secret_heads_app_revision_delete_v1
-            AFTER DELETE ON secret_heads
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = (SELECT app_id FROM environments WHERE id = OLD.env_id);
-            END;
-
--- trigger trg_secret_heads_app_revision_insert_v1
-CREATE TRIGGER trg_secret_heads_app_revision_insert_v1
-            AFTER INSERT ON secret_heads
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = (SELECT app_id FROM environments WHERE id = NEW.env_id);
-            END;
-
--- trigger trg_secret_heads_app_revision_update_v1
-CREATE TRIGGER trg_secret_heads_app_revision_update_v1
-            AFTER UPDATE ON secret_heads
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = (SELECT app_id FROM environments WHERE id = OLD.env_id);
-                UPDATE apps SET revision = revision + 1
-                    WHERE id = (SELECT app_id FROM environments WHERE id = NEW.env_id) AND (SELECT app_id FROM environments WHERE id = NEW.env_id) != (SELECT app_id FROM environments WHERE id = OLD.env_id);
-            END;
-
--- trigger trg_secret_heads_identity_migration_fence_delete_v1
-CREATE TRIGGER trg_secret_heads_identity_migration_fence_delete_v1
-            BEFORE DELETE ON secret_heads
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = (SELECT app_id FROM environments WHERE id = OLD.env_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_secret_heads_identity_migration_fence_insert_v1
-CREATE TRIGGER trg_secret_heads_identity_migration_fence_insert_v1
-            BEFORE INSERT ON secret_heads
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = (SELECT app_id FROM environments WHERE id = NEW.env_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_secret_heads_identity_migration_fence_update_v1
-CREATE TRIGGER trg_secret_heads_identity_migration_fence_update_v1
-            BEFORE UPDATE ON secret_heads
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id IN ((SELECT app_id FROM environments WHERE id = OLD.env_id), (SELECT app_id FROM environments WHERE id = NEW.env_id))
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
 -- trigger trg_secret_heads_revision_insert_v1
 CREATE TRIGGER trg_secret_heads_revision_insert_v1
         BEFORE INSERT ON secret_heads
@@ -3683,68 +2950,6 @@ CREATE TRIGGER trg_secret_revision_destructions_immutable_update_v1
             SELECT RAISE(ABORT, 'secret revision destruction evidence is immutable');
         END;
 
--- trigger trg_secret_revisions_app_revision_delete_v1
-CREATE TRIGGER trg_secret_revisions_app_revision_delete_v1
-            AFTER DELETE ON secret_revisions
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-            END;
-
--- trigger trg_secret_revisions_app_revision_insert_v1
-CREATE TRIGGER trg_secret_revisions_app_revision_insert_v1
-            AFTER INSERT ON secret_revisions
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = NEW.app_id;
-            END;
-
--- trigger trg_secret_revisions_app_revision_update_v1
-CREATE TRIGGER trg_secret_revisions_app_revision_update_v1
-            AFTER UPDATE ON secret_revisions
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-                UPDATE apps SET revision = revision + 1
-                    WHERE id = NEW.app_id AND NEW.app_id != OLD.app_id;
-            END;
-
--- trigger trg_secret_revisions_identity_migration_fence_delete_v1
-CREATE TRIGGER trg_secret_revisions_identity_migration_fence_delete_v1
-            BEFORE DELETE ON secret_revisions
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = OLD.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_secret_revisions_identity_migration_fence_insert_v1
-CREATE TRIGGER trg_secret_revisions_identity_migration_fence_insert_v1
-            BEFORE INSERT ON secret_revisions
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = NEW.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_secret_revisions_identity_migration_fence_update_v1
-CREATE TRIGGER trg_secret_revisions_identity_migration_fence_update_v1
-            BEFORE UPDATE ON secret_revisions
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id IN (OLD.app_id, NEW.app_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
 -- trigger trg_secret_revisions_immutable_v1
 CREATE TRIGGER trg_secret_revisions_immutable_v1
         BEFORE UPDATE ON secret_revisions
@@ -3763,124 +2968,10 @@ CREATE TRIGGER trg_secret_revisions_owner_insert_v1
             SELECT RAISE(ABORT, 'secret revision environment does not belong to application');
         END;
 
--- trigger trg_secrets_app_revision_delete_v1
-CREATE TRIGGER trg_secrets_app_revision_delete_v1
-            AFTER DELETE ON secrets
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-            END;
-
--- trigger trg_secrets_app_revision_insert_v1
-CREATE TRIGGER trg_secrets_app_revision_insert_v1
-            AFTER INSERT ON secrets
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = NEW.app_id;
-            END;
-
--- trigger trg_secrets_app_revision_update_v1
-CREATE TRIGGER trg_secrets_app_revision_update_v1
-            AFTER UPDATE ON secrets
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-                UPDATE apps SET revision = revision + 1
-                    WHERE id = NEW.app_id AND NEW.app_id != OLD.app_id;
-            END;
-
--- trigger trg_secrets_identity_migration_fence_delete_v1
-CREATE TRIGGER trg_secrets_identity_migration_fence_delete_v1
-            BEFORE DELETE ON secrets
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = OLD.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_secrets_identity_migration_fence_insert_v1
-CREATE TRIGGER trg_secrets_identity_migration_fence_insert_v1
-            BEFORE INSERT ON secrets
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = NEW.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_secrets_identity_migration_fence_update_v1
-CREATE TRIGGER trg_secrets_identity_migration_fence_update_v1
-            BEFORE UPDATE ON secrets
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id IN (OLD.app_id, NEW.app_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_versions_app_revision_delete_v1
-CREATE TRIGGER trg_versions_app_revision_delete_v1
-            AFTER DELETE ON versions
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-            END;
-
--- trigger trg_versions_app_revision_insert_v1
-CREATE TRIGGER trg_versions_app_revision_insert_v1
-            AFTER INSERT ON versions
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = NEW.app_id;
-            END;
-
--- trigger trg_versions_app_revision_update_v1
-CREATE TRIGGER trg_versions_app_revision_update_v1
-            AFTER UPDATE ON versions
-            BEGIN
-                UPDATE apps SET revision = revision + 1 WHERE id = OLD.app_id;
-                UPDATE apps SET revision = revision + 1
-                    WHERE id = NEW.app_id AND NEW.app_id != OLD.app_id;
-            END;
-
--- trigger trg_versions_canonical_id
-CREATE TRIGGER trg_versions_canonical_id
-            AFTER INSERT ON versions
-            WHEN NEW.canonical_id IS NULL OR NEW.canonical_id = ''
-            BEGIN
-                UPDATE versions
-                SET canonical_id = (
-                    SELECT lower(
-                        substr(timestamp_hex, 1, 8) || '-' ||
-                        substr(timestamp_hex, 9, 4) || '-7' || random_a || '-' ||
-                        variant || random_b_head || '-' || random_b_tail
-                    )
-                    FROM (
-                        SELECT
-                            printf(
-                                '%012x',
-                                CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
-                            ) AS timestamp_hex,
-                            substr(hex(randomblob(2)), 2, 3) AS random_a,
-                            substr('89ab', (random() & 3) + 1, 1) AS variant,
-                            substr(hex(randomblob(2)), 2, 3) AS random_b_head,
-                            hex(randomblob(6)) AS random_b_tail
-                    )
-                )
-                WHERE rowid = NEW.rowid;
-            END;
-
 -- trigger trg_versions_canonical_id_immutable_v1
 CREATE TRIGGER trg_versions_canonical_id_immutable_v1
             BEFORE UPDATE OF canonical_id ON versions
-            WHEN OLD.canonical_id IS NOT NULL
-             AND OLD.canonical_id != ''
-             AND NEW.canonical_id != OLD.canonical_id
+            WHEN NEW.canonical_id != OLD.canonical_id
             BEGIN
                 SELECT RAISE(ABORT, 'canonical_id is immutable once allocated');
             END;
@@ -3888,9 +2979,7 @@ CREATE TRIGGER trg_versions_canonical_id_immutable_v1
 -- trigger trg_versions_canonical_id_validate_insert_v1
 CREATE TRIGGER trg_versions_canonical_id_validate_insert_v1
             BEFORE INSERT ON versions
-            WHEN NEW.canonical_id IS NOT NULL
-             AND NEW.canonical_id != ''
-             AND NOT (
+            WHEN NOT (
                 length(NEW.canonical_id) = 36
                 AND lower(NEW.canonical_id) = NEW.canonical_id
                 AND substr(NEW.canonical_id, 9, 1) = '-'
@@ -3904,66 +2993,6 @@ CREATE TRIGGER trg_versions_canonical_id_validate_insert_v1
              )
             BEGIN
                 SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
-            END;
-
--- trigger trg_versions_canonical_id_validate_update_v1
-CREATE TRIGGER trg_versions_canonical_id_validate_update_v1
-            BEFORE UPDATE OF canonical_id ON versions
-            WHEN NEW.canonical_id IS NULL
-              OR NEW.canonical_id = ''
-              OR NOT (
-                length(NEW.canonical_id) = 36
-                AND lower(NEW.canonical_id) = NEW.canonical_id
-                AND substr(NEW.canonical_id, 9, 1) = '-'
-                AND substr(NEW.canonical_id, 14, 1) = '-'
-                AND substr(NEW.canonical_id, 15, 1) = '7'
-                AND substr(NEW.canonical_id, 19, 1) = '-'
-                AND substr(NEW.canonical_id, 20, 1) GLOB '[89ab]'
-                AND substr(NEW.canonical_id, 24, 1) = '-'
-                AND length(replace(NEW.canonical_id, '-', '')) = 32
-                AND replace(NEW.canonical_id, '-', '') NOT GLOB '*[^0-9a-f]*'
-              )
-            BEGIN
-                SELECT RAISE(ABORT, 'canonical_id must be lowercase hyphenated UUIDv7');
-            END;
-
--- trigger trg_versions_identity_migration_fence_delete_v1
-CREATE TRIGGER trg_versions_identity_migration_fence_delete_v1
-            BEFORE DELETE ON versions
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = OLD.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_versions_identity_migration_fence_insert_v1
-CREATE TRIGGER trg_versions_identity_migration_fence_insert_v1
-            BEFORE INSERT ON versions
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id = NEW.app_id
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
-            END;
-
--- trigger trg_versions_identity_migration_fence_update_v1
-CREATE TRIGGER trg_versions_identity_migration_fence_update_v1
-            BEFORE UPDATE ON versions
-            WHEN EXISTS (
-                SELECT 1 FROM identity_migrations AS migration
-                JOIN apps AS app ON app.id IN (OLD.app_id, NEW.app_id)
-                WHERE migration.canonical_application_id = app.canonical_id
-                  AND state IN ('running', 'waiting', 'verified', 'cutover')
-            )
-            BEGIN
-                SELECT RAISE(ABORT, 'identity migration catalog fence is active');
             END;
 
 -- trigger trg_versions_lineage_insert_v1
@@ -3994,3 +3023,88 @@ CREATE TRIGGER trg_versions_lineage_update_v1
         BEGIN
             SELECT RAISE(ABORT, 'version lineage is immutable');
         END;
+
+-- table capability_signing_keys
+-- Signing keys named by kid (RFC 7638 thumbprint), the private key
+-- AES-256-GCM encrypted under the secrets master key with the kid as AAD.
+-- At most one key signs.
+CREATE TABLE capability_signing_keys (
+    kid              TEXT NOT NULL PRIMARY KEY,
+    public_key       BLOB NOT NULL,
+    private_key      BLOB NOT NULL,
+    state            TEXT NOT NULL CHECK (state IN ('pending', 'active', 'previous')),
+    created_at       INTEGER NOT NULL,
+    state_changed_at INTEGER NOT NULL
+);
+
+-- index capability_signing_keys_one_active
+CREATE UNIQUE INDEX capability_signing_keys_one_active
+    ON capability_signing_keys (state) WHERE state = 'active';
+
+-- table capability_auth_epoch
+-- Singleton row: the current auth_epoch. Bumped to refuse every capability
+-- issued before it.
+CREATE TABLE capability_auth_epoch (
+    id             INTEGER PRIMARY KEY CHECK (id = 1),
+    epoch          INTEGER NOT NULL DEFAULT 1,
+    created_at     INTEGER NOT NULL
+);
+
+-- table capability_issuances
+-- Every capability this control plane signs.
+CREATE TABLE capability_issuances (
+    jti          TEXT NOT NULL PRIMARY KEY,
+    subject      TEXT NOT NULL,
+    node_id      TEXT,
+    audience     TEXT NOT NULL,
+    kid          TEXT NOT NULL,
+    auth_epoch   INTEGER NOT NULL,
+    issued_at    INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
+);
+
+-- index capability_issuances_node
+CREATE INDEX capability_issuances_node ON capability_issuances (node_id, expires_at)
+    WHERE node_id IS NOT NULL;
+
+-- index capability_issuances_expiry
+CREATE INDEX capability_issuances_expiry ON capability_issuances (expires_at);
+
+-- table capability_issuance_resources
+-- One row per (tenant, binding) a capability grants.
+CREATE TABLE capability_issuance_resources (
+    jti          TEXT NOT NULL REFERENCES capability_issuances (jti) ON DELETE CASCADE,
+    tenant       TEXT NOT NULL,
+    binding      TEXT NOT NULL,
+    generation   TEXT
+);
+
+-- index capability_issuance_resources_jti
+CREATE INDEX capability_issuance_resources_jti ON capability_issuance_resources (jti);
+
+-- index capability_issuance_resources_tenant
+CREATE INDEX capability_issuance_resources_tenant ON capability_issuance_resources (tenant);
+
+-- table capability_revocations
+-- A revoked capability, kept until its own expiry: `reason` is `jti`,
+-- `node:<id>` or `tenant:<tenant>`.
+CREATE TABLE capability_revocations (
+    jti          TEXT NOT NULL PRIMARY KEY REFERENCES capability_issuances (jti) ON DELETE CASCADE,
+    expires_at   INTEGER NOT NULL,
+    revoked_at   INTEGER NOT NULL,
+    reason       TEXT NOT NULL
+);
+
+-- index capability_revocations_expiry
+CREATE INDEX capability_revocations_expiry ON capability_revocations (expires_at);
+
+-- table revoked_nodes
+-- Nodes revoked as principals. A row here refuses the node everything on
+-- the machine channel and puts it on the signed revocation list, so every
+-- verifier refuses any capability naming it. It stays until an operator
+-- lifts it.
+CREATE TABLE revoked_nodes (
+    node_id      TEXT NOT NULL PRIMARY KEY,
+    revoked_at   INTEGER NOT NULL
+);
+

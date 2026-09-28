@@ -41,7 +41,7 @@ use super::pagination::{
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
-const APP_COLUMNS: &str = "id, canonical_id, revision, created_at";
+const APP_COLUMNS: &str = "id, canonical_id, created_at";
 const VERSION_COLUMNS: &str = "id, canonical_id, app_id, number, bundle_sha, bundle_path, manifest, canonical_artifact_id, provider_derivation_sha256, created_at";
 const CANONICAL_ARTIFACT_COLUMNS: &str = "id, app_id, artifact_sha256, content_root_sha256, standard_version, file_count, storage_path, record, created_at";
 const PROVIDER_DERIVATION_COLUMNS: &str = "manifest_sha256, artifact_id, provider, standard_version, payload_root_sha256, manifest, created_at";
@@ -268,7 +268,6 @@ impl CatalogStore {
                 Ok(App {
                     id,
                     canonical_id,
-                    revision: 1,
                     created_at,
                 })
             })
@@ -397,7 +396,6 @@ impl CatalogStore {
                     "DELETE FROM secret_heads WHERE env_id IN (SELECT id FROM environments WHERE app_id = ?1)",
                     params![app_id],
                 )?;
-                tx.execute("DELETE FROM secrets WHERE app_id = ?1", params![app_id])?;
                 let routes = tx.execute("DELETE FROM routes WHERE app_id = ?1", params![app_id])?;
                 let deployments =
                     tx.execute("DELETE FROM deployments WHERE app_id = ?1", params![app_id])?;
@@ -2992,10 +2990,6 @@ impl CatalogStore {
                             params![env_id, name],
                         )?;
                     }
-                    tx.execute(
-                        "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
-                        params![env_id, name],
-                    )?;
                 }
 
                 tx.execute(
@@ -3808,10 +3802,6 @@ impl CatalogStore {
                     params![env_id, name],
                 )?;
             }
-            tx.execute(
-                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
-                params![env_id, name],
-            )?;
             tx.commit()?;
             Ok(())
         })
@@ -3913,66 +3903,17 @@ impl CatalogStore {
         .await
     }
 
-    /// Store or replace one secret. The caller passes ciphertext produced
-    /// by [`super::SecretCipher`]; this layer never sees a plaintext value
-    /// and never logs one.
+    /// Store or replace one secret under a fresh revision; a test shorthand
+    /// for [`Self::put_secret_revision`].
+    #[cfg(test)]
     pub async fn put_secret(
         &self,
         env: &Environment,
         name: &str,
         ciphertext: Vec<u8>,
     ) -> CatalogResult<SecretMeta> {
-        validate_secret_name(name)?;
-        let app_id = env.app_id.clone();
-        let env_id = env.id.clone();
-        let name_owned = name.to_string();
-        let updated_at = now_secs();
-        let bytes = ciphertext.len();
-
-        let meta = self
-            .with_conn(move |conn| {
-                let tx = conn.unchecked_transaction()?;
-                let id = Uuid::new_v4().to_string();
-                tx.execute(
-                    "INSERT INTO secrets (id, app_id, env_id, name, ciphertext, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(env_id, name) DO UPDATE SET
-                         id = excluded.id,
-                         ciphertext = excluded.ciphertext,
-                         updated_at = excluded.updated_at",
-                    params![id, app_id, env_id, name_owned, ciphertext, updated_at],
-                )?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO secret_revisions
-                         (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'legacy-name-v1', ?6)",
-                    params![id, app_id, env_id, name_owned, ciphertext, updated_at],
-                )?;
-                tx.execute(
-                    "INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(env_id, name) DO UPDATE SET
-                         revision_id = excluded.revision_id,
-                         updated_at = excluded.updated_at",
-                    params![env_id, name_owned, id, updated_at],
-                )?;
-                tx.commit()?;
-                Ok(SecretMeta {
-                    name: name_owned,
-                    revision: id,
-                    updated_at,
-                })
-            })
-            .await?;
-
-        info!(
-            app_id = %env.app_id,
-            environment = %env.name,
-            secret = %meta.name,
-            ciphertext_bytes = bytes,
-            "Legacy secret stored encrypted and mirrored into an immutable revision; it takes effect on the next deployment push without creating an application version"
-        );
-        Ok(meta)
+        self.put_secret_revision(env, name, &CanonicalId::new_v7().to_string(), ciphertext)
+            .await
     }
 
     /// Append an already-encrypted secret revision and move only the current
@@ -4009,13 +3950,6 @@ impl CatalogStore {
                      revision_id = excluded.revision_id,
                      updated_at = excluded.updated_at",
                 params![env_id, name, revision, updated_at],
-            )?;
-            // Once a name uses revision-bound AAD, remove its legacy current
-            // row so an older process fails closed instead of reading stale
-            // plaintext under the same name.
-            tx.execute(
-                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
-                params![env_id, name],
             )?;
             tx.commit()?;
             Ok(SecretMeta {
@@ -4081,10 +4015,6 @@ impl CatalogStore {
                     "secret {name_owned} in environment {env_id}"
                 )));
             }
-            tx.execute(
-                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
-                params![env_id, name_owned],
-            )?;
             tx.commit()?;
             Ok(())
         })
@@ -4513,8 +4443,7 @@ fn map_app(row: &Row<'_>) -> rusqlite::Result<App> {
     Ok(App {
         id: row.get(0)?,
         canonical_id: map_canonical_id(row, 1)?,
-        revision: row.get(2)?,
-        created_at: row.get(3)?,
+        created_at: row.get(2)?,
     })
 }
 
@@ -5079,10 +5008,7 @@ mod tests {
                 // altered outside this process. Current direct writes are
                 // rejected by the schema test; the reader must still refuse
                 // pre-existing corruption instead of trusting the label.
-                conn.execute_batch(
-                    "DROP TRIGGER trg_apps_canonical_id_validate_update_v1;
-                     DROP TRIGGER trg_apps_canonical_id_immutable_v1;",
-                )?;
+                conn.execute_batch("DROP TRIGGER trg_apps_canonical_id_immutable_v1;")?;
                 conn.execute(
                     "UPDATE apps SET canonical_id = '550e8400-e29b-41d4-a716-446655440000' \
                      WHERE id = 'demo'",
