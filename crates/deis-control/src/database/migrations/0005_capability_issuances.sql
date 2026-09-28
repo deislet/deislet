@@ -42,3 +42,13 @@ CREATE TABLE capability_revocations (
 );
 
 CREATE INDEX capability_revocations_expiry ON capability_revocations (expires_at);
+
+-- Nodes revoked as principals. Revoking the jtis a node holds lasts only
+-- until it renews; a row here refuses the node everything on the machine
+-- channel (registration, assignments, secrets, new capabilities) and puts it
+-- on the signed revocation list, so every verifier refuses any capability
+-- naming it, whenever it was issued. It stays until an operator lifts it.
+CREATE TABLE revoked_nodes (
+    node_id      TEXT NOT NULL PRIMARY KEY,
+    revoked_at   INTEGER NOT NULL            -- Unix seconds
+);

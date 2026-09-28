@@ -12741,9 +12741,45 @@
       }
     },
     "/api/v1/capabilities/revocations/nodes/{node_id}": {
+      "delete": {
+        "description": "The node may register and be issued capabilities again. The capabilities\nrevoked with it stay revoked. Answers 404 when the node is not revoked.",
+        "operationId": "liftNodeRevocation",
+        "parameters": [
+          {
+            "description": "The node's id, as its certificate names it.",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The node is no longer revoked; verifiers accept its new capabilities from their next poll."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/Internal"
+          }
+        },
+        "summary": "Lift a node's revocation.",
+        "tags": [
+          "product"
+        ]
+      },
       "post": {
-        "description": "Every unexpired capability issued to the node with this id. Answers 200\nwith an empty list when it holds none.",
-        "operationId": "revokeNodeCapabilities",
+        "description": "Revokes every unexpired capability issued to the node with this id, and\nthe node itself until the revocation is lifted: it is taken out of the\nfleet, refused every machine-channel call and named on the revocation\nlist, so no capability issued to it is accepted anywhere. Answers 200\nwith an empty list when it holds no capability; revoking a node already\nrevoked is not an error.",
+        "operationId": "revokeNode",
         "parameters": [
           {
             "description": "The node's id, as its certificate names it.",
@@ -12764,7 +12800,7 @@
                 }
               }
             },
-            "description": "Every capability the node held is revoked."
+            "description": "The node and every capability it held are revoked."
           },
           "401": {
             "$ref": "#/components/responses/Unauthenticated"
@@ -12776,7 +12812,7 @@
             "$ref": "#/components/responses/Internal"
           }
         },
-        "summary": "Revoke every capability a node holds.",
+        "summary": "Revoke a node.",
         "tags": [
           "product"
         ]

@@ -7,11 +7,21 @@
 //! unknown, all of them at once by bumping the auth epoch.
 //!
 //! A revocation reaches the verifiers through the signed revocation list they
-//! poll every 30 seconds, so it is in force within one poll. Revoking what a
-//! node holds does not stop it asking again: a node that is still in the
-//! fleet and still assigned the tenant is issued a new token on its next
-//! renewal. Removing a machine is taking it out of the fleet and revoking its
-//! certificate; this is for "that token leaked".
+//! poll every 30 seconds, so it is in force within one poll.
+//!
+//! Revoking a jti or a tenant takes back tokens that exist; a node still in
+//! the fleet and still assigned that tenant is issued a new one on its next
+//! renewal, which is right for "that token leaked". Revoking a node is for
+//! "that machine is compromised", and takes back the holder rather than its
+//! tokens: the node is taken out of the fleet, the machine channel answers it
+//! nothing (no registration, assignments, secrets or capabilities), and it
+//! rides on the signed list by name, so every verifier refuses any capability
+//! naming it - one issued a moment before the revocation, one read from its
+//! offline cache, an expired one offered under T8 grace. That lasts until an
+//! administrator lifts it. The platform cannot tell one certificate for a
+//! name from another, so lift it only once the compromised key can no longer
+//! prove that name: every certificate it held has expired, or the rebuilt
+//! machine joins under a new node id.
 //!
 //! Every route here is an administrator's and is written to the audit log
 //! whatever its outcome; see [`crate::api::authz`].
@@ -19,6 +29,7 @@
 use axum::{
     Json,
     extract::{Path, State},
+    http::StatusCode,
 };
 use serde::Serialize;
 use tracing::{info, warn};
@@ -93,37 +104,75 @@ pub async fn revoke_capability(
     Ok(Json(CapabilityRevocation { revoked }))
 }
 
-/// Revoke every capability a node holds.
+/// Revoke a node.
 ///
-/// Every unexpired capability issued to the node with this id. Answers 200
-/// with an empty list when it holds none.
+/// Revokes every unexpired capability issued to the node with this id, and
+/// the node itself until the revocation is lifted: it is taken out of the
+/// fleet, refused every machine-channel call and named on the revocation
+/// list, so no capability issued to it is accepted anywhere. Answers 200
+/// with an empty list when it holds no capability; revoking a node already
+/// revoked is not an error.
 #[utoipa::path(
     post,
     path = "/api/v1/capabilities/revocations/nodes/{node_id}",
-    operation_id = "revokeNodeCapabilities",
+    operation_id = "revokeNode",
     tag = "product",
     params(("node_id" = String, Path, description = "The node's id, as its certificate names it.")),
     responses(
-        (status = 200, description = "Every capability the node held is revoked.", body = CapabilityRevocation),
+        (status = 200, description = "The node and every capability it held are revoked.", body = CapabilityRevocation),
         (status = 401, response = openapi::Unauthenticated),
         (status = 403, response = openapi::Forbidden),
     )
 )]
-pub async fn revoke_node_capabilities(
+pub async fn revoke_node(
     State(state): State<CatalogState>,
     Path(node_id): Path<String>,
 ) -> ApiResult<Json<CapabilityRevocation>> {
     let revoked = revoke(&state, RevocationScope::Node(node_id.clone())).await?;
-    if state.nodes.node(&node_id).is_some() {
-        warn!(
-            node = %node_id,
-            revoked = revoked.len(),
-            "Revoked every capability of a node that is still in the fleet; it is issued new ones on its next renewal unless it is removed"
-        );
-    } else {
-        info!(node = %node_id, revoked = revoked.len(), "Revoked every capability of a node");
-    }
+    // Out of the fleet as well: nothing is pushed to it and no proxy routes
+    // to it, and the machine channel refuses its attempts to register again.
+    // A node named in `deis_runtime_nodes` stays listed until it is taken
+    // out of that file, but is answered nothing all the same.
+    let removed = state.nodes.deregister(&node_id);
+    warn!(
+        node = %node_id,
+        revoked = revoked.len(),
+        removed = ?removed,
+        "Revoked a node: it is refused every machine call and every capability naming it until the revocation is lifted"
+    );
     Ok(Json(CapabilityRevocation { revoked }))
+}
+
+/// Lift a node's revocation.
+///
+/// The node may register and be issued capabilities again. The capabilities
+/// revoked with it stay revoked. Answers 404 when the node is not revoked.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/capabilities/revocations/nodes/{node_id}",
+    operation_id = "liftNodeRevocation",
+    tag = "product",
+    params(("node_id" = String, Path, description = "The node's id, as its certificate names it.")),
+    responses(
+        (status = 204, description = "The node is no longer revoked; verifiers accept its new capabilities from their next poll."),
+        (status = 404, response = openapi::NotFound),
+        (status = 401, response = openapi::Unauthenticated),
+        (status = 403, response = openapi::Forbidden),
+    )
+)]
+pub async fn lift_node_revocation(
+    State(state): State<CatalogState>,
+    Path(node_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let lifted = ledger(&state)?
+        .lift_node(&node_id)
+        .await
+        .map_err(|error| ApiError::DatabaseError(error.to_string()))?;
+    if !lifted {
+        return Err(ApiError::NotFound(format!("node {node_id} is not revoked")));
+    }
+    warn!(node = %node_id, "Lifted a node's revocation; it may register and be issued capabilities again");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Revoke every capability for an environment's storage tenant.
@@ -271,17 +320,21 @@ mod tests {
         assert_eq!(published_list(&h).await.auth_epoch, 2);
     }
 
+    /// Revoking a node puts it on the signed list by name, so it outlasts
+    /// the tokens it held; lifting it takes it off again, once.
     #[tokio::test]
-    async fn revoking_a_node_answers_what_it_held() {
+    async fn revoking_a_node_lists_it_until_it_is_lifted() {
         let h = platform().await;
-        let (status, body) = json(
-            &h.router,
-            "POST",
-            "/api/capabilities/revocations/nodes/runtime-test",
-            serde_json::Value::Null,
-        )
-        .await;
+        let path = "/api/capabilities/revocations/nodes/runtime-test";
+        let (status, body) = json(&h.router, "POST", path, serde_json::Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["revoked"], serde_json::json!([]));
+        assert_eq!(published_list(&h).await.revoked_nodes, vec!["runtime-test"]);
+
+        let (status, _) = json(&h.router, "DELETE", path, serde_json::Value::Null).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(published_list(&h).await.revoked_nodes.is_empty());
+        let (status, _) = json(&h.router, "DELETE", path, serde_json::Value::Null).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

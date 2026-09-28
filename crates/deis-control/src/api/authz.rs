@@ -1231,6 +1231,16 @@ fn classify_canonical(
             Resource::Every,
         )
         .changes_state(),
+        ["api", "capabilities", "revocations", "nodes", node] if method == Method::DELETE => {
+            Requirement::new(
+                "capability.lift_node_revocation",
+                Verb::Admin,
+                Resource::Every,
+                Resource::Every,
+            )
+            .about(node)
+            .changes_state()
+        }
         ["api", "capabilities", "revocations", "nodes", node] => Requirement::new(
             "capability.revoke_node",
             Verb::Admin,

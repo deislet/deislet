@@ -275,16 +275,17 @@ impl CapabilityIssuer {
     }
 
     /// The revocation list every verifier polls, signed with the active key:
-    /// the current auth epoch and every revoked capability that could still
-    /// be accepted somewhere.
+    /// the current auth epoch, every revoked capability that could still be
+    /// accepted somewhere, and every revoked node.
     pub async fn revocation_list(&self) -> Result<String, IssuerError> {
-        let revoked = match &self.ledger {
-            Some(ledger) => ledger.revoked_jtis().await?,
-            None => Vec::new(),
+        let (revoked, revoked_nodes) = match &self.ledger {
+            Some(ledger) => (ledger.revoked_jtis().await?, ledger.revoked_nodes().await?),
+            None => (Vec::new(), Vec::new()),
         };
         let inner = self.inner.read().await;
         Ok(revocation::sign(
-            &RevocationList::new(&self.issuer_id, inner.auth_epoch, revoked),
+            &RevocationList::new(&self.issuer_id, inner.auth_epoch, revoked)
+                .with_revoked_nodes(revoked_nodes),
             &inner.signing,
         ))
     }
@@ -808,6 +809,7 @@ mod tests {
         let ring = KeyRing::from_keys(issuer.published_keys().await);
         let list = revocation::verify(&issuer.revocation_list().await.unwrap(), &ring).unwrap();
         assert_eq!(list.revoked_jtis, vec![claims.jti]);
+        assert_eq!(list.revoked_nodes, vec!["n1"]);
         assert_eq!(list.auth_epoch, 2);
     }
 }

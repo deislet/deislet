@@ -148,7 +148,8 @@ pub const SECURITY_API_KEY: &str = "apiKey";
         crate::api::catalog::storage::storage_token,
         // Capability revocation.
         crate::api::catalog::capabilities::revoke_capability,
-        crate::api::catalog::capabilities::revoke_node_capabilities,
+        crate::api::catalog::capabilities::revoke_node,
+        crate::api::catalog::capabilities::lift_node_revocation,
         crate::api::catalog::capabilities::revoke_tenant_capabilities,
         crate::api::catalog::capabilities::bump_auth_epoch,
         crate::api::catalog::telemetry::environment_telemetry_token,

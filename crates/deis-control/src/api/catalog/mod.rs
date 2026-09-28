@@ -255,7 +255,7 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
         )
         .route(
             &at("/capabilities/revocations/nodes/:node_id"),
-            post(capabilities::revoke_node_capabilities),
+            post(capabilities::revoke_node).delete(capabilities::lift_node_revocation),
         )
         .route(
             &at("/capabilities/:jti"),

@@ -128,6 +128,29 @@ impl MachineChannelService {
         status
     }
 
+    /// Refuse a node revoked as a principal (see
+    /// [`crate::capability_ledger`]): it is answered nothing but its own
+    /// deregistration until an operator lifts the revocation. A ledger that
+    /// cannot be read refuses too - "could not tell" is not "not revoked".
+    async fn refuse_if_revoked(&self, node_id: &str) -> Result<(), Status> {
+        let Some(ledger) = self.issuer.ledger() else {
+            return Ok(());
+        };
+        match ledger.is_node_revoked(node_id).await {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                warn!(node = %node_id, "Refused a machine call from a revoked node");
+                Err(Status::permission_denied(format!(
+                    "node {node_id} has been revoked; an operator must lift the revocation \
+                     before it is answered again"
+                )))
+            }
+            Err(error) => Err(Status::unavailable(format!(
+                "could not tell whether node {node_id} is revoked: {error}"
+            ))),
+        }
+    }
+
     /// The name this caller proved, if the connection established one.
     ///
     /// `None` means the request did not arrive over a connection this
@@ -238,6 +261,7 @@ impl MachineChannel for MachineChannelService {
             .filter(|node_id| *node_id == asked.node_id)
             .ok_or_else(|| refuse_mismatch("node", &proved, &asked.node_id))?
             .to_string();
+        self.refuse_if_revoked(&node_id).await?;
 
         let announced: crate::api::registration::RegisterRequest =
             serde_json::from_str(&asked.registration_json).map_err(|error| {
@@ -322,6 +346,7 @@ impl MachineChannel for MachineChannelService {
             Some(node_id) if node_id == claimed => {}
             _ => return Err(refuse_mismatch("node", &proved, claimed)),
         }
+        self.refuse_if_revoked(claimed).await?;
 
         let base = self.state.deliverer.machine_reconciliation_base_url();
         let answer = assignments::assignments_for(&self.state, claimed, &base)
@@ -356,6 +381,9 @@ impl MachineChannel for MachineChannelService {
         let proved = Self::caller(&request)
             .ok_or_else(no_proved_identity)?
             .clone();
+        if let Some(node_id) = names::node_id_of(&proved) {
+            self.refuse_if_revoked(node_id).await?;
+        }
         let asked = request.into_inner();
 
         // A proxy may say it has taken up a table it is already running, and
@@ -404,6 +432,9 @@ impl MachineChannel for MachineChannelService {
                 return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
             }
         };
+        if let Err(refusal) = self.refuse_if_revoked(&node_id).await {
+            return Err(self.refuse_secret_fetch(&proved, None, refusal).await);
+        }
 
         let entries: Vec<deis_wire::conventions::SecretFetchEntry> =
             match serde_json::from_str(&request.get_ref().entries_json) {
@@ -552,6 +583,9 @@ impl MachineChannel for MachineChannelService {
                 return Err(self.refuse_issuance(&proved, None, refusal).await);
             }
         };
+        if let Err(refusal) = self.refuse_if_revoked(&node_id).await {
+            return Err(self.refuse_issuance(&proved, None, refusal).await);
+        }
 
         let asked = request.into_inner();
         let audience = asked.audience.as_str();
@@ -1435,5 +1469,91 @@ mod tests {
             .expect_err("a node asked as another node");
         assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
         assert_eq!(issuance_refusals(&h.state).await.len(), 3);
+    }
+
+    /// Revoking a node outlasts the tokens it held: until the revocation is
+    /// lifted it gets no new capability, no secret and no assignment list,
+    /// and cannot register its way back - each refusal on the audit log
+    /// where the RPC keeps one. Lifting it restores issuance.
+    #[tokio::test]
+    async fn a_revoked_node_is_answered_nothing_until_it_is_lifted() {
+        use deis_capability::{AUD_STORE, resources_for_audience};
+        let h = harness(true).await;
+        let (deployment_id, revision) = deployed_with_secret(&h).await;
+        let service = make_service(h.state.clone());
+        let ask = || {
+            from(
+                &node("runtime-test"),
+                capability_request(
+                    "runtime-test",
+                    AUD_STORE,
+                    &resources_for_audience("demo.production", AUD_STORE),
+                ),
+            )
+        };
+        service
+            .issue_capability(ask())
+            .await
+            .expect("issued before revocation");
+
+        let ledger = h.state.issuer.ledger().expect("the harness keeps a ledger");
+        let revoked = ledger
+            .revoke(crate::capability_ledger::RevocationScope::Node(
+                "runtime-test".into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revoked.len(), 1);
+
+        let refusal = service
+            .issue_capability(ask())
+            .await
+            .expect_err("a revoked node was issued a new capability");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            issued_jtis(&h.state).await.len(),
+            1,
+            "nothing new was issued"
+        );
+        assert_eq!(issuance_refusals(&h.state).await.len(), 1);
+
+        let refusal = service
+            .fetch_secret_values(from(
+                &node("runtime-test"),
+                secret_request("runtime-test", &deployment_id, &[&revision]),
+            ))
+            .await
+            .expect_err("a revoked node fetched secret values");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+        assert_eq!(secret_fetch_lines(&h.state).await.len(), 1);
+
+        let refusal = service
+            .fetch_assignments(from(
+                &node("runtime-test"),
+                FetchAssignmentsRequest {
+                    node_id: "runtime-test".to_string(),
+                },
+            ))
+            .await
+            .expect_err("a revoked node read its assignments");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        let refusal = service
+            .register(from(
+                &node("runtime-test"),
+                RegisterNodeRequest {
+                    node_id: "runtime-test".to_string(),
+                    registration_json: "{}".to_string(),
+                },
+            ))
+            .await
+            .expect_err("a revoked node registered again");
+        assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
+
+        assert!(ledger.lift_node("runtime-test").await.unwrap());
+        service
+            .issue_capability(ask())
+            .await
+            .expect("issued again once lifted");
     }
 }

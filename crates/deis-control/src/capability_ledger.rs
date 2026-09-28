@@ -7,6 +7,12 @@
 //! everybody": an operator can take back one token by `jti`, or every token a
 //! node or a tenant holds, because this table says which ones those are.
 //!
+//! A node is also revoked as a principal (`revoked_nodes`). The jtis it held
+//! are only what it held at that moment; the row refuses it every machine
+//! RPC from then on - new capabilities included - and rides on the signed
+//! list, so every verifier refuses any capability naming it until an operator
+//! lifts the revocation ([`Self::lift_node`]).
+//!
 //! A revocation names the capability's expiry as well, so the list verifiers
 //! poll ([`Self::revoked_jtis`]) carries only what could still be accepted
 //! and stays small however much is ever revoked.
@@ -14,7 +20,7 @@
 use std::sync::Arc;
 
 use deis_capability::CapabilityClaims;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::database::{Database, DatabaseError};
 
@@ -77,6 +83,7 @@ impl CapabilityLedger {
     }
 
     /// Revoke every unexpired capability `scope` covers; returns their jtis.
+    /// A node scope revokes the node itself as well, for good.
     ///
     /// Revoking a `jti` that was never issued here, or has already expired,
     /// revokes nothing and returns an empty list - the caller decides whether
@@ -91,6 +98,42 @@ impl CapabilityLedger {
     pub async fn revoked_jtis(&self) -> Result<Vec<String>, DatabaseError> {
         self.db
             .with_connection(move |conn| revoked_jtis_on(conn, now_secs()))
+            .await
+    }
+
+    /// Every node revoked as a principal, by id.
+    pub async fn revoked_nodes(&self) -> Result<Vec<String>, DatabaseError> {
+        self.db.with_connection(revoked_nodes_on).await
+    }
+
+    /// Whether `node_id` is revoked as a principal.
+    pub async fn is_node_revoked(&self, node_id: &str) -> Result<bool, DatabaseError> {
+        let node_id = node_id.to_string();
+        self.db
+            .with_connection(move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT 1 FROM revoked_nodes WHERE node_id = ?1",
+                        params![node_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some())
+            })
+            .await
+    }
+
+    /// Lift a node's revocation; `false` when it was not revoked. The jtis
+    /// revoked with it stay revoked.
+    pub async fn lift_node(&self, node_id: &str) -> Result<bool, DatabaseError> {
+        let node_id = node_id.to_string();
+        self.db
+            .with_connection(move |conn| {
+                Ok(conn.execute(
+                    "DELETE FROM revoked_nodes WHERE node_id = ?1",
+                    params![node_id],
+                )? > 0)
+            })
             .await
     }
 
@@ -168,6 +211,12 @@ fn revoke_on(
         })?;
         rows.collect::<Result<_, _>>()?
     };
+    if let RevocationScope::Node(node) = scope {
+        tx.execute(
+            "INSERT OR IGNORE INTO revoked_nodes (node_id, revoked_at) VALUES (?1, ?2)",
+            params![node, now],
+        )?;
+    }
     let reason = scope.reason();
     for (jti, expires_at) in &targets {
         tx.execute(
@@ -185,6 +234,12 @@ fn revoked_jtis_on(conn: &Connection, now: i64) -> Result<Vec<String>, DatabaseE
         "SELECT jti FROM capability_revocations WHERE expires_at > ?1 ORDER BY jti",
     )?;
     let rows = statement.query_map(params![now - LIST_MARGIN_SECS], |row| row.get(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn revoked_nodes_on(conn: &Connection) -> Result<Vec<String>, DatabaseError> {
+    let mut statement = conn.prepare("SELECT node_id FROM revoked_nodes ORDER BY node_id")?;
+    let rows = statement.query_map([], |row| row.get(0))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -276,6 +331,34 @@ mod tests {
         let listed = ledger.revoked_jtis().await.unwrap();
         assert_eq!(listed.len(), 3);
         assert!(!listed.contains(&human.jti));
+    }
+
+    /// Revoking a node outlasts the tokens it held: it stays revoked, and on
+    /// the list, until it is lifted - even when it held nothing.
+    #[tokio::test]
+    async fn a_revoked_node_stays_revoked_until_lifted() {
+        let ledger = ledger().await;
+        assert!(
+            ledger
+                .revoke(RevocationScope::Node("runtime-a".into()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        ledger
+            .revoke(RevocationScope::Tenant("a.production".into()))
+            .await
+            .unwrap();
+        assert!(ledger.is_node_revoked("runtime-a").await.unwrap());
+        assert!(!ledger.is_node_revoked("runtime-b").await.unwrap());
+        assert_eq!(ledger.revoked_nodes().await.unwrap(), vec!["runtime-a"]);
+
+        ledger.prune().await.unwrap();
+        assert!(ledger.is_node_revoked("runtime-a").await.unwrap());
+
+        assert!(ledger.lift_node("runtime-a").await.unwrap());
+        assert!(!ledger.lift_node("runtime-a").await.unwrap());
+        assert!(ledger.revoked_nodes().await.unwrap().is_empty());
     }
 
     #[tokio::test]

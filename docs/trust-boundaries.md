@@ -59,6 +59,9 @@ Nothing here issues, renews or revokes a certificate. That is the
 installation's own certificate authority, and `deis-identity` deliberately
 knows nothing about where the files came from. What the platform insists on is
 the shape of the name, not its issuer.
+What it can refuse is a name: a node revoked on the control plane is answered
+nothing on the machine channel, whatever certificate proves it, until the
+revocation is lifted (see "Taking capabilities back").
 
 ### Where each process is configured
 
@@ -354,7 +357,7 @@ Everything below is therefore the operator's to enforce:
 | The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`, and names the `[machine]` identity files. The three migration values must be different from each other and from every other credential. |
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
 | The control plane's `<data_dir>/bootstrap.token` | `0600`, written by the control plane itself on a first start and deleted the moment the bootstrap token is used. Until then it is an operator credential - it exists to create the first owner account and nothing else - so treat it like one and do not let it out of the host. It is not part of a backup of the data directory: it is short-lived by design, and backing one up means carrying an unused way in. |
-| Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchSecretValues` still answers for every environment's secrets. Issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. |
+| Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchSecretValues` still answers for every environment's secrets. Certificate issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. What the platform can do with a compromised node's name is revoke the node (see "Taking capabilities back"): the control plane then answers that name nothing and every verifier refuses its capabilities, whatever certificate proves it. |
 | Every node's configuration | `0600`, owned by the node's service user. It holds no shared credential - its telemetry capability is issued by the control plane at run time - but the file names the path of this node's private key and the one control plane this node obeys - which is what decides who may deploy to it. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same contents, same reasoning, on the one host that faces the internet. |
 | deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. They hold the independent `migration_admin_token` - possession of it can freeze and inventory any tenant in that backend - and name the service's `[machine_identity]` files. The private key is `0600` like every other machine's: whoever holds a store's key can answer for a store and collect the capabilities sent to it. |
@@ -444,12 +447,13 @@ log:
 | Call | Revokes |
 |---|---|
 | `DELETE /api/v1/capabilities/{jti}` (`capability.revoke`) | one capability |
-| `POST /api/v1/capabilities/revocations/nodes/{node_id}` (`capability.revoke_node`) | every unexpired capability issued to that node |
+| `POST /api/v1/capabilities/revocations/nodes/{node_id}` (`capability.revoke_node`) | the node itself, until lifted, and every unexpired capability issued to it (see below) |
+| `DELETE /api/v1/capabilities/revocations/nodes/{node_id}` (`capability.lift_node_revocation`) | nothing: lifts a node's revocation, so it may register and be issued capabilities again |
 | `POST /api/v1/apps/{app}/environments/{env}/capability-revocations` (`capability.revoke_tenant`) | every unexpired capability naming that tenant, whoever holds it |
 | `POST /api/v1/capabilities/auth-epoch` (`capability.auth_epoch.bump`) | every capability issued so far: the epoch floor rises |
 
 Verifiers learn of it from the revocation list: every revoked `jti` that
-could still be accepted, and the current auth epoch, **signed with the issuer
+could still be accepted, every revoked node, and the current auth epoch, **signed with the issuer
 key** in the capability wire format and served on the machine listener only.
 deis-store (for kv, sql and blob alike - one verifier behind all three),
 deis-queue and deis-telemetry poll it every 30 seconds over the machine
@@ -473,19 +477,36 @@ telemetry capability is still one token for every tenant it runs, so a
 tenant revocation briefly refuses that node's pushes too; the shippers keep
 their batches queued and the replacement arrives within seconds.
 
-Two things a revocation does not do. It does not stop a node asking again:
-a node still in the fleet and still running the tenant is issued a new
-capability straight away - to shut a machine out, remove it from the
-fleet and stop trusting its certificate. And it does not reach a verifier cut
-off from the control plane: in T8 degraded mode a verifier enforces the last
-list it adopted.
+**Revoking a node** is for a compromised machine, and takes back the holder
+rather than the tokens it happens to hold. The node goes on the
+`revoked_nodes` table until an administrator lifts it, and from then on:
+the control plane takes it out of the fleet, and the machine channel answers
+it nothing but its own deregistration - no registration, assignment list,
+routing table, secret value or capability (`FetchSecretValues` and
+`IssueCapability` refusals are on the audit log); and the signed list names
+it, so deis-store, deis-queue and deis-telemetry refuse **every** capability
+whose subject is that node's SPIFFE name - one issued a moment before the
+revocation, one read back from its offline cache, an expired one offered
+under T8 grace - within one poll. A node listed in `deis_runtime_nodes`
+stays in the fleet listing until it is taken out of that file, but is
+answered nothing all the same. The platform cannot tell one certificate for
+a name from another, so lift a revocation only once the compromised key can
+no longer prove that name - every certificate it held has expired - or
+rebuild the machine under a new node id.
+
+Revoking a `jti` or a tenant, by contrast, does not stop a node asking
+again: a node still in the fleet and still running the tenant is issued a
+new capability straight away, which is what "that token leaked" wants. And
+no revocation reaches a verifier cut off from the control plane: in T8
+degraded mode a verifier enforces the last list it adopted.
 
 **T8 degraded mode.** A verifier that has not adopted a list for two poll
 intervals is degraded. Only then, and only for a capability whose subject is
 a runtime node's SPIFFE name (`spiffe://<trust domain>/deislet/node/<id>`,
 parsed by `deis-identity`), does it accept an expired capability - and only
 if it was still valid (give or take 30 seconds) when the last list arrived,
-is at most 24 hours past its expiry, and is not revoked by that list. Human
+is at most 24 hours past its expiry, and neither it nor its node is revoked
+by that list. Human
 capabilities never get grace. Each verifier exports `deis_auth_degraded`,
 `deis_auth_degraded_since_seconds`, `deis_auth_grace_accepted_total` and
 `deis_auth_revocation_last_sync_seconds` - deis-telemetry on its `/metrics`,
