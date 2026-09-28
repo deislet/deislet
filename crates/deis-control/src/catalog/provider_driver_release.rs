@@ -2119,6 +2119,16 @@ pub(crate) mod tests {
 
     impl Fixture {
         pub(crate) fn new() -> Self {
+            Self::build(None)
+        }
+
+        /// A release whose driver entrypoint is `driver`, so a test can
+        /// launch a real process through the installed, verified tree.
+        pub(crate) fn with_driver_executable(driver: Vec<u8>) -> Self {
+            Self::build(Some(driver))
+        }
+
+        fn build(driver: Option<Vec<u8>>) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let install_root = temporary.path().join("installed");
             fs::create_dir(&install_root).unwrap();
@@ -2136,15 +2146,13 @@ pub(crate) mod tests {
                 .files
                 .iter()
                 .map(|file| {
-                    let byte = if file.path.contains("driver") {
-                        b'd'
-                    } else {
-                        b'w'
+                    let is_driver = file.path.contains("driver");
+                    let content = match (&driver, is_driver) {
+                        (Some(driver), true) => driver.clone(),
+                        (None, true) => vec![b'd'; 128],
+                        (_, false) => vec![b'w'; 256],
                     };
-                    (
-                        file.path.clone(),
-                        vec![byte; if byte == b'd' { 128 } else { 256 }],
-                    )
+                    (file.path.clone(), content)
                 })
                 .collect::<BTreeMap<_, _>>();
             bind_file_table(&mut distribution.files, &contents);

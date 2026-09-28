@@ -118,6 +118,10 @@ protoc-bin-vendored = "=3.2.0"
 # Mints the certificates the machine-channel tests hold real handshakes with.
 deis-identity-test-pki = { path = "../deis-identity-test-pki" }
 deis-provider-driver = { path = "../deis-provider-driver", features = ["test-support"] }
+# The Cloudflare end-to-end test runs the real driver and build adapter.
+deis-provider-driver-cloudflare = { path = "../deis-provider-driver-cloudflare" }
+deis-build-adapter-cloudflare = { path = "../deis-build-adapter-cloudflare" }
+deis-build-core = { workspace = true }
 tar = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 # The capability chain test runs real verifiers against the real binary.

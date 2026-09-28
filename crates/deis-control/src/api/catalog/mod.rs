@@ -366,6 +366,9 @@ pub(super) fn actor_subject(principal: &crate::identity::Principal) -> String {
 }
 
 #[cfg(test)]
+mod cloudflare_e2e;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::catalog::bundle::tests::sample_bundle;
