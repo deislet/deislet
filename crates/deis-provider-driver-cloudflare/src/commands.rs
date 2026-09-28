@@ -5,14 +5,27 @@
 //! | preflight | `whoami --json` |
 //! | plan | (local) read `binding-plan.json`, check `wrangler.toml` renders |
 //! | prepare | per resource: `kv namespace list`/`create`, `d1 list --json`/`create`, `r2 bucket info`/`create`, `queues info`/`create` |
-//! | upload | `versions upload --message deis:<digest> [--secrets-file /dev/stdin]` in a staged copy with the rendered `wrangler.toml` |
+//! | upload | `versions list --name <worker> --json` to see whether the Worker exists; for a new Worker, `deploy --message deis:placeholder` of a placeholder script first (wrangler refuses `versions upload` for a Worker that does not exist); then `versions upload --message deis:<digest> [--secrets-file /dev/stdin]` in a staged copy with the rendered `wrangler.toml` |
 //! | verify | `versions list --name <worker> --json` |
-//! | activate | `versions deploy <version>@100% --name <worker> --yes` |
+//! | activate | `versions deploy <version>@100% --name <worker> --yes`, then `triggers deploy` with the rendered `wrangler.toml` |
 //! | observe, inspect | `deployments status --name <worker> --json` |
-//! | rollback | `versions deploy <target version>@100% --name <worker> --yes` |
+//! | rollback | `versions deploy <target version>@100% --name <worker> --yes`, then `triggers deploy` with the configuration the target was activated with |
 //! | reconcile | the read-back of the operation it takes over (see [`reconcile`]) |
 //! | delete | `delete <worker> --force`, then the purge below when consented |
 //! | cleanup | local state only, then the purge below when consented |
+//!
+//! Triggers: `versions upload` and `versions deploy` do not touch what
+//! Cloudflare keeps per Worker rather than per version - cron schedules,
+//! queue consumers, and the workers.dev route. `triggers deploy` applies them
+//! from the rendered `wrangler.toml`: it PUTs `[triggers] crons` (always
+//! present in the rendered file, empty when the application has none, so a
+//! removed cron is cleared), attaches each `[[queues.consumers]]` entry and
+//! enables the workers.dev subdomain. It adds and updates queue consumers
+//! but never detaches one the configuration no longer lists.
+//!
+//! The placeholder that creates a new Worker answers 503 and is deployed
+//! with `workers_dev = false`, so nothing is reachable before activate; its
+//! version is never the one `activate` deploys.
 //!
 //! Purge (only with `DEIS_CLOUDFLARE_PURGE_DATA=<environment id>`): every KV
 //! namespace and D1 database whose name carries this environment's scope
@@ -50,6 +63,14 @@ use crate::wrangler::{Wrangler, WranglerError, WranglerOutput};
 /// Cloudflare API codes meaning "the Worker does not exist"
 /// (`workers.api.error.script_not_found`, `service_not_found`).
 pub const NOT_FOUND_CODES: [u64; 2] = [10007, 10090];
+/// wrangler's (code-less) user error for a Worker that exists but has never
+/// had a deployment.
+const NO_DEPLOYMENTS: &str = "has no deployments";
+/// The message of the placeholder version that creates a new Worker.
+pub const PLACEHOLDER_MESSAGE: &str = "deis:placeholder";
+const PLACEHOLDER_SCRIPT: &str = "export default {\n  fetch() {\n    return new Response(\"This deployment has not been activated yet.\\n\", { status: 503 });\n  },\n};\n";
+const PLACEHOLDER_COMPATIBILITY_DATE: &str = "2025-01-01";
+
 /// Cloudflare API codes meaning the credential is not accepted.
 const AUTHENTICATION_CODES: [u64; 4] = [9106, 9109, 10000, 10001];
 
@@ -287,9 +308,10 @@ impl<'a, 'c> Op<'a, 'c> {
         Ok(receipt)
     }
 
-    async fn upload(&self) -> Result<DriverReceipt, OpError> {
+    /// The artifact's `wrangler.toml` with every placeholder resolved from
+    /// the journal.
+    fn render_for_deploy(&self, journal: &DeploymentJournal) -> Result<String, OpError> {
         let (plan, resources) = self.plan_and_resources()?;
-        let mut journal = self.load_journal()?;
         let mut resolved = BTreeMap::new();
         for resource in &resources {
             let entry = journal.resources.get(&resource.key()).ok_or_else(|| {
@@ -304,24 +326,32 @@ impl<'a, 'c> Op<'a, 'c> {
         }
         let names = names_by_key(&resources);
         let source = read_wrangler_toml(self.ctx.artifact_dir)?;
-        let worker = self.worker();
-        let rendered = artifact::render_wrangler_toml(
+        Ok(artifact::render_wrangler_toml(
             &source,
             &plan,
             &RenderInputs {
-                worker_name: &worker,
+                worker_name: &self.worker(),
                 resolved: &resolved,
                 names: &names,
                 config: self.ctx.config,
             },
-        )?;
+        )?)
+    }
+
+    async fn upload(&self) -> Result<DriverReceipt, OpError> {
+        let mut journal = self.load_journal()?;
+        let rendered = self.render_for_deploy(&journal)?;
+        let worker = self.worker();
+        if !self.worker_exists().await? {
+            self.create_worker().await?;
+        }
 
         std::fs::create_dir_all(self.ctx.scratch_root)?;
         let staging = tempfile::Builder::new()
             .prefix("stage-")
             .tempdir_in(self.ctx.scratch_root)?;
         artifact::stage(self.ctx.artifact_dir, staging.path())?;
-        std::fs::write(staging.path().join(WRANGLER_TOML_FILE), rendered)?;
+        std::fs::write(staging.path().join(WRANGLER_TOML_FILE), &rendered)?;
 
         let message = self.upload_message();
         let mut args = vec!["versions", "upload", "--message", message.as_str()];
@@ -416,10 +446,16 @@ impl<'a, 'c> Op<'a, 'c> {
     async fn activate(&self) -> Result<DriverReceipt, OpError> {
         let mut journal = self.load_journal()?;
         let version_id = self.uploaded_version(&journal)?;
+        // Rendered before anything changes, so an artifact that no longer
+        // renders fails without touching traffic.
+        let rendered = self.render_for_deploy(&journal)?;
         let deployment_id = self.deploy_version(&version_id).await?;
         journal.active_version_id = Some(version_id.clone());
         journal.deployment_id = deployment_id.clone();
+        // Saved before the triggers, so a failure there is reconciled from
+        // "the version serves" onwards.
         self.save_journal(&journal)?;
+        self.activate_triggers(&version_id, &rendered).await?;
         let mut receipt = self.receipt(Some(DeploymentState::Active));
         receipt.side_effect = SideEffect::Confirmed;
         receipt.provider_version_id = Some(version_id);
@@ -435,7 +471,9 @@ impl<'a, 'c> Op<'a, 'c> {
         journal.active_version_id = Some(version_id.clone());
         journal.deployment_id = deployment_id.clone();
         self.save_journal(&journal)?;
+        let diagnostic = self.rollback_triggers(&version_id).await?;
         let mut receipt = self.receipt(Some(DeploymentState::RolledBack));
+        receipt.diagnostic = diagnostic;
         receipt.side_effect = SideEffect::Confirmed;
         receipt.provider_version_id = Some(version_id);
         receipt.provider_deployment_id = deployment_id;
@@ -484,6 +522,101 @@ impl<'a, 'c> Op<'a, 'c> {
             .record("version-deploy")
             .and_then(|record| record["deployment_id"].as_str())
             .map(str::to_owned))
+    }
+
+    /// Apply the per-Worker configuration of an activated version and keep
+    /// it for a later rollback to this version.
+    async fn activate_triggers(&self, version_id: &str, rendered: &str) -> Result<(), OpError> {
+        self.ctx
+            .journals
+            .save_version_config(&self.scope, version_id, rendered)?;
+        self.deploy_triggers(rendered).await
+    }
+
+    /// Re-apply the per-Worker configuration the rollback target was
+    /// activated with. A version this driver has no configuration for (its
+    /// state directory was lost) is served as it is, with the triggers left
+    /// unchanged and said so in the diagnostic.
+    async fn rollback_triggers(&self, version_id: &str) -> Result<Option<String>, OpError> {
+        match self
+            .ctx
+            .journals
+            .load_version_config(&self.scope, version_id)?
+        {
+            Some(rendered) => {
+                self.deploy_triggers(&rendered).await?;
+                Ok(None)
+            }
+            None => Ok(Some(format!(
+                "no stored configuration for version {version_id}: cron schedules, queue \
+                 consumers and routes of {} were left as they were",
+                self.worker()
+            ))),
+        }
+    }
+
+    /// `wrangler triggers deploy` in a directory holding only the rendered
+    /// `wrangler.toml` (it reads the configuration, never the code).
+    async fn deploy_triggers(&self, rendered: &str) -> Result<(), OpError> {
+        let dir = self.empty_dir()?;
+        std::fs::write(dir.path().join(WRANGLER_TOML_FILE), rendered)?;
+        self.ctx
+            .wrangler
+            .run(
+                self.ctx.credential,
+                &["triggers", "deploy"],
+                dir.path(),
+                None,
+                self.ctx.timeouts.command,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Whether the Worker exists on the account.
+    async fn worker_exists(&self) -> Result<bool, OpError> {
+        match self.list_versions().await {
+            Ok(_) => Ok(true),
+            Err(OpError::Wrangler(error))
+                if error
+                    .api_code()
+                    .is_some_and(|code| NOT_FOUND_CODES.contains(&code)) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Create the Worker with a placeholder that answers 503 and is not on
+    /// workers.dev: wrangler uploads versions only for a Worker that exists,
+    /// and `wrangler deploy` of the real code would make it serve before
+    /// verify and activate.
+    async fn create_worker(&self) -> Result<(), OpError> {
+        std::fs::create_dir_all(self.ctx.scratch_root)?;
+        let dir = tempfile::Builder::new()
+            .prefix("placeholder-")
+            .tempdir_in(self.ctx.scratch_root)?;
+        std::fs::write(
+            dir.path().join(WRANGLER_TOML_FILE),
+            format!(
+                "name = \"{}\"\nmain = \"placeholder.js\"\ncompatibility_date = \"{PLACEHOLDER_COMPATIBILITY_DATE}\"\nworkers_dev = false\n",
+                self.worker()
+            ),
+        )?;
+        std::fs::write(dir.path().join("placeholder.js"), PLACEHOLDER_SCRIPT)?;
+        self.ctx
+            .wrangler
+            .run(
+                self.ctx.credential,
+                &["deploy", "--message", PLACEHOLDER_MESSAGE],
+                dir.path(),
+                None,
+                self.ctx.timeouts.upload,
+            )
+            .await?;
+        info!(worker = %self.worker(), "Created Worker with a placeholder");
+        Ok(())
     }
 
     async fn observe(&self) -> Result<DriverReceipt, OpError> {
@@ -559,7 +692,10 @@ impl<'a, 'c> Op<'a, 'c> {
                 } else {
                     self.uploaded_version(&self.load_journal()?)?
                 };
-                let status = self.deployment_status_if_exists().await?;
+                let status = match self.worker_status().await? {
+                    WorkerStatus::Deployed(status) => Some(status),
+                    WorkerStatus::Absent | WorkerStatus::NoDeployment => None,
+                };
                 let serving = status.as_ref().and_then(serving_version);
                 if serving.as_deref() != Some(target.as_str()) {
                     return Err(not_applied(&format!(
@@ -574,19 +710,29 @@ impl<'a, 'c> Op<'a, 'c> {
                     .and_then(|status| status["id"].as_str())
                     .map(str::to_owned);
                 self.save_journal(&journal)?;
+                // The version serves; the triggers step after it may not have
+                // run. It is idempotent, so it runs again.
+                let diagnostic = if self.effective == DriverOperation::Rollback {
+                    self.rollback_triggers(&target).await?
+                } else {
+                    let rendered = self.render_for_deploy(&journal)?;
+                    self.activate_triggers(&target, &rendered).await?;
+                    None
+                };
                 let mut receipt =
                     self.receipt(Some(if self.effective == DriverOperation::Rollback {
                         DeploymentState::RolledBack
                     } else {
                         DeploymentState::Active
                     }));
+                receipt.diagnostic = diagnostic;
                 receipt.side_effect = SideEffect::Confirmed;
                 receipt.provider_version_id = Some(target);
                 receipt.provider_deployment_id = journal.deployment_id.clone();
                 Ok(receipt)
             }
             DriverOperation::Delete => {
-                if self.deployment_status_if_exists().await?.is_some() {
+                if !matches!(self.worker_status().await?, WorkerStatus::Absent) {
                     return Err(not_applied(&format!("{} still exists", self.worker())));
                 }
                 let mut receipt = self.receipt(None);
@@ -651,7 +797,7 @@ impl<'a, 'c> Op<'a, 'c> {
         }
         self.save_journal(&journal)?;
         let purged = if self.purge_consented() {
-            if self.deployment_status_if_exists().await?.is_some() {
+            if !matches!(self.worker_status().await?, WorkerStatus::Absent) {
                 return Err(OpError::State {
                     category: DriverErrorCategory::Resource,
                     code: "PURGE_WHILE_WORKER_EXISTS",
@@ -857,17 +1003,20 @@ impl<'a, 'c> Op<'a, 'c> {
         Ok(output.stdout_json("deployments status --json")?)
     }
 
-    /// Like [`Self::deployment_status`], but `None` when Cloudflare reports
-    /// the Worker absent.
-    async fn deployment_status_if_exists(&self) -> Result<Option<serde_json::Value>, OpError> {
+    /// Like [`Self::deployment_status`], but telling an absent Worker and
+    /// one without any deployment apart from a failure.
+    async fn worker_status(&self) -> Result<WorkerStatus, OpError> {
         match self.deployment_status().await {
-            Ok(status) => Ok(Some(status)),
+            Ok(status) => Ok(WorkerStatus::Deployed(status)),
             Err(OpError::Wrangler(error))
                 if error
                     .api_code()
                     .is_some_and(|code| NOT_FOUND_CODES.contains(&code)) =>
             {
-                Ok(None)
+                Ok(WorkerStatus::Absent)
+            }
+            Err(OpError::Wrangler(error)) if error.failure_mentions(NO_DEPLOYMENTS) => {
+                Ok(WorkerStatus::NoDeployment)
             }
             Err(error) => Err(error),
         }
@@ -1066,6 +1215,14 @@ impl<'a, 'c> Op<'a, 'c> {
             }
         }
     }
+}
+
+/// What `deployments status` says about the Worker.
+enum WorkerStatus {
+    Absent,
+    /// The Worker exists, but no version was ever deployed.
+    NoDeployment,
+    Deployed(serde_json::Value),
 }
 
 /// A reconcile that found the operation had no effect: safe to run again.

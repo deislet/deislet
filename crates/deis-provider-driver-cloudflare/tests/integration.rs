@@ -214,6 +214,35 @@ impl Harness {
             + 1
     }
 
+    /// What the fake account holds under `<kind_dir>/<name>`, if anything.
+    fn account_file(&self, kind_dir: &str, name: &str) -> Option<String> {
+        fs::read_to_string(self.state().join(kind_dir).join(name)).ok()
+    }
+
+    /// Rewrite the artifact's cron schedule in both files the adapter
+    /// writes, as a rebuild with another `cron` list would.
+    fn set_artifact_crons(&self, crons: &[&str]) {
+        let plan_path = self.artifact().join("binding-plan.json");
+        let mut plan: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&plan_path).unwrap()).unwrap();
+        plan["crons"] = serde_json::json!(crons);
+        fs::write(&plan_path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
+
+        let toml_path = self.artifact().join("wrangler.toml");
+        let mut doc: toml_edit::DocumentMut =
+            fs::read_to_string(&toml_path).unwrap().parse().unwrap();
+        if crons.is_empty() {
+            doc.remove("triggers");
+        } else {
+            let mut array = toml_edit::Array::new();
+            for cron in crons {
+                array.push(*cron);
+            }
+            doc["triggers"]["crons"] = toml_edit::value(array);
+        }
+        fs::write(&toml_path, doc.to_string()).unwrap();
+    }
+
     fn names_in(&self, kind_dir: &str) -> Vec<String> {
         let mut names = fs::read_dir(self.state().join(kind_dir))
             .map(|entries| {
@@ -422,6 +451,12 @@ async fn upload_deploys_a_fully_resolved_wrangler_toml() {
     let source = fs::read_to_string(harness.artifact().join("wrangler.toml")).unwrap();
     assert!(source.contains("deis:unresolved/kv/HOT"));
 
+    // Uploading a version applies no triggers.
+    let worker = scope.worker_name();
+    assert_eq!(harness.account_file("schedules", &worker), None);
+    assert_eq!(harness.account_file("consumers", &worker), None);
+    assert_eq!(harness.account_file("subdomain", &worker), None);
+
     let activated = harness.run(DriverOperation::Activate).await;
     assert_eq!(
         activated.provider_version_id.as_deref(),
@@ -430,10 +465,25 @@ async fn upload_deploys_a_fully_resolved_wrangler_toml() {
     assert!(activated.provider_deployment_id.is_some());
     let deploy = harness.calls_starting("versions deploy");
     assert_eq!(deploy.len(), 1);
-    assert!(deploy[0].starts_with(&format!(
-        "versions deploy {version}@100% --name {}",
-        scope.worker_name()
-    )));
+    assert!(deploy[0].starts_with(&format!("versions deploy {version}@100% --name {worker}")));
+    // Activate applies the per-Worker configuration after the version serves.
+    assert!(harness.call_index("triggers deploy") > harness.call_index("versions deploy"));
+    assert_eq!(
+        harness.account_file("schedules", &worker).as_deref(),
+        Some("[\"*/5 * * * *\"]\n")
+    );
+    assert_eq!(
+        harness.account_file("consumers", &worker).as_deref(),
+        Some(
+            format!(
+                "{}\n{}\n",
+                scope.resource_name(deis_build_core::BindingKind::Queue, "JOBS"),
+                scope.resource_name(deis_build_core::BindingKind::Queue, "ORDERS")
+            )
+            .as_str()
+        )
+    );
+    assert!(harness.account_file("subdomain", &worker).is_some());
 
     let observed = harness.run(DriverOperation::Observe).await;
     assert_eq!(observed.deployment_state, Some(DeploymentState::Active));
@@ -690,6 +740,202 @@ async fn failures_clear_once_the_provider_recovers() {
     harness.fail_with(DriverOperation::Preflight).await;
     harness.clear_failure("whoami");
     harness.run(DriverOperation::Preflight).await;
+}
+
+// ── first deploy and triggers ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_first_upload_creates_the_worker_with_a_placeholder() {
+    let harness = Harness::new();
+    let worker = harness.scope().worker_name();
+    harness.run(DriverOperation::Prepare).await;
+    harness.run(DriverOperation::Upload).await;
+
+    let calls = harness
+        .argv()
+        .into_iter()
+        .filter(|line| !line.starts_with("kv ") && !line.starts_with("d1 "))
+        .filter(|line| !line.starts_with("r2 ") && !line.starts_with("queues "))
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert_eq!(calls[0], format!("versions list --name {worker} --json"));
+    assert_eq!(calls[1], "deploy --message deis:placeholder");
+    assert!(calls[2].starts_with("versions upload --message deis:"));
+
+    // The placeholder is not reachable and is not what activate deploys.
+    let placeholder = fs::read_to_string(
+        harness
+            .state()
+            .join(format!("cwd.{}", harness.call_index("deploy "))),
+    )
+    .unwrap();
+    assert!(placeholder.contains("workers_dev = false"), "{placeholder}");
+    assert!(!placeholder.contains("[triggers]"), "{placeholder}");
+    assert_eq!(harness.account_file("subdomain", &worker), None);
+    assert_eq!(harness.account_file("schedules", &worker), None);
+
+    // Later uploads find the Worker and go straight to `versions upload`.
+    harness.run_for(DriverOperation::Upload, DIGEST_B).await;
+    assert_eq!(harness.calls_starting("deploy ").len(), 1);
+    assert_eq!(harness.calls_starting("versions upload").len(), 2);
+}
+
+#[tokio::test]
+async fn an_upload_after_the_worker_was_deleted_recreates_it() {
+    let harness = Harness::new();
+    harness.run(DriverOperation::Prepare).await;
+    harness.run(DriverOperation::Upload).await;
+    harness.run(DriverOperation::Activate).await;
+    harness.run(DriverOperation::Delete).await;
+
+    harness.run_for(DriverOperation::Upload, DIGEST_B).await;
+    harness.run_for(DriverOperation::Activate, DIGEST_B).await;
+    assert_eq!(harness.calls_starting("deploy ").len(), 2);
+    let observed = harness.run_for(DriverOperation::Observe, DIGEST_B).await;
+    assert_eq!(observed.deployment_state, Some(DeploymentState::Active));
+}
+
+#[tokio::test]
+async fn the_fake_refuses_a_version_for_a_worker_that_does_not_exist() {
+    // What real wrangler 4.129.0 does; the driver must never rely on
+    // `versions upload` creating a Worker.
+    let harness = Harness::new();
+    harness.run(DriverOperation::Prepare).await;
+    harness.inject_failure("deploy", 1, 10000, "Authentication error");
+    let error = harness.fail_with(DriverOperation::Upload).await;
+    assert_eq!(error.category, DriverErrorCategory::Authentication);
+    assert!(harness.calls_starting("versions upload").is_empty());
+
+    let dir = harness.root.path().join("direct");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"nobody\"\nmain = \"index.js\"\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(harness.root.path().join("fake-wrangler"))
+        .args(["versions", "upload", "--message", "m"])
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("You cannot upload a new version of a Worker that does not yet exist"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("[code:"),
+        "a user error carries no API code: {stderr}"
+    );
+    assert!(!harness.state().join("workers/nobody").exists());
+}
+
+#[tokio::test]
+async fn a_failed_triggers_step_is_reconciled_by_applying_it_again() {
+    let harness = Harness::new();
+    let worker = harness.scope().worker_name();
+    harness.run(DriverOperation::Prepare).await;
+    harness.run(DriverOperation::Upload).await;
+    harness.inject_failure("triggers-deploy", 1, 10013, "temporary");
+    let error = harness.fail_with(DriverOperation::Activate).await;
+    assert_eq!(error.side_effect, SideEffect::Possible);
+    assert_eq!(error.next_action, DriverNextAction::Reconcile);
+    assert_eq!(harness.account_file("schedules", &worker), None);
+    harness.clear_failure("triggers-deploy");
+
+    let mut request = harness.request(DriverOperation::Reconcile, DIGEST_A);
+    request.reconciles = Some(DriverReconcileContext {
+        operation: DriverOperation::Activate,
+    });
+    let receipt = harness.execute(&request).await.unwrap();
+    assert_eq!(receipt.deployment_state, Some(DeploymentState::Active));
+    assert_eq!(harness.calls_starting("versions deploy").len(), 1);
+    assert_eq!(
+        harness.account_file("schedules", &worker).as_deref(),
+        Some("[\"*/5 * * * *\"]\n")
+    );
+}
+
+#[tokio::test]
+async fn crons_follow_the_activated_version_and_a_rollback() {
+    let harness = Harness::new();
+    let worker = harness.scope().worker_name();
+    harness.run(DriverOperation::Prepare).await;
+    let first = harness
+        .run(DriverOperation::Upload)
+        .await
+        .provider_version_id
+        .unwrap();
+    harness.run(DriverOperation::Activate).await;
+
+    // A rebuild without any cron clears the schedule rather than leaving
+    // the old one running.
+    harness.set_artifact_crons(&[]);
+    harness.run_for(DriverOperation::Upload, DIGEST_B).await;
+    harness.run_for(DriverOperation::Activate, DIGEST_B).await;
+    let last = harness.argv().len();
+    let applied = fs::read_to_string(harness.state().join(format!("cwd.{last}"))).unwrap();
+    assert!(applied.contains("[triggers]\ncrons = []\n"), "{applied}");
+    assert_eq!(
+        harness.account_file("schedules", &worker).as_deref(),
+        Some("[]\n")
+    );
+
+    let mut request = harness.request(DriverOperation::Rollback, DIGEST_A);
+    request.rollback_target = Some(DriverRollbackTarget {
+        source_operation_id: CanonicalId::new_v7(),
+        activation_operation_id: CanonicalId::new_v7(),
+        activation_receipt_sha256: DIGEST_B.parse().unwrap(),
+        provider_deployment_id: None,
+        provider_version_id: Some(first.clone()),
+        provider_resource_ids: BTreeMap::new(),
+    });
+    let receipt = harness.execute(&request).await.unwrap();
+    assert_eq!(receipt.deployment_state, Some(DeploymentState::RolledBack));
+    assert_eq!(receipt.diagnostic, None);
+    assert_eq!(
+        harness.account_file("schedules", &worker).as_deref(),
+        Some("[\"*/5 * * * *\"]\n"),
+        "the rollback restores the target's schedule"
+    );
+}
+
+#[tokio::test]
+async fn an_artifact_whose_crons_disagree_with_its_plan_is_refused() {
+    let harness = Harness::new();
+    let path = harness.artifact().join("wrangler.toml");
+    let toml = fs::read_to_string(&path).unwrap();
+    fs::write(&path, toml.replace("*/5 * * * *", "0 * * * *")).unwrap();
+    let error = harness.fail_with(DriverOperation::Plan).await;
+    assert_eq!(error.code, "ARTIFACT_INVALID");
+    assert!(error.message.contains("crons"), "{}", error.message);
+}
+
+#[tokio::test]
+async fn reconciling_an_activate_on_a_worker_never_deployed_is_not_applied() {
+    let harness = Harness::new();
+    let worker = harness.scope().worker_name();
+    harness.run(DriverOperation::Prepare).await;
+    harness.run(DriverOperation::Upload).await;
+    // A Worker with versions but no deployment: `deployments status` is
+    // wrangler's code-less "has no deployments" user error.
+    fs::write(harness.state().join("workers").join(&worker), "").unwrap();
+
+    let mut request = harness.request(DriverOperation::Reconcile, DIGEST_A);
+    request.reconciles = Some(DriverReconcileContext {
+        operation: DriverOperation::Activate,
+    });
+    let error = harness.execute(&request).await.unwrap_err();
+    assert_eq!(error.code, "NOT_APPLIED");
+
+    // And it still exists, so a delete is not confirmed by it.
+    request.reconciles = Some(DriverReconcileContext {
+        operation: DriverOperation::Delete,
+    });
+    let error = harness.execute(&request).await.unwrap_err();
+    assert_eq!(error.code, "NOT_APPLIED");
 }
 
 // ── process envelope and workspace ─────────────────────────────────────────

@@ -324,6 +324,20 @@ impl WranglerError {
             _ => None,
         }
     }
+
+    /// Whether a failed command's own message (its `command-failed` record,
+    /// else its stderr) contains `text`. For wrangler's user errors, which
+    /// carry no API code.
+    pub fn failure_mentions(&self, text: &str) -> bool {
+        match self {
+            Self::CommandFailed {
+                message, stderr, ..
+            } => message
+                .as_deref()
+                .map_or_else(|| stderr.contains(text), |message| message.contains(text)),
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for WranglerError {

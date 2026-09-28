@@ -283,6 +283,49 @@ pub fn render_wrangler_toml(
         }
     }
 
+    // Cron schedules. `wrangler triggers deploy` replaces the Worker's
+    // schedules only when `[triggers] crons` is present, so the rendered file
+    // always carries it: an application that drops its last cron gets an
+    // empty list, which clears the schedule.
+    let source_crons = match doc
+        .get("triggers")
+        .and_then(|triggers| triggers.get("crons"))
+    {
+        None => None,
+        Some(item) => Some(
+            item.as_array()
+                .and_then(|array| {
+                    array
+                        .iter()
+                        .map(|cron| cron.as_str().map(str::to_owned))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or_else(|| ArtifactError::Invalid {
+                    message: "[triggers] crons is not a list of strings".to_owned(),
+                })?,
+        ),
+    };
+    if source_crons
+        .as_ref()
+        .is_some_and(|crons| crons != &plan.crons)
+        || (source_crons.is_none() && !plan.crons.is_empty())
+    {
+        return Err(ArtifactError::Invalid {
+            message: format!(
+                "[triggers] crons in {WRANGLER_TOML_FILE} do not match binding-plan.json's {:?}",
+                plan.crons
+            ),
+        });
+    }
+    let mut crons = toml_edit::Array::new();
+    for cron in &plan.crons {
+        crons.push(cron.as_str());
+    }
+    if !doc.contains_key("triggers") {
+        doc["triggers"] = Item::Table(toml_edit::Table::new());
+    }
+    doc["triggers"]["crons"] = value(crons);
+
     if let Some(vars) = doc.get_mut("vars").and_then(Item::as_table_like_mut) {
         for (name, item) in vars.iter_mut() {
             let Some(current) = item.as_str() else {

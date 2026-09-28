@@ -105,6 +105,64 @@ impl JournalStore {
         temp.persist(&path).map_err(|error| error.error)?;
         Ok(())
     }
+
+    /// Where the rendered `wrangler.toml` of one activated version is kept.
+    ///
+    /// Cloudflare applies cron schedules, queue consumers and the workers.dev
+    /// route per Worker, not per version, so a rollback re-applies them from
+    /// the configuration the target version was activated with. The file
+    /// holds no secret values (those travel on stdin only).
+    pub fn version_config_path(
+        &self,
+        scope: &DeploymentScope,
+        version_id: &str,
+    ) -> io::Result<PathBuf> {
+        if version_id.is_empty()
+            || !version_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{version_id:?} is not a Worker version id"),
+            ));
+        }
+        Ok(self
+            .root
+            .join(scope.token())
+            .join("versions")
+            .join(format!("{version_id}.toml")))
+    }
+
+    pub fn save_version_config(
+        &self,
+        scope: &DeploymentScope,
+        version_id: &str,
+        rendered: &str,
+    ) -> io::Result<()> {
+        let path = self.version_config_path(scope, version_id)?;
+        let dir = path.parent().expect("version config path has a parent");
+        fs::create_dir_all(dir)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        io::Write::write_all(&mut temp, rendered.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&path).map_err(|error| error.error)?;
+        Ok(())
+    }
+
+    /// The configuration `version_id` was activated with, if this driver
+    /// activated it.
+    pub fn load_version_config(
+        &self,
+        scope: &DeploymentScope,
+        version_id: &str,
+    ) -> io::Result<Option<String>> {
+        match fs::read_to_string(self.version_config_path(scope, version_id)?) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -138,6 +196,27 @@ mod tests {
         store.save(&a, &journal).unwrap();
         assert_eq!(store.load(&a).unwrap(), journal);
         assert_eq!(store.load(&b).unwrap(), DeploymentJournal::default());
+    }
+
+    #[test]
+    fn version_configs_are_kept_per_version_and_names_are_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JournalStore::new(dir.path());
+        let scope = DeploymentScope::new(
+            &"01890a5d-ac96-774b-bcce-b302099a8057".parse().unwrap(),
+            &"01890a5d-ac96-774b-bcce-b302099a8059".parse().unwrap(),
+        );
+        let id = "0b5c5d7e-1f2a-4b3c-8d4e-5f6a7b8c9d0e";
+        assert_eq!(store.load_version_config(&scope, id).unwrap(), None);
+        store
+            .save_version_config(&scope, id, "name = \"w\"\n")
+            .unwrap();
+        assert_eq!(
+            store.load_version_config(&scope, id).unwrap().as_deref(),
+            Some("name = \"w\"\n")
+        );
+        assert!(store.load_version_config(&scope, "../journal").is_err());
+        assert!(store.load_version_config(&scope, "").is_err());
     }
 
     #[test]

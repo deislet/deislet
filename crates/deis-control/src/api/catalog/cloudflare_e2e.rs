@@ -693,9 +693,29 @@ async fn deis_deploys_to_cloudflare_through_the_driver_process_and_deletes_the_w
     assert!(toml.contains(&format!("bucket_name = \"{r2}\"")), "{toml}");
     assert!(toml.contains(&format!("queue = \"{queue}\"")), "{toml}");
     assert!(toml.contains("crons = [\"*/5 * * * *\"]"), "{toml}");
-    // Activated: the Worker serves the uploaded version.
+    // The Worker did not exist, and wrangler uploads versions only for one
+    // that does: a placeholder created it first.
+    assert_eq!(
+        fake.calls("deploy --message deis:placeholder").len(),
+        1,
+        "{:?}",
+        fake.argv()
+    );
+    assert!(fake.call_index("deploy ", 0) < upload);
+    // Activated: the Worker serves the uploaded version, and its cron
+    // schedule, queue consumer and workers.dev route were applied after it.
     assert_eq!(fake.calls("versions deploy").len(), 1, "{:?}", fake.argv());
     assert!(fake.account().join("workers").join(&worker).is_file());
+    assert!(fake.call_index("triggers deploy", 0) > fake.call_index("versions deploy", 0));
+    assert_eq!(
+        fs::read_to_string(fake.account().join("schedules").join(&worker)).unwrap(),
+        "[\"*/5 * * * *\"]\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fake.account().join("consumers").join(&worker)).unwrap(),
+        format!("{queue}\n")
+    );
+    assert!(fake.account().join("subdomain").join(&worker).is_file());
 
     // The token reached wrangler only through its environment, never argv,
     // and the process environment held nothing else of the Control's.
@@ -727,6 +747,8 @@ async fn deis_deploys_to_cloudflare_through_the_driver_process_and_deletes_the_w
     }
     assert_eq!(fake.calls("versions upload").len(), 2);
     assert_eq!(fake.calls("versions deploy").len(), 2);
+    assert_eq!(fake.calls("triggers deploy").len(), 2);
+    assert_eq!(fake.calls("deploy ").len(), 1, "the Worker is created once");
     let second = fake.toml_seen_by_call(fake.call_index("versions upload", 1));
     assert_eq!(second, toml, "the re-deploy binds the same resources");
 
@@ -776,6 +798,7 @@ async fn deis_deploys_to_cloudflare_through_the_driver_process_and_deletes_the_w
         vec![format!("delete {worker} --force")]
     );
     assert!(!fake.account().join("workers").join(&worker).exists());
+    assert!(!fake.account().join("schedules").join(&worker).exists());
     assert_eq!(fake.names("kv"), vec![kv]);
     assert_eq!(fake.names("d1"), vec![d1]);
     assert_eq!(fake.names("r2"), vec![r2]);
