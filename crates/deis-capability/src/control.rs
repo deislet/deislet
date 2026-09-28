@@ -77,8 +77,9 @@ pub struct ServiceIdentityConfig {
     /// chain to, and what every caller of this service checks its
     /// certificate against.
     pub trust_root: PathBuf,
-    /// The control plane's machine channel, `https://host:port`. The JWKS is
-    /// read from it; `http://` is accepted only to a loopback address.
+    /// The control plane's machine channel, `https://host:port`. The JWKS and
+    /// the signed revocation list are read from it; `http://` is accepted
+    /// only to a loopback address.
     pub control_endpoint: String,
     /// How often the three files are re-read, in seconds, so a renewed
     /// certificate is adopted without a restart.

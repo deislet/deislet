@@ -213,7 +213,7 @@ fn tls_incoming(
 /// tests fill it by hand) shares it with the guards here.
 pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<RunningServer> {
     config.validate()?;
-    let (identity, _control) = machine_identity(config)?;
+    let (identity, control) = machine_identity(config)?;
 
     let migration_auth = match config.migration_admin_token.as_deref() {
         Some(token) => Some(
@@ -291,11 +291,7 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
     // no anonymous mode, no loopback bypass and no setting that turns this
     // off.
     let auth = TelemetryAuth::new(keys);
-    deis_capability::fetch::poll_revocations_over_http(
-        auth.verifier().clone(),
-        "telemetry",
-        &config.revocation_list_url,
-    );
+    deis_capability::fetch::poll_revocations(auth.verifier().clone(), "telemetry", control);
 
     let (shutdown, _) = watch::channel(false);
 

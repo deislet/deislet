@@ -36,18 +36,13 @@ pub struct Config {
     /// (retried with backoff until the control plane answers, refusing every
     /// call meanwhile), every 5 minutes after that, and whenever a token
     /// names a key this process does not hold yet.
+    ///
+    /// The control plane's signed revocation list is polled from the same
+    /// endpoint every 30 seconds; its signature is checked against the same
+    /// keys before its revoked `jti`s and minimum `auth_epoch` are enforced
+    /// and the T8 degraded-mode clock is reset.
     #[serde(default)]
     pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
-    /// Where the control plane serves its signed revocation list.
-    ///
-    /// Polled at `{revocation_list_url}/capability/revocation-list` every 30
-    /// seconds; the list's signature is checked against the same keys
-    /// capabilities are verified with before its revoked `jti`s and minimum
-    /// `auth_epoch` are enforced and the T8 degraded-mode clock is reset.
-    /// Only a loopback `http://` address is polled here; anything else is
-    /// refused at startup and the service stays degraded.
-    #[serde(default = "default_revocation_list_url")]
-    pub revocation_list_url: String,
     /// Where to serve the capability verifier's Prometheus metrics at
     /// `/metrics`. Not served when absent.
     #[serde(default)]
@@ -182,16 +177,11 @@ fn default_request_timeout_secs() -> u64 {
     30
 }
 
-fn default_revocation_list_url() -> String {
-    "http://127.0.0.1:8100".to_string()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             machine_identity: None,
-            revocation_list_url: default_revocation_list_url(),
             metrics_listen: None,
             migration_admin_token: None,
             data_dir: default_data_dir(),

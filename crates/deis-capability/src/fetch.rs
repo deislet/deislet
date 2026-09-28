@@ -111,65 +111,31 @@ pub fn spawn_refresher(
 }
 
 /// Fetch one signed revocation list. The poller is handed one of these
-/// rather than a URL so it does not care how the control plane is reached:
-/// over the machine channel with the service's own identity, or - in tests
-/// and on a single box - plain HTTP on loopback.
+/// rather than a client so its tests can serve lists of their own making;
+/// every process reaches the control plane through
+/// [`control_revocation_source`].
 pub type RevocationSource = Box<
     dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
 >;
 
-/// A [`RevocationSource`] that GETs `url` with a plain HTTP client.
-///
-/// Refuses anything but `http://` on a loopback host: a list fetched in the
-/// clear across a network is still signed, but its freshness is only as good
-/// as the path it took, and a path an attacker can hold is one they can use
-/// to withhold every list and push a verifier into degraded mode on purpose.
-/// Reaching the control plane's machine listener from another host takes the
-/// service's machine identity, which is a different source.
-pub fn http_revocation_source(url: &str, timeout: Duration) -> Result<RevocationSource, String> {
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("{url} is not a URL: {e}"))?;
-    let loopback = match parsed.host_str() {
-        Some("localhost") => true,
-        Some(host) => host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback()),
-        None => false,
-    };
-    if parsed.scheme() != "http" || !loopback {
-        return Err(format!(
-            "{url} is not plain HTTP on this machine; a revocation list from another host is \
-             fetched over the machine channel with this service's identity"
-        ));
-    }
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("cannot build an HTTP client: {e}"))?;
-    let url = url.to_string();
-    Ok(Box::new(move || {
+/// A [`RevocationSource`] reading the list from the control plane's machine
+/// channel through `client`: under mutual TLS with this service's identity,
+/// or plain HTTP only on loopback - the same rule, and the same client, the
+/// JWKS is fetched with. The list is signed either way; the channel is what
+/// keeps someone on the path from withholding every list to push a verifier
+/// into degraded mode on purpose.
+pub fn control_revocation_source(client: ControlClient) -> RevocationSource {
+    Box::new(move || {
         let client = client.clone();
-        let url = url.clone();
         Box::pin(async move {
-            let response = client
-                .get(&url)
-                .send()
+            client
+                .get_json::<crate::SignedRevocationList>(crate::revocation::REVOCATION_LIST_PATH)
                 .await
-                .map_err(|e| format!("request failed: {e}"))?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(format!("answered {status}"));
-            }
-            let body: crate::SignedRevocationList = response
-                .json()
-                .await
-                .map_err(|e| format!("body is not a signed revocation list: {e}"))?;
-            Ok(body.signed_list)
+                .map(|body| body.signed_list)
         })
-    }))
+    })
 }
 
 /// Keep `verifier` in step with the control plane's revocation list.
@@ -257,41 +223,51 @@ pub fn spawn_revocation_poller(
     })
 }
 
-/// Poll `{control_base_url}{REVOCATION_LIST_PATH}` over plain HTTP into
+/// Poll the control plane's revocation list through `client` into
 /// `verifier` every [`crate::DEFAULT_PULL_INTERVAL_SECS`].
 ///
-/// When the URL is not loopback HTTP (see [`http_revocation_source`]) nothing
-/// is polled and the refusal is logged at `error`: the verifier then never
-/// syncs, reports itself degraded and grants no T8 grace - it refuses
-/// expired capabilities and enforces no revocation beyond what the tokens
-/// themselves carry.
-pub fn poll_revocations_over_http(
+/// `client` is the one this service fetches the JWKS with, so a service that
+/// can verify capabilities at all can also learn which are revoked; until the
+/// first list arrives it reports itself degraded and grants no T8 grace.
+pub fn poll_revocations(
     verifier: crate::SharedVerifier,
     service: &'static str,
-    control_base_url: &str,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let url = format!(
-        "{}{}",
-        control_base_url.trim_end_matches('/'),
-        crate::revocation::REVOCATION_LIST_PATH
-    );
-    match http_revocation_source(&url, RefreshPolicy::default().request_timeout) {
-        Ok(source) => Some(spawn_revocation_poller(
-            verifier,
-            service,
-            Duration::from_secs(crate::DEFAULT_PULL_INTERVAL_SECS),
-            source,
-        )),
-        Err(error) => {
-            tracing::error!(
-                service,
-                %error,
-                "Not polling the control plane's revocation list; this service reports itself \
-                 degraded, refuses expired capabilities and enforces no revocation until it can"
-            );
-            None
+    client: ControlClient,
+) -> tokio::task::JoinHandle<()> {
+    let client = client.with_timeout(RefreshPolicy::default().request_timeout);
+    spawn_revocation_poller(
+        verifier,
+        service,
+        Duration::from_secs(crate::DEFAULT_PULL_INTERVAL_SECS),
+        control_revocation_source(client),
+    )
+}
+
+/// [`poll_revocations`] from the control plane a service's
+/// `[machine_identity]` table names, proving `identity` - the certificate the
+/// service serves with, and the one its JWKS is fetched under.
+///
+/// Without a table nothing is polled and the refusal is logged: the verifier
+/// then reports itself degraded and grants no T8 grace. Only a test serves
+/// that way; every binary refuses to start without the table.
+pub fn poll_revocations_for_service(
+    verifier: crate::SharedVerifier,
+    service: &'static str,
+    table: Option<&crate::ServiceIdentityConfig>,
+    identity: Arc<deis_identity::MachineIdentity>,
+) -> Result<(), crate::ControlClientError> {
+    match table {
+        Some(table) => {
+            poll_revocations(verifier, service, table.control_client(identity)?);
         }
+        None => tracing::error!(
+            service,
+            "No [machine_identity] table, so the control plane's revocation list is not polled; \
+             this service reports itself degraded, refuses expired capabilities and enforces no \
+             revocation beyond what the tokens carry"
+        ),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -399,7 +375,7 @@ mod tests {
             Arc::clone(&verifier),
             "test",
             Duration::from_millis(100),
-            http_revocation_source(&url, Duration::from_secs(5)).unwrap(),
+            control_revocation_source(ControlClient::loopback(&url).unwrap()),
         );
         eventually("the revocation", || {
             matches!(check(&verifier), Err(CapabilityError::Revoked { .. }))
@@ -431,16 +407,6 @@ mod tests {
             matches!(check(&verifier), Err(CapabilityError::AuthEpochTooLow { .. }))
         })
         .await;
-    }
-
-    #[test]
-    fn a_plain_http_source_is_only_for_this_machine() {
-        let timeout = Duration::from_secs(1);
-        assert!(http_revocation_source("http://127.0.0.1:1/x", timeout).is_ok());
-        assert!(http_revocation_source("http://[::1]:1/x", timeout).is_ok());
-        assert!(http_revocation_source("http://localhost:1/x", timeout).is_ok());
-        assert!(http_revocation_source("http://10.0.0.5:1/x", timeout).is_err());
-        assert!(http_revocation_source("https://127.0.0.1:1/x", timeout).is_err());
     }
 
     #[tokio::test]

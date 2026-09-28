@@ -36,21 +36,16 @@ pub struct Config {
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    /// Where the control plane serves its signed revocation list.
-    ///
-    /// Polled at `{revocation_list_url}/capability/revocation-list` every 30
-    /// seconds; a list is adopted only if its signature verifies against the
-    /// capability verifying key and it is fresh. Only a loopback `http://`
-    /// address is polled here; anything else is refused at startup and the
-    /// service stays degraded. Its state is exported on `/metrics` as
-    /// `deis_auth_*`.
-    #[serde(default = "default_revocation_list_url")]
-    pub revocation_list_url: String,
     /// This service's machine identity and the control plane's machine
     /// channel, where the capability JWKS is read from at startup (retried
     /// until the control plane answers, refusing every call meanwhile), every
     /// 5 minutes after that, and whenever a token names a key not yet held.
     /// Required by `serve`; see the module note.
+    ///
+    /// The control plane's signed revocation list is polled from the same
+    /// endpoint every 30 seconds; its signature is checked against the same
+    /// keys before its revoked `jti`s and minimum `auth_epoch` are enforced
+    /// and the T8 degraded-mode clock is reset.
     #[serde(default)]
     pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
     /// Independent bearer credential for the backend migration management
@@ -156,17 +151,12 @@ fn default_metrics_export_window_secs() -> u64 {
     300
 }
 
-fn default_revocation_list_url() -> String {
-    "http://127.0.0.1:8100".to_string()
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
-            revocation_list_url: default_revocation_list_url(),
             machine_identity: None,
             migration_admin_token: None,
             log_retention_days: default_log_retention_days(),
@@ -189,7 +179,6 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("metrics_listen", &self.metrics_listen)
             .field("data_dir", &self.data_dir)
-            .field("revocation_list_url", &self.revocation_list_url)
             .field(
                 "migration_admin_token",
                 &self.migration_admin_token.as_ref().map(|_| "<redacted>"),
@@ -308,6 +297,7 @@ mod tests {
             "capability_public_key = \"00\"",
             "auth_secret = \"x\"",
             "capability_jwks_url = \"http://127.0.0.1:8100\"",
+            "revocation_list_url = \"http://127.0.0.1:8100\"",
         ] {
             assert!(toml::from_str::<Config>(removed).is_err(), "{removed}");
         }

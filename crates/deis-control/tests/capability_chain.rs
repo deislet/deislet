@@ -76,9 +76,6 @@ struct Installation {
     config: PathBuf,
     port: u16,
     machine_port: u16,
-    /// A node's identity from the same authority, for reaching the machine
-    /// listener as a machine of this fleet does.
-    node_identity: deis_identity::IdentityFiles,
     ca: TestCa,
 }
 
@@ -101,10 +98,6 @@ impl Installation {
         // An installer creates the data directory; the control plane refuses
         // to invent one for its database.
         std::fs::create_dir_all(root.join("data")).expect("a data directory");
-
-        let node_id = names::node(TRUST_DOMAIN, "runtime-relay").expect("a node name");
-        let node_identity =
-            write_files(root, "node", &ca.issue(&node_id), &ca.root_pem).as_identity_files();
 
         let master_key = root.join("master.key");
         std::fs::write(&master_key, "7f".repeat(32)).expect("write master key");
@@ -145,7 +138,6 @@ trust_root = "{trust_root}"
             config,
             port,
             machine_port,
-            node_identity,
             ca,
         }
     }
@@ -288,23 +280,12 @@ impl Service {
         installation: &Installation,
         id: &str,
     ) -> Self {
-        Self::store_polling(listener, installation, id, installation.base_url()).await
-    }
-
-    /// A store that polls its revocation list at `revocation_list_url`.
-    async fn store_polling(
-        listener: tokio::net::TcpListener,
-        installation: &Installation,
-        id: &str,
-        revocation_list_url: String,
-    ) -> Self {
         let data = TempDir::new().expect("a directory");
         let addr = listener.local_addr().expect("an address");
         let name = names::store(TRUST_DOMAIN, id).expect("a store name");
         let config = deis_store::config::Config {
             listen: addr.to_string(),
             data_dir: data.path().to_path_buf(),
-            revocation_list_url,
             machine_identity: Some(installation.service_identity(id, &name)),
             ..deis_store::config::Config::default()
         };
@@ -348,7 +329,6 @@ impl Service {
         let config = deis_queue::config::Config {
             listen: addr.to_string(),
             data_dir: data.path().to_path_buf(),
-            revocation_list_url: installation.base_url(),
             machine_identity: Some(installation.service_identity(id, &name)),
             ..deis_queue::config::Config::default()
         };
@@ -717,64 +697,6 @@ async fn storage_keeps_working_across_a_control_plane_restart() {
     assert_confined(&fresh_store, &fresh_queue, &store_after, &queue_after).await;
 }
 
-/// Stands in for the transport a verifier with a machine identity uses: every
-/// GET on the returned loopback address fetches the signed revocation list
-/// from the control plane's machine listener over mutual TLS, as a node of
-/// this fleet, and passes the body through untouched. What the verifier
-/// checks - the signature, the freshness - is the production code; only the
-/// hop is the test's.
-async fn revocation_relay(installation: &Installation) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let identity = std::sync::Arc::new(
-        deis_identity::MachineIdentity::load(
-            installation.node_identity.clone(),
-            &[deis_identity::Protocol::Http11],
-        )
-        .expect("the relay's node identity"),
-    );
-    let control = names::control(TRUST_DOMAIN).expect("a control name");
-    let tls = identity
-        .client_config(&control, &[deis_identity::Protocol::Http11])
-        .expect("a client configuration");
-    let client = reqwest::Client::builder()
-        .use_preconfigured_tls((*tls).clone())
-        .build()
-        .expect("an mTLS client");
-    let upstream = format!(
-        "https://127.0.0.1:{}{}",
-        installation.machine_port,
-        deis_capability::revocation::REVOCATION_LIST_PATH
-    );
-
-    let listener = local_listener().await;
-    let addr = listener.local_addr().expect("an address");
-    tokio::spawn(async move {
-        loop {
-            let (mut socket, _) = listener.accept().await.expect("a connection");
-            let client = client.clone();
-            let upstream = upstream.clone();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 2048];
-                let _ = socket.read(&mut buf).await;
-                let (status, body) = match client.get(&upstream).send().await {
-                    Ok(response) => (
-                        response.status().as_u16(),
-                        response.text().await.unwrap_or_default(),
-                    ),
-                    Err(error) => (502, error.to_string()),
-                };
-                let answer = format!(
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(answer.as_bytes()).await;
-            });
-        }
-    });
-    format!("http://{addr}")
-}
-
 /// The `jti` a token carries, read without verifying it - the test is the
 /// one who asked for the token.
 fn jti_of(token: &str) -> String {
@@ -821,8 +743,7 @@ async fn a_revocation_reaches_the_store_within_one_poll() {
         queue_listener.local_addr().unwrap(),
     );
     let _control = installation.start(1).await;
-    let relay = revocation_relay(&installation).await;
-    let store = Service::store_polling(store_listener, &installation, "store-1", relay.clone()).await;
+    let store = Service::store(store_listener, &installation, "store-1").await;
 
     let api = Api::log_in(&installation).await;
     api.call(reqwest::Method::POST, "/apps", Some(json!({"id": APP})))
@@ -875,8 +796,7 @@ async fn a_revocation_reaches_the_store_within_one_poll() {
         .call(reqwest::Method::POST, "/capabilities/auth-epoch", None)
         .await;
     assert_eq!(bumped["auth_epoch"], 2);
-    let fresh =
-        Service::store_polling(local_listener().await, &installation, "store-2", relay).await;
+    let fresh = Service::store(local_listener().await, &installation, "store-2").await;
     refused_eventually(&fresh, &kept, Code::PermissionDenied, DEADLINE).await;
     let (after, _) = api.storage_tokens().await;
     use_store(&fresh, &after, "after-epoch-bump").await;

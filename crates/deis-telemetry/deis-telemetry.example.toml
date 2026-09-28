@@ -26,10 +26,6 @@ listen = "127.0.0.1:8092"
 # deis-control, which needs read:*/*).
 metrics_listen = "127.0.0.1:8093"
 
-# Where deis-control publishes the capability revocation list, polled every
-# 30 seconds.
-revocation_list_url = "http://127.0.0.1:8100"
-
 # Independent bearer credential for the optional BackendMigration management
 # service. Telemetry producers and readers must not be able to freeze,
 # inventory or release a tenant, so this is its own credential. When

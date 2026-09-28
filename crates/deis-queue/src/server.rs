@@ -194,11 +194,13 @@ pub async fn serve(
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
     let auth = QueueAuth::new(keys);
-    deis_capability::fetch::poll_revocations_over_http(
+    deis_capability::fetch::poll_revocations_for_service(
         auth.verifier().clone(),
         "queue",
-        &config.revocation_list_url,
-    );
+        config.machine_identity.as_ref(),
+        Arc::clone(&identity),
+    )
+    .context("cannot reach the control plane's machine channel as configured")?;
     if let Some(listen) = config.metrics_listen.as_deref() {
         let metrics = TcpListener::bind(listen)
             .await

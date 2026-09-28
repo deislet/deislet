@@ -445,7 +445,9 @@ Verifiers learn of it from the revocation list: every revoked `jti` that
 could still be accepted, and the current auth epoch, **signed with the issuer
 key** in the capability wire format and served on the machine listener only.
 deis-store (for kv, sql and blob alike - one verifier behind all three),
-deis-queue and deis-telemetry poll it every 30 seconds, check the signature
+deis-queue and deis-telemetry poll it every 30 seconds over the machine
+channel - under mutual TLS with their own `[machine_identity]`, the same
+client and endpoint they read the JWKS with - check the signature
 against the same JWKS capabilities are checked against, and refuse a list
 that is older than two minutes, from the future, or older than the one they
 last adopted - so a list edited on the way, or an old one replayed, changes

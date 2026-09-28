@@ -436,7 +436,6 @@ EOF
   # certificate is what each serves its gRPC listener with: TLS only.
   cat >/etc/deis/store.toml <<EOF
 listen = "0.0.0.0:${STORE_PORT}"
-revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/store"
 snapshot_dir = "/var/lib/deis/store-snapshots"
 snapshot_interval_secs = 86400
@@ -453,7 +452,6 @@ EOF
 
   cat >/etc/deis/queue.toml <<EOF
 listen = "0.0.0.0:${QUEUE_PORT}"
-revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/queue"
 connections = 8
 
@@ -472,7 +470,6 @@ EOF
   cat >/etc/deis/telemetry.toml <<EOF
 listen = "0.0.0.0:${TELEMETRY_PORT}"
 metrics_listen = "0.0.0.0:${TELEMETRY_METRICS_PORT}"
-revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/telemetry"
 log_retention_days = 7
 metric_retention_days = 30

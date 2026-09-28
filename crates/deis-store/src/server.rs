@@ -240,11 +240,13 @@ pub async fn serve(
     let auth_kv = StorageAuth::new(verifier.clone(), "kv");
     let auth_sql = StorageAuth::new(verifier.clone(), "sql");
     let auth_blob = StorageAuth::new(verifier.clone(), "blob");
-    deis_capability::fetch::poll_revocations_over_http(
+    deis_capability::fetch::poll_revocations_for_service(
         verifier.clone(),
         "store",
-        &config.revocation_list_url,
-    );
+        config.machine_identity.as_ref(),
+        Arc::clone(&identity),
+    )
+    .context("cannot reach the control plane's machine channel as configured")?;
     if let Some(listen) = config.metrics_listen.as_deref() {
         let metrics = TcpListener::bind(listen)
             .await

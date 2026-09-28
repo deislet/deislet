@@ -711,10 +711,9 @@ build_binaries() {
 # mutual TLS, each proving the certificate minted for it above - at startup,
 # every few minutes, and whenever a token names a key not yet seen, so a key
 # rotation needs nothing done here. The same certificate is what each serves
-# its gRPC listener with: there is no plaintext port. revocation_list_url is
-# where both poll for revoked tokens.
+# its gRPC listener with: there is no plaintext port. The signed revocation
+# list is polled from the same machine channel every 30 seconds.
 start_storage_services() {
-  local control_url="http://127.0.0.1:${DEIS_CONTROL_PORT}"
   local machine_url="https://127.0.0.1:${DEIS_CONTROL_MACHINE_PORT}"
 
   # deis-telemetry is in the same position: it holds no secret, verifies every
@@ -725,7 +724,6 @@ start_storage_services() {
 listen = "127.0.0.1:${DEIS_TELEMETRY_PORT}"
 metrics_listen = "127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}"
 data_dir = "${DEMO_DIR}/deis-telemetry-data"
-revocation_list_url = "${control_url}"
 
 # The gRPC listener speaks TLS only, presenting this certificate.
 [machine_identity]
@@ -752,7 +750,6 @@ EOF
   cat > "$DEIS_STORE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_STORE_PORT}"
 data_dir = "${DEMO_DIR}/deis-store-data"
-revocation_list_url = "${control_url}"
 
 [machine_identity]
 certificate = "${PKI_DIR}/store.crt"
@@ -765,7 +762,6 @@ EOF
   cat > "$DEIS_QUEUE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_QUEUE_PORT}"
 data_dir = "${DEMO_DIR}/deis-queue-data"
-revocation_list_url = "${control_url}"
 
 [machine_identity]
 certificate = "${PKI_DIR}/queue.crt"

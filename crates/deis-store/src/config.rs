@@ -63,20 +63,13 @@ pub struct Config {
     /// call meanwhile), every 5 minutes after that, and whenever a token
     /// names a key this process does not hold yet - so a control-plane key
     /// rotation needs nothing done here.
+    ///
+    /// The control plane's signed revocation list is polled from the same
+    /// endpoint every 30 seconds; its signature is checked against the same
+    /// keys before its revoked `jti`s and minimum `auth_epoch` are enforced
+    /// and the T8 degraded-mode clock is reset.
     #[serde(default)]
     pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
-    /// Where the control plane serves its signed revocation list.
-    ///
-    /// The store polls `{revocation_list_url}/capability/revocation-list`
-    /// every 30 seconds, checks the list's signature against the same keys
-    /// capabilities are verified with, and adopts it: the revoked `jti`s and
-    /// the minimum `auth_epoch` are enforced by kv, sql and blob alike, and
-    /// the T8 degraded-mode clock is reset. The list is served on the control
-    /// plane's machine listener; only a loopback `http://` address is polled
-    /// here, and anything else is refused at startup with the service left
-    /// degraded (no grace, no revocation beyond what tokens carry).
-    #[serde(default = "default_revocation_list_url")]
-    pub revocation_list_url: String,
     /// Where to serve the capability verifier's Prometheus metrics
     /// (`deis_auth_degraded`, `deis_auth_degraded_since_seconds`,
     /// `deis_auth_grace_accepted_total`, `deis_auth_revocation_last_sync_seconds`)
@@ -227,10 +220,6 @@ fn default_snapshot_retention() -> usize {
     7
 }
 
-fn default_revocation_list_url() -> String {
-    "http://127.0.0.1:8100".to_string()
-}
-
 /// A configured number of seconds, or `None` for the zero that means "no
 /// bound at all".
 fn optional_seconds(secs: u64) -> Option<Duration> {
@@ -253,7 +242,6 @@ impl Default for Config {
             upload_idle_timeout_secs: default_upload_idle_timeout_secs(),
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
             machine_identity: None,
-            revocation_list_url: default_revocation_list_url(),
             metrics_listen: None,
             migration_admin_token: None,
             snapshot_dir: None,
