@@ -206,10 +206,8 @@ fn bounded_page_limit(requested: usize, what: &str) -> usize {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct App {
     pub id: String,
-    /// Permanent product identity. `None` only when talking to a control
-    /// plane from before the canonical-identity migration.
-    #[serde(default)]
-    pub canonical_id: Option<CanonicalId>,
+    /// Permanent product identity.
+    pub canonical_id: CanonicalId,
     pub created_at: i64,
 }
 
@@ -217,9 +215,8 @@ pub struct App {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Version {
     pub id: String,
-    /// Permanent product identity; absent only on an older control plane.
-    #[serde(default)]
-    pub canonical_id: Option<CanonicalId>,
+    /// Permanent product identity.
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     /// The per-application counter a person says out loud: "v3".
     pub number: i64,
@@ -316,9 +313,8 @@ pub struct ProviderArtifactRef {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Environment {
     pub id: String,
-    /// Permanent product identity; absent only on an older control plane.
-    #[serde(default)]
-    pub canonical_id: Option<CanonicalId>,
+    /// Permanent product identity.
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     pub name: String,
     pub created_at: i64,
@@ -328,9 +324,8 @@ pub struct Environment {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Deployment {
     pub id: String,
-    /// Permanent product identity; absent only on an older control plane.
-    #[serde(default)]
-    pub canonical_id: Option<CanonicalId>,
+    /// Permanent product identity.
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     pub env_id: String,
     pub version_id: String,
@@ -608,9 +603,8 @@ mod canonical_identity_tests {
     use super::App;
 
     #[test]
-    fn old_control_without_canonical_identity_remains_readable() {
-        let app: App = serde_json::from_str(r#"{"id":"demo","created_at":1}"#).unwrap();
-        assert!(app.canonical_id.is_none());
+    fn an_app_without_its_canonical_identity_is_refused() {
+        assert!(serde_json::from_str::<App>(r#"{"id":"demo","created_at":1}"#).is_err());
     }
 
     #[test]
@@ -620,7 +614,7 @@ mod canonical_identity_tests {
         )
         .unwrap();
         assert_eq!(
-            valid.canonical_id.unwrap().to_string(),
+            valid.canonical_id.to_string(),
             "018f2518-7e38-7f80-8000-000000000001"
         );
 
@@ -2649,6 +2643,7 @@ mod deployment_plan_tests {
     fn version() -> serde_json::Value {
         serde_json::json!({
             "id": "version-1",
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000009",
             "app_id": "demo",
             "number": 1,
             "bundle_sha": "sha256",
@@ -2847,6 +2842,7 @@ mod list_page_tests {
     fn version(id: &str, number: i64) -> serde_json::Value {
         serde_json::json!({
             "id": id,
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000009",
             "app_id": "demo",
             "number": number,
             "bundle_sha": "sha256",
@@ -2923,7 +2919,7 @@ mod list_page_tests {
     fn a_last_page_reads_as_no_cursor() {
         let read: ListPage<Environment> = serde_json::from_value(serde_json::json!({
             "schemaVersion": 1,
-            "items": [{"id": "env-1", "app_id": "demo", "name": "production", "created_at": 1}],
+            "items": [{"id": "env-1", "canonical_id": "018f2518-7e38-7f80-8000-000000000009", "app_id": "demo", "name": "production", "created_at": 1}],
             "page": {"limit": 100, "count": 1, "total": 1, "nextCursor": null}
         }))
         .unwrap();
@@ -3179,7 +3175,6 @@ mod list_page_tests {
         assert_eq!(history.deployments[0].version_id, "version-dep-9");
         assert_eq!(history.deployments[0].note.as_deref(), Some("hotfix"));
         assert!(history.deployments[1].note.is_none());
-        assert!(history.deployments[0].canonical_id.is_some());
         // The rest of the history is counted, not read.
         assert_eq!(history.total, 137);
         let _ = shutdown.send(());
@@ -3339,6 +3334,7 @@ mod list_page_tests {
                         "schemaVersion": 1,
                         "items": [{
                             "id": "env-1",
+                            "canonical_id": "018f2518-7e38-7f80-8000-000000000009",
                             "app_id": "demo",
                             "name": "production",
                             "created_at": 1
@@ -3399,6 +3395,7 @@ mod surface_tests {
     fn version(id: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000009",
             "app_id": "demo",
             "number": 1,
             "bundle_sha": "sha256",
@@ -4519,7 +4516,6 @@ mod captured_example_tests {
         ("ApiToken", "unscoped"),
         ("ApiToken", "last_used_at"),
         ("ApiToken", "revoked_at"),
-        ("App", "canonical_id"),
         ("ControlListPage_Account", "items.0.disabled_at"),
         ("ControlListPage_ApiToken", "items.0.unscoped"),
         ("ControlListPage_ApiToken", "items.0.last_used_at"),
@@ -4532,17 +4528,13 @@ mod captured_example_tests {
         ("ControlListPage_AuditEntry", "items.0.peer"),
         ("ControlListPage_AuditEntry", "items.0.detail"),
         ("ControlListPage_AuditEntry", "items.0.requestId"),
-        ("ControlListPage_Deployment", "items.0.canonical_id"),
         ("ControlListPage_Deployment", "items.0.note"),
         ("ControlListPage_DomainGrant", "items.0.note"),
-        ("ControlListPage_Environment", "items.0.canonical_id"),
         ("ControlListPage_Route", "items.0.host"),
         ("ControlListPage_SecretMeta", "items.0.revision"),
-        ("ControlListPage_VersionView", "items.0.canonical_id"),
         ("ControlListPage_VersionView", "items.0.manifest"),
         ("ControlListPage_VersionView", "items.0.compatibility"),
         ("DeploymentPlanResponse", "plan.last_error"),
-        ("DeploymentResponse", "deployment.canonical_id"),
         ("DeploymentResponse", "deployment.note"),
         ("DeploymentResponse", "delivery"),
         ("DeploymentResponse", "delivery.phase"),
@@ -4551,7 +4543,6 @@ mod captured_example_tests {
         ("DeploymentResponse", "delivery.skipped"),
         ("DeploymentResponse", "plan"),
         ("DeploymentResponse", "plan.last_error"),
-        ("Environment", "canonical_id"),
         ("ErrorBody", "error.requestId"),
         ("ErrorBody", "error.violations"),
         ("ErrorBody", "error.retryable"),
@@ -4559,8 +4550,6 @@ mod captured_example_tests {
         ("SecretChangeResponse", "delivery.phase"),
         ("SecretChangeResponse", "delivery.skipped"),
         ("SecretDeletedResponse", "delivery.phase"),
-        ("UploadResponse", "version.canonical_id"),
-        ("VersionView", "canonical_id"),
         ("VersionView", "manifest"),
         ("VersionView", "compatibility"),
     ];

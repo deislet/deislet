@@ -379,9 +379,7 @@ async fn deploy_to_provider(
     {
         bail!("the control plane version does not preserve the uploaded artifact lineage");
     }
-    let version_id = upload.version.canonical_id.ok_or_else(|| {
-        anyhow::anyhow!("the control plane answered the version without its canonical id")
-    })?;
+    let version_id = upload.version.canonical_id;
     output.line(format!(
         "  {} version {} ({})",
         "✓".green(),

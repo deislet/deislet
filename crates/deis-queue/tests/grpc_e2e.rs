@@ -6,11 +6,12 @@
 //! the server, and the lease and dead letter behaviour a consumer will
 //! actually meet.
 //!
-//! Every call stamps `x-deis-tenant` with an `<app>.<environment>` value,
-//! which is what deis-runtime has to send. The tests below use
-//! `app-one.production` and `app-two.production` as two unrelated tenants,
-//! and one test pairs `app-one.production` with `app-one.preview` to check
-//! that two environments of the *same* application are also two namespaces.
+//! The tests name tenants by readable labels such as `app-one.production`
+//! and `app-two.production`; `canonical` turns each label into the
+//! canonical `v1/<application id>/<environment id>` tenant its capability
+//! names, which is the only place a tenant is ever stated. One test pairs
+//! `app-one.production` with `app-one.preview` to check that two environments
+//! of the *same* application are also two namespaces.
 //!
 //! Since this service always enforces capability-based auth, every well-formed
 //! call also carries an `Authorization: Bearer <capability>` header. The

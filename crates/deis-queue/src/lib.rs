@@ -1,26 +1,21 @@
 //! Deislet message queue: durable enqueue plus lease-based consumption.
 //!
 //! The service is deliberately "dumb". It knows exactly one thing about the
-//! world outside itself: a tenant id, carried in the `x-deis-tenant` gRPC
-//! metadata header. It has no idea what a version, an environment, a
-//! deployment or a node is, and it never calls anything back. Consumers come
-//! to it; it does not push to them, because pushing would mean the queue had
-//! to know which node runs which application.
+//! world outside itself: a tenant, which the capability on each call names.
+//! It has no idea what a version, an environment, a deployment or a node is,
+//! and it never calls anything back. Consumers come to it; it does not push
+//! to them, because pushing would mean the queue had to know which node runs
+//! which application.
 //!
 //! # What a tenant is here, and what it is not
 //!
-//! The platform above builds the tenant id out of an application and an
-//! environment (`deis_wire::conventions::tenant_id`), so `demo.production`
-//! and `demo.preview-7` are two tenants of one application with two separate
-//! sets of queues. To this service that is invisible: it sees one opaque key,
-//! one tenant dimension, and it never takes the value apart for any purpose
-//! other than validating it. That is the point - a preview deployment must
-//! not be able to consume the work production enqueued, and the cheapest way
-//! to guarantee it is that the two never name the same rows here.
-//!
-//! Note which header carries it. `x-deis-app-id` names the *application* on
-//! the data path and is not the storage tenant; a call that stamps only that
-//! one is refused rather than served from a default namespace.
+//! A tenant is one application environment, keyed by canonical ids:
+//! `v1/<application id>/<environment id>`, so a preview and production of the
+//! same application have two separate sets of queues, and a preview cannot
+//! consume the work production enqueued. This service validates the key and
+//! never takes it apart for any other purpose. No request header names a
+//! tenant; a call whose capability names none for the `queue` binding is
+//! refused.
 //!
 //! # Delivery semantics
 //!

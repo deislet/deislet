@@ -92,8 +92,9 @@ pub const TELEMETRY_BINDINGS: &[&str] = &[TELEMETRY_INGEST];
 /// With [`TELEMETRY_INGEST`] it lets a node push its own, node-level records
 /// (the ones carrying no application); with [`TELEMETRY_READ`] it lets an
 /// operator read everything, every tenant's records and the platform's own.
-/// Never a real tenant: a tenant is always `<app>.<environment>`, and this
-/// has no `.`.
+/// Never a real tenant: a telemetry tenant is always `<app>.<environment>`
+/// and a storage one `v1/<application id>/<environment id>`, and this has
+/// neither a `.` nor a `/`.
 pub const TELEMETRY_PLATFORM_TENANT: &str = "@platform";
 
 /// The longest a capability may be valid for, `exp - iat`, in seconds.

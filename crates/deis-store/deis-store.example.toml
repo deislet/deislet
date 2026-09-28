@@ -32,11 +32,9 @@ listen = "127.0.0.1:8090"
 # layout is not a secret, but the process still must not be able to write
 # outside this tree for any other reason - run it as a user that cannot.
 #
-# A tenant is one application in one environment, spelled "<app>.<environment>"
-# (for example "demo.production"). A directory written before that was true is
-# keyed by bare application ids and cannot be read now; there is no migration,
-# and the service refuses to start on one rather than serving empty stores
-# over the top of it.
+# A tenant is one application in one environment, keyed by canonical ids
+# ("v1/<application id>/<environment id>") and named by the capability on each
+# call, never by the caller.
 data_dir = "./data"
 
 # How much a commit is allowed to cost in durability: "normal" or "full".

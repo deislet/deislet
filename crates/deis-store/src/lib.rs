@@ -1,29 +1,23 @@
 //! Deislet storage services: KV, SQL database and blob objects.
 //!
 //! The service is deliberately "dumb". It knows exactly one thing about the
-//! world outside itself: a tenant id, carried in the `x-deis-tenant` gRPC
-//! metadata header. It has no idea what a version, an environment or a
-//! deployment is, and it never calls anything back. It holds no opinion about
-//! which application owns which tenant either - only about whether the caller
-//! in front of it can prove it holds the capability for the tenant it names.
-//! Those decisions live in deis-control and deis-runtime; keeping them out of
-//! here is what lets storage be restarted, backed up and reasoned about on
-//! its own.
+//! world outside itself: a tenant, which the capability on each call names.
+//! It has no idea what a version, an environment or a deployment is, and it
+//! never calls anything back. It holds no opinion about which application
+//! owns which tenant either - only about whether the caller in front of it
+//! holds a capability for one. Those decisions live in deis-control and
+//! deis-runtime; keeping them out of here is what lets storage be restarted,
+//! backed up and reasoned about on its own.
 //!
 //! # What a tenant is here, and what it is not
 //!
-//! The platform above builds the tenant id out of an application and an
-//! environment (`deis_wire::conventions::tenant_id`), so `demo.production`
-//! and `demo.preview-7` are two tenants of one application. To this service
-//! that is invisible: it sees one opaque key, one tenant dimension, and it
-//! never takes the value apart for any purpose other than validating it.
-//! That is the point - a preview deployment must not be able to read or
-//! overwrite what production stored, and the cheapest way to guarantee it is
-//! that the two never name the same namespace here.
-//!
-//! Note which header carries it. `x-deis-app-id` names the *application* on
-//! the data path and is not the storage tenant; a call that stamps only that
-//! one is refused rather than served from a default namespace.
+//! A tenant is one application environment, keyed by canonical ids:
+//! `v1/<application id>/<environment id>`. A preview and production of the
+//! same application are two tenants, and an application deleted and created
+//! again under the same name is a new one, so neither can read or overwrite
+//! what the other stored. This service validates the key and never takes it
+//! apart for any other purpose. No request header names a tenant; a call
+//! whose capability names none for this binding is refused.
 //!
 //! Data layout under the configured data directory:
 //!
