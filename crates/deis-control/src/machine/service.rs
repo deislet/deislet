@@ -133,10 +133,7 @@ impl MachineChannelService {
     /// deregistration until an operator lifts the revocation. A ledger that
     /// cannot be read refuses too - "could not tell" is not "not revoked".
     async fn refuse_if_revoked(&self, node_id: &str) -> Result<(), Status> {
-        let Some(ledger) = self.issuer.ledger() else {
-            return Ok(());
-        };
-        match ledger.is_node_revoked(node_id).await {
+        match self.issuer.ledger().is_node_revoked(node_id).await {
             Ok(false) => Ok(()),
             Ok(true) => {
                 warn!(node = %node_id, "Refused a machine call from a revoked node");
@@ -1510,7 +1507,7 @@ mod tests {
             .await
             .expect("issued before revocation");
 
-        let ledger = h.state.issuer.ledger().expect("the harness keeps a ledger");
+        let ledger = h.state.issuer.ledger();
         let revoked = ledger
             .revoke(crate::capability_ledger::RevocationScope::Node(
                 "runtime-test".into(),

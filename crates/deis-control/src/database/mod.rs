@@ -227,6 +227,19 @@ impl Database {
         Ok(db)
     }
 
+    /// A fresh in-memory database with the whole schema, built without an
+    /// async runtime. For tests that need somewhere to keep a table - an
+    /// in-memory capability issuer's ledger, for one - and cannot await.
+    #[doc(hidden)]
+    pub fn in_memory_blocking() -> Result<Self, DatabaseError> {
+        let connection = Connection::open_in_memory()?;
+        configure_connection(&connection, Path::new(":memory:"))?;
+        schema::run_migrations(&connection)?;
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
     /// Opaque list-cursor persistence for the lists that read this
     /// database directly - the diagnostic histories - backed by the same
     /// table every resource store's lists page through.

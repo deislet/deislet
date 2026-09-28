@@ -124,9 +124,10 @@ pub struct CapabilityIssuer {
     /// for an in-memory issuer, which never rotates.
     vault: Option<Arc<SecretCipher>>,
     policy: RotationPolicy,
-    /// Where every issued token is recorded, and revocations kept. `None`
-    /// only for an in-memory test issuer that nothing revokes from.
-    ledger: Option<CapabilityLedger>,
+    /// Where every issued token is recorded, and revocations kept. Every
+    /// issuer has one: an issuer that could not say what it revoked would
+    /// answer every verifier "nothing".
+    ledger: CapabilityLedger,
 }
 
 /// What the issuer signs and publishes with.
@@ -157,7 +158,8 @@ impl Stage {
 
 impl CapabilityIssuer {
     /// An in-memory issuer with a freshly generated key that is never
-    /// stored. For tests: tokens it signs stop verifying when it is dropped.
+    /// stored, and a ledger in a database of its own. For tests: tokens it
+    /// signs stop verifying when it is dropped.
     pub async fn ephemeral(issuer_id: &str) -> Self {
         Self::for_test(issuer_id)
     }
@@ -165,6 +167,8 @@ impl CapabilityIssuer {
     /// Synchronous form of [`Self::ephemeral`].
     #[doc(hidden)]
     pub fn for_test(issuer_id: &str) -> Self {
+        let ledger = Database::in_memory_blocking()
+            .expect("an in-memory database for a test issuer's ledger");
         let signing = generate_key();
         Self {
             inner: Arc::new(RwLock::new(KeyState {
@@ -175,16 +179,18 @@ impl CapabilityIssuer {
             issuer_id: issuer_id.to_string(),
             vault: None,
             policy: RotationPolicy::default(),
-            ledger: None,
+            ledger: CapabilityLedger::new(Arc::new(ledger)),
         }
     }
 
     /// Load the stored keys, generating and storing the first one on a
-    /// fresh database. Private keys are encrypted under `vault`.
+    /// fresh database. Private keys are encrypted under `vault`; every token
+    /// issued is recorded, and revocations kept, in `ledger`'s tables.
     pub fn open(
         conn: &Connection,
         vault: Arc<SecretCipher>,
         issuer_id: &str,
+        ledger: Arc<Database>,
     ) -> Result<Self, IssuerError> {
         let now = now_secs();
         let tx = conn.unchecked_transaction()?;
@@ -218,20 +224,21 @@ impl CapabilityIssuer {
             issuer_id: issuer_id.to_string(),
             vault: Some(vault),
             policy: RotationPolicy::default(),
-            ledger: None,
+            ledger: CapabilityLedger::new(ledger),
         })
     }
 
     /// Record every token issued from now on in `db`'s issuance table, and
-    /// serve revocations from it.
+    /// serve revocations from it - for a test that keeps its catalog and
+    /// its ledger in one database, as a running control plane does.
     pub fn with_ledger(mut self, db: Arc<Database>) -> Self {
-        self.ledger = Some(CapabilityLedger::new(db));
+        self.ledger = CapabilityLedger::new(db);
         self
     }
 
-    /// The issuance and revocation tables, when this issuer has them.
-    pub fn ledger(&self) -> Option<&CapabilityLedger> {
-        self.ledger.as_ref()
+    /// The issuance and revocation tables.
+    pub fn ledger(&self) -> &CapabilityLedger {
+        &self.ledger
     }
 
     /// Replace the rotation schedule; tests use a short one.
@@ -268,9 +275,7 @@ impl CapabilityIssuer {
             };
             (token, claims)
         };
-        if let Some(ledger) = &self.ledger {
-            ledger.record(&claims).await?;
-        }
+        self.ledger.record(&claims).await?;
         Ok(token)
     }
 
@@ -278,10 +283,8 @@ impl CapabilityIssuer {
     /// the current auth epoch, every revoked capability that could still be
     /// accepted somewhere, and every revoked node.
     pub async fn revocation_list(&self) -> Result<String, IssuerError> {
-        let (revoked, revoked_nodes) = match &self.ledger {
-            Some(ledger) => (ledger.revoked_jtis().await?, ledger.revoked_nodes().await?),
-            None => (Vec::new(), Vec::new()),
-        };
+        let revoked = self.ledger.revoked_jtis().await?;
+        let revoked_nodes = self.ledger.revoked_nodes().await?;
         let inner = self.inner.read().await;
         Ok(revocation::sign(
             &RevocationList::new(&self.issuer_id, inner.auth_epoch, revoked)
@@ -318,15 +321,13 @@ impl CapabilityIssuer {
         if let Some(state) = changed {
             self.install(state).await;
         }
-        if let Some(ledger) = &self.ledger {
-            let (revocations, issuances) = ledger.prune().await?;
-            if revocations + issuances > 0 {
-                info!(
-                    revocations,
-                    issuances,
-                    "Pruned revocations no verifier can need and issuance records past retention"
-                );
-            }
+        let (revocations, issuances) = self.ledger.prune().await?;
+        if revocations + issuances > 0 {
+            info!(
+                revocations,
+                issuances,
+                "Pruned revocations no verifier can need and issuance records past retention"
+            );
         }
         Ok(())
     }
@@ -386,15 +387,11 @@ impl CapabilityIssuer {
     /// issued from now on carries the new epoch. Persisted, so it survives a
     /// restart. Mass revocation - nodes renew, anything else has to ask again.
     pub async fn bump_auth_epoch(&self) -> Result<u64, IssuerError> {
-        let epoch = match &self.ledger {
-            Some(ledger) => {
-                ledger
-                    .database()
-                    .with_connection(|conn| bump_epoch_on(conn).map_err(IssuerError::from))
-                    .await?
-            }
-            None => self.inner.read().await.auth_epoch + 1,
-        };
+        let epoch = self
+            .ledger
+            .database()
+            .with_connection(|conn| bump_epoch_on(conn).map_err(IssuerError::from))
+            .await?;
         self.set_auth_epoch(epoch).await;
         Ok(epoch)
     }
@@ -641,6 +638,19 @@ mod tests {
         conn
     }
 
+    /// What every verifier does before it accepts anything: adopt a
+    /// revocation list, here one naming nothing.
+    fn adopt_empty_list(verifier: &mut CapabilityVerifier) {
+        verifier
+            .apply_revocation_list(deis_capability::RevocationList::new("iss", 0, vec![]))
+            .unwrap();
+    }
+
+    /// A ledger for an issuer whose ledger no assertion reads.
+    fn scratch_ledger() -> Arc<Database> {
+        Arc::new(Database::in_memory_blocking().unwrap())
+    }
+
     fn vault(byte: u8) -> Arc<SecretCipher> {
         Arc::new(SecretCipher::from_key_bytes(&[byte; MASTER_KEY_LEN]).unwrap())
     }
@@ -655,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn issuer_generates_key_on_first_start() {
         let conn = in_memory_db();
-        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
         assert_eq!(issuer.auth_epoch().await, 1);
 
         let token = store_token(&issuer).await;
@@ -670,14 +680,16 @@ mod tests {
     #[tokio::test]
     async fn issuer_persists_and_reloads_key() {
         let conn = in_memory_db();
-        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
         let token = store_token(&issuer).await;
 
-        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
         assert_eq!(issuer.verifying_key().await, restarted.verifying_key().await);
 
         let ring = KeyRing::from_keys(restarted.jwks().await.verifying_keys().unwrap());
-        CapabilityVerifier::with_key_ring(ring)
+        let mut verifier = CapabilityVerifier::with_key_ring(ring);
+        adopt_empty_list(&mut verifier);
+        verifier
             .verify(&token, AUD_STORE, TENANT, "kv")
             .expect("a token from before the restart verifies after it");
     }
@@ -685,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn the_stored_private_key_is_ciphertext_bound_to_the_master_key() {
         let conn = in_memory_db();
-        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
         let signing = issuer.inner.read().await.signing.to_bytes();
         let stored: Vec<u8> = conn
             .query_row("SELECT private_key FROM capability_signing_keys", [], |r| r.get(0))
@@ -695,7 +707,7 @@ mod tests {
             "the private key must not be stored in the clear"
         );
 
-        match CapabilityIssuer::open(&conn, vault(8), ISSUER) {
+        match CapabilityIssuer::open(&conn, vault(8), ISSUER, scratch_ledger()) {
             Err(IssuerError::Key { .. }) => {}
             Err(other) => panic!("expected a key error, got {other}"),
             Ok(_) => panic!("a different master key must not open the stored key"),
@@ -712,7 +724,7 @@ mod tests {
             publish_lead: Duration::from_secs(10),
             retire_after: Duration::from_secs(50),
         };
-        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER)
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger())
             .unwrap()
             .with_policy(policy);
         let t0 = now_secs();
@@ -731,7 +743,8 @@ mod tests {
         let second = issuer.verifying_key().await;
         assert_ne!(second, first, "the successor signs after the publish lead");
         let ring = KeyRing::from_keys(issuer.published_keys().await);
-        let verifier = CapabilityVerifier::with_key_ring(ring.clone());
+        let mut verifier = CapabilityVerifier::with_key_ring(ring.clone());
+        adopt_empty_list(&mut verifier);
         verifier
             .verify(&old_token, AUD_STORE, TENANT, "kv")
             .expect("the previous key still verifies");
@@ -750,19 +763,19 @@ mod tests {
             .expect("the active key verifies");
 
         // And the state survives a restart.
-        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
         assert_eq!(restarted.verifying_key().await, second);
     }
 
     #[tokio::test]
     async fn bump_auth_epoch_increments() {
         let conn = in_memory_db();
-        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let issuer = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
 
         assert_eq!(issuer.auth_epoch().await, 1);
         assert_eq!(issuer.bump_auth_epoch_on(&conn).await.unwrap(), 2);
         assert_eq!(issuer.bump_auth_epoch_on(&conn).await.unwrap(), 3);
-        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER).unwrap();
+        let restarted = CapabilityIssuer::open(&conn, vault(7), ISSUER, scratch_ledger()).unwrap();
         assert_eq!(restarted.auth_epoch().await, 3);
     }
 
@@ -784,7 +797,6 @@ mod tests {
         let claims = deis_capability::decode(&token, &issuer.verifying_key().await).unwrap();
         let revoked = issuer
             .ledger()
-            .unwrap()
             .revoke(crate::capability_ledger::RevocationScope::Node("n1".into()))
             .await
             .unwrap();

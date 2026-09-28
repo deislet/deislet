@@ -38,7 +38,7 @@ use utoipa::ToSchema;
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::openapi;
-use crate::capability_ledger::{CapabilityLedger, RevocationScope};
+use crate::capability_ledger::RevocationScope;
 
 /// What a revocation took back.
 #[derive(Debug, Serialize, ToSchema)]
@@ -57,17 +57,10 @@ pub struct AuthEpoch {
     pub auth_epoch: u64,
 }
 
-fn ledger(state: &CatalogState) -> ApiResult<&CapabilityLedger> {
-    state.issuer.ledger().ok_or_else(|| {
-        ApiError::NotConfigured(
-            "this control plane keeps no issuance record, so there is nothing to revoke from"
-                .to_string(),
-        )
-    })
-}
-
 async fn revoke(state: &CatalogState, scope: RevocationScope) -> ApiResult<Vec<String>> {
-    ledger(state)?
+    state
+        .issuer
+        .ledger()
         .revoke(scope)
         .await
         .map_err(|error| ApiError::DatabaseError(error.to_string()))
@@ -164,7 +157,9 @@ pub async fn lift_node_revocation(
     State(state): State<CatalogState>,
     Path(node_id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let lifted = ledger(&state)?
+    let lifted = state
+        .issuer
+        .ledger()
         .lift_node(&node_id)
         .await
         .map_err(|error| ApiError::DatabaseError(error.to_string()))?;
@@ -226,7 +221,6 @@ pub async fn revoke_tenant_capabilities(
     )
 )]
 pub async fn bump_auth_epoch(State(state): State<CatalogState>) -> ApiResult<Json<AuthEpoch>> {
-    ledger(&state)?;
     let auth_epoch = state
         .issuer
         .bump_auth_epoch()

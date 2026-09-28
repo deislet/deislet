@@ -302,19 +302,20 @@ async fn main() -> Result<(), anyhow::Error> {
     // Persistent, encrypted under the master key, and rotated on a schedule;
     // see `capability_issuer`. Loaded before anything can issue a token.
     let capability_vault = load_capability_vault(&config)?;
+    // Every token is recorded before it is handed out, and revocations are
+    // served from the same tables.
+    let ledger = Arc::clone(&database);
     let capability_issuer = database
         .with_connection(move |conn| {
             deis_control::capability_issuer::CapabilityIssuer::open(
                 conn,
                 capability_vault,
                 "spiffe://deislet/control/main",
+                ledger,
             )
         })
         .await
-        .map_err(|e| anyhow::anyhow!("cannot load the capability signing keys: {e}"))?
-        // Every token is recorded before it is handed out, and revocations
-        // are served from the same tables.
-        .with_ledger(Arc::clone(&database));
+        .map_err(|e| anyhow::anyhow!("cannot load the capability signing keys: {e}"))?;
 
     // One stop signal for the whole process, taken before anything is
     // started so every part gets the same edge: the listener stops
