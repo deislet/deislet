@@ -15,9 +15,9 @@ use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
-use crate::auth::TelemetryAuth;
+use crate::auth::{ReadScope, TelemetryAuth};
 use crate::now_us;
 use crate::prom;
 use crate::stats::{Access, ServiceStats};
@@ -62,16 +62,19 @@ pub fn router(state: MetricsState, auth: TelemetryAuth) -> Router {
         .with_state(state)
 }
 
-/// Refuse anything on this port that does not present the token.
+/// Refuse anything on this port that does not present a capability allowed
+/// to read everything.
 ///
-/// 401 with a `WWW-Authenticate` header rather than a bare 403, because the
-/// caller is a scraper and that is the answer telling it which credential it
-/// was supposed to send. With no secret configured this passes everything
-/// through unchanged; see [`crate::auth`].
+/// 401 with a `WWW-Authenticate` header when no valid token was presented,
+/// because the caller is a scraper and that is the answer telling it which
+/// credential it was supposed to send. 403 when the token is valid but only
+/// reads some tenants: the page is every tenant's series at once, so only a
+/// platform-wide read capability may have it. See [`crate::auth`].
 async fn guard(State(auth): State<TelemetryAuth>, request: Request, next: Next) -> Response {
-    match auth.verify_headers(request.headers()).await {
-        Ok(_) => return next.run(request).await,
-        Err(_) => {
+    let grant = match auth.verify_headers(request.headers()) {
+        Ok(grant) => grant,
+        Err(error) => {
+            warn!(%error, "refused a scrape without a valid capability");
             return (
                 StatusCode::UNAUTHORIZED,
                 [
@@ -81,6 +84,21 @@ async fn guard(State(auth): State<TelemetryAuth>, request: Request, next: Next) 
                 "# deis-telemetry requires a capability token on this endpoint\n",
             )
                 .into_response();
+        }
+    };
+    match grant.read_scope() {
+        Ok(ReadScope::All) => next.run(request).await,
+        _ => {
+            warn!(
+                principal = %grant.principal(),
+                "refused a scrape whose capability does not read every tenant"
+            );
+            (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, CONTENT_TYPE)],
+                "# this endpoint needs a platform-wide telemetry read capability\n",
+            )
+                .into_response()
         }
     }
 }

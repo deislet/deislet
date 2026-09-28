@@ -717,6 +717,22 @@ pub struct StorageCredentials {
     pub queue_token: Option<String>,
 }
 
+/// A deis-telemetry read capability and the tenants it reads.
+#[derive(Deserialize)]
+pub struct TelemetryCredentials {
+    pub tenants: Vec<String>,
+    pub token: String,
+}
+
+/// Never derived: the token must not reach a log line.
+impl std::fmt::Debug for TelemetryCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryCredentials")
+            .field("tenants", &self.tenants)
+            .finish_non_exhaustive()
+    }
+}
+
 /// What this credential can see of the runtime fleet.
 ///
 /// Fleet scope belongs to the platform operator, so a credential that only
@@ -2232,6 +2248,35 @@ impl Control {
             &format!("obtaining a storage capability token for {environment} of app {app_id}"),
         )
         .await
+    }
+
+    // ---- telemetry --------------------------------------------------------
+
+    /// A read capability for deis-telemetry: `deis logs`, `deis tail` and
+    /// `deis trace` present it on every call.
+    ///
+    /// Served by `deis-control`'s `api::catalog::telemetry`, gated on
+    /// `read` over exactly what is asked for - one environment, or every
+    /// environment of the application when `environment` is `None` - and
+    /// recorded in the audit log every time.
+    pub async fn telemetry_credentials(
+        &self,
+        app_id: &str,
+        environment: Option<&str>,
+    ) -> Result<TelemetryCredentials> {
+        let (path, what) = match environment {
+            Some(environment) => (
+                format!("/apps/{app_id}/environments/{environment}/telemetry-token"),
+                format!("obtaining a telemetry read capability for {environment} of app {app_id}"),
+            ),
+            None => (
+                format!("/apps/{app_id}/telemetry-token"),
+                format!(
+                    "obtaining a telemetry read capability for every environment of app {app_id}"
+                ),
+            ),
+        };
+        self.send(self.request(Method::GET, &path), &what).await
     }
 
     // ---- accounts, tokens and the audit log ---------------------------

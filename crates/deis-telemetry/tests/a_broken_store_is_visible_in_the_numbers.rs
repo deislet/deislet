@@ -25,6 +25,8 @@
 //! database is touched, so queries, the metric table and the scrape all keep
 //! working - exactly as they would on a disk with no space left for a commit.
 
+mod support;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
@@ -34,7 +36,6 @@ use deis_telemetry::proto::{LogEntry, PushLogsRequest};
 use deis_telemetry::server::{self, RunningServer};
 use deis_telemetry::stats::ServiceStats;
 use deis_telemetry::{MAX_GRPC_MESSAGE_BYTES, now_us};
-use ed25519_dalek::SigningKey;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tonic::transport::Channel;
@@ -71,16 +72,16 @@ fn entry(message: &str) -> LogEntry {
     }
 }
 
-/// Deterministic verifying key for tests that don't need to sign tokens.
-fn test_verifying_key() -> ed25519_dalek::VerifyingKey {
-    let seed: [u8; 32] = [0x42; 32];
-    SigningKey::from_bytes(&seed).verifying_key()
-}
 async fn http_get(addr: SocketAddr, path: &str) -> String {
     let mut stream = TcpStream::connect(addr)
         .await
         .expect("the metrics listener must accept the connection");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    // As an operator: the page is every tenant's series, so only the
+    // platform-wide read may have it.
+    let token = support::operator_token();
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    );
     stream
         .write_all(request.as_bytes())
         .await
@@ -157,7 +158,7 @@ async fn health_of_settles_on(
 #[tokio::test]
 async fn a_store_that_refuses_writes_moves_the_counters_and_the_health_status() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service starts");
     let stats = server.stats.clone();
@@ -169,9 +170,12 @@ async fn a_store_that_refuses_writes_moves_the_counters_and_the_health_status() 
     assert_eq!(ServiceStats::get(&stats.logs_lost), 0);
     assert!(stats.store_health.state().is_serving());
 
-    let mut logs = LogServiceClient::new(channel(&server).await)
-        .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
+    let mut logs = LogServiceClient::with_interceptor(
+        channel(&server).await,
+        support::Bearer::new(&support::operator_token()),
+    )
+    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES);
     logs.push_logs(PushLogsRequest {
         entries: vec![entry("before")],
         metadata: HashMap::new(),
@@ -285,7 +289,7 @@ async fn a_scrape_that_cannot_read_the_store_is_counted_and_said_out_loud() {
     // whether anybody ever learns that the export failed depends entirely on
     // a counter a later, successful scrape can carry.
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let server = server::start(&test_config(dir.path()))
+    let server = server::start(&test_config(dir.path()), support::keys())
         .await
         .expect("the service starts");
     let stats = server.stats.clone();

@@ -20,7 +20,9 @@ use chrono::{DateTime, Utc};
 use colored::Colorize;
 
 use crate::commands::{escape_control, escaped, resolve};
-use crate::platform::telemetry::{self, LogEntry, LogLevel, QueryRequest, TailRequest, Telemetry};
+use crate::platform::telemetry::{
+    self, LogEntry, LogLevel, QueryRequest, TailRequest, Telemetry, TelemetryCredential,
+};
 use crate::render::{Output, parse_since, timestamp_micros};
 use crate::settings::{Overrides, Settings};
 
@@ -82,7 +84,8 @@ pub async fn query(args: QueryArgs, output: Output) -> Result<()> {
     let limit = args.limit.max(1);
 
     let endpoint = settings.telemetry_endpoint()?.to_string();
-    let mut telemetry = Telemetry::connect(&endpoint).await?;
+    let credential = TelemetryCredential::obtain(&settings, &app, environment.as_deref()).await?;
+    let mut telemetry = Telemetry::connect(&endpoint, credential).await?;
 
     let mut entries: Vec<LogEntry> = Vec::new();
     let mut cursor = String::new();
@@ -188,7 +191,8 @@ pub async fn tail(args: TailArgs, output: Output) -> Result<()> {
     let level = parse_level(args.level.as_deref())?;
 
     let endpoint = settings.telemetry_endpoint()?.to_string();
-    let mut telemetry = Telemetry::connect(&endpoint).await?;
+    let credential = TelemetryCredential::obtain(&settings, &app, environment.as_deref()).await?;
+    let mut telemetry = Telemetry::connect(&endpoint, credential).await?;
     let mut stream = telemetry
         .tail(TailRequest {
             app_id: app.clone(),

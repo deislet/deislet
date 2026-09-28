@@ -19,8 +19,12 @@ check_telemetry_logs() {
   # carries the environment as a field, so asking for an application answers
   # with all of its environments - which is the question anybody looking at
   # logs is asking.
-  local out
+  # With a read capability for this one environment, minted the way `deis
+  # logs` gets it: deis-telemetry refuses a query without one.
+  local out token
+  token=$(telemetry_token "$ENV_NAME")
   out=$(grpcurl -plaintext -max-time 10 \
+    -H "authorization: Bearer ${token}" \
     -import-path "${ROOT_DIR}/crates/deis-telemetry/proto" \
     -proto telemetry.proto \
     -d "{\"app_id\":\"${APP_ID}\",\"contains\":\"greeted\",\"limit\":20}" \

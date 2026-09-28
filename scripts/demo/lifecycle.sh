@@ -131,7 +131,6 @@ start_demo() {
   DEIS_TELEMETRY_CONFIG="${DEMO_DIR}/deis-telemetry.toml"
 
   build_binaries
-  start_data_plane
   start_origin
   start_acme_ca
 
@@ -413,8 +412,9 @@ EOF
   # credential.
   bootstrap_operator_session
 
-  # deis-store and deis-queue only now: the keys they verify every call
-  # against are fetched from this control plane, at the port it just bound.
+  # deis-telemetry, deis-store and deis-queue only now: the keys they verify
+  # every call against are fetched from this control plane, at the port it
+  # just bound.
   start_storage_services
 
   echo "🚀 Starting Runtime (HTTP: ${DEIS_RUNTIME_PORT})"

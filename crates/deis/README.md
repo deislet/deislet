@@ -64,7 +64,6 @@ environment = "production"
 | `control.endpoint` | `DEIS_CONTROL_ENDPOINT` |
 | `control.token` | `DEIS_CONTROL_TOKEN` |
 | `telemetry.endpoint` | `DEIS_TELEMETRY_ENDPOINT` |
-| telemetry auth secret (credentials file, per address - see below) | `DEIS_TELEMETRY_AUTH_SECRET` |
 | `defaults.app` | `DEIS_APP` |
 | `defaults.environment` | `DEIS_ENVIRONMENT` |
 
@@ -84,13 +83,13 @@ address, so one machine can hold credentials for a staging and a production
 platform at once. `deis config list` shows every setting, where it came from,
 and which variable overrides it — it never prints the token itself.
 
-`deis logs`, `deis tail` and `deis trace` read deis-telemetry, which has a
-shared secret of its own (`auth_secret` in that service's configuration)
-rather than a control-plane token. It follows the same rule: never in the
-project file. Set `DEIS_TELEMETRY_AUTH_SECRET` to the same string, or put it
-in the credentials file under a `[telemetry."<address>"]` entry with an
-`auth_secret` key, keyed by the telemetry address exactly as control tokens
-are keyed by theirs.
+`deis logs`, `deis tail` and `deis trace` need nothing further. Each asks
+the control plane for a 15-minute read capability for the environment it is
+about (or every environment of the application, with `--all-environments`),
+gated on `read` over that same scope and recorded in the audit log, and
+presents it to deis-telemetry, which returns only those environments'
+records. So they need the control plane reachable and a control token, like
+every other command.
 
 ## Commands
 

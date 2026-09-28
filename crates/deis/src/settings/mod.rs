@@ -33,18 +33,6 @@ pub const CREDENTIALS_FILE: &str = "credentials.toml";
 pub const ENV_CONTROL_ENDPOINT: &str = "DEIS_CONTROL_ENDPOINT";
 pub const ENV_CONTROL_TOKEN: &str = "DEIS_CONTROL_TOKEN";
 pub const ENV_TELEMETRY_ENDPOINT: &str = "DEIS_TELEMETRY_ENDPOINT";
-/// The shared secret deis-telemetry's own `auth_secret` is set to, from which
-/// `deis logs`, `deis tail` and `deis trace` derive the token they present.
-///
-/// A secret rather than a ready-made token because that is what the only other
-/// holder of this credential takes: a node reads the same string as
-/// `logging.auth_secret` and derives with the same function over the same
-/// subject (`deis_runtime::telemetry::TelemetryCredential`). The control plane
-/// cannot hand this one out the way it hands out a storage token - its
-/// storage-token route mints a *tenant* credential from deis-store's secret,
-/// and a telemetry token names the channel, not a tenant - so configuration is
-/// the only source there is.
-pub const ENV_TELEMETRY_AUTH_SECRET: &str = "DEIS_TELEMETRY_AUTH_SECRET";
 pub const ENV_QUEUE_ENDPOINT: &str = "DEIS_QUEUE_ENDPOINT";
 pub const ENV_APP: &str = "DEIS_APP";
 pub const ENV_ENVIRONMENT: &str = "DEIS_ENVIRONMENT";
@@ -147,29 +135,11 @@ pub struct DefaultsSection {
 pub struct Credentials {
     #[serde(default)]
     pub endpoints: BTreeMap<String, CredentialEntry>,
-    /// One entry per deis-telemetry address, keyed the same way `endpoints` is
-    /// keyed by a control-plane address.
-    ///
-    /// Its own map rather than a field on [`CredentialEntry`] because the two
-    /// addresses are independent: a project can name a deis-telemetry and no
-    /// control plane, and `deis logs` is the command that then has to work.
-    /// Keying this by the telemetry address is also what lets the log reader
-    /// resolve its own credential from the one string it is given.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub telemetry: BTreeMap<String, TelemetryEntry>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct CredentialEntry {
     pub token: String,
-}
-
-/// What this CLI holds for one deis-telemetry.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct TelemetryEntry {
-    /// The same string that service's `auth_secret` is set to. See
-    /// [`ENV_TELEMETRY_AUTH_SECRET`].
-    pub auth_secret: String,
 }
 
 /// Directory holding the per-user credentials file.
@@ -235,35 +205,6 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-/// The secret to derive this deis-telemetry's capability token from, and where
-/// it was found.
-///
-/// Keyed by the telemetry address for the same reason the control-plane token
-/// is keyed by the control-plane address: a developer with a staging and a
-/// production collector keeps both and edits nothing between commands.
-///
-/// Resolved from the endpoint alone, so the log reader can obtain its own
-/// credential from the one string every caller already hands it. That is
-/// deliberate: `deis logs`, `deis tail` and `deis trace` reach deis-telemetry
-/// through four separate `connect` calls, and a credential passed in as an
-/// argument is a credential one of those four forgets. The project file is not
-/// consulted - it is committed, and this is a secret.
-///
-/// A blank value counts as absent. An empty header is a token that matches
-/// nothing, and sending one turns "no credential configured", which works
-/// against a loopback collector with no `auth_secret`, into a refusal.
-pub fn telemetry_auth_secret(endpoint: &str) -> Result<Option<Setting>> {
-    if let Some(setting) = from_env(ENV_TELEMETRY_AUTH_SECRET) {
-        return Ok(Some(setting));
-    }
-    Ok(load_credentials()?
-        .telemetry
-        .get(endpoint.trim_end_matches('/'))
-        .map(|entry| entry.auth_secret.trim())
-        .filter(|secret| !secret.is_empty())
-        .map(|secret| Setting::new(secret, Source::Credentials)))
 }
 
 /// Read the project file out of `dir`. A missing file means "no project
@@ -351,12 +292,9 @@ impl Settings {
             (
                 "telemetry",
                 &project.telemetry,
-                format!(
-                    "deis-telemetry is not reached with a token from this file: set \
-                     ${ENV_TELEMETRY_AUTH_SECRET} to the same string that service's `auth_secret` \
-                     is set to, or put it in {} under a [telemetry.\"<address>\"] entry.",
-                    credentials_path().display()
-                ),
+                "deis-telemetry needs nothing set here: its read capability is minted by the \
+                 control plane per command, so this line was never going to be read."
+                    .to_string(),
             ),
             (
                 "queue",
@@ -614,7 +552,6 @@ pub(crate) fn clear_env() {
         ENV_CONTROL_ENDPOINT,
         ENV_CONTROL_TOKEN,
         ENV_TELEMETRY_ENDPOINT,
-        ENV_TELEMETRY_AUTH_SECRET,
         ENV_QUEUE_ENDPOINT,
         ENV_APP,
         ENV_ENVIRONMENT,

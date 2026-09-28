@@ -11,37 +11,32 @@
 # fifth BackendMigration service appears only when migration_admin_token is
 # configured and uses that independent credential.
 #
-# Loopback on purpose, because the auth_secret line below is commented out.
-# With no auth_secret, anything that can reach these two ports may read every
-# application's logs, traces and metric series and may push entries carrying
-# any app_id it likes, so what protects the data is only that the ports are
-# unreachable from another host. Binding either of them anywhere else in that
-# state is refused at startup rather than warned about.
+# Every call on either port - push, query, follow, scrape - must carry a
+# capability deis-control signed; there is no mode without that check, so these
+# may be bound beyond loopback. The health service is exempt: it names no
+# application and reads no data. See src/auth.rs for what each capability may
+# touch.
 listen = "127.0.0.1:8092"
 
 # Prometheus scrape endpoint (HTTP GET /metrics). A separate port so a
 # scraper can read the exported numbers without reaching the ingest and
-# query RPCs. Both ports count for the rule above: this one serves every
-# application's metric series.
+# query RPCs. It serves every application's series at once, so it accepts
+# only a platform-wide read capability (GET /api/platform/telemetry-token on
+# deis-control, which needs read:*/*).
 metrics_listen = "127.0.0.1:8093"
 
-# Shared secret this service's capability token is derived from. Commented
-# out by default, which is the single-box install described above.
-#
-# Set it, and every gRPC call and every scrape must carry
-# base64(HMAC-SHA256(auth_secret, "deis-telemetry")) - the producers on each
-# node, `deis logs` / `deis tail` / `deis trace`, and the Prometheus scraper.
-# The token names this service rather than a tenant, so it is one credential
-# for the channel and not one per application; anything holding it may name
-# any app_id. The health service is exempt: it names no application and reads
-# no data, so a liveness probe needs no credential.
-#
-# Required as soon as either address above is not a loopback address.
-# auth_secret = "put a long random string here"
+# Where deis-control publishes the keys it signs capabilities with. Fetched at
+# startup, every few minutes, and whenever a token names a key not yet held;
+# until the first fetch lands every call is refused.
+capability_jwks_url = "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
+
+# Where deis-control publishes the capability revocation list, polled every
+# 30 seconds.
+revocation_list_url = "http://127.0.0.1:8100"
 
 # Independent bearer credential for the optional BackendMigration management
-# service. This is never the auth_secret above: telemetry producers and
-# readers must not be able to freeze, inventory or release a tenant. When
+# service. Telemetry producers and readers must not be able to freeze,
+# inventory or release a tenant, so this is its own credential. When
 # absent, management RPCs are not registered. The durable fence journal is
 # still enforced, so removing this setting cannot bypass an active fence.
 #

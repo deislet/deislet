@@ -37,6 +37,7 @@ use tracing::{debug, info, warn};
 use deis_backend_migration::{ComponentInventory, InventoryHasher};
 
 use crate::MAX_GRPC_MESSAGE_BYTES;
+use crate::auth::Owner;
 use crate::identity;
 
 /// Microseconds in one day, the width of a log partition.
@@ -1077,8 +1078,11 @@ impl TelemetryStore {
             let mut tenants = BTreeSet::new();
             visit_stored_signals(conn, |signal| {
                 let signal = signal.map_err(anyhow::Error::msg)?;
-                let tenant = signal.tenant().map_err(anyhow::Error::msg)?;
-                tenants.insert(tenant);
+                // A node's own records belong to no tenant and are never
+                // fenced or migrated with one.
+                if let Owner::Tenant(tenant) = signal.owner().map_err(anyhow::Error::msg)? {
+                    tenants.insert(tenant);
+                }
                 Ok(())
             })?;
             Ok(tenants.into_iter().collect())
@@ -1103,8 +1107,9 @@ impl TelemetryStore {
                         return Ok(());
                     }
                 };
-                let record_tenant = match signal.tenant() {
-                    Ok(tenant) => tenant,
+                let record_tenant = match signal.owner() {
+                    Ok(Owner::Tenant(tenant)) => tenant,
+                    Ok(Owner::Platform) => return Ok(()),
                     Err(_) => {
                         unchecked_orphan_count += 1;
                         return Ok(());
@@ -1164,7 +1169,7 @@ enum StoredSignal {
 }
 
 impl StoredSignal {
-    fn tenant(&self) -> std::result::Result<String, String> {
+    fn owner(&self) -> std::result::Result<Owner, String> {
         match self {
             Self::Log(record) => identity::log(record),
             Self::Metric(record) => identity::metric(record),

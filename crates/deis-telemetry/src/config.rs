@@ -1,9 +1,9 @@
 //! Operator-facing configuration.
 //!
-//! Every call must carry an Ed25519-signed capability token in
-//! `Authorization: Bearer <token>`. Writes use `aud="telemetry"` and reads
-//! and scrapes use `aud="telemetry.read"`. The verifying key is configured
-//! via `capability_public_key` or fetched from the control plane.
+//! Every call must carry a capability minted by deis-control in
+//! `Authorization: Bearer <token>`; the verifying keys are fetched from the
+//! control plane's JWKS at `capability_jwks_url` and kept current. There is
+//! no setting that turns the check off. See [`crate::auth`].
 //!
 //! Health is public and optional migration management has its own credential.
 
@@ -28,12 +28,12 @@ pub struct Config {
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    /// The control plane's capability verifying key, in hex.
-    ///
-    /// This is the Ed25519 public key that deis-control uses to sign
-    /// capability tokens.
-    #[serde(default)]
-    pub capability_public_key: Option<String>,
+    /// Where the control plane publishes the keys it signs capabilities
+    /// with (its JWKS). Fetched at startup, again every few minutes, and
+    /// whenever a token names a key not yet held; until the first fetch
+    /// lands every call is refused.
+    #[serde(default = "default_capability_jwks_url")]
+    pub capability_jwks_url: String,
     /// Where the control plane serves its signed revocation list.
     ///
     /// Polled at `{revocation_list_url}/capability/revocation-list` every 30
@@ -49,8 +49,8 @@ pub struct Config {
     /// and enforces the durable fence journal so removing this credential
     /// cannot bypass an already acquired fence.
     ///
-    /// This must not equal `auth_secret`: application telemetry callers must
-    /// never inherit authority to freeze, inventory or release a tenant.
+    /// Application telemetry callers never inherit authority to freeze,
+    /// inventory or release a tenant: this is a separate credential.
     #[serde(default)]
     pub migration_admin_token: Option<String>,
     /// How many days of logs to keep. Logs live in one table per UTC day;
@@ -147,6 +147,10 @@ fn default_metrics_export_window_secs() -> u64 {
     300
 }
 
+fn default_capability_jwks_url() -> String {
+    "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json".to_string()
+}
+
 fn default_revocation_list_url() -> String {
     "http://127.0.0.1:8100".to_string()
 }
@@ -157,7 +161,7 @@ impl Default for Config {
             listen: default_listen(),
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
-            capability_public_key: None,
+            capability_jwks_url: default_capability_jwks_url(),
             revocation_list_url: default_revocation_list_url(),
             migration_admin_token: None,
             log_retention_days: default_log_retention_days(),
@@ -180,10 +184,8 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("metrics_listen", &self.metrics_listen)
             .field("data_dir", &self.data_dir)
-            .field(
-                "capability_public_key",
-                &self.capability_public_key.as_ref().map(|_| "<redacted>"),
-            )
+            .field("capability_jwks_url", &self.capability_jwks_url)
+            .field("revocation_list_url", &self.revocation_list_url)
             .field(
                 "migration_admin_token",
                 &self.migration_admin_token.as_ref().map(|_| "<redacted>"),
@@ -271,6 +273,10 @@ mod tests {
         assert_eq!(config.log_retention_days, 7);
         assert_eq!(config.trace_retention_days, 3);
         assert_eq!(config.trace_tail_capacity, 4096);
+        assert_eq!(
+            config.capability_jwks_url,
+            "http://127.0.0.1:8100/.well-known/deis/capability-jwks.json"
+        );
         config.validate().expect("defaults must be valid");
     }
 
@@ -296,6 +302,14 @@ mod tests {
     }
 
     #[test]
+    fn a_static_verifying_key_is_not_a_setting() {
+        // The keys come from the control plane's JWKS and nowhere else.
+        for removed in ["capability_public_key = \"00\"", "auth_secret = \"x\""] {
+            assert!(toml::from_str::<Config>(removed).is_err(), "{removed}");
+        }
+    }
+
+    #[test]
     fn unknown_field_is_rejected() {
         let err = toml::from_str::<Config>("retention_days = 5").unwrap_err();
         assert!(
@@ -306,10 +320,9 @@ mod tests {
 
     #[test]
     fn credentials_are_parsed_but_never_printed_by_debug() {
-        let config: Config = toml::from_str(
-            "capability_public_key = \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\nmigration_admin_token = \"migration-administrator-secret-000001\"",
-        )
-        .unwrap();
+        let config: Config =
+            toml::from_str("migration_admin_token = \"migration-administrator-secret-000001\"")
+                .unwrap();
         assert_eq!(
             config.migration_admin_token.as_deref(),
             Some("migration-administrator-secret-000001")

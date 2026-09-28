@@ -101,10 +101,11 @@ process. See the `[control]` and `[machine_identity]` keys below.
   invocation takes - the cold start that a request paid for, the `waitUntil`
   tail, and a service call into another application, which continues the
   caller's trace rather than starting its own. See `runtime::ops::CurrentTrace`.
-- **Credential**: with `logging.auth_secret` set, all three channels (logs,
-  traces, metrics) present deis-telemetry's capability token. Without it a
-  collector that has an `auth_secret` refuses everything this node produces.
-  See `src/telemetry.rs`.
+- **Credential**: all three channels (logs, traces, metrics) present one
+  capability the control plane issues over the machine channel: `ingest` for
+  every application environment the node runs plus `@platform` for its own
+  records, renewed before it expires and as soon as that set changes. Until
+  one arrives pushes stay queued. See `src/telemetry.rs`.
 
 ### 3. Management Interface (`src/management/`)
 - **Protocol**: gRPC over HTTP/2.
@@ -212,7 +213,6 @@ rate_limit_ops_per_sec = 1000.0
 [logging]                   # shipping to deis-telemetry
 enabled = false
 # endpoint = "http://127.0.0.1:8092"
-# auth_secret = "the same value as deis-telemetry's auth_secret"
 buffer_size = 10000
 flush_interval_secs = 5
 batch_size = 100

@@ -58,11 +58,11 @@ producer is refused until retention or an operator frees space. The
 `/metrics` counters and the `grpc.health.v1` status say that it happened;
 nothing stops it.
 
-**`app_id` is not bound to the producer.** The capability token names this
-service, not a tenant (see `src/auth.rs` for why it cannot be otherwise
-today), so anything that holds the shared secret - every node - may push
-records under any `app_id` and query any application's logs and traces. The
-token keeps the network out; it does not keep one node's applications apart
-from another's. A node that is compromised, or simply misconfigured, can
-write lines into an application it does not run and read lines from one it
-never saw.
+**What a caller may touch is its capability's.** Every call carries a
+capability deis-control signed (audience `telemetry`), verified against the
+control plane's JWKS. A node's names `ingest` for each application
+environment it runs plus `@platform` for its own records, so it cannot write
+into an application it does not run and cannot read at all; a person's names
+`read` for the environments their scopes reach, and queries and follow
+streams return only those. `@platform` with `read` sees everything and is
+the only capability the Prometheus page accepts. See `src/auth.rs`.

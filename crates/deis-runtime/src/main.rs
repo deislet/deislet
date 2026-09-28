@@ -18,6 +18,7 @@ use deis_runtime::egress_proxy::{self, ProxyDecision};
 use deis_runtime::health::NodeHealth;
 use deis_runtime::logging::{LogBuffer, LogShipper, RuntimeLayer, ShipperConfig};
 use deis_runtime::runtime::{FetchPolicy, MetricShipper, MetricShipperConfig};
+use deis_runtime::telemetry::TelemetryCredential;
 
 // What this node accepts on its command line.
 //
@@ -383,15 +384,23 @@ async fn run(
     let app_repo = Arc::new(AppRepo::new(&db_path).await?);
     info!("App repo initialized");
 
-    let log_shipper = LogShipper::new(log_buffer.clone(), ShipperConfig::from(&config.logging));
+    // One telemetry capability for all three shippers, kept current by the
+    // renewal task started below once the machine channel exists. Until then
+    // pushes queue; see `deis_runtime::telemetry`.
+    let telemetry_credential = TelemetryCredential::default();
+
+    let mut log_shipper_config = ShipperConfig::from(&config.logging);
+    log_shipper_config.credential = telemetry_credential.clone();
+    let log_shipper = LogShipper::new(log_buffer.clone(), log_shipper_config);
     log_shipper.start().await;
 
     // Counters are recorded by the isolates whether or not anyone ships them;
     // without this the node's request, error and execution-time numbers would
     // only ever exist in this process's memory and deis-telemetry would have
     // nothing to answer a dashboard with.
-    let metric_shipper =
-        MetricShipper::for_process(MetricShipperConfig::from(&config.logging), node_id.clone());
+    let mut metric_shipper_config = MetricShipperConfig::from(&config.logging);
+    metric_shipper_config.credential = telemetry_credential.clone();
+    let metric_shipper = MetricShipper::for_process(metric_shipper_config, node_id.clone());
     metric_shipper.start().await;
 
     // Where an application's `fetch()` may go. Deny by default; the operator's
@@ -562,9 +571,25 @@ async fn run(
         .and_then(AssignmentClient::machine_channel_client)
     {
         deployer.fetch_secrets_through(deis_runtime::deployment::SecretSource::new(
-            channel,
+            channel.clone(),
             node_id.clone(),
         ));
+
+        // The telemetry capability follows what this node runs: ingest for
+        // every application environment it serves, and for its own records.
+        let running = deployer.clone();
+        deis_runtime::telemetry::spawn_renewal(
+            telemetry_credential.clone(),
+            channel,
+            node_id.clone(),
+            move || {
+                running
+                    .running()
+                    .into_iter()
+                    .map(|(key, _)| key.tenant_id())
+                    .collect()
+            },
+        );
     }
 
     // Which door this node announces itself at is the configuration's to

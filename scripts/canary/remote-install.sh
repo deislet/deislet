@@ -3,7 +3,7 @@
 # payload that canary-release.sh rsyncs over.
 #
 # Existing /etc/deis/secrets.env is reused: a release must not rotate the
-# master key or the storage/telemetry secrets out from under a live catalog.
+# master key out from under a live catalog.
 # Pass --rewrite-config to regenerate the TOML files from those secrets
 # (ports, bind addresses) without minting new keys.
 #
@@ -118,7 +118,6 @@ ensure_secrets() {
     return
   fi
 
-  TELEMETRY_AUTH="$(openssl rand -hex 32)"
   MASTER_KEY="$(openssl rand -hex 32)"
 
   umask 077
@@ -128,7 +127,6 @@ LAN_IP=${LAN_IP}
 ZONE=${ZONE}
 NODE_ID=${NODE_ID}
 PROXY_ID=${PROXY_ID}
-TELEMETRY_AUTH=${TELEMETRY_AUTH}
 MASTER_KEY=${MASTER_KEY}
 CONTROL_PORT=${CONTROL_PORT}
 RUNTIME_PORT=${RUNTIME_PORT}
@@ -303,7 +301,6 @@ max_subrequests = 50
 [logging]
 enabled = true
 endpoint = "http://127.0.0.1:${TELEMETRY_PORT}"
-auth_secret = "${TELEMETRY_AUTH}"
 buffer_size = 10000
 flush_interval_secs = 5
 batch_size = 100
@@ -433,16 +430,16 @@ data_dir = "/var/lib/deis/queue"
 connections = 8
 EOF
 
-  # deis-telemetry takes no shared secret: it verifies control-signed
-  # capabilities by capability_public_key, and without one it does not
-  # enforce - its query and tail endpoints would serve every tenant's logs
-  # and traces to anyone who can reach them. So both listeners stay on
-  # loopback, which the service itself names as the only safe place for a
-  # non-enforcing telemetry; the runtime ([logging] above) and the operator
-  # CLI on this host reach it at 127.0.0.1.
+  # deis-telemetry holds no secret either: every call and every scrape carries
+  # a capability the control plane signed - a node's ingest capability, or a
+  # reader's, minted per command by the CLI - checked against the keys it
+  # fetches from the control plane's JWKS. It always enforces, so it listens
+  # on the LAN like store and queue.
   cat >/etc/deis/telemetry.toml <<EOF
-listen = "127.0.0.1:${TELEMETRY_PORT}"
-metrics_listen = "127.0.0.1:${TELEMETRY_METRICS_PORT}"
+listen = "0.0.0.0:${TELEMETRY_PORT}"
+metrics_listen = "0.0.0.0:${TELEMETRY_METRICS_PORT}"
+capability_jwks_url = "http://127.0.0.1:${CONTROL_PORT}/.well-known/deis/capability-jwks.json"
+revocation_list_url = "http://127.0.0.1:${CONTROL_PORT}"
 data_dir = "/var/lib/deis/telemetry"
 log_retention_days = 7
 metric_retention_days = 30
@@ -521,8 +518,7 @@ write_operator_env() {
 # Source this file to talk to this canary from a shell.
 export DEIS_CONTROL_ENDPOINT=http://${LAN_IP}:${CONTROL_PORT}
 export DEIS_CONTROL_TOKEN=${operator_token}
-export DEIS_TELEMETRY_ENDPOINT=http://127.0.0.1:${TELEMETRY_PORT}
-export DEIS_TELEMETRY_AUTH_SECRET=${TELEMETRY_AUTH}
+export DEIS_TELEMETRY_ENDPOINT=http://${LAN_IP}:${TELEMETRY_PORT}
 export DEIS_QUEUE_ENDPOINT=http://${LAN_IP}:${QUEUE_PORT}
 EOF
   chown deis:deis /etc/deis/operator.env
@@ -533,15 +529,11 @@ EOF
     cat >/home/leo/.config/deis/credentials.toml <<EOF
 [endpoints."http://${LAN_IP}:${CONTROL_PORT}"]
 token = "${operator_token}"
-
-[telemetry."http://127.0.0.1:${TELEMETRY_PORT}"]
-auth_secret = "${TELEMETRY_AUTH}"
 EOF
     cat >/home/leo/.config/deis/env <<EOF
 export DEIS_CONTROL_ENDPOINT=http://${LAN_IP}:${CONTROL_PORT}
 export DEIS_CONTROL_TOKEN=${operator_token}
-export DEIS_TELEMETRY_ENDPOINT=http://127.0.0.1:${TELEMETRY_PORT}
-export DEIS_TELEMETRY_AUTH_SECRET=${TELEMETRY_AUTH}
+export DEIS_TELEMETRY_ENDPOINT=http://${LAN_IP}:${TELEMETRY_PORT}
 export DEIS_QUEUE_ENDPOINT=http://${LAN_IP}:${QUEUE_PORT}
 EOF
     chown -R leo:leo /home/leo/.config/deis
@@ -718,7 +710,7 @@ print_status() {
   log "  preview     http://<env>--<app>.${ZONE}/  (production: http://<app>.${ZONE}/)"
   log "  store gRPC  ${LAN_IP}:${STORE_PORT}"
   log "  queue gRPC  ${LAN_IP}:${QUEUE_PORT}"
-  log "  telemetry   127.0.0.1:${TELEMETRY_PORT}  (metrics 127.0.0.1:${TELEMETRY_METRICS_PORT}; loopback only, auth is not enforcing)"
+  log "  telemetry   ${LAN_IP}:${TELEMETRY_PORT}  (metrics ${LAN_IP}:${TELEMETRY_METRICS_PORT}; a control-signed capability is required)"
   log "credentials:  /etc/deis/operator.env (minted through the bootstrap token;"
   log "              a fresh database that has not been logged in yet keeps its token at /var/lib/deis/control/bootstrap.token)"
   if [[ -f /var/lib/deis/RELEASE ]]; then

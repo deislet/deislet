@@ -663,16 +663,6 @@ load_state() {
   source "$STATE_FILE"
 }
 
-# Bring up deis-telemetry, the service every other component reports to. It
-# is started before the control plane on purpose: it depends on nothing,
-# while every other component ships logs at it, so it should already be
-# listening when the rest come up. Its HTTP scrape endpoint is a real answer
-# and so a stronger readiness signal than a TCP probe.
-#
-# deis-store and deis-queue come up in start_storage_services, after the
-# control plane: they verify every call against the keys the control plane
-# publishes, and the address they fetch those from carries the port the
-# control plane ends up bound to.
 # Build every demo binary once, up front.
 #
 # The services are then launched as binaries rather than through `cargo run`,
@@ -700,26 +690,6 @@ build_binaries() {
   fi
 }
 
-start_data_plane() {
-  cat > "$DEIS_TELEMETRY_CONFIG" <<EOF
-listen = "127.0.0.1:${DEIS_TELEMETRY_PORT}"
-metrics_listen = "127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}"
-data_dir = "${DEMO_DIR}/deis-telemetry-data"
-EOF
-  chmod 600 "$DEIS_TELEMETRY_CONFIG"
-
-  echo "🚀 Starting Telemetry (gRPC: ${DEIS_TELEMETRY_PORT}, metrics: ${DEIS_TELEMETRY_METRICS_PORT})"
-  "${BIN_DIR}/deis-telemetry" --config "$DEIS_TELEMETRY_CONFIG" \
-    > "${LOG_DIR}/deis-telemetry.log" 2>&1 &
-  DEIS_TELEMETRY_PID=$!
-
-  local rc=0
-  wait_for_service wait_for_http \
-    "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" "$DEIS_TELEMETRY_PID" 60 || rc=$?
-  report_service "Telemetry" "$rc" "${LOG_DIR}/deis-telemetry.log" \
-    "logs and metrics pushed at it are dropped"
-}
-
 # deis-store (KV/DB/Blob) and deis-queue, once the control plane is up.
 #
 # Neither has a secret of its own. Every call must carry an Ed25519
@@ -732,6 +702,31 @@ EOF
 # port, which this demo may not have been given, so both are spelled out.
 start_storage_services() {
   local control_url="http://127.0.0.1:${DEIS_CONTROL_PORT}"
+
+  # deis-telemetry is in the same position: it holds no secret, verifies every
+  # push, query and scrape against the same published keys, and so comes up
+  # here too - before the node, which is the first thing to ship at it.
+  cat > "$DEIS_TELEMETRY_CONFIG" <<EOF
+listen = "127.0.0.1:${DEIS_TELEMETRY_PORT}"
+metrics_listen = "127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}"
+data_dir = "${DEMO_DIR}/deis-telemetry-data"
+capability_jwks_url = "${control_url}/.well-known/deis/capability-jwks.json"
+revocation_list_url = "${control_url}"
+EOF
+  chmod 600 "$DEIS_TELEMETRY_CONFIG"
+
+  echo "🚀 Starting Telemetry (gRPC: ${DEIS_TELEMETRY_PORT}, metrics: ${DEIS_TELEMETRY_METRICS_PORT})"
+  "${BIN_DIR}/deis-telemetry" --config "$DEIS_TELEMETRY_CONFIG" \
+    > "${LOG_DIR}/deis-telemetry.log" 2>&1 &
+  DEIS_TELEMETRY_PID=$!
+
+  # Any answer at all is ready: the scrape endpoint refuses a caller without
+  # a capability, which this probe is.
+  local telemetry_rc=0
+  wait_for_service wait_for_http_any \
+    "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" "$DEIS_TELEMETRY_PID" 60 || telemetry_rc=$?
+  report_service "Telemetry" "$telemetry_rc" "${LOG_DIR}/deis-telemetry.log" \
+    "logs and metrics pushed at it are dropped"
 
   cat > "$DEIS_STORE_CONFIG" <<EOF
 listen = "127.0.0.1:${DEIS_STORE_PORT}"
@@ -1013,6 +1008,20 @@ control_url() {
 # so a caller that forgets it gets 401 rather than an answer.
 control_api() {
   curl -s -H "Authorization: Bearer ${OPERATOR_TOKEN}" "$(control_url)$1" || true
+}
+
+# A deis-telemetry read capability, minted by the control plane for the
+# operator: for one environment of the demo application when given one, for
+# the whole platform (every tenant, and what the Prometheus page needs) when
+# given `--platform`. Empty when the control plane would not mint one.
+telemetry_token() {
+  local route
+  if [ "${1:-}" = "--platform" ]; then
+    route="/api/platform/telemetry-token"
+  else
+    route="/api/v1/apps/${APP_ID}/environments/${1:-$ENV_NAME}/telemetry-token"
+  fi
+  control_api "$route" | jq -r '.token // empty' 2>/dev/null || true
 }
 
 # Every item of one Control API list, whatever its size, as one JSON array.

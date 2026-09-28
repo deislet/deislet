@@ -2566,7 +2566,6 @@ dependencies = [
  "deis-capability",
  "deis-wire",
  "ed25519-dalek",
- "hex",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",

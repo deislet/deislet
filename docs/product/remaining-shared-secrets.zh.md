@@ -19,10 +19,11 @@
 |---|---|---|---|
 | `auth_secret`（deis-store） | `crates/deis-store/src/config.rs` | 节点对对象与 KV 存储的全部调用 | 全场一个值 |
 | `auth_secret`（deis-queue） | `crates/deis-queue/src/config.rs` | 队列的投递、领取与 fence 操作 | 全场一个值 |
-| `auth_secret`（deis-telemetry） | `crates/deis-telemetry/src/config.rs` | 日志、trace 与指标的写入 | 全场一个值 |
 | storage token | `deis_wire::conventions::storage_token`（HMAC-SHA256 派生） | 一个租户在存储上的读写 | 由上面的 `storage_auth_secret` 按租户派生；不过期、不可单独撤销，轮换等于一次性作废全部 |
 | `migration_admin_token` | `crates/deis-control/src/config.rs` 与 `deis-backend-migration` | 后端迁移与恢复的管理操作 | 独立的静态 token |
 | inspector 会话令牌 | `crates/deis-runtime/src/app/manager.rs` | 一个调试会话 | **不属于这一类**：节点自己铸造、驻留内存、会过期，与舰队无关。列在这里只是为了说明它为什么不该跟着一起删 |
+
+deis-telemetry 的 `auth_secret` 已经删掉：遥测只认 control 签发的 capability，写入用 `ingest`、读取用 `read`，都按租户限定，节点经机器通道申领、CLI 向 control 申领并记审计，没有不鉴权的模式。见 `docs/trust-boundaries.md` 的「Telemetry」一节。
 
 ## 为什么这一轮不做
 
@@ -36,7 +37,7 @@ ADR-025 把这些划在 stage 5（data capability enforcement），而本轮的�
   「按租户隔离」是真的（一个租户的 token 对另一个租户无用），但**撤销粒度是全部**：
   换掉那个值，每个租户的 token 同时作废。真正的修法是短期、受众限定、绑定持有密钥的能力券
   （ADR-025 M2），不是把这个值换成另一个值。
-- **三个 `auth_secret` 是三条独立的门**，不要合并成一个「服务密钥」再共享 —— 那只是把三个
+- **两个 `auth_secret` 是两条独立的门**，不要合并成一个「服务密钥」再共享 —— 那只是把几个
   全场通用值换成一个，范围更大。
 - 这三个服务各自的监听同样需要「谁在调用」的答案，而 `deis-identity` 已经能提供：它们要的是
   同一套 `MachineIdentity` 与 SPIFFE 命名，不需要新机制。

@@ -209,7 +209,7 @@ Capability 默认 5 分钟、最长 15 分钟，不使用长期 refresh token。
 2. **Dual trust bootstrap**：启用独立 machine listener、内部 CA、issuer 与 trust bundle；逐实例 enrollment。实例先能 mTLS 健康/续期，再承接业务。PSK 调用逐次记录 endpoint、peer、claimed ID 和时间，并令 production readiness 降级。
 3. **Read path enforcement**：按 `routing → bundle → assignments` 切换到 principal 授权。每一路只有在所有目标实例已用 mTLS 成功、负面测试通过且旧路径无调用超过至少两个 registration TTL 后，才关闭该 endpoint 的 PSK；一旦关闭不得按请求自动 downgrade。
 4. **Management enforcement**：Control-to-runtime/proxy/store/queue/telemetry 和 migration/restore 调用改为 mTLS + operation capability。先验证 PREPARE/ACTIVATE/ABORT、trigger、fence、inventory、release 与 status 的精确权限，再逐 endpoint 关闭 PSK/static admin token。
-5. **Data capability enforcement**：runtime 到 store/queue/telemetry 改为 cnf-bound 短期 capability；验证跨 tenant/binding/action/generation 与重放均拒绝后，移除 shared HMAC secret。
+5. **Data capability enforcement**：runtime 到 store/queue/telemetry 改为 cnf-bound 短期 capability；验证跨 tenant/binding/action/generation 与重放均拒绝后，移除 shared HMAC secret。telemetry 一侧已于 2026-09 落地（`cnf` 仍待 RB-2）：deis-telemetry 经 JWKS 校验 `aud=telemetry` 的 capability，`ingest` 与 `read` 两个 binding 互不蕴含，读取按租户过滤，保留租户 `@platform` 表示节点自身记录（写）或全平台（读）；节点经 `IssueCapability` 申领，人经 `telemetry-token` 路由申领并记审计；共享 secret 与不鉴权模式均已删除（`crates/deis-telemetry/src/auth.rs`）。
 6. **Strict**：配置、数据库、示例和启动参数不再接受 fleet PSK；删除 legacy listener/route 与代码，撤销并销毁旧值，保留不含 secret 的迁移审计。所有实例更新 trust 后才移除旧 CA/issuer key。
 
 Dual 阶段的 PSK 无法区分 principal，因此仍具有旧的横向权限，不能报告 `production-secure`。不能以“某个 claimed node 已迁移”为依据拒绝来自同一共享 PSK 的降级，因为 PSK 本身证明不了是谁；关闭必须按 endpoint/fleet readiness gate 原子进行。中途失败保持当前明确阶段，重试相同 operation，不反向打开已严格关闭的入口。

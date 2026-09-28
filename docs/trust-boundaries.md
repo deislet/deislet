@@ -18,10 +18,11 @@ changed with them: there is no anonymous path and no key shared through a
 configuration file any more - every caller presents a token, resolved against
 a hash in the control plane's database, and a control plane with no credential
 at all mints a one-time bootstrap token written to a file only its own host can
-read. What did not change: `storage_auth_secret` and the matching `auth_secret`
-on deis-store and deis-queue, the `auth_secret` shared between deis-telemetry
-and every node's `[logging]`, are still values copied between files, and whoever
-holds one holds everything it opens. A reader who concludes that everything
+read. Telemetry moved too: deis-telemetry holds no secret and accepts only
+capabilities the control plane signed (see "Telemetry" below). What did not
+change: `storage_auth_secret` and the matching `auth_secret` on deis-store and
+deis-queue are still values copied between files, and whoever holds one holds
+everything it opens. A reader who concludes that everything
 moved to certificates will protect the wrong files, which is why this document
 says which is which before it says anything else.
 
@@ -143,9 +144,33 @@ one file.
 | Value | Held by | What holding it is worth |
 |---|---|---|
 | `storage_auth_secret` on deis-control, the identical `auth_secret` on deis-store and deis-queue | three processes, one value | The control plane mints `base64(HMAC-SHA256(auth_secret, tenant))` for each tenant and writes it into that tenant's deployment; the backend recomputes the expected token from the tenant the call itself claims (`crates/deis-store/src/auth.rs`, `crates/deis-control/src/delivery/mod.rs`). The secret mints a token for **any** tenant, so holding it is holding every tenant's data in both backends. A token does not expire; the only lever is changing the secret, which invalidates every token at once. |
-| `auth_secret` on deis-telemetry, the identical `[logging] auth_secret` on **every node** | deis-telemetry and every runtime node | One token for the whole service - `base64(HMAC-SHA256(auth_secret, "deis-telemetry"))`, the subject fixed - so it says "the holder is part of this platform" and names no tenant (`crates/deis-telemetry/src/auth.rs`, `crates/deis-runtime/src/telemetry.rs`). Holding it is reading every application's logs, traces and metric series. This is the one shared value a node's own configuration file still carries. |
 | `store_migration_admin_token`, `queue_migration_admin_token`, `telemetry_migration_admin_token` | deis-control and the backend it names | Freeze and inventory any tenant in that backend. Each is independent of the others and must not equal that backend's `auth_secret` - deis-store refuses to start its management service if it does (`crates/deis-store/src/server.rs`). |
 | the master key in `secret_key_file` | deis-control alone | Not shared between machines, but one key for every tenant: every environment's secrets in the database are encrypted with it (`crates/deis-control/src/catalog/secrets.rs`). The encrypted rows are worth nothing without it and everything with it. |
+
+## Telemetry
+
+deis-telemetry has no secret of its own and no mode without the check. Every
+push, query, follow stream and Prometheus scrape presents a capability with
+audience `telemetry`, verified against the keys the control plane publishes
+at `/.well-known/deis/capability-jwks.json` (`capability_jwks_url`), with the
+same 15-minute ceiling, revocation list and T8 grace as deis-store and
+deis-queue (`crates/deis-telemetry/src/auth.rs`). A capability's resources say
+what it may touch, one (tenant, binding) pair each:
+
+| Binding | Issued to | What it allows |
+|---|---|---|
+| `ingest` for `<app>.<env>` | a node, over the machine channel (`IssueCapability`), for each application environment it runs | Push that tenant's logs, traces and metric samples. A record for any tenant the capability does not name is refused and counted as rejected. It reads nothing. |
+| `ingest` for `@platform` | every node | Push the node's own records - the ones with no application (process metrics, component log lines). |
+| `read` for `<app>.<env>` | a person, from `GET /api/v1/apps/{app}/environments/{env}/telemetry-token` (needs `read:{app}/{env}`) or `GET /api/v1/apps/{app}/telemetry-token` (needs `read:{app}/*`, every environment) | Query and follow that tenant's records and nothing else: a read must name an application the capability reaches, and whatever comes back is filtered to the tenants it names. It writes nothing. |
+| `read` for `@platform` | a person holding `read:*/*`, from `GET /api/platform/telemetry-token` | Read everything, every tenant and the nodes' own records. The Prometheus page is every series at once, so it accepts only this. |
+
+Every mint on the human side is recorded in the audit log whatever its
+outcome (`telemetry_token.mint`, `telemetry_token.mint_platform`), like the
+storage-token mint. What a compromised node can do here is what it can do
+with its capability: write the tenants it runs and its own records, and read
+nothing. A Prometheus server scraping the page needs a fresh platform read
+capability at least every 15 minutes (a `bearer_token_file` kept current by
+something holding `read:*/*`); there is no long-lived scrape credential.
 
 ## What the fleet-wide key was, and why it went
 
@@ -264,7 +289,7 @@ network - not by the absence of a published address:
 | Control plane's human listener (`bind_addr`, `port`) | The operators' network. Never the internet. It serves the dashboard and the API - every caller presents a token, and there is no anonymous path - plus a control channel that admits nobody. |
 | Control plane's `[machine]` listener | Machines holding a certificate this fleet signed. This is where the assignment list, the routing table and the bundle store live, so it must never be the internet either - the certificate demand is the authentication, not the containment. |
 | deis-store and deis-queue gRPC ports | Runtime nodes, the control plane and the operators' network only. Each binds loopback by default and refuses to start bound anywhere else with no `auth_secret`; the optional migration service shares the listener under its own independent token. |
-| deis-telemetry's gRPC port and its Prometheus port | The same set, and both count: one serves logs and traces, the other every application's metric series. |
+| deis-telemetry's gRPC port and its Prometheus port | The same set. Every call on either presents a control-signed capability, and neither has a mode without that check, so binding them beyond loopback is not a hole in itself; keeping them off the internet is still the containment. |
 | deis-proxy's listeners | The internet. This is the only one that belongs there. |
 
 A `[machine_identity]` private key is a credential like any other, whatever
@@ -287,9 +312,9 @@ Everything below is therefore the operator's to enforce:
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
 | The control plane's `<data_dir>/bootstrap.token` | `0600`, written by the control plane itself on a first start and deleted the moment the bootstrap token is used. Until then it is an operator credential - it exists to create the first owner account and nothing else - so treat it like one and do not let it out of the host. It is not part of a backup of the data directory: it is short-lived by design, and backing one up means carrying an unused way in. |
 | Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchSecretValues` still answers for every environment's secrets. Issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. |
-| Every node's configuration | `0600`, owned by the node's service user. It no longer holds a fleet credential, but it is not free of secrets: `[logging] auth_secret` is deis-telemetry's own value, and the file also names the path of this node's private key and the one control plane this node obeys - which is what decides who may deploy to it. |
+| Every node's configuration | `0600`, owned by the node's service user. It holds no shared credential - its telemetry capability is issued by the control plane at run time - but the file names the path of this node's private key and the one control plane this node obeys - which is what decides who may deploy to it. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same contents, same reasoning, on the one host that faces the internet. |
-| deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. They hold the application-data `auth_secret` and the independent `migration_admin_token`; possession of the latter can freeze and inventory any tenant in that backend. Never reuse one value for both domains. |
+| deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. deis-store and deis-queue hold the application-data `auth_secret`; all three hold the independent `migration_admin_token`, whose possession can freeze and inventory any tenant in that backend. Never reuse one value for both domains. deis-telemetry's configuration holds no application credential at all. |
 | `.demo/` written by `scripts/demo.sh` | The demo writes every configuration it generates, `state.env`, `secret.key` and every private key it mints as `0600`; `scripts/test-demo-witnesses.sh` holds it to that statically. Five of those files carry a credential value - `state.env`, `secret.key` and the store, queue and control-plane configurations - and the node's and the proxy's carry a path to a key file instead. It is still a workstation tool: it puts every process under one user, so the mode separates the demo from other accounts on the host and nothing else. Do not copy a `.demo/` configuration into a real deployment. |
 
 ## Rotating the credential
@@ -352,18 +377,14 @@ whoever reads it, and each has its own blast radius:
    more: each is signed by the control plane's issuer key, lives fifteen
    minutes and is recorded in the issuance table. Withdrawing them is a call,
    not a file edit - see "Taking capabilities back" below.
-2. deis-telemetry's `auth_secret` must change on the collector and in every
-   node's `[logging] auth_secret` together. A node with the wrong value is not
-   refused at startup: it serves requests normally and every push is rejected,
-   so the symptom is empty `deis logs` and `deis trace` rather than a failure.
-3. Human credentials are tokens, resolved against hashes in the control
+2. Human credentials are tokens, resolved against hashes in the control
    plane's database, so there is no file-held key to rotate: withdrawing one
    is `deis token revoke`. An unused bootstrap token expires on its own, and a
    used one is already revoked. The count of unscoped credentials is reported
    at startup and is the number to drive to zero.
-4. The three migration admin tokens are independent of everything else by
+3. The three migration admin tokens are independent of everything else by
    design. Change one without touching the others.
-5. `secret_key_file` is not rotatable by editing a line: every secret in the
+4. `secret_key_file` is not rotatable by editing a line: every secret in the
    database is encrypted under it.
 
 ## Taking capabilities back

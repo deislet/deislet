@@ -296,7 +296,10 @@ check_a_redirect_chain_costs_a_subrequest_per_hop() {
 # scrape endpoint did not answer". The waiter below fails on either rather
 # than excusing them, because from here they are the same missing evidence.
 memory_cutoff_counter() {
-  curl -s -m 5 "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" 2>/dev/null \
+  # The page is every tenant's series, so only the platform-wide read
+  # capability may have it.
+  curl -s -m 5 -H "Authorization: Bearer $(telemetry_token --platform)" \
+    "http://127.0.0.1:${DEIS_TELEMETRY_METRICS_PORT}/metrics" 2>/dev/null \
     | grep "^deis_runtime_memory_cutoffs_total{app_id=\"${APP_ID}\",environment=\"${ENV_NAME}\"" \
     | awk '{print $NF}' || true
 }

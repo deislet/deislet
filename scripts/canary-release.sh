@@ -220,14 +220,13 @@ merge_credentials() {
   # shellcheck disable=SC1090
   source "${env_file}"
   python3 - "${HOME}/.config/deis/credentials.toml" \
-    "${DEIS_CONTROL_ENDPOINT}" "${DEIS_CONTROL_TOKEN}" \
-    "${DEIS_TELEMETRY_ENDPOINT}" "${DEIS_TELEMETRY_AUTH_SECRET}" <<'PY'
+    "${DEIS_CONTROL_ENDPOINT}" "${DEIS_CONTROL_TOKEN}" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-control, token, telemetry, secret = sys.argv[2:6]
+control, token = sys.argv[2:4]
 path.parent.mkdir(parents=True, exist_ok=True)
 text = path.read_text() if path.exists() else ""
 
@@ -239,13 +238,11 @@ def drop_section(src: str, header: str) -> str:
     return pat.sub("", src)
 
 text = drop_section(text, f'endpoints."{control}"')
-text = drop_section(text, f'telemetry."{telemetry}"')
 text = text.strip()
 parts = []
 if text:
     parts.append(text)
 parts.append(f'[endpoints."{control}"]\ntoken = "{token}"')
-parts.append(f'[telemetry."{telemetry}"]\nauth_secret = "{secret}"')
 path.write_text("\n\n".join(parts) + "\n")
 path.chmod(0o600)
 print(path)
@@ -269,7 +266,7 @@ cmd_apps() {
   # shellcheck disable=SC1091
   source "${STAGE}/operator.env"
   export DEIS_CONTROL_ENDPOINT DEIS_CONTROL_TOKEN
-  export DEIS_TELEMETRY_ENDPOINT DEIS_TELEMETRY_AUTH_SECRET
+  export DEIS_TELEMETRY_ENDPOINT
   export DEIS_QUEUE_ENDPOINT
 
   local callee

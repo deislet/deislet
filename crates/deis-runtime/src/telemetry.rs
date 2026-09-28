@@ -1,146 +1,104 @@
-//! The credential this node presents to deis-telemetry.
+//! The credential this node presents to deis-telemetry, and the task that
+//! keeps it current.
 //!
-//! # Why there is one
+//! # What it is
 //!
-//! deis-telemetry holds every application's logs, every invocation trace and
-//! every metric series on the installation. It guards all of that with one
-//! capability token: with a `capability_public_key` configured it refuses any
-//! call that does not present a valid Ed25519-signed capability token, and
-//! with none configured it refuses to start at all unless both of its
-//! listeners are on loopback. So on any installation where the nodes are not
-//! the same machine as the collector, the collector has a key, and a node that
-//! cannot present the matching token has every log line, every trace and every
-//! metric sample it ever produces refused.
+//! A capability minted by deis-control over the machine channel
+//! (`IssueCapability`, audience `telemetry`), naming this node as its subject
+//! and one [`TELEMETRY_INGEST`] resource for every application environment
+//! the node runs, plus [`TELEMETRY_PLATFORM_TENANT`] for the node's own
+//! records (process metrics, component log lines - anything with no
+//! application). deis-telemetry stores a pushed record only if the
+//! capability names its owner, so a node ships exactly what it runs and
+//! nothing else, and it reads nothing at all: ingest does not imply read.
 //!
-//! What made that worth a module rather than a line in each shipper is how it
-//! failed: a node with no credential does not stop. The log shipper keeps the
-//! batch queued and tries again on the next tick, the metric shipper pushes
-//! cumulative totals that are refused and pushed again, and the trace shipper
-//! puts its records back at the front of the queue. Each of them is doing
-//! exactly what it should when telemetry is *down* -- and none of them can be
-//! fixed by waiting, because the calls are not failing, they are being refused.
-//! The operator sees a collector that is up, nodes that are up, and nothing in
-//! `deis logs` or `deis trace` for any application.
+//! There is no secret in this node's configuration to derive a signing key
+//! from. The control plane is the only signer, and deis-telemetry verifies
+//! against its published keys.
 //!
-//! # What an operator configures
+//! # How it stays current
 //!
-//! `logging.auth_secret`, or `DEIS_RUNTIME_LOGGING_AUTH_SECRET`, set to the
-//! same string as deis-telemetry's own `auth_secret`. The secret is hashed
-//! with SHA-256 to derive a 32-byte Ed25519 signing key, which in turn signs
-//! a capability token. The secret itself is never sent, never logged and never
-//! written to the configuration.
+//! [`spawn_renewal`] asks for a capability as soon as the node starts, again
+//! before the current one's 15 minutes run out, and again as soon as the set
+//! of application environments the node runs changes - a newly deployed
+//! application's lines would otherwise be refused until the next renewal.
+//! A failed request is retried every 30 seconds or so; until one succeeds the
+//! shippers keep their batches queued, exactly as they do when deis-telemetry
+//! is down.
 //!
-//! # Why the subject is a channel and not a tenant
+//! # Why the node does not stop when it has none
 //!
-//! deis-store and deis-queue derive a token per tenant, so a token that leaked
-//! out of one application authorises that application's data and nothing else.
-//! A telemetry call is not about one tenant: one push carries lines from every
-//! application on the node, and one query reads across all of them. So the
-//! subject is the service itself, and the token says "the holder is part of
-//! this platform" and nothing more. deis-telemetry's `auth` module has the
-//! whole of that reasoning; this side only has to derive the same value.
+//! Log delivery is never allowed to become a reason a request fails. A node
+//! whose credential is missing or refused keeps serving and keeps its
+//! batches; what it says about that is loud, in [`report_posture`] and in
+//! each shipper's refusal message.
 
-use deis_capability::{encode, CapabilityClaims, CapabilityResource};
-use ed25519_dalek::SigningKey;
-use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use deis_capability::{
+    CapabilityResource, AUD_TELEMETRY, TELEMETRY_INGEST, TELEMETRY_PLATFORM_TENANT,
+};
+use deis_wire::machine::machine_channel_client::MachineChannelClient;
+use deis_wire::machine::IssueCapabilityRequest;
 use tonic::metadata::{Ascii, MetadataValue};
+use tonic::transport::Channel;
 use tonic::Request;
 
-/// The audience the runtime stamps into every telemetry capability token.
-///
-/// deis-telemetry's gRPC interceptor tries `"telemetry"` first, then
-/// `"telemetry.read"` — see `deis_telemetry::auth`. A push-side credential
-/// uses `"telemetry"` so the interceptor matches on the first attempt.
-const TELEMETRY_AUDIENCE: &str = "telemetry";
+/// Renew this long before the current capability expires. Issued
+/// capabilities live 15 minutes.
+const RENEW_EVERY: Duration = Duration::from_secs(10 * 60);
 
-/// The lifetime of a telemetry capability token in seconds.
-///
-/// The token is derived from the configured secret at node startup and reused
-/// for the lifetime of the process. A generous lifetime avoids the token
-/// expiring while the node is running, but it is ultimately bounded by
-/// `auth_epoch` revocation on the collector side.
-const TELEMETRY_TOKEN_LIFETIME_SECS: u64 = 365 * 24 * 3600;
+/// Most jitter taken off [`RENEW_EVERY`], so a fleet restarted together does
+/// not renew in lockstep.
+const RENEW_JITTER: Duration = Duration::from_secs(60);
 
-/// The token this node presents on every telemetry call, or nothing when no
-/// secret is configured.
+/// Wait before retrying a failed request.
+const RETRY_EVERY: Duration = Duration::from_secs(30);
+
+/// Most jitter added to [`RETRY_EVERY`].
+const RETRY_JITTER: Duration = Duration::from_secs(10);
+
+/// How often the set of running application environments is compared with
+/// the one the current capability names.
+const TENANT_CHECK_EVERY: Duration = Duration::from_secs(5);
+
+/// The token this node presents on every telemetry call.
 ///
-/// Cheap to clone, and deliberately shared by the three channels: logs,
-/// metrics and traces go to one service over one credential, and three
-/// derivations would be three places for the audience to be spelled wrong.
+/// Cheap to clone, and deliberately shared by the three channels and the
+/// renewal task: logs, metrics and traces go to one service over one
+/// credential, and a renewal reaches every shipper at once.
 #[derive(Clone, Default)]
 pub struct TelemetryCredential {
-    /// Pre-formatted `Bearer <token>` value, parsed once at startup so a
-    /// secret that cannot be sent as gRPC metadata is a startup complaint
-    /// rather than a failure on every push for the life of the process.
-    bearer: Option<MetadataValue<Ascii>>,
+    /// Pre-formatted `Bearer <token>` value.
+    bearer: Arc<RwLock<Option<MetadataValue<Ascii>>>>,
 }
 
 impl TelemetryCredential {
-    /// Derive the credential from the configured secret.
-    ///
-    /// Hashes the secret with SHA-256 to derive a 32-byte Ed25519 seed, signs
-    /// a capability token with audience `"telemetry"`, and pre-formats it as
-    /// an `Authorization: Bearer <token>` header value.
-    ///
-    /// A blank secret counts as none: an empty header would be presented as a
-    /// token and refused, where sending nothing at least works against a
-    /// collector that requires no proof -- which is the single-box default and
-    /// has to keep working untouched.
-    pub fn from_secret(secret: Option<&str>) -> Self {
-        let Some(secret) = secret.map(str::trim).filter(|secret| !secret.is_empty()) else {
-            return Self { bearer: None };
-        };
-
-        // Derive a deterministic 32-byte Ed25519 seed from the shared secret.
-        let hash = Sha256::digest(secret.as_bytes());
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&hash);
-        let signing_key = SigningKey::from_bytes(&seed);
-
-        let claims = CapabilityClaims::new(
-            TELEMETRY_AUDIENCE,
-            "deis-runtime",
-            "deis-runtime",
-            1,
-            Duration::from_secs(TELEMETRY_TOKEN_LIFETIME_SECS),
-            vec![CapabilityResource {
-                tenant: String::new(),
-                binding: String::new(),
-                generation: None,
-            }],
-        );
-        let token = encode(&claims, &signing_key);
-
-        let bearer = format!("Bearer {token}");
-        match bearer.parse::<MetadataValue<Ascii>>() {
-            Ok(value) => Self {
-                bearer: Some(value),
-            },
-            // The token is base64url of JSON + Ed25519 sig, so this cannot
-            // happen from a secret of any shape; it is said out loud rather
-            // than silently dropped because the consequence of shipping
-            // without the token is that everything this node observes is
-            // refused.
-            Err(_) => {
-                tracing::error!(
-                    "the telemetry capability token derived from logging.auth_secret cannot be \
-                     sent as gRPC metadata, so this node will ship without one. Against a \
-                     deis-telemetry that has a capability_public_key, every log line, trace \
-                     and metric sample from this node is refused"
-                );
-                Self { bearer: None }
-            }
-        }
+    /// A credential holding `token` from the start, for tests and for
+    /// callers that obtained one some other way.
+    pub fn with_token(token: &str) -> Result<Self, String> {
+        let credential = Self::default();
+        credential.set(token)?;
+        Ok(credential)
     }
 
-    /// Whether this node has a credential at all.
-    ///
-    /// Reported once when a shipper starts, so the startup log says which of
-    /// the two regimes is in force rather than leaving it to be worked out
-    /// from an empty `deis logs`.
+    /// Replace the token every shipper presents.
+    pub fn set(&self, token: &str) -> Result<(), String> {
+        let bearer = format!("Bearer {token}")
+            .parse::<MetadataValue<Ascii>>()
+            .map_err(|_| "the telemetry capability is not valid gRPC metadata".to_string())?;
+        *self.bearer.write().unwrap_or_else(|e| e.into_inner()) = Some(bearer);
+        Ok(())
+    }
+
+    /// Whether this node holds a capability at all.
     pub fn is_present(&self) -> bool {
-        self.bearer.is_some()
+        self.bearer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     /// Wrap one message in a request carrying the token.
@@ -149,7 +107,12 @@ impl TelemetryCredential {
     /// be refused, retried, and refused again for as long as the node ran.
     pub fn stamp<T>(&self, message: T) -> Request<T> {
         let mut request = Request::new(message);
-        if let Some(bearer) = &self.bearer {
+        if let Some(bearer) = self
+            .bearer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             request
                 .metadata_mut()
                 .insert("authorization", bearer.clone());
@@ -159,14 +122,13 @@ impl TelemetryCredential {
 }
 
 /// Redacted on purpose: a derived `Debug` would put the token into any line
-/// that formats a shipper, and the token is the whole of the authority to read
-/// and to forge every application's telemetry on this installation.
+/// that formats a shipper.
 impl std::fmt::Debug for TelemetryCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TelemetryCredential")
             .field(
                 "bearer",
-                &if self.bearer.is_some() {
+                &if self.is_present() {
                     "<present>"
                 } else {
                     "<absent>"
@@ -176,32 +138,136 @@ impl std::fmt::Debug for TelemetryCredential {
     }
 }
 
-/// What a shipper says when it starts, so an operator can tell the two regimes
-/// apart from the first lines of a node's log.
+/// What a shipper says when it starts, so an operator can tell from the
+/// first lines of a node's log where its credential comes from.
 ///
-/// Not a refusal to start. A node that cannot ship telemetry must still serve
-/// requests -- log delivery is never allowed to become a reason a request fails
-/// -- so the mismatch is loud and the node carries on.
+/// Not a refusal to start: a node that cannot ship telemetry must still
+/// serve requests.
 pub fn report_posture(credential: &TelemetryCredential, endpoint: &str) {
     if credential.is_present() {
         tracing::info!(
             %endpoint,
-            "This node presents an Ed25519 capability token on every log, trace and metric \
-             push. If deis-telemetry answers unauthenticated, the two no longer share the same \
-             capability signing key"
+            "This node presents a control-plane-issued telemetry capability on every log, trace \
+             and metric push"
         );
     } else {
-        tracing::warn!(
+        tracing::info!(
             %endpoint,
-            "No logging.auth_secret is configured, so this node ships to deis-telemetry without \
-             a capability token. That works only against a collector that has no \
-             capability_public_key either -- which it may only have when both of its \
-             listeners are on loopback. Against any other collector every log line, every \
-             invocation trace and every metric sample from this node is refused, the node \
-             retries them for as long as it runs, and `deis logs` and `deis trace` stay \
-             empty for every application it serves"
+            "This node has no telemetry capability yet; it asks the control plane for one over \
+             the machine channel, and pushes are queued until it arrives. A node with no \
+             control plane configured never gets one, and deis-telemetry refuses everything it \
+             ships"
         );
     }
+}
+
+/// What to ask the control plane for: ingest for every tenant in `tenants`
+/// and for the node's own records.
+fn resources_for(tenants: &BTreeSet<String>) -> Vec<CapabilityResource> {
+    std::iter::once(TELEMETRY_PLATFORM_TENANT)
+        .chain(tenants.iter().map(String::as_str))
+        .map(|tenant| CapabilityResource {
+            tenant: tenant.to_string(),
+            binding: TELEMETRY_INGEST.to_string(),
+            generation: None,
+        })
+        .collect()
+}
+
+/// Ask for one capability covering `tenants`.
+async fn issue(
+    client: &mut MachineChannelClient<Channel>,
+    node_id: &str,
+    tenants: &BTreeSet<String>,
+) -> Result<String, String> {
+    let resources_json = serde_json::to_string(&resources_for(tenants))
+        .map_err(|e| format!("cannot encode the requested resources: {e}"))?;
+    let response = client
+        .issue_capability(Request::new(IssueCapabilityRequest {
+            node_id: node_id.to_string(),
+            audience: AUD_TELEMETRY.to_string(),
+            resources_json,
+        }))
+        .await
+        .map_err(|status| format!("{}: {}", status.code(), status.message()))?;
+    Ok(response.into_inner().capability_token)
+}
+
+/// Keep `credential` holding a capability for whatever `tenants` returns,
+/// for as long as the process runs.
+///
+/// `tenants` is asked often (every few seconds) and must be cheap: it is the
+/// set of `<app>.<environment>` this node currently runs.
+pub fn spawn_renewal<F>(
+    credential: TelemetryCredential,
+    client: MachineChannelClient<Channel>,
+    node_id: String,
+    tenants: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> BTreeSet<String> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut client = client;
+        // What the capability held now names, and when it has to be renewed
+        // regardless. `None` until the first request succeeds.
+        let mut issued: Option<(BTreeSet<String>, tokio::time::Instant)> = None;
+        loop {
+            let wanted = tenants();
+            let due = match &issued {
+                None => true,
+                Some((named, renew_at)) => {
+                    *named != wanted || tokio::time::Instant::now() >= *renew_at
+                }
+            };
+            if !due {
+                tokio::time::sleep(TENANT_CHECK_EVERY).await;
+                continue;
+            }
+            match issue(&mut client, &node_id, &wanted).await {
+                Ok(token) => match credential.set(&token) {
+                    Ok(()) => {
+                        tracing::info!(
+                            tenants = wanted.len(),
+                            "Obtained a telemetry capability for this node's application \
+                             environments and its own records"
+                        );
+                        let renew_at =
+                            tokio::time::Instant::now() + RENEW_EVERY - jitter(RENEW_JITTER);
+                        issued = Some((wanted, renew_at));
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "The control plane returned an unusable telemetry capability");
+                        tokio::time::sleep(RETRY_EVERY + jitter(RETRY_JITTER)).await;
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        held = credential.is_present(),
+                        "Could not obtain a telemetry capability; pushes stay queued, and the \
+                         request is retried in about {}s",
+                        RETRY_EVERY.as_secs()
+                    );
+                    tokio::time::sleep(RETRY_EVERY + jitter(RETRY_JITTER)).await;
+                }
+            }
+        }
+    })
+}
+
+/// A uniformly random duration in `[0, max)`, from the standard library's
+/// randomly keyed hasher. Only meant to spread load across a fleet.
+fn jitter(max: Duration) -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    let max_ms = max.as_millis() as u64;
+    if max_ms == 0 {
+        return Duration::ZERO;
+    }
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    Duration::from_millis(random % max_ms)
 }
 
 #[cfg(test)]
@@ -209,78 +275,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_node_without_a_secret_carries_no_token() {
-        assert!(!TelemetryCredential::from_secret(None).is_present());
-        assert!(!TelemetryCredential::from_secret(Some("")).is_present());
-        assert!(
-            !TelemetryCredential::from_secret(Some("   ")).is_present(),
-            "whitespace is what a half-filled config file holds, and an empty header is refused \
-             where no header at all is not"
+    fn a_node_without_a_capability_stamps_nothing() {
+        let credential = TelemetryCredential::default();
+        assert!(!credential.is_present());
+        assert!(credential
+            .stamp(())
+            .metadata()
+            .get("authorization")
+            .is_none());
+    }
+
+    #[test]
+    fn a_renewed_token_reaches_every_holder() {
+        let credential = TelemetryCredential::default();
+        let shipper = credential.clone();
+        credential.set("v1.first.sig").unwrap();
+        credential.set("v1.second.sig").unwrap();
+        let stamped = shipper.stamp(());
+        assert_eq!(
+            stamped
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer v1.second.sig")
         );
     }
 
     #[test]
-    fn the_token_is_an_ed25519_capability() {
-        let credential = TelemetryCredential::from_secret(Some("shared-secret"));
-        assert!(credential.is_present());
-
-        let stamped = credential.stamp(());
-        let header_value = stamped
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .expect("the token travels in an Authorization: Bearer header");
-
-        assert!(
-            header_value.starts_with("Bearer "),
-            "the header value must be 'Bearer <token>', got: {header_value:?}"
-        );
-
-        // The token itself must be a valid v1 capability token.
-        let token = header_value.strip_prefix("Bearer ").unwrap();
-        assert!(
-            token.starts_with("v1."),
-            "the capability token must start with 'v1.', got prefix: {:?}",
-            &token[..token.len().min(10)]
-        );
-
-        // The same secret must produce a valid capability token each time.
-        // Each call generates a fresh jti (JWT ID), so the tokens are not
-        // byte-identical, but both must be well-formed Bearer tokens signed
-        // by the same key.
-        let credential2 = TelemetryCredential::from_secret(Some("shared-secret"));
-        let stamped2 = credential2.stamp(());
-        let header_value2 = stamped2
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .unwrap();
-        assert!(
-            header_value2.starts_with("Bearer v1."),
-            "the second token from the same secret must also be a capability token"
-        );
-
-        // A different secret must produce a different token.
-        let credential3 = TelemetryCredential::from_secret(Some("other-secret"));
-        let stamped3 = credential3.stamp(());
-        let header_value3 = stamped3
-            .metadata()
-            .get("authorization")
-            .and_then(|value| value.to_str().ok())
-            .unwrap();
-        assert_ne!(
-            header_value, header_value3,
-            "different secrets must produce different Ed25519 keys and different tokens"
-        );
+    fn the_request_names_every_tenant_and_the_platform_for_ingest_only() {
+        let tenants: BTreeSet<String> = ["shop.production", "shop.preview"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let resources = resources_for(&tenants);
+        assert_eq!(resources.len(), 3);
+        assert!(resources.iter().all(|r| r.binding == TELEMETRY_INGEST));
+        assert_eq!(resources[0].tenant, TELEMETRY_PLATFORM_TENANT);
+        assert!(resources.iter().any(|r| r.tenant == "shop.preview"));
     }
 
     #[test]
-    fn a_node_without_a_secret_stamps_nothing() {
-        let stamped = TelemetryCredential::from_secret(None).stamp(());
-        assert!(
-            stamped.metadata().get("authorization").is_none(),
-            "an empty token is presented and refused; no token at all is served by a collector \
-             that requires none"
-        );
+    fn a_token_that_is_not_metadata_is_refused() {
+        assert!(TelemetryCredential::default().set("line\nbreak").is_err());
     }
 }
