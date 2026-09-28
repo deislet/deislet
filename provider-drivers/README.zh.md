@@ -2,9 +2,11 @@
 
 这里保存 provider 自动化实现的机器契约和来源锁，不保存账号凭证，也不把构建 adapter 当成部署支持。
 
+> **冻结**：driver 的签名发布治理（发布授权、透明日志、信任根轮换、安装器校验）只修缺陷，不加新功能；Deislet 的控制面只构建 Unix 版本，Windows 相关代码已删除。见 [provider-driver-governance.md](../docs/operations/provider-driver-governance.md)。
+
 - `official-tool-lock.json` 固定已审查官方工具的精确版本、npm registry tarball、SRI 与 SHA-256。
 - `official-tool-lock.schema.json` 约束来源记录及服务端凭证传输结论。
-- `contracts/v1/provider-driver.schema.json` 是完整 driver manifest 契约。只有 12 个生命周期操作全部实现并通过 contract/live tests 后，才可在这里增加某个 backend 的正式 manifest。
+- `contracts/v1/provider-driver.schema.json` 是完整 driver manifest 契约。只有 12 个生命周期操作全部实现并通过 contract/live tests 后，才可在这里增加某个 target 的正式 manifest。
 - `contracts/v1/provider-driver-release.schema.json` 把一个逻辑 release digest 映射到各主机的 archive、完整文件表、component materialization 与 executable；平台分发物不能各自冒充统一 driver identity。
 - `deis-provider-driver` crate 是同一契约的 Rust 执行边界：统一 request/receipt/error、不可绕过的 query-before-retry，以及不经 shell、清空继承环境、固定 executable digest、超时、进程组取消、输出限额和凭证脱敏。
 - 同一 crate 的安装器会在受控 root 内校验 archive 和每个 regular file、拒绝 link/traversal/extra/missing/case collision，以 content-addressed 只读目录发布并在复用/执行前全树复核。

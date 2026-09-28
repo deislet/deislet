@@ -9,8 +9,6 @@ use std::{collections::BTreeMap, fmt, fs::OpenOptions, io::Read as _, path::Path
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-#[cfg(windows)]
-use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
@@ -872,10 +870,6 @@ fn read_secure_trust_metadata_file(
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    #[cfg(windows)]
-    options
-        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
-        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     let mut file = options
         .open(path)
         .map_err(DriverReleaseAuthorizationError::Io)?;
@@ -885,15 +879,6 @@ fn read_secure_trust_metadata_file(
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(DriverReleaseAuthorizationError::Invalid(
             "provider driver release trust metadata must be a regular non-symlink file",
-        ));
-    }
-    #[cfg(windows)]
-    if metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
-    {
-        return Err(DriverReleaseAuthorizationError::Invalid(
-            "provider driver release trust metadata cannot be a Windows reparse point",
         ));
     }
     if metadata.len() > MAX_TRUST_ROOT_BYTES {
@@ -907,15 +892,6 @@ fn read_secure_trust_metadata_file(
             "provider driver release trust metadata must be owned by the service identity and not group/other writable",
         ));
     }
-    #[cfg(windows)]
-    crate::windows_security::validate_private_file(&file).map_err(|error| match error {
-        crate::windows_security::WindowsSecurityError::Io(error) => {
-            DriverReleaseAuthorizationError::Io(error)
-        }
-        crate::windows_security::WindowsSecurityError::Insecure(message) => {
-            DriverReleaseAuthorizationError::Invalid(message)
-        }
-    })?;
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.read_to_end(&mut bytes)
         .map_err(DriverReleaseAuthorizationError::Io)?;
@@ -928,8 +904,6 @@ fn read_secure_trust_metadata_file(
         || metadata.len() != final_metadata.len()
         || metadata.mtime() != final_metadata.mtime()
         || metadata.mtime_nsec() != final_metadata.mtime_nsec();
-    #[cfg(not(unix))]
-    let metadata_changed = metadata.len() != final_metadata.len();
     if metadata_changed || u64::try_from(bytes.len()).ok() != Some(final_metadata.len()) {
         return Err(DriverReleaseAuthorizationError::Invalid(
             "provider driver release trust metadata changed while it was read",
@@ -1484,8 +1458,6 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("trust-root.json");
         std::fs::write(&path, serde_jcs::to_vec(root.get()).unwrap()).unwrap();
-        #[cfg(windows)]
-        crate::windows_security::set_private_acl_for_test(&path, false, false, true).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1496,25 +1468,6 @@ mod tests {
         }
         let loaded = ValidatedDriverReleaseTrustRoot::load_file(&path).unwrap();
         assert_eq!(loaded.canonical_sha256(), root.canonical_sha256());
-
-        #[cfg(windows)]
-        {
-            crate::windows_security::set_private_acl_for_test(&path, false, false, false).unwrap();
-            assert!(
-                ValidatedDriverReleaseTrustRoot::load_file(&path)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("protected")
-            );
-            crate::windows_security::set_private_acl_for_test(&path, false, true, true).unwrap();
-            assert!(
-                ValidatedDriverReleaseTrustRoot::load_file(&path)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("untrusted")
-            );
-            crate::windows_security::set_private_acl_for_test(&path, false, false, true).unwrap();
-        }
 
         #[cfg(unix)]
         {

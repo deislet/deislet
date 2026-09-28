@@ -3368,40 +3368,16 @@ pub(crate) mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    #[cfg(windows)]
-    fn make_install_root_private(path: &Path) {
-        deis_provider_driver::test_support::set_windows_private_acl(path, true, false, true)
-            .unwrap();
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn make_install_root_private(_path: &Path) {}
-
     #[cfg(unix)]
     fn make_file_writable(path: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    #[cfg(windows)]
-    fn make_file_writable(path: &Path) {
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
     #[cfg(unix)]
     fn make_installed_file_read_only(path: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
-    }
-
-    #[cfg(windows)]
-    fn make_installed_file_read_only(path: &Path) {
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(path, permissions).unwrap();
     }
 
     fn make_writable_for_cleanup(root: &Path) {
@@ -3426,15 +3402,5 @@ pub(crate) mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = if directory { 0o700 } else { 0o600 };
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
-    }
-
-    #[cfg(windows)]
-    fn make_cleanup_entry_writable(path: &Path, _directory: bool) {
-        if let Ok(metadata) = fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = fs::set_permissions(path, permissions);
-        }
     }
 }
