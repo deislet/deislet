@@ -283,7 +283,7 @@ pub fn build_binding_plan_for_target(
                  this project enables the unnamed service(s) {}. The unnamed namespace has no \
                  name to bind a provider resource by. Declare named bindings instead - \
                  `\"bindings\": {{ \"MY_KV\": {{ \"kind\": \"kv\" }} }}` - and reach them as \
-                 `context.bindings.MY_KV`",
+                 `context.env.MY_KV`",
                 enabled.join(", ")
             );
         }

@@ -3481,7 +3481,7 @@ const assetsBinding = ObjectFreeze({
 // Service bindings: calling another application on this platform
 // ---------------------------------------------------------
 //
-// `context.bindings.AUTH.fetch("/verify", { method: "POST", body })` -- the
+// `context.env.AUTH.fetch("/verify", { method: "POST", body })` -- the
 // same shape as any other fetch, so a handler that already talks to an HTTP
 // service moves to a service binding by changing what it calls, not how.
 //
@@ -3657,7 +3657,7 @@ class ServiceBinding {
   }
 }
 
-// Build the table `context.bindings` publishes, out of what the manifest
+// Build the table of named bindings (`context.env.<NAME>`), out of what the manifest
 // declared.
 //
 // The names come from the platform, never from the application: `op_get_bindings`
@@ -3755,14 +3755,16 @@ function createServiceContext() {
   // environment reaches its own static files through exactly the same name a
   // Cloudflare Pages handler does.
   //
-  // The named bindings are published twice, on purpose, and they are the same
-  // object either way:
+  // The named bindings are published twice, and they are the same object
+  // either way:
   //
-  //   context.bindings.HOT   the platform's table, and the honest place: only
-  //                          bindings are in it, so a reader knows what they
-  //                          are looking at;
-  //   env.HOT                where code written for Cloudflare reaches for it,
-  //                          so a project ported from there needs no rewrite.
+  //   env.HOT                the application ABI: Edge Canon's
+  //                          `context.env.<NAME>`, which is also where code
+  //                          written for Cloudflare reaches for it;
+  //   context.bindings.HOT   the platform's internal table, below the
+  //                          generated bridge. Not part of the standard
+  //                          context, and refused in application source at
+  //                          build.
   //
   // A variable or a secret named after one of those is refused at build, at
   // upload and at load (`Manifest::validate`) exactly as `ASSETS` is; if one
