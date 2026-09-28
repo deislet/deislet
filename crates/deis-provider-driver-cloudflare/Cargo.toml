@@ -16,7 +16,6 @@ name = "deis-provider-driver-cloudflare"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = { workspace = true }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 deis-build-core = { workspace = true }

@@ -31,7 +31,6 @@ colored = "2.1"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_jcs = "0.2.0"
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
 walkdir = "2.4"
@@ -42,7 +41,6 @@ sha2 = "0.10"
 hex = "0.4"
 
 # SWC dependencies (for parser module)
-swc_core = "0.100"
 swc_common = "18.0"
 swc_ecma_ast = "20.0"
 swc_ecma_parser = "34.0"
