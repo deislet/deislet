@@ -90,7 +90,8 @@ mod tests {
     use super::*;
 
     fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("deis-wire-incarnation-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("deis-wire-incarnation-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         dir
     }

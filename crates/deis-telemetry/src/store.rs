@@ -34,7 +34,6 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, params_from_iter};
 use tracing::{debug, info, warn};
 
-
 use crate::MAX_GRPC_MESSAGE_BYTES;
 
 /// Microseconds in one day, the width of a log partition.

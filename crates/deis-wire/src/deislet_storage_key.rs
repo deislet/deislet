@@ -256,7 +256,7 @@ mod tests {
             format!("ct1_550e8400-e29b-41d4-a716-446655440000_{ENV}"),
             format!("ct1_{APP}_{ENV}@"),
             format!("ct1_{APP}_{ENV}@a.b"),
-            format!("ct1_{APP}_{ENV}@..") ,
+            format!("ct1_{APP}_{ENV}@.."),
             format!("ct1_{APP}_{ENV}@HOT@COLD"),
             "shop.production".to_string(),
             "shop.production@HOT".to_string(),

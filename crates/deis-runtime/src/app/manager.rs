@@ -6,7 +6,7 @@ use crate::app_repo::AppRepo;
 use crate::assets::AssetBundle;
 use crate::config::ExecutionLimits;
 use crate::runtime::{FetchPolicy, IsolateSpec, OpMetricsSummary, RuntimePool};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 
 /// Compare two credentials in time that does not depend on how many leading
@@ -25,8 +25,8 @@ fn constant_time_eq(expected: &str, presented: &str) -> bool {
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
 }
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
@@ -1172,7 +1172,10 @@ impl ApplicationManager {
             env: record.config.env.clone(),
             standard_env: record.config.standard_env.clone(),
             node_process_env: Some(record.config.node_process_env.clone()),
-            storage_tenant: record.config.storage_tenant.map(|tenant| tenant.to_string()),
+            storage_tenant: record
+                .config
+                .storage_tenant
+                .map(|tenant| tenant.to_string()),
             permissions: record.config.permissions.clone(),
             memory_limit_mb: Some(
                 self.effective_memory_limit_mb(key, record.config.limits.as_ref()),

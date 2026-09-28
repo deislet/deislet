@@ -894,9 +894,7 @@ mod tests {
         let snapshot = held.path().join("snap");
         let manifest = take(source.path(), &snapshot).unwrap();
         assert!(
-            manifest
-                .databases
-                .contains(&format!("db/{media}.sqlite")),
+            manifest.databases.contains(&format!("db/{media}.sqlite")),
             "the binding's SQL database must be in the snapshot: {:?}",
             manifest.databases
         );

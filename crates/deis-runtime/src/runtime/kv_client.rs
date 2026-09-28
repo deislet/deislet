@@ -401,7 +401,7 @@ mod tests {
         }
 
         fn capability_token_for(&self, tenant: &str) -> String {
-            use deis_capability::{encode, CapabilityClaims, CapabilityResource};
+            use deis_capability::{CapabilityClaims, CapabilityResource, encode};
             use std::time::Duration;
             let claims = CapabilityClaims::new(
                 "store",
@@ -422,9 +422,8 @@ mod tests {
         /// lazily dialled, carrying whatever proof the node was handed.
         /// `tenant` is the `<app>.<environment>` pair the store keys on.
         fn binding(&self, tenant: &str, token: Option<&str>) -> KvClient {
-            let identity =
-                StorageIdentity::new(crate::runtime::tenant::test_tenant(tenant), token)
-                    .expect("a legal tenant");
+            let identity = StorageIdentity::new(crate::runtime::tenant::test_tenant(tenant), token)
+                .expect("a legal tenant");
             KvClient::connect_lazy(&self.endpoint, &identity).expect("client is built")
         }
 
@@ -819,11 +818,19 @@ mod tests {
             .await
             .expect("production's token is served");
         assert_eq!(
-            store.client("demo.production").get("k".to_string()).await.unwrap(),
+            store
+                .client("demo.production")
+                .get("k".to_string())
+                .await
+                .unwrap(),
             Some(b"v".to_vec())
         );
         assert_eq!(
-            store.client("demo.preview-7").get("k".to_string()).await.unwrap(),
+            store
+                .client("demo.preview-7")
+                .get("k".to_string())
+                .await
+                .unwrap(),
             None
         );
     }
@@ -838,7 +845,7 @@ mod tests {
         // A genuine signature for this tenant, but for the sql binding: the
         // kv service finds no tenant it may act for and refuses it.
         let wrong = {
-            use deis_capability::{encode, CapabilityClaims, CapabilityResource};
+            use deis_capability::{CapabilityClaims, CapabilityResource, encode};
             encode(
                 &CapabilityClaims::new(
                     "store",

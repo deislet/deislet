@@ -1318,7 +1318,11 @@ mod tests {
     /// The canonical tenant of `app`'s production environment: what a node
     /// names in a store or queue capability request.
     async fn production_tenant(state: &CatalogState, app: &str) -> String {
-        let env = state.store.get_environment(app, "production").await.unwrap();
+        let env = state
+            .store
+            .get_environment(app, "production")
+            .await
+            .unwrap();
         crate::api::catalog::assignments::canonical_tenant_of(state, app, &env.id)
             .await
             .unwrap()
@@ -1369,11 +1373,7 @@ mod tests {
             let answer = service
                 .issue_capability(from(
                     &node("runtime-test"),
-                    capability_request(
-                        "runtime-test",
-                        aud,
-                        &resources_for_audience(&tenant, aud),
-                    ),
+                    capability_request("runtime-test", aud, &resources_for_audience(&tenant, aud)),
                 ))
                 .await
                 .expect("a node may have a capability for what it runs");
@@ -1408,7 +1408,8 @@ mod tests {
         deployed_with_secret(&h).await;
         let service = make_service(h.state.clone());
 
-        let victim = deis_wire::CanonicalTenantId::derived_from_label("victim.production").to_string();
+        let victim =
+            deis_wire::CanonicalTenantId::derived_from_label("victim.production").to_string();
         let mut asked =
             resources_for_audience(&production_tenant(&h.state, "demo").await, AUD_STORE);
         asked.extend(resources_for_audience(&victim, AUD_STORE));

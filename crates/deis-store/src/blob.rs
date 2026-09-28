@@ -3135,11 +3135,7 @@ mod tests {
     async fn startup_clears_abandoned_uploads() {
         let dir = TempDir::new().unwrap();
         let a = tenant("app-one.production");
-        let incoming = dir
-            .path()
-            .join("blob")
-            .join(a.as_str())
-            .join(INCOMING_DIR);
+        let incoming = dir.path().join("blob").join(a.as_str()).join(INCOMING_DIR);
         std::fs::create_dir_all(&incoming).unwrap();
         std::fs::write(incoming.join("stale.part"), b"half an object").unwrap();
 

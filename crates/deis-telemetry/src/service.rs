@@ -19,7 +19,6 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
 
-
 use crate::auth::{Owner, ReadScope, grant_of};
 use crate::identity;
 use crate::now_us;
@@ -778,7 +777,6 @@ impl LogServiceRpc for LogService {
             first_rejection.get_or_insert_with(|| Rejection::TooManyDays.describe());
         }
 
-
         if rejected > 0 {
             warn!(
                 rejected,
@@ -1192,7 +1190,6 @@ impl TraceServiceRpc for TraceService {
             first_rejection.get_or_insert_with(|| TraceRejection::TooManyDays.describe());
         }
 
-
         if rejected > 0 {
             warn!(
                 rejected,
@@ -1435,9 +1432,7 @@ impl MetricServiceRpc for MetricService {
                 &self.stats,
                 Access::Write,
                 "store metric batch",
-                move || {
-                    store.insert_metrics(&records)
-                },
+                move || store.insert_metrics(&records),
             )
             .await
             {

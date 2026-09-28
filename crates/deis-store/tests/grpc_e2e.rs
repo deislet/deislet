@@ -156,10 +156,7 @@ impl Harness {
         Self::start_over(None, data_dir.to_path_buf()).await
     }
 
-    async fn start_over(
-        owned: Option<TempDir>,
-        data_dir: std::path::PathBuf,
-    ) -> Self {
+    async fn start_over(owned: Option<TempDir>, data_dir: std::path::PathBuf) -> Self {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir,
@@ -228,7 +225,6 @@ impl Harness {
             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
-
 }
 
 impl Drop for Harness {
@@ -575,8 +571,14 @@ async fn a_request_without_a_usable_tenant_is_refused() {
     let mine = canonical("app-one.production");
     for (what, token) in [
         ("../../etc", make_raw_store_token(&[("../../etc", "kv")])),
-        ("a name label", make_raw_store_token(&[("app-one.production", "kv")])),
-        ("no tenant for kv", make_raw_store_token(&[(mine.as_str(), "sql")])),
+        (
+            "a name label",
+            make_raw_store_token(&[("app-one.production", "kv")]),
+        ),
+        (
+            "no tenant for kv",
+            make_raw_store_token(&[(mine.as_str(), "sql")]),
+        ),
         (
             "two tenants",
             make_raw_store_token(&[(mine.as_str(), "kv"), (other.as_str(), "kv")]),

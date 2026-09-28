@@ -2672,8 +2672,18 @@ mod tests {
         let err = svc.fetch_rows(&two, "SELECT * FROM users", &[]).await;
         assert!(matches!(err, Err(StoreError::Sqlite(_))));
 
-        assert!(dir.path().join("db").join(format!("{}.sqlite", tenant("app-one.production"))).exists());
-        assert!(dir.path().join("db").join(format!("{}.sqlite", tenant("app-two.production"))).exists());
+        assert!(
+            dir.path()
+                .join("db")
+                .join(format!("{}.sqlite", tenant("app-one.production")))
+                .exists()
+        );
+        assert!(
+            dir.path()
+                .join("db")
+                .join(format!("{}.sqlite", tenant("app-two.production")))
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -3435,7 +3445,10 @@ mod tests {
         let (dir, svc) = service();
         let a = tenant("app-one.production");
         make_table(&svc, &a).await;
-        let path = dir.path().join("db").join(format!("{}.sqlite", tenant("app-one.production")));
+        let path = dir
+            .path()
+            .join("db")
+            .join(format!("{}.sqlite", tenant("app-one.production")));
 
         let tx = svc.open_transaction(&a, None).await.unwrap();
         // Not one statement has run inside the transaction yet.

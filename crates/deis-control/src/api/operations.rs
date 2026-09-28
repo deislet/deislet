@@ -23,15 +23,15 @@ use tracing::{info, warn};
 
 use crate::api::catalog::actor_subject;
 use crate::api::catalog::providers::{keyed_operation_context, operation_headers};
+use crate::api::error::ApiError;
 use crate::api::error::ApiResult;
 use crate::api::headers::{IDEMPOTENCY_KEY, optional_header, single_header};
-use crate::api::paths::ApiPaths;
-use crate::catalog::{CatalogStore, OperationScopeNames, ProviderDeploymentCancellation};
-use crate::api::error::ApiError;
 use crate::api::openapi;
+use crate::api::paths::ApiPaths;
 use crate::api::versioning::{
     CORRELATION_ID_HEADER as CORRELATION_ID, REQUEST_ID_HEADER as REQUEST_ID,
 };
+use crate::catalog::{CatalogStore, OperationScopeNames, ProviderDeploymentCancellation};
 use crate::identity::{Demand, Principal, Selector, Verb};
 
 const IF_MATCH: &str = "if-match";
@@ -294,8 +294,7 @@ impl OperationController {
                 app: Selector::One(&scope.application_name),
                 environment: Selector::One(&scope.environment_name),
             },
-            OperationController::BackendRestore
-            | OperationController::None => Demand {
+            OperationController::BackendRestore | OperationController::None => Demand {
                 verb: Verb::Admin,
                 app: Selector::Every,
                 environment: Selector::Every,
@@ -491,7 +490,6 @@ fn optional_if_match(headers: &HeaderMap) -> ApiResult<Option<u64>> {
         )
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1078,7 +1076,10 @@ mod gated_tests {
 
         for (uri, credential) in [
             // No credential at all, and the gate is enforcing: 401.
-            ("/api/v1/operations/01990f44-1000-7000-8000-000000000001", None),
+            (
+                "/api/v1/operations/01990f44-1000-7000-8000-000000000001",
+                None,
+            ),
             // A credential that reaches one environment of one
             // application, asked for an administrator's route: 403.
             (
@@ -1204,12 +1205,7 @@ mod gated_tests {
             assert_eq!(body["error"]["code"], codes::INSUFFICIENT_SCOPE, "{id}");
             assert_eq!(body["error"]["requestId"], REQUEST, "{id}");
             let text = answer.text();
-            for secret in [
-                "demo",
-                "production",
-                "preview",
-                id.as_str(),
-            ] {
+            for secret in ["demo", "production", "preview", id.as_str()] {
                 assert!(
                     !text.contains(secret),
                     "the refusal of {id} must not carry {secret:?}: {text}"
@@ -1331,4 +1327,3 @@ mod gated_tests {
         );
     }
 }
-

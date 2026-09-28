@@ -227,11 +227,7 @@ impl BackendRestoreCoordinator {
         reason: &str,
     ) -> Result<(), BackendRestoreCoordinatorError> {
         self.catalog
-            .defer_backend_restore(
-                operation_id,
-                operation_revision,
-                reason.to_string(),
-            )
+            .defer_backend_restore(operation_id, operation_revision, reason.to_string())
             .await?;
         Ok(())
     }

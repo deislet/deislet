@@ -14,7 +14,7 @@
 //! `app_id`, because deis-telemetry attributes records to that label and an
 //! operator reads names (see `crate::logging::layer`).
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use deis_wire::CanonicalTenantId;
 use tonic::Request;
 
@@ -88,7 +88,10 @@ mod tests {
     fn refuses_anything_but_a_canonical_tenant() {
         for bad in ["", "demo", "demo.production", "../etc.production", "v1/a/b"] {
             let err = Tenant::new(bad).expect_err("not canonical");
-            assert!(err.to_string().contains("not a canonical storage tenant"), "{err}");
+            assert!(
+                err.to_string().contains("not a canonical storage tenant"),
+                "{err}"
+            );
         }
     }
 }

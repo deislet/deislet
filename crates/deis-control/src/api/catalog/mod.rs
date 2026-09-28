@@ -475,7 +475,12 @@ pub(crate) mod tests {
             message: T,
         ) -> tonic::Request<T> {
             let app = self.state.store.get_app(app_id).await.unwrap();
-            let env = self.state.store.get_environment(app_id, environment).await.unwrap();
+            let env = self
+                .state
+                .store
+                .get_environment(app_id, environment)
+                .await
+                .unwrap();
             let tenant = deis_wire::CanonicalTenantId::new(app.canonical_id, env.canonical_id);
             let token = self.state.storage.queue_token_for(&tenant).await.unwrap();
             let mut request = tonic::Request::new(message);
@@ -613,9 +618,10 @@ pub(crate) mod tests {
             crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test");
         // Guarded like deis-queue is: the tenant of a call is the one its
         // capability names.
-        let queue_auth = deis_queue::auth::QueueAuth::new(deis_capability::KeyRing::from_keys([
-            issuer.verifying_key().await,
-        ]));
+        let queue_auth =
+            deis_queue::auth::QueueAuth::new(deis_capability::KeyRing::from_keys([issuer
+                .verifying_key()
+                .await]));
         // Served over TLS with a queue's certificate, as deis-queue is: the
         // control plane's own calls refuse anything else.
         let fleet = deis_identity_test_pki::TestFleet::new();

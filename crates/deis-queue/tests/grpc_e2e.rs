@@ -168,7 +168,6 @@ impl Harness {
             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
-
 }
 
 impl Drop for Harness {
@@ -1191,7 +1190,10 @@ async fn a_call_without_one_capability_tenant_is_refused() {
     for tenants in [
         vec!["app-one.production".to_string()],
         vec!["../../etc".to_string()],
-        vec![canonical("app-one.production"), canonical("app-two.production")],
+        vec![
+            canonical("app-one.production"),
+            canonical("app-two.production"),
+        ],
     ] {
         let claims = CapabilityClaims::new(
             "queue",

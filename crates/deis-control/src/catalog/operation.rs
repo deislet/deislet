@@ -660,7 +660,6 @@ fn sha256_hex(value: &[u8]) -> String {
     format!("{:x}", Sha256::digest(value))
 }
 
-
 #[cfg(test)]
 impl CatalogStore {
     /// Write one queued operation of `kind` straight into the table, for
@@ -778,13 +777,7 @@ mod tests {
         }
 
         let running = store
-            .transition_product_operation(
-                operation_id,
-                1,
-                OperationEvent::Start,
-                "inventory",
-                None,
-            )
+            .transition_product_operation(operation_id, 1, OperationEvent::Start, "inventory", None)
             .await
             .unwrap();
         assert_eq!(running.state, OperationState::Running);
@@ -894,8 +887,7 @@ mod tests {
         assert_eq!(operation.operation_id, live);
         assert_eq!(operation.scope.environment_id, Some(production));
 
-        let gone =
-            copy_scoped_to(&store, original, CanonicalId::new_v7().to_string()).await;
+        let gone = copy_scoped_to(&store, original, CanonicalId::new_v7().to_string()).await;
         let (_, names) = store
             .product_operation_with_scope_names(gone)
             .await

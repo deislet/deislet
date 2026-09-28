@@ -1109,7 +1109,8 @@ impl QueueService {
         let cutoff = self.clock.now().saturating_sub(retention);
         self.pool
             .with_conn(move |conn| {
-                let count = conn.execute("DELETE FROM dead_letter WHERE died_at <= ?1", [cutoff])?;
+                let count =
+                    conn.execute("DELETE FROM dead_letter WHERE died_at <= ?1", [cutoff])?;
                 Ok(count)
             })
             .await
@@ -1770,7 +1771,6 @@ fn abort_consumer_generation_tx(
         active_deployment_id: active_deployment,
     })
 }
-
 
 /// Move every ready message that has already used its attempts into the dead
 /// letter table. Returns the ids and attempt counts, for the caller to log.

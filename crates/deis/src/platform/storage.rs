@@ -35,8 +35,7 @@ use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
 use deis_wire::conventions::{
-    BINDING_HEADER, MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES, is_valid_binding_name,
-    split_tenant,
+    BINDING_HEADER, MAX_GRPC_MESSAGE_BYTES, STREAM_CHUNK_BYTES, is_valid_binding_name, split_tenant,
 };
 
 /// KV and the SQL database share one proto file and one gRPC service

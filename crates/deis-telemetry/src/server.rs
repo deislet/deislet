@@ -245,12 +245,7 @@ pub async fn start(config: &Config, keys: deis_capability::KeyRing) -> Result<Ru
         limits,
         retention,
     );
-    let metrics_service = MetricService::new(
-        store.clone(),
-        Arc::clone(&stats),
-        limits,
-        retention,
-    );
+    let metrics_service = MetricService::new(store.clone(), Arc::clone(&stats), limits, retention);
 
     let grpc_listener = TcpListener::bind(&config.listen)
         .await
