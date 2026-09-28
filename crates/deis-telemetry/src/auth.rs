@@ -103,6 +103,9 @@ pub struct Grant {
     principal: String,
     ingest: Named,
     read: Named,
+    /// When the capability stops being valid, as Unix seconds. A stream
+    /// opened with it ends here: the check runs once, when the stream opens.
+    expires_at: u64,
 }
 
 impl Grant {
@@ -111,7 +114,13 @@ impl Grant {
             ingest: Named::of(&verified, TELEMETRY_INGEST),
             read: Named::of(&verified, TELEMETRY_READ),
             principal: verified.sub,
+            expires_at: verified.exp,
         }
+    }
+
+    /// When the capability expires, as Unix seconds.
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
     }
 
     /// The principal the capability was issued to, for log lines.

@@ -1003,6 +1003,55 @@ async fn a_read_capability_cannot_write() {
     server.shutdown().await.expect("clean shutdown");
 }
 
+/// A follow stream is authorised when it opens, and ends when the capability
+/// it opened with expires: a reader cannot outlive its credential by keeping
+/// one connection open.
+#[tokio::test]
+async fn a_follow_stream_ends_when_its_capability_expires() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let server = server::start(&test_config(dir.path()), support::keys())
+        .await
+        .expect("the service must start");
+    for traces in [false, true] {
+        let reader = support::token_as(
+            "spiffe://deis.test/human/someone",
+            &[("shop.production", TELEMETRY_READ)],
+            Duration::from_secs(2),
+        );
+        let ended = if traces {
+            let mut live = traces_as(&server, &reader)
+                .await
+                .tail_traces(TailTracesRequest {
+                    app_id: "shop".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("the reader may follow its own application")
+                .into_inner();
+            tokio::time::timeout(Duration::from_secs(10), live.message())
+                .await
+                .expect("the stream ends within its capability's lifetime")
+                .expect_err("the stream ends with a refusal, not a record")
+        } else {
+            let mut live = logs_as(&server, &reader)
+                .await
+                .tail(TailRequest {
+                    app_id: "shop".to_string(),
+                    ..Default::default()
+                })
+                .await
+                .expect("the reader may follow its own application")
+                .into_inner();
+            tokio::time::timeout(Duration::from_secs(10), live.message())
+                .await
+                .expect("the stream ends within its capability's lifetime")
+                .expect_err("the stream ends with a refusal, not a record")
+        };
+        assert_eq!(ended.code(), tonic::Code::Unauthenticated, "{ended:?}");
+        assert!(ended.message().contains("expired"), "{ended:?}");
+    }
+}
+
 #[tokio::test]
 async fn a_read_capability_sees_only_its_own_tenant() {
     let dir = tempfile::tempdir().expect("temp dir");

@@ -189,15 +189,19 @@ one file.
 deis-telemetry has no secret of its own and no mode without the check. Every
 push, query, follow stream and Prometheus scrape presents a capability with
 audience `telemetry`, verified against the keys the control plane publishes
-at `/.well-known/deis/capability-jwks.json` (`capability_jwks_url`), with the
+at `/.well-known/deis/capability-jwks.json` on its machine listener - read
+under mutual TLS with deis-telemetry's own `[machine_identity]` - with the
 same 15-minute ceiling, revocation list and T8 grace as deis-store and
-deis-queue (`crates/deis-telemetry/src/auth.rs`). A capability's resources say
+deis-queue (`crates/deis-telemetry/src/auth.rs`). A follow stream (`Tail`,
+`TailTraces`) is checked when it opens and ends with `Unauthenticated` when
+the capability it opened with expires; a revocation reaches an open stream at
+that point, not sooner. A capability's resources say
 what it may touch, one (tenant, binding) pair each:
 
 | Binding | Issued to | What it allows |
 |---|---|---|
 | `ingest` for `<app>.<env>` | a node, over the machine channel (`IssueCapability`), for each application environment it runs | Push that tenant's logs, traces and metric samples. A record for any tenant the capability does not name is refused and counted as rejected. It reads nothing. |
-| `ingest` for `@platform` | every node | Push the node's own records - the ones with no application (process metrics, component log lines). |
+| `ingest` for `@platform` | every node, whatever it runs | Push the node's own records - the ones with no application (process metrics, component log lines). |
 | `read` for `<app>.<env>` | a person, from `GET /api/v1/apps/{app}/environments/{env}/telemetry-token` (needs `read:{app}/{env}`) or `GET /api/v1/apps/{app}/telemetry-token` (needs `read:{app}/*`, every environment) | Query and follow that tenant's records and nothing else: a read must name an application the capability reaches, and whatever comes back is filtered to the tenants it names. It writes nothing. |
 | `read` for `@platform` | a person holding `read:*/*`, from `GET /api/platform/telemetry-token` | Read everything, every tenant and the nodes' own records. The Prometheus page is every series at once, so it accepts only this. |
 
@@ -205,7 +209,8 @@ Every mint on the human side is recorded in the audit log whatever its
 outcome (`telemetry_token.mint`, `telemetry_token.mint_platform`), like the
 storage-token mint. What a compromised node can do here is what it can do
 with its capability: write the tenants it runs and its own records, and read
-nothing. A Prometheus server scraping the page needs a fresh platform read
+nothing - `IssueCapability` refuses a node any `read` binding, and any tenant
+it does not run (`crates/deis-control/src/machine/issuance.rs`). A Prometheus server scraping the page needs a fresh platform read
 capability at least every 15 minutes (a `bearer_token_file` kept current by
 something holding `read:*/*`); there is no long-lived scrape credential.
 

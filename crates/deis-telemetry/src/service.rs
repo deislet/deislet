@@ -995,7 +995,8 @@ impl LogServiceRpc for LogService {
         &self,
         request: Request<TailRequest>,
     ) -> Result<Response<Self::TailStream>, Status> {
-        let scope = grant_of(&request)?.read_scope()?;
+        let grant = grant_of(&request)?;
+        let scope = grant.read_scope()?;
         let peer = request
             .remote_addr()
             .map(|addr| addr.to_string())
@@ -1014,8 +1015,53 @@ impl LogServiceRpc for LogService {
         );
         let rx = self.hub.subscribe(label, Scoped { filter, scope });
         let stream = ReceiverStream::new(rx).map(|record| Ok(to_entry(&record)));
+        let stream = until_expiry(stream, grant.expires_at());
         Ok(Response::new(Box::pin(stream) as Self::TailStream))
     }
+}
+
+/// `items`, ended when the capability that opened the stream expires.
+///
+/// A follow stream is authorised once, when it opens, so without this a
+/// reader whose capability ran out - or was revoked and not renewed - would
+/// go on receiving lines for as long as the connection held. At `expires_at`
+/// the stream ends with `Unauthenticated`, which tells the reader to come
+/// back with a fresh capability rather than that the service went away.
+fn until_expiry<T, S>(items: S, expires_at: u64) -> ReceiverStream<Result<T, Status>>
+where
+    T: Send + 'static,
+    S: Stream<Item = Result<T, Status>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    tokio::spawn(async move {
+        let remaining = expires_at.saturating_sub(now_us().max(0) as u64 / 1_000_000);
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(remaining));
+        tokio::pin!(deadline);
+        tokio::pin!(items);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    let _ = tx
+                        .send(Err(Status::unauthenticated(
+                            "the capability this stream was opened with has expired; open it \
+                             again with a fresh one",
+                        )))
+                        .await;
+                    break;
+                }
+                _ = tx.closed() => break,
+                item = items.next() => match item {
+                    Some(item) => {
+                        if tx.send(item).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+    ReceiverStream::new(rx)
 }
 
 /// Why a trace record could not be stored.
@@ -1377,7 +1423,8 @@ impl TraceServiceRpc for TraceService {
         &self,
         request: Request<TailTracesRequest>,
     ) -> Result<Response<Self::TailTracesStream>, Status> {
-        let scope = grant_of(&request)?.read_scope()?;
+        let grant = grant_of(&request)?;
+        let scope = grant.read_scope()?;
         let peer = request
             .remote_addr()
             .map(|addr| addr.to_string())
@@ -1398,6 +1445,7 @@ impl TraceServiceRpc for TraceService {
         );
         let rx = self.hub.subscribe(label, Scoped { filter, scope });
         let stream = ReceiverStream::new(rx).map(|record| Ok(to_proto_trace(&record)));
+        let stream = until_expiry(stream, grant.expires_at());
         Ok(Response::new(Box::pin(stream) as Self::TailTracesStream))
     }
 }
