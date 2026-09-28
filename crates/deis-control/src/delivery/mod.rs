@@ -740,6 +740,16 @@ fn compatibility_to_wire(declared: &DeclaredCompatibility) -> proto::Compatibili
     }
 }
 
+/// What [`DeploymentDeliverer::prepare_environment_snapshot`] settles for
+/// one deployment. The values are held only to be handed to the node or
+/// driver the snapshot is for; `Debug` is not derived on purpose.
+pub struct PreparedEnvironmentSnapshot {
+    pub declarations: deis_wire::EnvironmentDeclarations,
+    pub snapshot: deis_wire::EnvironmentBindingSnapshot,
+    pub secret_names: Vec<String>,
+    pub secret_values_by_revision: BTreeMap<String, String>,
+}
+
 pub fn decrypt_secret(
     backend: &SecretsBackend,
     env_id: &str,
@@ -1192,124 +1202,15 @@ impl DeploymentDeliverer {
         let mut environment_snapshot = None;
         let mut secret_values_by_revision = BTreeMap::new();
 
-        if let Some(declarations) = manifest.environment.clone() {
+        if let Some(prepared) = self
+            .prepare_environment_snapshot(env, version, &manifest, config_values, prepared_snapshot)
+            .await?
+        {
             env_map.clear();
-            declarations
-                .validate(
-                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
-                    manifest.bindings.all_names(),
-                )
-                .map_err(|error| CatalogError::invalid(error.to_string()))?;
-            let declaration_identity = declarations
-                .identity()
-                .map_err(|error| CatalogError::invalid(error.to_string()))?;
-            let mut available_revisions = BTreeSet::new();
-            let snapshot = if let Some(snapshot) = prepared_snapshot {
-                if !config_values.is_empty() {
-                    return Err(CatalogError::invalid(
-                        "EC_ENV_SNAPSHOT_INVALID: config values cannot replace a historical snapshot",
-                    ));
-                }
-                for binding in &snapshot.bindings {
-                    if let deis_wire::EnvironmentBinding::Secret(secret) = binding {
-                        let stored = self
-                            .store
-                            .secret_revision_ciphertext(&env.id, &secret.name, &secret.revision)
-                            .await
-                            .map_err(|_| {
-                                CatalogError::invalid(
-                                    "EC_ENV_SECRET_REVISION_UNAVAILABLE: historical secret revision is unavailable",
-                                )
-                            })?;
-                        let value = decrypt_secret(self.secrets.as_ref(), &env.id, &stored)?;
-                        deis_wire::validate_secret_value(&value)
-                            .map_err(|error| CatalogError::invalid(error.to_string()))?;
-                        available_revisions.insert(stored.revision.clone());
-                        secret_values_by_revision.insert(stored.revision, value);
-                        secret_names.push(stored.name);
-                    }
-                }
-                snapshot
-            } else {
-                let current = self
-                    .store
-                    .secret_ciphertexts(&env.id)
-                    .await?
-                    .into_iter()
-                    .map(|stored| (stored.name.clone(), stored))
-                    .collect::<BTreeMap<_, _>>();
-                let declared = declarations.by_name();
-                for name in config_values.keys() {
-                    let Some(declaration) = declared.get(name.as_str()) else {
-                        return Err(CatalogError::invalid(
-                            "EC_ENV_BINDING_UNDECLARED: deployment config contains an undeclared name",
-                        ));
-                    };
-                    if declaration.kind != deis_wire::EnvironmentKind::Config {
-                        return Err(CatalogError::invalid(
-                            "EC_ENV_BINDING_TYPE_MISMATCH: deployment config supplies a secret declaration",
-                        ));
-                    }
-                }
-
-                let mut bindings = Vec::new();
-                for declaration in &declarations.declarations {
-                    match declaration.kind {
-                        deis_wire::EnvironmentKind::Config => {
-                            if let Some(value) = config_values.get(&declaration.name) {
-                                bindings.push(deis_wire::EnvironmentBinding::Config(
-                                    deis_wire::EnvironmentConfigBinding::new(
-                                        &declaration.name,
-                                        declaration.value_type,
-                                        value.clone(),
-                                    )
-                                    .map_err(|error| CatalogError::invalid(error.to_string()))?,
-                                ));
-                            } else if declaration.required {
-                                return Err(CatalogError::invalid(
-                                    "EC_ENV_REQUIRED_MISSING: required config binding is unavailable",
-                                ));
-                            }
-                        }
-                        deis_wire::EnvironmentKind::Secret => {
-                            if let Some(stored) = current.get(&declaration.name) {
-                                let value = decrypt_secret(self.secrets.as_ref(), &env.id, stored)?;
-                                deis_wire::validate_secret_value(&value)
-                                    .map_err(|error| CatalogError::invalid(error.to_string()))?;
-                                available_revisions.insert(stored.revision.clone());
-                                secret_values_by_revision.insert(stored.revision.clone(), value);
-                                secret_names.push(stored.name.clone());
-                                bindings.push(deis_wire::EnvironmentBinding::Secret(
-                                    deis_wire::EnvironmentSecretBinding::new(
-                                        &stored.name,
-                                        &stored.revision,
-                                    ),
-                                ));
-                            } else if declaration.required {
-                                return Err(CatalogError::invalid(
-                                    "EC_ENV_REQUIRED_MISSING: required secret binding is unavailable",
-                                ));
-                            }
-                        }
-                    }
-                }
-                deis_wire::EnvironmentBindingSnapshot::new(
-                    declarations.standard_version.clone(),
-                    version_id,
-                    env.canonical_id.to_string(),
-                    declaration_identity,
-                    bindings,
-                )
-            };
-            snapshot
-                .validate(
-                    &declarations,
-                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
-                    |revision| available_revisions.contains(revision),
-                )
-                .map_err(|error| CatalogError::invalid(error.to_string()))?;
-            environment_declarations = Some(declarations);
-            environment_snapshot = Some(snapshot);
+            secret_names = prepared.secret_names;
+            secret_values_by_revision = prepared.secret_values_by_revision;
+            environment_declarations = Some(prepared.declarations);
+            environment_snapshot = Some(prepared.snapshot);
         } else {
             // No `environment` declarations: nothing binds a secret, so none
             // is delivered. A secret value reaches a node only through a
@@ -1390,6 +1291,151 @@ impl DeploymentDeliverer {
             routing_generation: None,
             action: proto::DeploymentAction::Unspecified,
         })
+    }
+
+    /// The environment snapshot a deployment of `version` to `env` binds:
+    /// the version's declarations, the `config_values` given for this
+    /// deployment and the secret revisions at the environment's heads - or
+    /// exactly `prepared_snapshot`, re-checked, when one is given. `None`
+    /// when the version declares no `environment`.
+    ///
+    /// Every bound secret is decrypted and validated here, so a snapshot
+    /// that names a revision this control plane cannot read is refused
+    /// before anything is recorded against it.
+    pub async fn prepare_environment_snapshot(
+        &self,
+        env: &Environment,
+        version: &Version,
+        manifest: &deis_bundle::Manifest,
+        config_values: BTreeMap<String, serde_json::Value>,
+        prepared_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
+    ) -> CatalogResult<Option<PreparedEnvironmentSnapshot>> {
+        let Some(declarations) = manifest.environment.clone() else {
+            return Ok(None);
+        };
+        let version_id = version.id.as_str();
+        let mut secret_names = Vec::new();
+        let mut secret_values_by_revision = BTreeMap::new();
+        declarations
+            .validate(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                manifest.bindings.all_names(),
+            )
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        let declaration_identity = declarations
+            .identity()
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        let mut available_revisions = BTreeSet::new();
+        let snapshot = if let Some(snapshot) = prepared_snapshot {
+            if !config_values.is_empty() {
+                return Err(CatalogError::invalid(
+                    "EC_ENV_SNAPSHOT_INVALID: config values cannot replace a historical snapshot",
+                ));
+            }
+            for binding in &snapshot.bindings {
+                if let deis_wire::EnvironmentBinding::Secret(secret) = binding {
+                    let stored = self
+                        .store
+                        .secret_revision_ciphertext(&env.id, &secret.name, &secret.revision)
+                        .await
+                        .map_err(|_| {
+                            CatalogError::invalid(
+                                "EC_ENV_SECRET_REVISION_UNAVAILABLE: historical secret revision is unavailable",
+                            )
+                        })?;
+                    let value = decrypt_secret(self.secrets.as_ref(), &env.id, &stored)?;
+                    deis_wire::validate_secret_value(&value)
+                        .map_err(|error| CatalogError::invalid(error.to_string()))?;
+                    available_revisions.insert(stored.revision.clone());
+                    secret_values_by_revision.insert(stored.revision, value);
+                    secret_names.push(stored.name);
+                }
+            }
+            snapshot
+        } else {
+            let current = self
+                .store
+                .secret_ciphertexts(&env.id)
+                .await?
+                .into_iter()
+                .map(|stored| (stored.name.clone(), stored))
+                .collect::<BTreeMap<_, _>>();
+            let declared = declarations.by_name();
+            for name in config_values.keys() {
+                let Some(declaration) = declared.get(name.as_str()) else {
+                    return Err(CatalogError::invalid(
+                        "EC_ENV_BINDING_UNDECLARED: deployment config contains an undeclared name",
+                    ));
+                };
+                if declaration.kind != deis_wire::EnvironmentKind::Config {
+                    return Err(CatalogError::invalid(
+                        "EC_ENV_BINDING_TYPE_MISMATCH: deployment config supplies a secret declaration",
+                    ));
+                }
+            }
+
+            let mut bindings = Vec::new();
+            for declaration in &declarations.declarations {
+                match declaration.kind {
+                    deis_wire::EnvironmentKind::Config => {
+                        if let Some(value) = config_values.get(&declaration.name) {
+                            bindings.push(deis_wire::EnvironmentBinding::Config(
+                                deis_wire::EnvironmentConfigBinding::new(
+                                    &declaration.name,
+                                    declaration.value_type,
+                                    value.clone(),
+                                )
+                                .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                            ));
+                        } else if declaration.required {
+                            return Err(CatalogError::invalid(
+                                "EC_ENV_REQUIRED_MISSING: required config binding is unavailable",
+                            ));
+                        }
+                    }
+                    deis_wire::EnvironmentKind::Secret => {
+                        if let Some(stored) = current.get(&declaration.name) {
+                            let value = decrypt_secret(self.secrets.as_ref(), &env.id, stored)?;
+                            deis_wire::validate_secret_value(&value)
+                                .map_err(|error| CatalogError::invalid(error.to_string()))?;
+                            available_revisions.insert(stored.revision.clone());
+                            secret_values_by_revision.insert(stored.revision.clone(), value);
+                            secret_names.push(stored.name.clone());
+                            bindings.push(deis_wire::EnvironmentBinding::Secret(
+                                deis_wire::EnvironmentSecretBinding::new(
+                                    &stored.name,
+                                    &stored.revision,
+                                ),
+                            ));
+                        } else if declaration.required {
+                            return Err(CatalogError::invalid(
+                                "EC_ENV_REQUIRED_MISSING: required secret binding is unavailable",
+                            ));
+                        }
+                    }
+                }
+            }
+            deis_wire::EnvironmentBindingSnapshot::new(
+                declarations.standard_version.clone(),
+                version_id,
+                env.canonical_id.to_string(),
+                declaration_identity,
+                bindings,
+            )
+        };
+        snapshot
+            .validate(
+                &declarations,
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                |revision| available_revisions.contains(revision),
+            )
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        Ok(Some(PreparedEnvironmentSnapshot {
+            declarations,
+            snapshot,
+            secret_names,
+            secret_values_by_revision,
+        }))
     }
 
     /// Build the payload for one assignment row, the way a push would.
@@ -2195,11 +2241,7 @@ mod tests {
     }
 
     async fn deliverer(secrets_ready: bool) -> (DeploymentDeliverer, Arc<CatalogStore>) {
-        deliverer_with(
-            secrets_ready,
-            authenticated_wiring(),
-        )
-        .await
+        deliverer_with(secrets_ready, authenticated_wiring()).await
     }
 
     /// A test identity whose signing key is deterministic, so two tests
@@ -2705,7 +2747,11 @@ mod tests {
                     env.name
                 );
             }
-            assert!(request.env.contains_key(deis_wire::conventions::STORE_ENDPOINT_ENV));
+            assert!(
+                request
+                    .env
+                    .contains_key(deis_wire::conventions::STORE_ENDPOINT_ENV)
+            );
         }
     }
 

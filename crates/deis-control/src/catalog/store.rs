@@ -1334,6 +1334,29 @@ impl CatalogStore {
             .await
     }
 
+    /// The version of `app_id` whose permanent identity is `canonical_id`.
+    pub async fn get_version_by_canonical_id(
+        &self,
+        app_id: &str,
+        canonical_id: CanonicalId,
+    ) -> CatalogResult<Version> {
+        let app_id = app_id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {VERSION_COLUMNS} FROM versions WHERE app_id = ?1 AND canonical_id = ?2"
+                ),
+                params![app_id, canonical_id.to_string()],
+                map_version,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CatalogError::not_found(format!("version {canonical_id} of app {app_id}"))
+            })
+        })
+        .await
+    }
+
     /// Resolve the human-facing "v3" to a version row.
     pub async fn get_version_by_number(&self, app_id: &str, number: i64) -> CatalogResult<Version> {
         let app_id = app_id.to_string();

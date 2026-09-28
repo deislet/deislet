@@ -7,7 +7,7 @@
 //! | `EDGE_CANON_PROVIDER_CREDENTIAL` | `{"api_token","account_id"}` (see [`crate::credentials`]) |
 //! | `EDGE_CANON_PROVIDER_CONFIG` | optional JSON object `{NAME: "value"}` filling `[vars]` placeholders |
 //! | `EDGE_CANON_PROVIDER_SECRETS` | optional JSON object `{NAME: "value"}`, sent to wrangler on stdin only |
-//! | `DEIS_CLOUDFLARE_PURGE_DATA` | the environment id whose KV/D1/R2/queue resources `delete`/`cleanup` may destroy; anything else destroys nothing |
+//! | `DEIS_PROVIDER_PURGE_DATA` | the environment id whose KV/D1/R2/queue resources `delete`/`cleanup` may destroy; anything else destroys nothing |
 //! | `DEIS_PROVIDER_TOOLS_DIR` | toolchain cache (default `$HOME/.deis/tools`) |
 //! | `DEIS_PROVIDER_NODE` | absolute path of the Node.js executable (default: `node` on `PATH`) |
 //!
@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 use deis_provider_driver::DriverWorkspace;
 use zeroize::Zeroize;
 
-pub const CONFIG_ENV: &str = "EDGE_CANON_PROVIDER_CONFIG";
-pub const SECRETS_ENV: &str = "EDGE_CANON_PROVIDER_SECRETS";
-pub const PURGE_ENV: &str = "DEIS_CLOUDFLARE_PURGE_DATA";
+pub const CONFIG_ENV: &str = deis_provider_driver::DRIVER_PROCESS_CONFIG_ENV;
+pub const SECRETS_ENV: &str = deis_provider_driver::DRIVER_PROCESS_SECRETS_ENV;
+pub const PURGE_ENV: &str = deis_provider_driver::DRIVER_PROCESS_PURGE_ENV;
 pub const TOOLS_DIR_ENV: &str = "DEIS_PROVIDER_TOOLS_DIR";
 pub const NODE_ENV: &str = "DEIS_PROVIDER_NODE";
 
@@ -98,7 +98,7 @@ pub struct DriverEnvironment {
     pub search_path: Option<OsString>,
     pub config: BTreeMap<String, String>,
     pub secrets: SecretValues,
-    /// The environment id named by `DEIS_CLOUDFLARE_PURGE_DATA`.
+    /// The environment id named by `DEIS_PROVIDER_PURGE_DATA`.
     pub purge_environment_id: Option<String>,
 }
 

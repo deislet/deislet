@@ -44,6 +44,7 @@ pub mod provider_credential;
 pub mod provider_deployment_reconciler;
 pub mod provider_driver_operation;
 pub mod provider_driver_release;
+pub mod provider_inputs;
 pub mod provider_lifecycle;
 pub mod provider_payload;
 pub mod provider_target_grant;
@@ -82,16 +83,18 @@ pub use provider_deployment_reconciler::{
     ProviderDeploymentReconciler, ProviderDeploymentReconcilerConfig,
 };
 pub use provider_driver_operation::{
-    OPERATION_NOT_CANCELLABLE, OPERATION_NOT_ROLLBACKABLE, PROVIDER_DEPLOYMENT_STEPS,
-    PROVIDER_ROLLBACK_STEPS, ProviderDeploymentCancellation, ProviderDeploymentDriveOutcome,
-    ProviderDeploymentSpec, ProviderDeploymentStep, ProviderDeploymentWorkflow,
-    ProviderDriverOperationRecord, ProviderInstallation, ProviderInstallationSpec,
-    ProviderRollbackSpec, ProviderTarget, ProviderTargetSpec, ProviderWorkflowKind,
+    BoundEnvironmentSnapshot, OPERATION_NOT_CANCELLABLE, OPERATION_NOT_ROLLBACKABLE,
+    PROVIDER_DEPLOYMENT_STEPS, PROVIDER_ROLLBACK_STEPS, ProviderDeploymentCancellation,
+    ProviderDeploymentDriveOutcome, ProviderDeploymentSpec, ProviderDeploymentStep,
+    ProviderDeploymentWorkflow, ProviderDriverOperationRecord, ProviderEnvironmentSnapshot,
+    ProviderInstallation, ProviderInstallationSpec, ProviderRollbackSpec, ProviderStepInputFacts,
+    ProviderTarget, ProviderTargetSpec, ProviderWorkflowKind,
 };
 pub use provider_driver_release::{
     ProviderDriverDispatcher, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
     ProviderDriverReleaseRegistry, ResolvedProviderDriverRelease,
 };
+pub use provider_inputs::{CatalogOperationInputs, PROVIDER_SECRET_DELIVERY_ACTION};
 pub use provider_lifecycle::{
     PROVIDER_INSTALLATION_HAS_DEPENDENTS, PROVIDER_INSTALLATION_IN_USE, PROVIDER_RESOURCE_DELETED,
     PROVIDER_TARGET_IN_USE, ProviderLifecycleAuditEvent, ProviderLifecycleCascadeEntry,

@@ -700,6 +700,10 @@
           "artifact": {
             "$ref": "#/components/schemas/ArtifactVersionRef"
           },
+          "configValues": {
+            "description": "Values for the `config` declarations of the version's `environment`,\nby name. They are recorded in the environment snapshot this\ndeployment binds, with the environment's current secret revisions,\nand handed to the provider driver from there; the snapshot's digest\nis filled into `plan.bindingSnapshotDigest`.",
+            "type": "object"
+          },
           "plan": {
             "$ref": "#/components/schemas/ProviderNeutralPlan"
           },

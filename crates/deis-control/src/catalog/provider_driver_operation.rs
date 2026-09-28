@@ -5,6 +5,7 @@
 //! only claims or settles an exact request, while the orchestrator performs
 //! network/process work outside the database boundary.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -277,6 +278,57 @@ pub struct ProviderDeploymentSpec {
     pub provider_target_id: CanonicalId,
     pub artifact: ArtifactVersionRef,
     pub plan: ProviderNeutralPlan,
+    /// The deployment-time config values the caller gave. Part of the
+    /// request's identity; the values themselves reach the driver only
+    /// through the snapshot below.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_values: BTreeMap<String, serde_json::Value>,
+    /// The environment snapshot this deployment binds, prepared by the
+    /// caller from the version's declarations, `config_values` and the
+    /// environment's secret heads. Its identity becomes the plan's
+    /// `bindingSnapshotDigest`, so the desired state - and every receipt
+    /// bound to it - names exactly the secret revisions and config values
+    /// the driver will be handed. Not part of the request's identity: a
+    /// replay after a secret rotation is still the same request.
+    #[serde(skip)]
+    pub environment_snapshot: Option<ProviderEnvironmentSnapshot>,
+}
+
+/// An environment snapshot recorded for a provider deployment, in the same
+/// table and under the same identity a Deislet deployment's snapshot uses.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderEnvironmentSnapshot {
+    /// The environment's catalog row id (not its canonical id).
+    pub env_id: String,
+    /// The application's catalog row id.
+    pub app_id: String,
+    /// The version's catalog row id.
+    pub version_id: String,
+    pub declarations_sha256: String,
+    /// SHA-256 of `document`; the snapshot's identity.
+    pub snapshot_id: Sha256Digest,
+    /// The snapshot's canonical JSON.
+    pub document: String,
+}
+
+/// What the driver inputs of one workflow step are built from.
+#[derive(Clone, Debug)]
+pub struct ProviderStepInputFacts {
+    pub workflow_operation_id: CanonicalId,
+    pub kind: ProviderWorkflowKind,
+    pub application_id: CanonicalId,
+    pub environment_id: CanonicalId,
+    /// The snapshot the workflow's plan binds, with the catalog ids of its
+    /// application and environment.
+    pub snapshot: Option<BoundEnvironmentSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BoundEnvironmentSnapshot {
+    pub snapshot_id: String,
+    pub env_id: String,
+    pub app_id: String,
+    pub snapshot: deis_wire::EnvironmentBindingSnapshot,
 }
 
 /// A rollback of one succeeded provider deployment on its own environment.
@@ -840,6 +892,24 @@ impl CatalogStore {
                 validate_operation_target(&target, &validation_request)?;
                 resolve_application_environment(&transaction, &validation_request)?;
                 validate_artifact_lineage(&transaction, &target, &validation_request)?;
+                let mut plan = spec.plan.clone();
+                if let Some(snapshot) = &spec.environment_snapshot {
+                    if plan
+                        .binding_snapshot_digest
+                        .as_ref()
+                        .is_some_and(|given| *given != snapshot.snapshot_id)
+                    {
+                        return Err(CatalogError::invalid(
+                            "plan.bindingSnapshotDigest names a different environment snapshot than the one this deployment binds; leave it out and the control plane fills it in",
+                        ));
+                    }
+                    record_environment_snapshot_tx(&transaction, snapshot)?;
+                    plan.binding_snapshot_digest = Some(snapshot.snapshot_id.clone());
+                } else if plan.binding_snapshot_digest.is_some() {
+                    return Err(CatalogError::invalid(
+                        "plan.bindingSnapshotDigest was given, but this version declares no environment to bind",
+                    ));
+                }
                 let desired = ProviderDeploymentDesiredState {
                     schema_version: 1,
                     application_id: spec.application_id,
@@ -850,13 +920,13 @@ impl CatalogStore {
                     target_grant_revision: Some(grant.revision),
                     standard_version: target.target.standard_version.clone(),
                     artifact: spec.artifact.clone(),
-                    plan: spec.plan.clone(),
+                    plan,
                 };
                 let desired_state_json = canonical_json(&desired, "provider desired state")?;
                 let desired_state_digest: Sha256Digest = sha256_hex(desired_state_json.as_bytes())
                     .parse()
                     .expect("SHA-256 formatter is canonical");
-                let plan_json = canonical_json(&spec.plan, "provider deployment plan")?;
+                let plan_json = canonical_json(&desired.plan, "provider deployment plan")?;
                 let operation = insert_provider_workflow_tx(
                     &transaction,
                     &ProviderWorkflowInsert {
@@ -1203,6 +1273,89 @@ impl CatalogStore {
         self.database()
             .with_connection(move |connection| {
                 load_provider_deployment_workflow(connection, operation_id)
+            })
+            .await
+    }
+
+    /// What the driver inputs of child operation `child_operation_id` are
+    /// built from, or `None` for an operation that belongs to no workflow.
+    ///
+    /// Fails closed: a plan that names a snapshot this catalog does not
+    /// hold, or one recorded for another environment, is an error rather
+    /// than a deployment without its secrets.
+    pub async fn provider_step_input_facts(
+        &self,
+        child_operation_id: CanonicalId,
+    ) -> CatalogResult<Option<ProviderStepInputFacts>> {
+        self.database()
+            .with_connection(move |connection| {
+                let row: Option<(String, String, String, String, String)> = connection
+                    .query_row(
+                        "SELECT w.operation_id, w.kind, w.application_id, w.environment_id,
+                                w.plan_json
+                           FROM provider_deployment_steps s
+                           JOIN provider_deployment_workflows w
+                             ON w.operation_id = s.parent_operation_id
+                          WHERE s.child_operation_id = ?1",
+                        [child_operation_id.to_string()],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((workflow, kind, application, environment, plan_json)) = row
+                else {
+                    return Ok(None);
+                };
+                let kind = ProviderWorkflowKind::parse(&kind).ok_or_else(|| {
+                    CatalogError::invalid(format!("unknown provider workflow kind {kind:?}"))
+                })?;
+                let environment_id = parse_id(&environment, "provider deployment environment")?;
+                let plan: ProviderNeutralPlan = parse_json(&plan_json, "provider deployment plan")?;
+                let snapshot = match plan.binding_snapshot_digest {
+                    None => None,
+                    Some(digest) => {
+                        let (env_id, app_id, document): (String, String, String) = connection
+                            .query_row(
+                                "SELECT env_id, app_id, document
+                                   FROM environment_binding_snapshots WHERE snapshot_id = ?1",
+                                [digest.as_str()],
+                                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                            )
+                            .optional()?
+                            .ok_or_else(|| {
+                                CatalogError::not_found(format!(
+                                    "environment snapshot {digest} bound by provider workflow {workflow}"
+                                ))
+                            })?;
+                        let snapshot: deis_wire::EnvironmentBindingSnapshot =
+                            parse_json(&document, "environment snapshot")?;
+                        if snapshot.environment_id != environment_id.to_string() {
+                            return Err(CatalogError::conflict(format!(
+                                "environment snapshot {digest} belongs to another environment than provider workflow {workflow}"
+                            )));
+                        }
+                        Some(BoundEnvironmentSnapshot {
+                            snapshot_id: digest.as_str().to_owned(),
+                            env_id,
+                            app_id,
+                            snapshot,
+                        })
+                    }
+                };
+                Ok(Some(ProviderStepInputFacts {
+                    workflow_operation_id: parse_id(&workflow, "provider deployment operation")?,
+                    kind,
+                    application_id: parse_id(&application, "provider deployment application")?,
+                    environment_id,
+                    snapshot,
+                }))
             })
             .await
     }
@@ -2144,6 +2297,46 @@ struct ProviderWorkflowInsert<'a> {
     desired_state_json: &'a str,
     desired_state_digest: &'a Sha256Digest,
     plan_json: &'a str,
+}
+
+/// Record `snapshot` in the table Deislet deployments record theirs in.
+/// The identity is the content's digest, so recording the same snapshot
+/// twice is a no-op, and a row that holds different content under the same
+/// identity is refused.
+fn record_environment_snapshot_tx(
+    connection: &Connection,
+    snapshot: &ProviderEnvironmentSnapshot,
+) -> CatalogResult<()> {
+    if sha256_hex(snapshot.document.as_bytes()) != snapshot.snapshot_id.as_str() {
+        return Err(CatalogError::invalid(
+            "EC_ENV_SNAPSHOT_INVALID: environment snapshot identity is not the digest of its document",
+        ));
+    }
+    connection.execute(
+        "INSERT OR IGNORE INTO environment_binding_snapshots
+             (snapshot_id, app_id, env_id, version_id, declarations_sha256, document, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            snapshot.snapshot_id.as_str(),
+            snapshot.app_id,
+            snapshot.env_id,
+            snapshot.version_id,
+            snapshot.declarations_sha256,
+            snapshot.document,
+            now_secs(),
+        ],
+    )?;
+    let existing: String = connection.query_row(
+        "SELECT document FROM environment_binding_snapshots WHERE snapshot_id = ?1",
+        [snapshot.snapshot_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if existing != snapshot.document {
+        return Err(CatalogError::conflict(
+            "EC_ENV_SNAPSHOT_IDENTITY_COLLISION: snapshot identity names different content",
+        ));
+    }
+    Ok(())
 }
 
 /// Write the parent operation, the workflow row and its first step in the
@@ -5755,6 +5948,8 @@ mod tests {
             provider_target_id: harness.target.target_id,
             artifact,
             plan: ProviderNeutralPlan::default(),
+            config_values: Default::default(),
+            environment_snapshot: None,
         };
         let request_context = context("provider-deployment-sequence");
         let parent = harness
@@ -5886,6 +6081,8 @@ mod tests {
             provider_target_id: harness.target.target_id,
             artifact: attach_cloudflare_artifact(&harness).await,
             plan: ProviderNeutralPlan::default(),
+            config_values: Default::default(),
+            environment_snapshot: None,
         };
         let request_context = context("provider-deployment-before-revoke");
         let accepted = harness
@@ -5984,6 +6181,8 @@ mod tests {
                     provider_target_id: harness.target.target_id,
                     artifact: attach_cloudflare_artifact(&harness).await,
                     plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
                 },
                 context("provider-deployment-immutable"),
             )
@@ -6055,6 +6254,8 @@ mod tests {
                     provider_target_id: harness.target.target_id,
                     artifact: attach_cloudflare_artifact(&harness).await,
                     plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
                 },
                 context("provider-deployment-reconcile"),
             )
@@ -6153,6 +6354,8 @@ mod tests {
                     provider_target_id: harness.target.target_id,
                     artifact: attach_cloudflare_artifact(&harness).await,
                     plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
                 },
                 context("provider-deployment-failure"),
             )
@@ -6209,6 +6412,8 @@ mod tests {
                     provider_target_id: harness.target.target_id,
                     artifact: attach_cloudflare_artifact(&harness).await,
                     plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
                 },
                 context("provider-deployment-busy"),
             )
@@ -6261,6 +6466,8 @@ mod tests {
                     provider_target_id: harness.target.target_id,
                     artifact: attach_cloudflare_artifact(&harness).await,
                     plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
                 },
                 context("provider-deployment-background-readiness"),
             )
@@ -6392,6 +6599,8 @@ mod tests {
                         provider_target_id: harness.target.target_id,
                         artifact: artifact.clone(),
                         plan: ProviderNeutralPlan::default(),
+                        config_values: Default::default(),
+                        environment_snapshot: None,
                     },
                     context(&format!("provider-deployment-page-{index}")),
                 )
@@ -6485,6 +6694,8 @@ mod tests {
                     provider_target_id: harness.target.target_id,
                     artifact: attach_cloudflare_artifact(&harness).await,
                     plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
                 },
                 context("provider-deployment-selection-backoff"),
             )
@@ -6644,6 +6855,8 @@ mod tests {
                     provider_target_id: harness.target.target_id,
                     artifact: attach_cloudflare_artifact(&harness).await,
                     plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
                 },
                 context("provider-deployment-crash-window"),
             )
@@ -6930,6 +7143,8 @@ mod tests {
                     provider_target_id: harness.target.target_id,
                     artifact: artifact.clone(),
                     plan: ProviderNeutralPlan::default(),
+                    config_values: Default::default(),
+                    environment_snapshot: None,
                 },
                 context(key),
             )

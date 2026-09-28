@@ -107,6 +107,7 @@ deis-queue = { path = "../deis-queue" }
 # Drives the node session lifecycle (src/session.rs) and the command
 # lifecycle (src/database/command_status.rs).
 yasm = { workspace = true }
+zeroize = "1.8"
 
 [build-dependencies]
 tonic-build = "0.12"

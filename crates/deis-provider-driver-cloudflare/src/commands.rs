@@ -29,7 +29,7 @@
 //! deploys. The rendered configuration also carries `preview_urls = false`,
 //! so an uploaded version has no preview URL before it is activated.
 //!
-//! Purge (only with `DEIS_CLOUDFLARE_PURGE_DATA=<environment id>`): every KV
+//! Purge (only with `DEIS_PROVIDER_PURGE_DATA=<environment id>`): every KV
 //! namespace and D1 database whose name carries this environment's scope
 //! prefix, plus the R2 buckets and queues the journal or plan name, are
 //! deleted with `kv namespace delete`, `d1 delete`, `r2 bucket delete` and
@@ -105,7 +105,7 @@ pub struct OperationContext<'a> {
     /// Deployment config values for `[vars]`.
     pub config: &'a BTreeMap<String, String>,
     pub secrets: &'a SecretValues,
-    /// The environment id `DEIS_CLOUDFLARE_PURGE_DATA` names, if any.
+    /// The environment id `DEIS_PROVIDER_PURGE_DATA` names, if any.
     pub purge_environment_id: Option<&'a str>,
     pub timeouts: Timeouts,
 }
@@ -856,7 +856,7 @@ impl<'a, 'c> Op<'a, 'c> {
             format!("purged {} resource(s): {}", purged.len(), purged.join(", "))
         } else {
             format!(
-                "{} data resource(s) retained; set DEIS_CLOUDFLARE_PURGE_DATA={} to destroy them",
+                "{} data resource(s) retained; set DEIS_PROVIDER_PURGE_DATA={} to destroy them",
                 journal.resources.len(),
                 self.request.environment_id
             )

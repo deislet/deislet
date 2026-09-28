@@ -2118,10 +2118,18 @@ impl Control {
         environment: &str,
         provider_target_id: CanonicalId,
         artifact: &ProviderArtifactRef,
+        config_values: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<ProviderOperationSummary> {
         let what = format!(
             "starting a provider deployment of {environment} of app {app_id} to target {provider_target_id}"
         );
+        let mut body = serde_json::json!({
+            "providerTargetId": provider_target_id,
+            "artifact": artifact,
+        });
+        if !config_values.is_empty() {
+            body["configValues"] = serde_json::to_value(config_values)?;
+        }
         let (_, headers, operation) = self
             .send_with_metadata::<ProviderOperationSummary>(
                 self.request(
@@ -2129,10 +2137,7 @@ impl Control {
                     &format!("/apps/{app_id}/environments/{environment}/provider-deployments"),
                 )
                 .header(IDEMPOTENCY_KEY, new_idempotency_key())
-                .json(&serde_json::json!({
-                    "providerTargetId": provider_target_id,
-                    "artifact": artifact,
-                })),
+                .json(&body),
                 &what,
             )
             .await?;

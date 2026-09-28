@@ -21,6 +21,7 @@ compile_error!("deis-provider-driver runs inside deis-control, which is built fo
 mod credential;
 mod digest;
 mod executor;
+mod inputs;
 mod installer;
 mod lifecycle;
 mod manifest;
@@ -40,6 +41,10 @@ pub use digest::{Sha256Digest, Sha256DigestError};
 pub use executor::{
     CommandExecutionError, CommandExecutionErrorKind, CommandInvocation, CommandOutput,
     PinnedCommandRunner, PinnedExecutable, SecretInjection, SecretString, SideEffectPolicy,
+};
+pub use inputs::{
+    DRIVER_PROCESS_CONFIG_ENV, DRIVER_PROCESS_PURGE_ENV, DRIVER_PROCESS_SECRETS_ENV,
+    NoOperationInputs, OperationInputError, OperationInputSource, OperationInputs,
 };
 pub use installer::{
     DriverInstallationError, DriverReleaseInstaller, InstalledDriverRelease,

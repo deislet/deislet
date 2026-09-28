@@ -2272,6 +2272,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "yasm",
+ "zeroize",
  "zip",
 ]
 

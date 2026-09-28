@@ -711,6 +711,11 @@ async fn build_catalog_state(
                                     crate::catalog::ProviderDriverDispatcher::new(
                                         registry,
                                         Arc::clone(&provider_credentials),
+                                        Arc::new(crate::catalog::CatalogOperationInputs::new(
+                                            store.as_ref().clone(),
+                                            Arc::clone(&secrets),
+                                            Arc::new(AuditStore::new(store.database())),
+                                        )),
                                         workspaces,
                                         crate::catalog::provider_driver_release::driver_process_config(),
                                     )

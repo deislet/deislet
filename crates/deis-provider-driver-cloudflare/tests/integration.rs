@@ -615,7 +615,7 @@ async fn delete_removes_the_worker_and_keeps_data_without_consent() {
         deleted
             .diagnostic
             .unwrap()
-            .contains("DEIS_CLOUDFLARE_PURGE_DATA")
+            .contains("DEIS_PROVIDER_PURGE_DATA")
     );
 
     // Deleting again is idempotent: Cloudflare's not-found is success.
@@ -955,7 +955,10 @@ async fn uploaded_versions_have_no_preview_url() {
                 .join(format!("cwd.{}", harness.call_index(prefix))),
         )
         .unwrap();
-        assert!(config.contains("preview_urls = false"), "{prefix}: {config}");
+        assert!(
+            config.contains("preview_urls = false"),
+            "{prefix}: {config}"
+        );
     }
 }
 

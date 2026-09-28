@@ -14,11 +14,12 @@ use chrono::{DateTime, Utc};
 use deis_provider_driver::{
     DriverInstallationError, DriverReleaseInstaller, DriverWorkspaceRoot, ExecutableProviderDriver,
     ExecutableProviderDriverConfig, HostOperatingSystem, InstalledDriverRelease,
-    ProviderCredentialBroker, Sha256Digest, ValidatedDriverReleaseAuthorization,
-    ValidatedDriverReleaseTransparencyProof, ValidatedDriverReleaseTrustRoot,
-    ValidatedDriverTrustRootRotation, ValidatedProviderDriverManifest,
-    ValidatedProviderDriverRelease, VerifiedDriverReleaseAuthorization,
-    VerifiedDriverReleaseTransparencyProof, VerifiedDriverTrustRootRotation,
+    OperationInputSource, ProviderCredentialBroker, Sha256Digest,
+    ValidatedDriverReleaseAuthorization, ValidatedDriverReleaseTransparencyProof,
+    ValidatedDriverReleaseTrustRoot, ValidatedDriverTrustRootRotation,
+    ValidatedProviderDriverManifest, ValidatedProviderDriverRelease,
+    VerifiedDriverReleaseAuthorization, VerifiedDriverReleaseTransparencyProof,
+    VerifiedDriverTrustRootRotation,
 };
 use deis_wire::CanonicalId;
 use rusqlite::types::Value;
@@ -108,6 +109,8 @@ pub fn driver_process_config() -> ExecutableProviderDriverConfig {
 pub struct ProviderDriverDispatcher {
     registry: ProviderDriverReleaseRegistry,
     credential_broker: Arc<dyn ProviderCredentialBroker>,
+    /// Each operation's config values, secret values and purge consent.
+    inputs: Arc<dyn OperationInputSource>,
     /// Where every driver process gets its verified payload and state.
     workspaces: DriverWorkspaceRoot,
     process_config: ExecutableProviderDriverConfig,
@@ -1044,9 +1047,12 @@ fn validate_trust_root_transition(
 }
 
 impl ProviderDriverDispatcher {
+    /// `inputs` supplies each operation's config values, secret values and
+    /// purge consent; see [`crate::catalog::CatalogOperationInputs`].
     pub fn new(
         registry: ProviderDriverReleaseRegistry,
         credential_vault: Arc<CatalogProviderCredentialVault>,
+        inputs: Arc<dyn OperationInputSource>,
         workspaces: DriverWorkspaceRoot,
         process_config: ExecutableProviderDriverConfig,
     ) -> CatalogResult<Self> {
@@ -1062,6 +1068,7 @@ impl ProviderDriverDispatcher {
         Ok(Self {
             registry,
             credential_broker,
+            inputs,
             workspaces,
             process_config,
         })
@@ -1083,6 +1090,7 @@ impl ProviderDriverDispatcher {
     ) -> CatalogResult<ExecutableProviderDriver> {
         let resolved = self.registry.resolve_for_target(target_id).await?;
         let credential_broker = Arc::clone(&self.credential_broker);
+        let inputs = Arc::clone(&self.inputs);
         let workspaces = self.workspaces.clone();
         let process_config = self.process_config;
         tokio::task::spawn_blocking(move || {
@@ -1090,6 +1098,7 @@ impl ProviderDriverDispatcher {
                 resolved.manifest,
                 resolved.installed,
                 credential_broker,
+                inputs,
                 workspaces,
                 process_config,
             )
@@ -3237,6 +3246,7 @@ pub(crate) mod tests {
         let dispatcher = ProviderDriverDispatcher::new(
             registry.clone(),
             Arc::clone(&vault),
+            Arc::new(deis_provider_driver::NoOperationInputs),
             crate::catalog::provider_payload::test_workspaces(),
             ExecutableProviderDriverConfig::default(),
         )

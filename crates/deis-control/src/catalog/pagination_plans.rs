@@ -1323,6 +1323,8 @@ async fn seed_provider_rows(
                     provider_payload_sha256: provider_sha256,
                 },
                 plan: ProviderNeutralPlan::default(),
+                config_values: Default::default(),
+                environment_snapshot: None,
             },
             operation_context("plan-evidence-deployment"),
         )

@@ -331,6 +331,10 @@ async fn deploy_to_provider(
             app
         );
     }
+    // Deployment-time config values ride with the request; secret values
+    // never leave the control plane except to the driver, from the
+    // environment snapshot the deployment binds.
+    let config_values = deployment_config_values(dir, &bundle.manifest)?;
     output.line(format!(
         "  {} built {} payload {} from canonical {}",
         "✓".green(),
@@ -418,6 +422,7 @@ async fn deploy_to_provider(
                 canonical_artifact_sha256: lineage.artifact_sha256.clone(),
                 provider_payload_sha256: payload.payload_root_sha256.clone(),
             },
+            &config_values,
         )
         .await?;
     output.line(format!(

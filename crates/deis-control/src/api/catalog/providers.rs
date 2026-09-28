@@ -26,6 +26,7 @@ use deis_provider_driver::{
 use deis_wire::{CanonicalId, ProductOperation};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::future::Future;
 use tokio::io::AsyncWriteExt;
 use utoipa::IntoParams;
@@ -48,8 +49,8 @@ use crate::{
         ProviderCredentialBinding, ProviderCredentialBindingSpec,
         ProviderCredentialMutationContext, ProviderDeploymentSpec, ProviderDeploymentWorkflow,
         ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
-        ProviderDriverReleaseRegistry, ProviderInstallation, ProviderInstallationSpec,
-        ProviderLifecycleAuditEvent, ProviderLifecycleMutationContext,
+        ProviderDriverReleaseRegistry, ProviderEnvironmentSnapshot, ProviderInstallation,
+        ProviderInstallationSpec, ProviderLifecycleAuditEvent, ProviderLifecycleMutationContext,
         ProviderLifecycleResourceKind, ProviderRollbackSpec, ProviderTarget, ProviderTargetGrant,
         ProviderTargetGrantAuditEvent, ProviderTargetGrantHistoryFilter,
         ProviderTargetGrantMutationContext, ProviderTargetGrantSpec,
@@ -158,6 +159,14 @@ pub struct BeginProviderDeploymentRequest {
     #[serde(default)]
     #[schema(value_type = crate::api::openapi::ProviderNeutralPlanDocument)]
     pub plan: ProviderNeutralPlan,
+    /// Values for the `config` declarations of the version's `environment`,
+    /// by name. They are recorded in the environment snapshot this
+    /// deployment binds, with the environment's current secret revisions,
+    /// and handed to the provider driver from there; the snapshot's digest
+    /// is filled into `plan.bindingSnapshotDigest`.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub config_values: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -2035,6 +2044,13 @@ pub async fn begin_provider_deployment(
         &principal,
         &format!("/api/apps/{app_id}/environments/{env_name}/provider-deployments"),
     )?;
+    let environment_snapshot = provider_environment_snapshot(
+        &state,
+        &environment,
+        request.artifact.artifact_version_id,
+        request.config_values.clone(),
+    )
+    .await?;
     let operation = state
         .store
         .begin_provider_deployment(
@@ -2044,12 +2060,80 @@ pub async fn begin_provider_deployment(
                 provider_target_id: request.provider_target_id,
                 artifact: request.artifact,
                 plan: request.plan,
+                config_values: request.config_values,
+                environment_snapshot,
             },
             context,
         )
         .await?;
     let headers = operation_headers(paths, &operation, &app_id, &env_name)?;
     Ok((StatusCode::ACCEPTED, headers, Json(operation)))
+}
+
+/// The environment snapshot a provider deployment of `version_id` binds:
+/// the version's declarations, the config values given for it and the
+/// environment's current secret revisions, prepared and checked exactly as
+/// a Deislet deployment's is. `None` for a version that declares no
+/// `environment`, which may then be given no config either.
+async fn provider_environment_snapshot(
+    state: &CatalogState,
+    environment: &crate::catalog::Environment,
+    version_id: CanonicalId,
+    config_values: BTreeMap<String, serde_json::Value>,
+) -> ApiResult<Option<ProviderEnvironmentSnapshot>> {
+    let version = match state
+        .store
+        .get_version_by_canonical_id(&environment.app_id, version_id)
+        .await
+    {
+        Ok(version) => version,
+        // Left to the catalog, which refuses an artifact that does not
+        // resolve - after it has checked the target grant, so that this
+        // route says nothing about versions to a caller without one.
+        Err(CatalogError::NotFound(_)) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let manifest = deis_bundle::Manifest::parse(&version.manifest).map_err(|error| {
+        ApiError::from(CatalogError::BundleStorage(format!(
+            "stored manifest of version {version_id} no longer parses: {error}"
+        )))
+    })?;
+    let given_config = !config_values.is_empty();
+    let Some(prepared) = state
+        .deliverer
+        .prepare_environment_snapshot(environment, &version, &manifest, config_values, None)
+        .await?
+    else {
+        if given_config {
+            return Err(ApiError::from(CatalogError::invalid(
+                "EC_ENV_BINDING_UNDECLARED: deployment config was given for a version that declares no environment",
+            )));
+        }
+        return Ok(None);
+    };
+    let invalid = |error: deis_wire::EnvironmentError| CatalogError::invalid(error.to_string());
+    let document = String::from_utf8(prepared.snapshot.canonical_json().map_err(invalid)?)
+        .map_err(|_| {
+            CatalogError::invalid("EC_ENV_SNAPSHOT_INVALID: canonical snapshot is not UTF-8")
+        })?;
+    let snapshot_id = prepared
+        .snapshot
+        .identity()
+        .map_err(invalid)?
+        .parse()
+        .map_err(|_| {
+            CatalogError::invalid(
+                "EC_ENV_SNAPSHOT_INVALID: snapshot identity is not a SHA-256 digest",
+            )
+        })?;
+    Ok(Some(ProviderEnvironmentSnapshot {
+        env_id: environment.id.clone(),
+        app_id: environment.app_id.clone(),
+        version_id: version.id.clone(),
+        declarations_sha256: prepared.declarations.identity().map_err(invalid)?,
+        snapshot_id,
+        document,
+    }))
 }
 
 #[utoipa::path(
@@ -2806,6 +2890,7 @@ pub(crate) mod tests {
         let dispatcher = crate::catalog::ProviderDriverDispatcher::new(
             registry,
             Arc::clone(&harness.state.provider_credentials),
+            Arc::new(deis_provider_driver::NoOperationInputs),
             crate::catalog::provider_payload::test_workspaces(),
             ExecutableProviderDriverConfig::default(),
         )
@@ -4615,7 +4700,9 @@ pub(crate) mod tests {
                     "INSERT INTO versions
                        (id, canonical_id, app_id, number, bundle_sha, bundle_path,
                         manifest, canonical_artifact_id, provider_derivation_sha256, created_at)
-                     VALUES (?1, ?2, ?3, 1, ?4, '/test/bundle.zip', '{}', ?5, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, 1, ?4, '/test/bundle.zip',
+                             '{\"schema\":1,\"app\":\"demo\",\"entry\":\"worker/index.js\"}',
+                             ?5, ?6, ?7)",
                     rusqlite::params![
                         uuid::Uuid::new_v4().to_string(),
                         artifact_version_id.to_string(),

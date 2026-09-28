@@ -33,10 +33,13 @@
 >   [`scripts/cloudflare-smoke.sh`](../scripts/cloudflare-smoke.sh)（或手动触发的
 >   `.github/workflows/cloudflare-smoke.yml`），跑通之前不应把 Cloudflare 部署当作已验证能力。
 >   运维接入步骤见 [`docs/operations/cloudflare.md`](operations/cloudflare.md)。
-> - **未做：** D1 迁移（ADR-008 T5-3）；control 目前不把环境的 secret 与部署期配置值交给 driver
->   （声明了部署期 `config` 的应用因此无法经 control 部署到 Cloudflare，driver 会拒绝残留的占位符）；
+> - **secret 与部署期配置：** control 在开始 provider 部署时记录环境快照（部署期 `config` 值加上各
+>   secret 头部的 revision），其摘要写进期望状态的 `plan.bindingSnapshotDigest`；dispatcher 把
+>   config 交给各步骤，只在 `upload` 这一步把快照绑定的那几个 secret revision 解密后经
+>   driver 进程环境交出，不经 argv，且审计行落盘之后才交出（审计写不进去就不交、等重试）。
+> - **未做：** D1 迁移（ADR-008 T5-3）；
 >   control 没有下线（delete/cleanup）provider 部署的产品 API，也不传数据清除许可
->   `DEIS_CLOUDFLARE_PURGE_DATA`，driver 侧的 delete/cleanup 目前只能直接调用 driver。
+>   `DEIS_PROVIDER_PURGE_DATA`，driver 侧的 delete/cleanup 目前只能直接调用 driver。
 >
 > 相应地，本文表格里 Deislet 侧的若干数值上限已按共享标准收敛到与 Cloudflare 一致：KV key 512B、
 > metadata 1 KiB、TTL ≥ 60 秒、list 单页 1000；SQL 单值 2,000,000 字节、单条语句 100,000 字节；

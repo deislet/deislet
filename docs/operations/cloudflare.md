@@ -16,8 +16,8 @@ preflight, plan, prepare, upload, verify, activate and observe.
 | Driver: wrangler install, exit codes, namespaced resource creation, placeholder fill, first-deploy Worker creation, upload/activate, cron schedules and queue consumers (`triggers deploy`), rollback, delete/cleanup | implemented, tested against a fake `wrangler` that records its invocations and models the wrangler 4.129.0 behaviour the driver relies on (see below); the fake is written from wrangler's source, not recorded from a live account |
 | Control plane end to end: product API → provider deployment → signed driver release launched as a process → `wrangler` | covered by `crates/deis-control/src/api/catalog/cloudflare_e2e.rs` against the fake `wrangler`: the first deploy creates the Worker before uploading a version; resolved, namespaced `wrangler.toml`; cron schedule, queue consumer and workers.dev applied after activation; a second deploy reuses every resource; delete removes the Worker and keeps the data |
 | Against a real Cloudflare account | **not yet verified**; run [`scripts/cloudflare-smoke.sh`](../../scripts/cloudflare-smoke.sh) |
-| Environment secrets and deployment-time config values handed from the control plane to the driver | not done: the driver accepts them (`EDGE_CANON_PROVIDER_SECRETS` / `EDGE_CANON_PROVIDER_CONFIG`), the control plane does not send them yet. An application that declares deployment-time `config` values therefore cannot be deployed to Cloudflare through the control plane: the driver refuses the unfilled `[vars]` placeholders |
-| Undeploying through the control plane | not done: the driver implements `delete` and `cleanup`, but the control plane has no product API that issues them, and it never passes the purge consent (`DEIS_CLOUDFLARE_PURGE_DATA`) |
+| Environment secrets and deployment-time config values handed from the control plane to the driver | implemented, covered by `cloudflare_e2e.rs` against the fake `wrangler`: the config value fills its `[vars]` placeholder, the bound secret reaches `wrangler versions upload` on stdin and never argv, a rotated secret reaches the next deployment, and a delivery the audit log cannot record does not happen (see [Secrets and config](#secrets-and-config)) |
+| Undeploying through the control plane | not done: the driver implements `delete` and `cleanup`, but the control plane has no product API that issues them, and it never passes the purge consent (`DEIS_PROVIDER_PURGE_DATA`) |
 | D1 migrations before activate (ADR-008 T5-3) | not done |
 
 Until the smoke script has passed against a real account, treat Cloudflare
@@ -90,6 +90,35 @@ All of these are control plane API calls made by an admin credential.
    target, add `--provider-target <name or id>`. `deis provider-deployments
    list|get|cancel|rollback` follow and intervene.
 
+## Secrets and config
+
+`deis deploy --target cloudflare` sends the deployment-time config values
+from `.config.json` with the provider deployment request (`configValues`).
+Secret values never travel with a request; they are set on the environment
+(`deis secret set`) exactly as for a Deislet deployment.
+
+When the deployment is begun, the control plane records an environment
+snapshot, in the same table and under the same identity a Deislet
+deployment uses: the version's `environment` declarations, the config values
+given, and the secret revision at each declared secret's head. A required
+value that is missing refuses the deployment there. The snapshot's digest is
+written into the desired state as `plan.bindingSnapshotDigest`, so every
+receipt of the deployment is bound to exactly those revisions and values; a
+secret rotated afterwards reaches the next deployment, not this one.
+
+When the dispatcher launches the driver for a step, it reads the snapshot
+back and hands the driver what that step needs, in the process environment
+and never on argv or in a file: every step gets the config values
+(`EDGE_CANON_PROVIDER_CONFIG`; `plan`, `upload` and `activate` render them
+into `[vars]`), and `upload`, the one step that sends
+secrets to Cloudflare (`wrangler versions upload --secrets-file
+/dev/stdin`), gets the secret values (`EDGE_CANON_PROVIDER_SECRETS`). Only
+the revisions the snapshot binds are decrypted. As with a node's
+`FetchSecretValues`, the values leave the control plane only once an audit
+row saying so (`secret.provider-delivery`, naming the revisions and a count,
+never a value) is durable: if the audit log cannot be written, the step is
+not started and waits to be retried.
+
 ## How a deployment reaches Cloudflare
 
 Each lifecycle step is one wrangler 4.129.0 command (the full table is at the
@@ -147,7 +176,7 @@ Every Cloudflare resource is namespaced by application and environment id, so
 two applications that both declare a KV binding `HOT` never share a namespace.
 `delete` removes the Worker. Data resources (KV, D1, R2, Queues) are
 destroyed only when the operator explicitly consents for that environment by
-setting `DEIS_CLOUDFLARE_PURGE_DATA=<environment id>` for the driver process:
+setting `DEIS_PROVIDER_PURGE_DATA=<environment id>` for the driver process:
 with that consent, both `delete` (after removing the Worker) and `cleanup`
 (which refuses while the Worker still exists) purge the environment's
 resources. Without it, neither does. The exact naming and the consent
