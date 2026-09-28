@@ -17,7 +17,6 @@ deis-wire = { workspace = true }
 deis-capability = { path = "../deis-capability", features = ["jwks-fetch"] }
 deis-identity = { path = "../deis-identity" }
 tokio-rustls = "0.26"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 tonic = "0.12"
 tonic-health = "0.12"
 prost = "0.13"
