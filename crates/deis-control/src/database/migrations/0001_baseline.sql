@@ -143,9 +143,6 @@ CREATE TABLE backend_restore_plans (
                                                            'switching', 'verifying', 'succeeded',
                                                            'failed', 'cancelled')),
             attempt_count                  INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
-            coordinator_id                 TEXT,
-            lease_expires_at               INTEGER CHECK(lease_expires_at IS NULL OR
-                                                          lease_expires_at >= 0),
             execution_report_json          TEXT CHECK(execution_report_json IS NULL OR
                                                        json_valid(execution_report_json)),
             last_error                     TEXT CHECK(last_error IS NULL OR
@@ -174,24 +171,7 @@ CREATE TABLE backend_restore_plans (
               AND replace(restore_set_id, '-', '') NOT GLOB '*[^0-9a-f]*'),
             CHECK(length(restore_set_sha256) = 64
               AND lower(restore_set_sha256) = restore_set_sha256
-              AND restore_set_sha256 NOT GLOB '*[^0-9a-f]*'),
-            CHECK((coordinator_id IS NULL AND lease_expires_at IS NULL)
-               OR (coordinator_id IS NOT NULL AND lease_expires_at IS NOT NULL)),
-            CHECK(coordinator_id IS NULL OR
-                 (length(coordinator_id) = 36
-                  AND lower(coordinator_id) = coordinator_id
-                  AND substr(coordinator_id, 9, 1) = '-'
-                  AND substr(coordinator_id, 14, 1) = '-'
-                  AND substr(coordinator_id, 15, 1) = '7'
-                  AND substr(coordinator_id, 19, 1) = '-'
-                  AND substr(coordinator_id, 20, 1) GLOB '[89ab]'
-                  AND substr(coordinator_id, 24, 1) = '-'
-                  AND length(replace(coordinator_id, '-', '')) = 32
-                  AND replace(coordinator_id, '-', '') NOT GLOB '*[^0-9a-f]*')),
-            CHECK((state IN ('staging', 'switching', 'verifying')
-                   AND coordinator_id IS NOT NULL)
-               OR (state NOT IN ('staging', 'switching', 'verifying')
-                   AND coordinator_id IS NULL))
+              AND restore_set_sha256 NOT GLOB '*[^0-9a-f]*')
         );
 
 -- table canonical_artifacts

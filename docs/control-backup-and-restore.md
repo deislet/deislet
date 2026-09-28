@@ -13,6 +13,31 @@ control section) and [ADR-024](adr/024-coordinated-embedded-backend-restore.md)
 (the coordinated restore of the three data-plane backends, which is a different
 procedure for different data).
 
+## Two kinds of data, two tools
+
+An installation's state lives in two places, and each has its own backup tool.
+They do not overlap and neither replaces the other:
+
+| Data | Tool | Recovery point |
+|---|---|---|
+| The control plane: `control.db`, bundles, keys, machine identity | Litestream plus file copies (this document) | continuous, about one second behind |
+| The data services: deis-store, deis-queue and deis-telemetry directories | `deis-backend-topology` ([ADR-024](adr/024-coordinated-embedded-backend-restore.md)) | the barrier time of the chosen snapshot set |
+
+- **Litestream covers the control plane only.** It replicates one SQLite file
+  written by one process. It knows nothing about the three data services, whose
+  databases are many files per tenant, written by other processes.
+- **`deis-backend-topology` covers the data services only.** It takes a
+  snapshot of all three under one write barrier (so a queue message and the KV
+  write it refers to come from the same moment) and restores all three
+  together, with a journal that survives a crash half way through. It never
+  touches `control.db`.
+- Both assume a single installation: one control process, and one store, one
+  queue and one telemetry service on the same host as the driver. A restore
+  runs inside that one control process; there is no second control instance
+  to hand it over to. If control stops half way through a restore, the next
+  start picks the operation up again from its durable state and the driver's
+  journal.
+
 ## The restore set
 
 A restore that has the database and not the rest comes up healthy, answers

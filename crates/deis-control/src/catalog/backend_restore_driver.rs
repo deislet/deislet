@@ -22,14 +22,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tracing::warn;
 
 use super::{BackendRestorePlan, CatalogError, CatalogStore};
 use crate::config::ControlConfig;
 
 const MAX_DRIVER_OUTPUT_BYTES: u64 = 1024 * 1024;
-const COORDINATOR_LEASE_SECONDS: u64 = 30;
-const COORDINATOR_HEARTBEAT_SECONDS: u64 = 10;
 
 #[derive(Debug, Error)]
 pub enum BackendRestoreCoordinatorError {
@@ -48,7 +45,6 @@ pub struct BackendRestoreCoordinator {
     executable: PathBuf,
     driver_config: PathBuf,
     timeout: Duration,
-    coordinator_id: CanonicalId,
 }
 
 impl BackendRestoreCoordinator {
@@ -83,7 +79,6 @@ impl BackendRestoreCoordinator {
             executable,
             driver_config,
             timeout: Duration::from_secs(config.backend_restore_driver_timeout_secs),
-            coordinator_id: CanonicalId::new_v7(),
         })
     }
 
@@ -91,42 +86,8 @@ impl BackendRestoreCoordinator {
         &self,
         operation_id: CanonicalId,
     ) -> Result<BackendRestoreExecutionReport, BackendRestoreCoordinatorError> {
-        let (plan, operation) = self
-            .catalog
-            .begin_backend_restore(operation_id, self.coordinator_id, COORDINATOR_LEASE_SECONDS)
-            .await?;
-        let (stop_sender, mut stop_receiver) = tokio::sync::oneshot::channel();
-        let catalog = Arc::clone(&self.catalog);
-        let coordinator_id = self.coordinator_id;
-        let heartbeat = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut stop_receiver => break,
-                    _ = tokio::time::sleep(Duration::from_secs(COORDINATOR_HEARTBEAT_SECONDS)) => {
-                        if let Err(error) = catalog
-                            .renew_backend_restore_lease(
-                                operation_id,
-                                coordinator_id,
-                                COORDINATOR_LEASE_SECONDS,
-                            )
-                            .await
-                        {
-                            warn!(
-                                %operation_id,
-                                %coordinator_id,
-                                %error,
-                                "Backend restore coordinator lost its durable lease; terminal commit will fail closed"
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        let result = self.coordinate_claimed(plan, operation).await;
-        let _ = stop_sender.send(());
-        let _ = heartbeat.await;
-        result
+        let (plan, operation) = self.catalog.begin_backend_restore(operation_id).await?;
+        self.coordinate_claimed(plan, operation).await
     }
 
     async fn coordinate_claimed(
@@ -239,11 +200,7 @@ impl BackendRestoreCoordinator {
         match report.state {
             BackendRestoreExecutionState::Succeeded => {
                 self.catalog
-                    .complete_backend_restore(
-                        report.clone(),
-                        self.coordinator_id,
-                        operation_revision,
-                    )
+                    .complete_backend_restore(report.clone(), operation_revision)
                     .await?;
                 Ok(report)
             }
@@ -251,7 +208,6 @@ impl BackendRestoreCoordinator {
                 self.catalog
                     .fail_backend_restore_rolled_back(
                         report,
-                        self.coordinator_id,
                         operation_revision,
                         "topology driver proved that a failed restore returned every backend to its prior incarnation"
                             .to_string(),
@@ -273,7 +229,6 @@ impl BackendRestoreCoordinator {
         self.catalog
             .defer_backend_restore(
                 operation_id,
-                self.coordinator_id,
                 operation_revision,
                 reason.to_string(),
             )
@@ -535,9 +490,8 @@ mod tests {
         );
         let store = Arc::new(CatalogStore::new(database));
         let planned = planned_restore(&store, &format!("terminal-{state:?}")).await;
-        let coordinator_id = CanonicalId::new_v7();
         let (claimed, operation) = store
-            .begin_backend_restore(planned.operation_id, coordinator_id, 30)
+            .begin_backend_restore(planned.operation_id)
             .await
             .unwrap();
         let components = RestoreBackend::REQUIRED
@@ -570,7 +524,6 @@ mod tests {
             executable: PathBuf::from("/bin/true"),
             driver_config: directory.path().join("unused.toml"),
             timeout: Duration::from_secs(1),
-            coordinator_id,
         };
         let outcome = coordinator
             .accept_terminal_report(claimed.operation_id, report, operation.revision)
