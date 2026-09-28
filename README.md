@@ -32,7 +32,7 @@ running application. The specification an application is written against is
 
 > **Product evolution:** the current code and demo implement the v0.1-era
 > contract described below. The next contract is a single capability set with
-> no provider profiles and is still a proposal; no backend is certified against
+> no provider profiles and is still a proposal; no target is certified against
 > it yet. See the [product contract entry](docs/product/README.md),
 > [accepted ADRs](docs/adr/README.md), and [executable roadmap](docs/product/roadmap.zh.md).
 
@@ -149,39 +149,39 @@ for two consecutive checks:
 | a current certificate is not reissued, and a restart reuses the account | which is what keeps a restart loop from spending an issuance quota |
 | the node's log was not cut off while these checks read it | the checks that grep it get their evidence from it, and it is a file any unauthenticated request can add to; the demo gives it a ceiling, and a run that reached the ceiling says so instead of quoting a file that stops early |
 
-## The nine components
+## The components
 
-Six of them are processes you run; three are the toolchain and the shared
-protocol.
+Six of them are processes you run; the rest are the toolchain, the provider
+drivers and the libraries they share. Every crate under `crates/` is listed
+here. The words used are defined in [docs/glossary.md](docs/glossary.md).
 
 | Component | What it does |
 |---|---|
 | [`deis-control`](crates/deis-control) | The control plane, and the only authority on metadata. Holds applications, immutable versions, environments, immutable deployment plans plus append-only pointers/events/observations, routes, encrypted secret revisions, accounts, scoped tokens and an append-only audit log in SQLite; coordinates prepare/activate/reconcile and retained-generation drain; serves bundle downloads and each node's phase-aware assignment list; owns the cron schedule; mints per-tenant storage capability tokens; exports Prometheus metrics; and runs the React console. The catalog half currently has no console page: applications, versions, environments, deployments, secrets, routes, and plan status are reached through `deis` or the REST API. |
 | [`deis-runtime`](crates/deis-runtime) | A node. Runs every application of every environment it is assigned, one isolate per `(app, environment)` on its own OS thread. Serves static assets from the bundle before starting an isolate — through the version's own `_redirects`, `_headers` and not-found rules — injects the exact four-field HTTP context and publishes static assets, storage and service bindings under `context.env.<NAME>`, dispatches a `service` binding to another application in this same process without an address anywhere, streams a response body out as it is produced, polls the queues an app declares, and ships logs, metrics and one trace per invocation to deis-telemetry. What an application may assume is pinned to its selected Edge Canon and compatibility versions. |
-| [`deis-proxy`](crates/deis-proxy) | Traffic entry, built on Pingora. Terminates TLS and picks the certificate by SNI, resolves the application by `x-deis-app-id` or by host **and path prefix** against the routing table it polls from the control plane, stamps `x-deis-app-id` and `x-deis-environment` onto the upstream request, load-balances across nodes, obtains and renews its own certificates over ACME when `[tls.acme]` is on, and upgrades its own binary without dropping connections. |
+| [`deis-proxy`](crates/deis-proxy) | Traffic entry, built on Pingora. Terminates TLS and picks the certificate by SNI, deletes every `x-deis-*` header the client sent, resolves the application by host **and path prefix** against the routing table it polls from the control plane (and keeps on disk for a restart that cannot reach it), stamps `x-deis-app-id` and `x-deis-environment` onto the upstream request, reaches nodes over mutual TLS, load-balances across nodes, obtains and renews its own certificates over ACME when `[tls.acme]` is on, and upgrades its own binary without dropping connections. |
 | [`deis-store`](crates/deis-store) | KV, per-tenant SQL and content-addressed blobs, as three gRPC services in one process on SQLite and the local disk. The object store does more than put/get/delete: listing with a prefix, a delimiter and a cursor, `Head`, ranged reads, and writes and deletes made conditional on an object's sha256 — the platform's one atomic coordination primitive. Consistent backups are `deis-store snapshot` / `restore`. Knows nothing about versions, deployments or environments. |
 | [`deis-queue`](crates/deis-queue) | A durable queue with lease-based consumption: `Send` and `SendBatch`, `Pull` under a lease, `Ack`, `Nack` with a delay, and a dead-letter table once a message has been tried too often - with the reason it was given up on, which `deis queue dead-letters` reads and `deis queue replay` acts on. Nodes poll it; it never pushes. Consistent, digest-verified backups use `deis-queue snapshot` / `restore`. |
 | [`deis-telemetry`](crates/deis-telemetry) | Logs, metrics and invocation traces, independent of everything else. Three services side by side: batched logs with `Query` and a streaming `Tail`; one trace per invocation with `QueryTraces` and `TailTraces`, which is what `deis trace` reads; and metrics exported in Prometheus format, latency among them as a histogram rather than a high-water mark. Only deis-runtime ships to it so far; the other components still log to their own stdout. |
 | [`deis`](crates/deis) | The developer CLI, and the only interface a person needs. `init`, `dev`, `validate` and `build` work on the project on disk; `targets` reads the locked registry-derived standard status embedded at build time; and `config` holds the CLI's own settings — the credential among them, which it will not write into the project. `deploy`, `versions`, `rollback`, `status`, `secret`, `logs`, `tail`, `trace`, `kv`, `db`, `blob`, `queue`, `account`, `token` and `audit` talk to a running platform. Delegates every bit of parsing and compiling to deis-build. |
-| [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four build targets. This platform and Cloudflare Workers are the supported ones; Deno Deploy and Tencent EdgeOne are frozen at stateless-function artifacts — no authentication, no bindings, no new work. Translation only: it never deploys. |
-| [`deis-provider-driver`](crates/deis-provider-driver) | The provider driver contract and launcher. The control plane runs a signed, installed driver release as a process per operation, hands it an operation-scoped credential and a private work directory holding the provider payload it re-verified against the requested digest (`contracts/v1/provider-driver-process.schema.json`). |
+| [`deis-build`](crates/deis-build) | The compiler. Turns a project's file tree into a deployable for one of four build targets. This platform and Cloudflare Workers are the supported ones; Deno Deploy and Tencent EdgeOne are frozen at stateless-function artifacts — no certification, no bindings, no new work. Translation only: it never deploys. |
+| [`deis-provider-driver`](crates/deis-provider-driver) | The provider driver contract and launcher. The control plane runs a signed, installed driver release as a process per operation, hands it an operation-scoped credential and a private work directory holding the provider payload it re-verified against the requested digest (`contracts/v1/provider-driver-process.schema.json`). The release-signing, transparency-log and installer half is [frozen](docs/operations/provider-driver-governance.md): fixes only, Unix hosts only. |
 | [`deis-provider-driver-cloudflare`](crates/deis-provider-driver-cloudflare) | The Cloudflare provider driver: maps preflight/plan/prepare/upload/verify/activate/observe/delete/cleanup onto a pinned `wrangler`, creates namespaced KV/D1/R2/Queue resources and fills the payload's `deis:unresolved/...` placeholders. Verified against a fake `wrangler` only; see `docs/operations/cloudflare.md`. |
 | [`deis-wire`](crates/deis-wire) | The gRPC toolkit and, in `deis_wire::conventions`, the names both sides of every wire agree on: the header names, the tenant id, the message ceiling, the reserved environment keys. |
 
-A few more crates carry contracts rather than behaviour:
-[`deis-bundle`](crates/deis-bundle) is the bundle format, shared by the
-compiler, the control plane and the node — the manifest, the asset index and
-the archive layout, and with them everything a version declares about itself:
-the `_redirects` and `_headers` tables and the not-found choice, the pattern
-language a route and a rule are both written in, the named `bindings` and the
-`callable_by` list that answers them, the limits an application asks to be
-held to, and the compatibility date and flags that pin what it may assume.
-Each of those has four readers and one definition, which is the whole reason
-the crate exists; [`deis-build-core`](crates/deis-build-core) holds the types,
-config and bundling logic every compile target's code generator shares; and
-`deis-build-adapter-*` are one code generator per compile target, each named
-after the build target it answers for —
-`deis-build-adapter-{cloudflare,deno,tencent,deislet}`.
+The libraries:
+
+| Crate | What it holds |
+|---|---|
+| [`deis-bundle`](crates/deis-bundle) | The bundle format, shared by the compiler, the control plane and the node: the manifest, the asset index and the archive layout, and with them everything a version declares about itself — the `_redirects` and `_headers` tables and the not-found choice, the route pattern language, the named `bindings` and the `callable_by` list that answers them, the limits an application asks to be held to, and the compatibility date and flags. Four readers, one definition. |
+| [`deis-artifact`](crates/deis-artifact) | The Edge Canon canonical build output (the *artifact*) and the integrity checks on the provider payloads derived from it. A bundle is the `deislet` target's payload; the artifact is what every target's payload is derived from. |
+| [`deis-build-core`](crates/deis-build-core) | The types, project configuration, binding plan and bundling logic every build adapter shares. |
+| `deis-build-adapter-{deislet,cloudflare,deno,tencent}` | One build adapter per target, each named after the `--target` value it answers for. |
+| [`deis-node-contract`](crates/deis-node-contract) | The Node.js built-ins and exports Edge Canon promises, read by both the compiler's validation and the node's runtime. |
+| [`deis-capability`](crates/deis-capability) | The Ed25519-signed capability tokens the control plane mints and deis-store, deis-queue and deis-telemetry verify. |
+| [`deis-identity`](crates/deis-identity) | Machine identity: SPIFFE-named certificates and the mutual TLS every process-to-process channel runs on. [`deis-identity-test-pki`](crates/deis-identity-test-pki) is a certificate authority small enough for a test. |
+| [`deis-backend-topology`](crates/deis-backend-topology) | Coordinated snapshot and restore of deis-store, deis-queue and deis-telemetry. |
+| [`deis-backend-migration`](crates/deis-backend-migration) | The inventory and writer-fence contract the data services expose to the control plane. |
 
 Six crates carry a README of their own — `deis`, `deis-build`, `deis-control`,
 `deis-proxy`, `deis-runtime` and `deis-wire` — and `crates/deis-build/docs/`
