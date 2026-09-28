@@ -14,8 +14,10 @@ preflight, plan, prepare, upload, verify, activate and observe.
 | Build: bindings, queues and cron mapped onto `wrangler.toml` with `deis:unresolved/<kind>/<name>` placeholders | implemented, covered by local tests |
 | Payload delivery: CLI upload, control payload store, per-operation work directory re-verified against the digest | implemented, covered by local tests |
 | Driver: wrangler install, exit codes, namespaced resource creation, placeholder fill, upload/activate, delete/cleanup | implemented, verified against a fake `wrangler` that records its invocations and replays real outputs and exit codes |
+| Control plane end to end: product API → provider deployment → signed driver release launched as a process → `wrangler` | covered by `crates/deis-control/src/api/catalog/cloudflare_e2e.rs` against the fake `wrangler`: resolved, namespaced `wrangler.toml`; a second deploy reuses every resource; delete removes the Worker and keeps the data |
 | Against a real Cloudflare account | **not yet verified**; run [`scripts/cloudflare-smoke.sh`](../../scripts/cloudflare-smoke.sh) |
-| Environment secrets and deployment-time config values handed from the control plane to the driver | not done: the driver accepts them (`EDGE_CANON_PROVIDER_SECRETS` / `EDGE_CANON_PROVIDER_CONFIG`), the control plane does not send them yet |
+| Environment secrets and deployment-time config values handed from the control plane to the driver | not done: the driver accepts them (`EDGE_CANON_PROVIDER_SECRETS` / `EDGE_CANON_PROVIDER_CONFIG`), the control plane does not send them yet. An application that declares deployment-time `config` values therefore cannot be deployed to Cloudflare through the control plane: the driver refuses the unfilled `[vars]` placeholders |
+| Undeploying through the control plane | not done: the driver implements `delete` and `cleanup`, but the control plane has no product API that issues them, and it never passes the purge consent (`DEIS_CLOUDFLARE_PURGE_DATA`) |
 | D1 migrations before activate (ADR-008 T5-3) | not done |
 
 Until the smoke script has passed against a real account, treat Cloudflare
@@ -53,6 +55,14 @@ credential, `PATH=/usr/local/bin:/usr/bin:/bin`, `TMPDIR` and `HOME`. Node.js
 22 or newer must therefore be installed as `/usr/local/bin/node` or
 `/usr/bin/node` on the control plane host; the driver installs `wrangler`
 itself from its locked package graph and verifies every package before use.
+
+One driver process may run for at most 270 seconds (the credential lease it
+holds is five minutes); the Cloudflare driver stops itself at 240 seconds and
+reports a retryable timeout. The first operation on a fresh control plane
+also downloads the toolchain into `<data_dir>/provider-work/home/.deis/tools`;
+on a slow link that can use up the budget. The operation is then retried, and
+because the install is atomic the retry starts it again cleanly; running any
+driver operation once before the first real deploy warms the cache.
 
 ## Setting it up
 

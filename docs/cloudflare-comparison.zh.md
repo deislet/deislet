@@ -18,11 +18,16 @@
 >   provider deployment API；control 把按摘要复核过的 payload 放进每次操作私有的工作目录交给
 >   `deis-provider-driver-cloudflare`，由它驱动 wrangler 走 preflight → plan → prepare → upload →
 >   verify → activate → observe。这条链路的测试用的是记录调用、返回真实 wrangler 输出与退出码的
->   假 wrangler 可执行文件，**尚未在真实 Cloudflare 账号上验证**。真实账号验证用
+>   假 wrangler 可执行文件（包括一条端到端测试：control 经产品 API 收下产物、驱动 provider deployment、
+>   按签名 release 启动真实的 driver 进程，假 wrangler 收到回填完毕且带命名空间的 `wrangler.toml`，
+>   第二次部署复用已有资源，delete 删掉 Worker），**尚未在真实 Cloudflare 账号上验证**。真实账号验证用
 >   [`scripts/cloudflare-smoke.sh`](../scripts/cloudflare-smoke.sh)（或手动触发的
 >   `.github/workflows/cloudflare-smoke.yml`），跑通之前不应把 Cloudflare 部署当作已验证能力。
 >   运维接入步骤见 [`docs/operations/cloudflare.md`](operations/cloudflare.md)。
-> - **未做：** D1 迁移（ADR-008 T5-3）；control 目前不把环境的 secret 与部署期配置值交给 driver。
+> - **未做：** D1 迁移（ADR-008 T5-3）；control 目前不把环境的 secret 与部署期配置值交给 driver
+>   （声明了部署期 `config` 的应用因此无法经 control 部署到 Cloudflare，driver 会拒绝残留的占位符）；
+>   control 没有下线（delete/cleanup）provider 部署的产品 API，也不传数据清除许可
+>   `DEIS_CLOUDFLARE_PURGE_DATA`，driver 侧的 delete/cleanup 目前只能直接调用 driver。
 >
 > 相应地，本文表格里 Deislet 侧的若干数值上限已按共享标准收敛到与 Cloudflare 一致：KV key 512B、
 > metadata 1 KiB、TTL ≥ 60 秒、list 单页 1000；SQL 单值 2,000,000 字节、单条语句 100,000 字节；

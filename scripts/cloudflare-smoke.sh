@@ -258,7 +258,6 @@ PY
     HOME="$WORK/provider-work/home" \
     TMPDIR="$directory" \
     DEIS_PROVIDER_NODE="$(command -v node)" \
-    DEIS_PROVIDER_STATE_DIR="$STATE_DIR" \
     EDGE_CANON_PROVIDER_CREDENTIAL="$CREDENTIAL" \
     EDGE_CANON_PROVIDER_SECRETS="{\"SMOKE_SECRET\":\"$SECRET_VALUE\"}" \
     "$@" \
