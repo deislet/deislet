@@ -4185,7 +4185,6 @@ export default function handler(context: any): Response {
 
         // Ordinary traffic for the same application between chunks, which is
         // the whole point: each of those is an invocation of its own.
-        let mut chunks = 0;
         for _ in 0..12 {
             let chunk = tokio::select! {
                 chunk = std::future::poll_fn(|cx| reader.poll_chunk(cx)) => chunk,
@@ -4194,14 +4193,12 @@ export default function handler(context: any): Response {
             if chunk.is_none() {
                 break;
             }
-            chunks += 1;
             let (_, _, tally) = answer_to(&mut runtime, "/tally").await;
             let _ = text(tally);
         }
 
         let (_, _, tally) = answer_to(&mut runtime, "/tally").await;
         let tally: serde_json::Value = serde_json::from_str(&text(tally).unwrap()).unwrap();
-        println!("TALLY: {tally} chunks={chunks}");
         assert_eq!(
             tally["made"], 3,
             "the producer inherited the invocation's ceiling of 3 outbound calls and no more"
@@ -4210,6 +4207,148 @@ export default function handler(context: any): Response {
             tally["refused"], 1,
             "the call past the ceiling has to be refused rather than granted"
         );
+    }
+
+    /// The interleaving that made the test above flaky, forced rather than
+    /// waited for: a producer's outbound call settles while another request
+    /// to the same application is running, and the producer's next call -
+    /// made in the continuation of the first - is still in flight when that
+    /// request ends.
+    ///
+    /// That continuation used to run with the request as the owner in force,
+    /// so the next call was filed against the request: aborted when the
+    /// request ended ("the invocation ended while the call was still in
+    /// flight") and charged to the request's allowance instead of the
+    /// stream's. A settled call now puts its own stretch back in force.
+    ///
+    /// No timing is involved: the upstream releases each step only when the
+    /// one before it has been observed, so the order is the same on a loaded
+    /// machine as on an idle one.
+    #[tokio::test]
+    async fn a_producer_call_settling_inside_another_request_stays_the_streams() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        // `first` answers once `/slow` has arrived, so it settles inside
+        // that request. `/slow` answers once `second` has arrived, so the
+        // producer's second call is made inside that request too. `second`
+        // answers only when the test says so, after `/slow` has ended.
+        let slow_arrived = Arc::new(Notify::new());
+        let second_arrived = Arc::new(Notify::new());
+        let release_second = Arc::new(Notify::new());
+        let router = axum::Router::new()
+            .route(
+                "/first",
+                axum::routing::get({
+                    let slow_arrived = slow_arrived.clone();
+                    move || async move {
+                        slow_arrived.notified().await;
+                        "first"
+                    }
+                }),
+            )
+            .route(
+                "/slow",
+                axum::routing::get({
+                    let slow_arrived = slow_arrived.clone();
+                    let second_arrived = second_arrived.clone();
+                    move || async move {
+                        slow_arrived.notify_one();
+                        second_arrived.notified().await;
+                        "slow"
+                    }
+                }),
+            )
+            .route(
+                "/second",
+                axum::routing::get({
+                    let second_arrived = second_arrived.clone();
+                    let release_second = release_second.clone();
+                    move || async move {
+                        second_arrived.notify_one();
+                        release_second.notified().await;
+                        "second"
+                    }
+                }),
+            );
+        let upstream = serve(router).await;
+        let code = r#"
+            let made = 0;
+            let failed = "";
+            export default async function handler(ctx) {
+                const path = new URL(ctx.request.url).pathname;
+                if (path === "/tally") {
+                    return new Response(JSON.stringify({ made, failed }));
+                }
+                if (path === "/slow") {
+                    await fetch(ctx.env.PROBE_URL + "slow");
+                    return new Response("slow");
+                }
+                const encoder = new TextEncoder();
+                const stream = new ReadableStream({
+                    async pull(controller) {
+                        try {
+                            await fetch(ctx.env.PROBE_URL + "first");
+                            made += 1;
+                            await fetch(ctx.env.PROBE_URL + "second");
+                            made += 1;
+                            controller.enqueue(encoder.encode("xy"));
+                        } catch (e) {
+                            failed = String(e);
+                        }
+                        controller.close();
+                    },
+                });
+                return new Response(stream);
+            }
+        "#;
+        let spec = IsolateSpec {
+            env: HashMap::from([(
+                "PROBE_URL".to_string(),
+                format!("http://localhost:{}/", upstream.port()),
+            )]),
+            fetch_policy: allow_localhost(upstream.port()),
+            ..IsolateSpec::default()
+        };
+        let mut runtime = AppRuntime::new(
+            "stream_settles_elsewhere.production".to_string(),
+            code.to_string(),
+            None,
+            spec,
+            &ServiceWiring::default(),
+            ServiceRouter::detached(),
+        )
+        .unwrap();
+        runtime.init_module().await.unwrap();
+
+        let (_, _, body) = answer_to(&mut runtime, "/feed").await;
+        let ResponseBody::Stream(mut reader) = body else {
+            panic!("the handler answered with a stream");
+        };
+        // The producer's first call is in flight and cannot settle until
+        // this request reaches the upstream.
+        let (status, _, _) = answer_to(&mut runtime, "/slow").await;
+        assert_eq!(status, 200);
+        // `/slow` has ended with the producer's second call still open.
+        release_second.notify_one();
+
+        let read = async {
+            let mut body = Vec::new();
+            while let Some(chunk) = std::future::poll_fn(|cx| reader.poll_chunk(cx)).await {
+                body.extend_from_slice(&chunk);
+            }
+            (body, reader.failure())
+        };
+        let ((body, failure), ()) = tokio::join!(read, runtime.pump_response_streams());
+        let (_, _, tally) = answer_to(&mut runtime, "/tally").await;
+        let tally: serde_json::Value = serde_json::from_str(&text(tally).unwrap()).unwrap();
+        assert_eq!(
+            tally["failed"], "",
+            "the producer's call was ended by the request it happened to be made in"
+        );
+        assert_eq!(tally["made"], 2);
+        assert_eq!(failure, None);
+        assert_eq!(body, b"xy");
     }
 
     /// A producer that paces itself with a self-rescheduling `setTimeout`

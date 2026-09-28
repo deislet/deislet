@@ -389,7 +389,35 @@ async function fetch(input, init = undefined) {
   // a handler's existing error path catches it -- and logs the refusal on the
   // node with the application, the destination and the reason. Nothing is
   // dialled when this rejects.
-  await op_deis_fetch_guard(currentUrl, chargedScope());
+  //
+  // The call is put on its caller's clock before anything is awaited, so
+  // that the stretch it belongs to is on the books from the first moment:
+  // a response stream that adopts its caller's calls while the guard below
+  // is still deciding takes this one too.
+  const bounded = boundedByExecutionBudget(current.signal);
+  const signal = bounded.signal;
+  const caller = entryOwner;
+  // Put the stretch this call belongs to back in force whenever the call
+  // resumes: the one that made it or, once a response stream has adopted
+  // it, that stream. An `await` settles inside whichever stretch the event
+  // loop happens to be running then - a later request to this application,
+  // say - and that stretch has already made itself the owner of what is
+  // armed next. Without this, a producer's next `fetch`, made in the
+  // continuation of this one, was filed against that request: swept
+  // (aborted) when the request ended, and charged to its allowance rather
+  // than to the stream's. Sticky, as a timer's callback is, for the reason
+  // given there.
+  const resumeCaller = () => {
+    resumeOwner(bounded.guard === null ? caller : ownerOfGuards(bounded.guard.set));
+  };
+  try {
+    await op_deis_fetch_guard(currentUrl, chargedScope());
+  } catch (e) {
+    disarmGuard(bounded.guard);
+    throw e;
+  } finally {
+    resumeCaller();
+  }
 
   // The guard passed, so an outbound connection of this application is now
   // in flight. Released in the `finally` below, whichever way the call
@@ -400,18 +428,21 @@ async function fetch(input, init = undefined) {
   // `runtime/fetch_ops.rs`.
   try {
 
-  const signal = boundedByExecutionBudget(current.signal);
-
   for (let hops = 0; ; hops++) {
     // Same reason as the init in `nextRequest`: read as a dictionary, so
     // nothing an application left on `Object.prototype` gets to fill in the
     // members that keep this loop -- and therefore the policy check on every
     // hop -- in charge of the redirect.
-    const hop = await nativeFetch(current, {
-      __proto__: null,
-      redirect: "manual",
-      signal,
-    });
+    let hop;
+    try {
+      hop = await nativeFetch(current, {
+        __proto__: null,
+        redirect: "manual",
+        signal,
+      });
+    } finally {
+      resumeCaller();
+    }
     const inner = toInnerResponse(hop);
 
     // `manual` is the application asking to be handed the redirect itself,
@@ -486,7 +517,11 @@ async function fetch(input, init = undefined) {
     // write down was judged by: the same schemes, the same address ranges,
     // the same ports, the same allowlist, the same refusal of this platform's
     // own endpoints.
-    await op_deis_fetch_guard(followingUrl, chargedScope());
+    try {
+      await op_deis_fetch_guard(followingUrl, chargedScope());
+    } finally {
+      resumeCaller();
+    }
 
     current = following;
     currentUrl = followingUrl;
@@ -732,26 +767,52 @@ function budgetExpired() {
 // A negative answer from the op means this isolate is running without a
 // budget -- the snapshot build, and any path with no invocation in flight --
 // and the application's own signal is then the only one.
+//
+// Answers the signal and the guard filed for the call, or null for the guard
+// when none was armed.
 function boundedByExecutionBudget(callerSignal) {
   const remaining = op_deis_fetch_budget_ms();
   if (remaining < 0) {
-    return callerSignal;
+    return { signal: callerSignal, guard: null };
   }
 
   const controller = new abortSignal.AbortController();
+  let guard = null;
   if (remaining === 0) {
     // Nothing left to spend. Aborting before the call is made means no socket
     // is opened at all, and the application sees the same error it would have
     // seen a moment later.
     controller.abort(budgetExpired());
   } else {
-    armGuard(ownedGuards(), controller, remaining);
+    guard = armGuard(ownedGuards(), controller, remaining);
   }
 
-  return abortSignal.createDependentAbortSignal(
-    [callerSignal, controller.signal],
-    "Failed to bound fetch() by the execution budget",
-  );
+  return {
+    signal: abortSignal.createDependentAbortSignal(
+      [callerSignal, controller.signal],
+      "Failed to bound fetch() by the execution budget",
+    ),
+    guard,
+  };
+}
+
+// The owner whose guard set `set` is: a stream still open, or the
+// invocation. A set no live owner holds - its stream has ended - answers the
+// invocation, the owner that is always swept, as `resumeOwner` does.
+function ownerOfGuards(set) {
+  if (set === invocationOwner.guards) return invocationOwner;
+  for (const owner of new SafeSetIterator(streamOwners)) {
+    if (owner.guards === set) return owner;
+  }
+  return invocationOwner;
+}
+
+// Take one guard off the books without aborting it: the call it bounds was
+// never made. A null guard - no budget was armed - is nothing to do.
+function disarmGuard(guard) {
+  if (guard === null) return;
+  nativeClearTimeout(guard.id);
+  SetPrototypeDelete(guard.set, guard);
 }
 
 // File one guard in `set` and start its countdown.
