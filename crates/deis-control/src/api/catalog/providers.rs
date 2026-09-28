@@ -2832,6 +2832,7 @@ pub(crate) mod tests {
         let dispatcher = crate::catalog::ProviderDriverDispatcher::new(
             registry,
             Arc::clone(&harness.state.provider_credentials),
+            crate::catalog::provider_payload::test_workspaces(),
             ExecutableProviderDriverConfig::default(),
         )
         .unwrap();

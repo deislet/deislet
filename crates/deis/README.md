@@ -5,9 +5,10 @@ apart is the point:
 
 - **The project on disk.** `deis init`, `deis dev`, `deis validate` and
   `deis build` need no platform at all. It always creates one verified Edge
-  Canon Build Output first; `--vendor cloudflare|deno|tencent` derives what
-  that vendor's own tooling deploys from that same parent. This CLI never
-  pushes to them.
+  Canon Build Output first and derives each selected target's payload from
+  that same parent: `deislet` and `cloudflare` by default (whichever
+  `.config.json` enables), the frozen `deno` and `tencent` only when named
+  with `--target`.
 - **The locked standard registry.** `deis targets list|inspect` reads the same
   generated target-status JSON as the product documentation and Web console;
   it does not infer support from an adapter being present.
@@ -20,11 +21,12 @@ apart is the point:
   `deis-store` whose address and capability token the control plane hands
   out.
 
-`deis deploy` targets **this** platform only. There is deliberately no
-`--vendor` on it: it could never have pushed to Cloudflare or Deno, and a
-flag suggesting otherwise is worse than no flag.
+`deis deploy` deploys to this platform, or with `--target cloudflare` to
+Cloudflare through the control plane's Cloudflare provider driver. The frozen
+Deno and EdgeOne targets are not deployable from this CLI and `--target`
+refuses them.
 
-Compilation, validation and vendor code generation all live in `deis-build`;
+Compilation, validation and target code generation all live in `deis-build`;
 this crate is its command-line shell plus everything above.
 
 ## Install
@@ -136,13 +138,14 @@ tenant by accident.
 
 Check the project against the specification.
 
-### `deis build [--vendor …]`
+### `deis build [--target …]`
 
 Compile one content-addressed canonical artifact, then derive the selected
-provider payload. `--vendor deislet` produces
-`dist/providers/deislet/<payload-digest>/bundle.zip`, the
-bundle a version is made of; the other vendors produce their own output for
-their own tooling. The command prints the canonical and derivation identities.
+provider payloads. `--target deislet` produces
+`dist/providers/deislet/<payload-digest>/bundle.zip`, the bundle a version is
+made of; `--target cloudflare` produces `wrangler.toml`, the Worker bundle and
+`binding-plan.json`; `--target all` also builds the frozen targets. Without
+`--target` it builds the enabled non-frozen targets. The command prints the canonical and derivation identities.
 Provider packaging fails before output when a declared standard feature has no
 implemented mapping; it never silently removes that feature.
 
@@ -165,6 +168,20 @@ fleet ignored is exactly the failure this is for.
 
 A byte-identical bundle reuses the existing version instead of burning a new
 number, and says so.
+
+```bash
+deis deploy --target cloudflare
+deis deploy --target cloudflare --provider-target cf-eu   # when several are granted
+```
+
+With `--target cloudflare` it builds the Deislet bundle and the Cloudflare
+payload from one canonical artifact, records the version (without moving any
+self-hosted pointer), uploads the payload, starts a provider deployment on the
+Cloudflare provider target the environment is granted, and follows it until
+it settles; a failed or cancelled workflow fails the command. Setting up the
+driver, credential, target and grant is in
+[`docs/operations/cloudflare.md`](../../docs/operations/cloudflare.md). This
+path is verified against a fake `wrangler`, not yet a real account.
 
 ### `deis targets list|inspect`
 

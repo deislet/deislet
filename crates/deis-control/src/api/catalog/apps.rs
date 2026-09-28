@@ -201,6 +201,7 @@ pub async fn delete_app(
     Path(app_id): Path<String>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<DeleteAppResponse>> {
+    let application_id = state.store.get_app(&app_id).await?.canonical_id;
     // The caller is named on the grant revocations this delete performs.
     let removed = state
         .store
@@ -248,6 +249,16 @@ pub async fn delete_app(
                 "Could not delete a canonical artifact directory; it is now unreferenced"
             ),
         }
+    }
+
+    match state.provider_payloads.remove_application(application_id) {
+        Ok(true) => info!(app_id = %app_id, "Removed the deleted app's stored provider payloads"),
+        Ok(false) => {}
+        Err(e) => warn!(
+            app_id = %app_id,
+            error = %e,
+            "Could not delete the deleted app's provider payloads; they are now unreferenced"
+        ),
     }
 
     // Best effort: an empty per-app directory is noise, but a leftover one
@@ -594,16 +605,12 @@ mod tests {
         // because releasing a name means someone else can now use it under the
         // same `<app>.<environment>` string.
         let verifying_key = h.state.issuer.verifying_key().await;
-        let before_claims = deis_capability::decode(
-            before["token"].as_str().unwrap(),
-            &verifying_key,
-        )
-        .expect("before token must be a valid Ed25519 capability");
-        let after_claims = deis_capability::decode(
-            after["token"].as_str().unwrap(),
-            &verifying_key,
-        )
-        .expect("after token must be a valid Ed25519 capability");
+        let before_claims =
+            deis_capability::decode(before["token"].as_str().unwrap(), &verifying_key)
+                .expect("before token must be a valid Ed25519 capability");
+        let after_claims =
+            deis_capability::decode(after["token"].as_str().unwrap(), &verifying_key)
+                .expect("after token must be a valid Ed25519 capability");
         assert!(
             before_claims.authorizes_tenant("victim.production"),
             "before token must authorise the tenant"

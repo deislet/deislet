@@ -3,7 +3,7 @@
 //! What happens here is what happens on a deployment, with the control plane
 //! taken out of the middle:
 //!
-//! 1. `deis build --vendor deislet` produces the bundle.
+//! 1. `deis build --target deislet` produces the bundle.
 //! 2. A local HTTP server holds it, the way the control plane holds a version.
 //! 3. A real `deis-runtime` is started and told to load it with the same
 //!    `ApplyDeployment` call the control plane makes.

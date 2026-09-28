@@ -1543,7 +1543,7 @@ fi
 # 16. The compiler-target check says which vendor tools stood behind it
 # ----------------------------------------------------------------------
 #
-# `deis build -v all` verifies the cloudflare artifact with wrangler and the
+# `deis build --target all` verifies the cloudflare artifact with wrangler and the
 # deno artifact with deno when those are on PATH, and says at ⚠ when they are
 # not; the tencent target has no local dry-run. The check's files and markers
 # are the same either way, so its ✓ used to read identically on a machine

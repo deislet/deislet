@@ -196,16 +196,36 @@
         "providerRequestId": {"type": ["string", "null"], "minLength": 1, "maxLength": 512}
       }
     },
+    "absolutePath": {"type": "string", "minLength": 2, "maxLength": 4096, "pattern": "^/"},
+    "workspace": {
+      "description": "Where this driver process finds its artifact and keeps its files. It travels beside the durable request, never inside it: the same request may run in a different workspace on every attempt. The Control creates `directory` (mode 0700) for this process only, starts the process with it as the working directory and removes it after the process exits. `artifactDirectory` is `<directory>/<request.artifact.providerPayloadSha256>`, the provider payload tree the Control copied from its payload store and re-hashed against that digest before starting the process; it is null exactly when `request.artifact` is null. `stateDirectory` (mode 0700) persists across operations for one provider target and environment so a driver can journal what it created; it is never inside `directory`. The process environment is cleared: besides the operation-scoped credential the Control sets only `PATH` (`/usr/local/bin:/usr/bin:/bin`), `TMPDIR` (= `directory`) and `HOME` (a private directory shared by every driver process of this Control, for toolchain caches).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["directory", "artifactDirectory", "stateDirectory"],
+      "properties": {
+        "directory": {"$ref": "#/$defs/absolutePath"},
+        "artifactDirectory": {"anyOf": [{"$ref": "#/$defs/absolutePath"}, {"type": "null"}]},
+        "stateDirectory": {"$ref": "#/$defs/absolutePath"}
+      }
+    },
     "processRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["messageType", "schemaVersion", "protocol", "request"],
+      "required": ["messageType", "schemaVersion", "protocol", "request", "workspace"],
       "properties": {
         "messageType": {"const": "request"},
         "schemaVersion": {"const": 1},
         "protocol": {"const": "edge-canon-provider-driver-v1"},
-        "request": {"$ref": "#/$defs/driverRequest"}
-      }
+        "request": {"$ref": "#/$defs/driverRequest"},
+        "workspace": {"$ref": "#/$defs/workspace"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"request": {"properties": {"artifact": {"type": "null"}}}}},
+          "then": {"properties": {"workspace": {"properties": {"artifactDirectory": {"type": "null"}}}}},
+          "else": {"properties": {"workspace": {"properties": {"artifactDirectory": {"$ref": "#/$defs/absolutePath"}}}}}
+        }
+      ]
     },
     "processOutcome": {
       "type": "object",

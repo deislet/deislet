@@ -20,6 +20,7 @@ mod release_authorization;
 mod release_transparency;
 #[cfg(windows)]
 mod windows_security;
+mod workspace;
 
 #[cfg(all(windows, feature = "test-support"))]
 #[doc(hidden)]
@@ -109,4 +110,8 @@ pub use release_transparency::{
     DriverReleaseTransparencyProof, DriverReleaseTransparencyWitness,
     TRANSPARENCY_PROOF_MEDIA_TYPE, ValidatedDriverReleaseTransparencyProof,
     VerifiedDriverReleaseTransparencyProof,
+};
+pub use workspace::{
+    DRIVER_PROCESS_PATH, DriverArtifactError, DriverArtifactErrorKind, DriverArtifactSource,
+    DriverWorkspace, DriverWorkspaceRoot, OperationWorkspace,
 };

@@ -3,6 +3,12 @@
 //! The binary reads a [`deis_provider_driver::DriverProcessRequest`] envelope
 //! from stdin (one operation per invocation), dispatches it to wrangler,
 //! and writes back a [`deis_provider_driver::DriverProcessOutcome`].
+//!
+//! The envelope's [`deis_provider_driver::DriverWorkspace`] says where the
+//! build output is: wrangler runs in `artifactDirectory`, the payload the
+//! Control verified against `providerPayloadSha256`, and the deployment
+//! journal is kept in `stateDirectory`. The driver never reads its own
+//! working directory or install directory for application files.
 
 use std::io;
 use std::path::PathBuf;
@@ -10,16 +16,28 @@ use std::time::Duration;
 
 use deis_provider_driver::{
     DriverError, DriverErrorCategory, DriverNextAction, DriverProcessOutcome, DriverProcessRequest,
-    SideEffect,
+    DriverWorkspace, SideEffect,
 };
 use deis_wire::CanonicalId;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-use crate::commands::DeploymentJournal;
+use crate::commands::{self, OperationContext, Timeouts};
 use crate::credentials::CloudflareCredential;
-use crate::wrangler::WranglerBinary;
+use crate::environment::DriverEnvironment;
+use crate::journal::JournalStore;
+use crate::toolchain::{
+    EMBEDDED_TOOLCHAIN_LOCK, HttpFetcher, Installer, NodeRuntime, Platform, ToolchainPin,
+};
+use crate::wrangler::{Wrangler, WranglerError};
 
-const PROCESS_TIMEOUT: Duration = Duration::from_secs(300);
+/// The whole process's budget, including a first-run toolchain install.
+///
+/// It must end before the Control's launcher gives up on the process
+/// (`deis_control::catalog::provider_driver_release::DRIVER_PROCESS_TIMEOUT`,
+/// 270 s, bounded by the five-minute credential lease), so a slow operation
+/// is reported as this driver's retryable `DRIVER_TIMEOUT` outcome rather
+/// than as a killed process with no outcome at all.
+pub const PROCESS_TIMEOUT: Duration = Duration::from_secs(240);
 
 /// A zero digest for placeholder errors before real request data is available.
 fn zero_digest() -> deis_provider_driver::Sha256Digest {
@@ -68,8 +86,8 @@ pub async fn execute_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let request = match process_request.validate() {
-        Ok(r) => r,
+    let (request, workspace) = match process_request.validate() {
+        Ok(validated) => validated,
         Err(_) => {
             let outcome = DriverProcessOutcome::failed(DriverError {
                 operation_id: CanonicalId::new_v7(),
@@ -77,7 +95,7 @@ pub async fn execute_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
                 desired_state_digest: zero_digest(),
                 category: DriverErrorCategory::DriverIntegrity,
                 code: "PROTOCOL_MISMATCH".to_owned(),
-                message: "driver process request does not use the exact v1 protocol".to_owned(),
+                message: "driver process request does not use the exact v1 protocol or its workspace disagrees with the request".to_owned(),
                 retryable: false,
                 side_effect: SideEffect::None,
                 next_action: DriverNextAction::None,
@@ -88,7 +106,7 @@ pub async fn execute_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    match tokio::time::timeout(PROCESS_TIMEOUT, execute_request(request)).await {
+    match tokio::time::timeout(PROCESS_TIMEOUT, execute_request(request, workspace)).await {
         Ok(result) => result,
         Err(_) => {
             let outcome = DriverProcessOutcome::failed(DriverError {
@@ -111,125 +129,171 @@ pub async fn execute_from_stdin() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn execute_request(
     request: deis_provider_driver::DriverRequest,
+    workspace: DriverWorkspace,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let credential = match load_credential(&request) {
-        Ok(cred) => cred,
-        Err(outcome) => {
-            print_outcome(&outcome)?;
-            return Ok(());
+    let outcome = run_request(&request, &workspace).await;
+    print_outcome(&outcome)?;
+    Ok(())
+}
+
+/// Resolve the driver's inputs, install/verify the toolchain, and run one
+/// operation.
+async fn run_request(
+    request: &deis_provider_driver::DriverRequest,
+    workspace: &DriverWorkspace,
+) -> DriverProcessOutcome {
+    let credential = match load_credential(request) {
+        Ok(credential) => credential,
+        Err(outcome) => return *outcome,
+    };
+    let environment = match DriverEnvironment::from_process(workspace) {
+        Ok(environment) => environment,
+        Err(message) => {
+            return setup_failure(
+                request,
+                DriverErrorCategory::Configuration,
+                "DRIVER_ENVIRONMENT",
+                message,
+                false,
+            );
         }
     };
 
-    let wrangler = match WranglerBinary::ensure_installed().await {
-        Ok(w) => w,
+    let wrangler = match install_wrangler(&environment).await {
+        Ok(wrangler) => wrangler,
         Err(error) => {
-            error!(%error, "Failed to install wrangler");
-            let outcome = DriverProcessOutcome::failed(DriverError {
-                operation_id: request.operation_id,
-                operation: request.operation,
-                desired_state_digest: request.desired_state_digest.clone(),
-                category: DriverErrorCategory::Internal,
-                code: "WRANGLER_INSTALL_FAILED".to_owned(),
-                message: error.to_string(),
-                retryable: true,
-                side_effect: SideEffect::None,
-                next_action: DriverNextAction::Retry,
-                provider_request_id: None,
-            });
-            print_outcome(&outcome)?;
-            return Ok(());
+            error!(%error, "Failed to prepare wrangler");
+            let category = match error {
+                WranglerError::Integrity { .. } => DriverErrorCategory::DriverIntegrity,
+                _ => DriverErrorCategory::Internal,
+            };
+            let retryable = !matches!(
+                error,
+                WranglerError::Integrity { .. } | WranglerError::Node { .. }
+            );
+            return setup_failure(
+                request,
+                category,
+                "WRANGLER_INSTALL_FAILED",
+                error.to_string(),
+                retryable,
+            );
         }
     };
 
-    let work_dir = determine_work_dir();
-    let mut journal = DeploymentJournal::load(&work_dir);
+    let journals = JournalStore::new(&environment.state_dir);
+    let scratch_root = environment.state_dir.join("cloudflare").join("work");
+    let context = OperationContext {
+        wrangler: &wrangler,
+        credential: &credential,
+        artifact_dir: environment.artifact_dir(),
+        journals: &journals,
+        scratch_root: &scratch_root,
+        config: &environment.config,
+        secrets: &environment.secrets,
+        purge_environment_id: environment.purge_environment_id.as_deref(),
+        timeouts: Timeouts::default(),
+    };
 
     info!(
         operation_id = %request.operation_id,
         operation = ?request.operation,
         "Executing operation"
     );
-
-    let outcome = match crate::commands::execute_operation(
-        &wrangler,
-        &credential,
-        &request,
-        &work_dir,
-        &mut journal,
-    )
-    .await
-    {
+    match commands::execute_operation(&context, request).await {
         Ok(receipt) => {
-            info!(
-                operation_id = %request.operation_id,
-                state = ?receipt.state,
-                "Operation completed"
-            );
-            // Save journal for crash resilience
-            let mut journal_for_save = journal.clone();
-            if let Some(ref vid) = receipt.provider_version_id {
-                journal_for_save.version_id = Some(vid.clone());
-            }
-            if let Some(ref did) = receipt.provider_deployment_id {
-                journal_for_save.deployment_id = Some(did.clone());
-            }
-            if let Err(error) = journal_for_save.save(&work_dir) {
-                warn!(%error, "Failed to save deployment journal");
-            }
+            info!(operation_id = %request.operation_id, state = ?receipt.state, "Operation completed");
             DriverProcessOutcome::succeeded(receipt)
         }
         Err(error) => {
-            error!(
-                operation_id = %request.operation_id,
-                ?error,
-                "Operation failed"
-            );
+            error!(operation_id = %request.operation_id, code = %error.code, "Operation failed");
             DriverProcessOutcome::failed(error)
         }
-    };
+    }
+}
 
-    print_outcome(&outcome)?;
-    Ok(())
+async fn install_wrangler(environment: &DriverEnvironment) -> Result<Wrangler, WranglerError> {
+    let node = NodeRuntime::locate(
+        environment.node.as_deref(),
+        environment.search_path.as_deref(),
+        crate::MINIMUM_NODE_MAJOR,
+    )
+    .await?;
+    let fetcher = HttpFetcher::new()?;
+    let pin = ToolchainPin::wrangler();
+    let toolchain = Installer {
+        tools_root: &environment.tools_dir,
+        lock_json: EMBEDDED_TOOLCHAIN_LOCK,
+        pin: &pin,
+        fetcher: &fetcher,
+        platform: Platform::host(),
+    }
+    .ensure()
+    .await?;
+    Ok(Wrangler::installed(
+        &node,
+        &toolchain,
+        environment.wrangler_home(),
+    ))
+}
+
+fn setup_failure(
+    request: &deis_provider_driver::DriverRequest,
+    category: DriverErrorCategory,
+    code: &str,
+    message: String,
+    retryable: bool,
+) -> DriverProcessOutcome {
+    DriverProcessOutcome::failed(DriverError {
+        operation_id: request.operation_id,
+        operation: request.operation,
+        desired_state_digest: request.desired_state_digest.clone(),
+        category,
+        code: code.to_owned(),
+        message,
+        retryable,
+        side_effect: SideEffect::None,
+        next_action: if retryable {
+            DriverNextAction::Retry
+        } else {
+            DriverNextAction::None
+        },
+        provider_request_id: None,
+    })
 }
 
 fn load_credential(
     request: &deis_provider_driver::DriverRequest,
-) -> Result<CloudflareCredential, DriverProcessOutcome> {
-    let value = match std::env::var("EDGE_CANON_PROVIDER_CREDENTIAL") {
-        Ok(v) => v,
-        Err(_) => {
-            return Err(DriverProcessOutcome::failed(DriverError {
-                operation_id: request.operation_id,
-                operation: request.operation,
-                desired_state_digest: request.desired_state_digest.clone(),
-                category: DriverErrorCategory::Authentication,
-                code: "CREDENTIAL_NOT_SET".to_owned(),
-                message: "EDGE_CANON_PROVIDER_CREDENTIAL is not set".to_owned(),
-                retryable: false,
-                side_effect: SideEffect::None,
-                next_action: DriverNextAction::None,
-                provider_request_id: None,
-            }));
-        }
+) -> Result<CloudflareCredential, Box<DriverProcessOutcome>> {
+    let failure = |code: &str, message: String| {
+        Box::new(setup_failure(
+            request,
+            DriverErrorCategory::Authentication,
+            code,
+            message,
+            false,
+        ))
     };
-    CloudflareCredential::from_env_value(&value).map_err(|error| {
-        DriverProcessOutcome::failed(DriverError {
-            operation_id: request.operation_id,
-            operation: request.operation,
-            desired_state_digest: request.desired_state_digest.clone(),
-            category: DriverErrorCategory::Authentication,
-            code: "CREDENTIAL_PARSE_FAILED".to_owned(),
-            message: error.to_string(),
-            retryable: false,
-            side_effect: SideEffect::None,
-            next_action: DriverNextAction::None,
-            provider_request_id: None,
-        })
-    })
+    let mut value = std::env::var("EDGE_CANON_PROVIDER_CREDENTIAL").map_err(|_| {
+        failure(
+            "CREDENTIAL_NOT_SET",
+            "EDGE_CANON_PROVIDER_CREDENTIAL is not set".to_owned(),
+        )
+    })?;
+    let credential = CloudflareCredential::from_env_value(&value)
+        .map_err(|error| failure("CREDENTIAL_PARSE_FAILED", error.to_string()));
+    zeroize::Zeroize::zeroize(&mut value);
+    credential
 }
 
-fn determine_work_dir() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+/// The directory wrangler runs in and reads the build output from: the
+/// verified payload the Control materialized for this operation, or the
+/// operation's scratch directory when it has no artifact.
+pub fn artifact_work_dir(workspace: &DriverWorkspace) -> PathBuf {
+    workspace
+        .artifact_directory
+        .clone()
+        .unwrap_or_else(|| workspace.directory.clone())
 }
 
 fn print_outcome(outcome: &DriverProcessOutcome) -> Result<(), Box<dyn std::error::Error>> {

@@ -1,0 +1,8 @@
+{
+  "name": "deis-cloudflare-driver-wrangler",
+  "private": true,
+  "description": "The pinned wrangler toolchain the deis Cloudflare provider driver installs. See README.md.",
+  "dependencies": {
+    "wrangler": "4.129.0"
+  }
+}
