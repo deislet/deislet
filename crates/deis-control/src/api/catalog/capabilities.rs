@@ -122,11 +122,11 @@ pub async fn revoke_node(
     Path(node_id): Path<String>,
 ) -> ApiResult<Json<CapabilityRevocation>> {
     let revoked = revoke(&state, RevocationScope::Node(node_id.clone())).await?;
-    // Out of the fleet as well: nothing is pushed to it and no proxy routes
-    // to it, and the machine channel refuses its attempts to register again.
-    // A node named in `deis_runtime_nodes` stays listed until it is taken
-    // out of that file, but is answered nothing all the same.
-    let removed = state.nodes.deregister(&node_id);
+    // Out of the fleet as well - a node named in `deis_runtime_nodes`
+    // included: nothing is pushed to it, no cron fire is handed to it, no
+    // proxy routes to it, and a registration racing this one cannot put it
+    // back (see `RuntimeNodeManager::revoke`).
+    let removed = state.nodes.revoke(&node_id);
     warn!(
         node = %node_id,
         revoked = revoked.len(),
@@ -163,7 +163,11 @@ pub async fn lift_node_revocation(
         .lift_node(&node_id)
         .await
         .map_err(|error| ApiError::DatabaseError(error.to_string()))?;
-    if !lifted {
+    // The fleet is told whatever the ledger said: a revocation this process
+    // held in memory but the ledger no longer does must not keep the node
+    // out.
+    let held = state.nodes.lift_revocation(&node_id);
+    if !lifted && !held {
         return Err(ApiError::NotFound(format!("node {node_id} is not revoked")));
     }
     warn!(node = %node_id, "Lifted a node's revocation; it may register and be issued capabilities again");

@@ -760,6 +760,24 @@ async fn build_catalog_state(
         }
     };
 
+    // A node revoked before this process started stays out of the fleet: a
+    // configured one is not driven, and none may register back. A ledger
+    // that cannot be read here is a control plane that cannot start safely.
+    match issuer.ledger().revoked_nodes().await {
+        Ok(revoked) => {
+            for node in &revoked {
+                nodes.revoke(node);
+            }
+            if !revoked.is_empty() {
+                warn!(nodes = ?revoked, "Revoked nodes are kept out of the fleet until an operator lifts their revocation");
+            }
+        }
+        Err(error) => panic!(
+            "cannot read which nodes are revoked, so no node could be told apart from a revoked \
+             one: {error}"
+        ),
+    }
+
     catalog::CatalogState {
         store: Arc::clone(&store),
         bundles: Arc::new(bundles),
