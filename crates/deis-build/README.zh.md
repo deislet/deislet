@@ -79,13 +79,12 @@ let result = compiler.build().await?;
 | [库使用指南](./docs/library-usage.zh.md) | 作为 Rust 库集成使用 |
 | [输出模式](./docs/output-modes.zh.md) | Files/Memory/Both 三种输出模式 |
 | [基础服务](./docs/basic-services.zh.md) | KV Storage 和 Cache API 说明 |
-| [错误系统](./docs/error-system.zh.md) | 错误分类和处理 |
 | [适配器规范](./docs/adapter-specs.zh.md) | 各平台适配器要产出什么 |
 | [deislet 目标](./docs/deislet-target.zh.md) | 应用包格式与自建平台目标 |
 | [贡献指南](./docs/contributing.zh.md) | 这个 crate 自己的开发说明 |
 | [CONTRIBUTING.md](../deis/CONTRIBUTING.md) | 工作区通用规则 |
 
-`docs/` 下 `library-usage.md`、`error-system.md`、`adapter-specs.md` 三个英文文件目前
+`docs/` 下 `library-usage.md`、`adapter-specs.md` 两个英文文件目前
 只有一句「English version coming soon」，内容都在对应的 `.zh.md` 里。
 
 ## 目标产物与认证状态

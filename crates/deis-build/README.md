@@ -96,7 +96,6 @@ let result = compiler.build().await?;
 | [库使用指南](./docs/library-usage.zh.md) | — (stub) | 作为 Rust 库使用 |
 | [输出模式](./docs/output-modes.zh.md) | [Output Modes](./docs/output-modes.md) | Files/Memory/Both 模式 |
 | [基础服务](./docs/basic-services.zh.md) | [Basic Services](./docs/basic-services.md) | KV 和 Cache 说明 |
-| [错误系统](./docs/error-system.zh.md) | — (stub) | 错误分类和处理 |
 | [适配器规范](./docs/adapter-specs.zh.md) | — (stub) | 各平台适配器要产出什么 |
 | [贡献指南](./docs/contributing.zh.md) | [CONTRIBUTING.md](../deis/CONTRIBUTING.md) | 如何参与开发 |
 | [deislet 目标](./docs/deislet-target.zh.md) | [The deislet target](./docs/deislet-target.md) | 应用包格式与自建平台目标 Bundle format and the platform's own target |
