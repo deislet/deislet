@@ -1,12 +1,12 @@
 //! The Tencent EdgeOne adapter.
 //!
-//! One adapter per vendor, and the crate is named after the `--vendor` value
-//! it answers for: `deis build --vendor tencent` is served by
+//! One adapter per target, and the crate is named after the `--target` value
+//! it answers for: `deis build --target tencent` is served by
 //! `deis-build-adapter-tencent`. That correspondence is the whole naming
 //! rule, and [`VENDOR`] plus the test at the bottom of this file is what
 //! keeps a rename from quietly breaking it.
 
-/// The `--vendor` value this adapter answers for.
+/// The `--target` value this adapter answers for.
 ///
 /// `deis-build` dispatches on it, so the string here and the crate name are
 /// the same fact written twice; `the_crate_is_named_after_the_vendor` fails

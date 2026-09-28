@@ -117,7 +117,7 @@ says, or record how a decision was made — decisions belong in an ADR.
 ## Adding a build target
 
 The adapters live in `crates/deis-build-adapter-<vendor>`, and the crate name
-is the `--vendor` value verbatim — `--vendor cloudflare` is served by
+is the `--target` value verbatim — `--target cloudflare` is served by
 `deis-build-adapter-cloudflare`. A `VENDOR` constant in each one, and a test
 that compares it with `CARGO_PKG_NAME`, is what keeps that from drifting.
 `deis-build`'s dispatch matches on those constants rather than on literals.

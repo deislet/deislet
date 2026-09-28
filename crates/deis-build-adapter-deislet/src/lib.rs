@@ -22,10 +22,10 @@
 //!   so the same input has to produce the same bytes. See [`archive`].
 //!
 
-/// The `--vendor` value this adapter answers for.
+/// The `--target` value this adapter answers for.
 ///
-/// One adapter per vendor, and the crate is named after the value it serves:
-/// `deis build --vendor deislet` is served by `deis-build-adapter-deislet`.
+/// One adapter per target, and the crate is named after the value it serves:
+/// `deis build --target deislet` is served by `deis-build-adapter-deislet`.
 /// `deis-build` dispatches on this string, so it and the crate name are the
 /// same fact written twice; `the_crate_is_named_after_the_vendor` below fails
 /// if they stop agreeing.

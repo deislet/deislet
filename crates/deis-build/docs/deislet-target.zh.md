@@ -1,6 +1,6 @@
 # deislet 目标
 
-`deis-build build --vendor deislet` 把项目打成**应用包**——一个 zip，是 deislet 平台上「一个版本」的唯一载体。格式由 [`docs/implementation-plan.zh.md` 第 2 节](../../../docs/implementation-plan.zh.md) 规定，写包的是 deis-build，验包的是 deis-control，装包的是 deis-runtime，三方共用 `deis-bundle` 里的同一份定义。
+`deis build --target deislet` 把项目打成**应用包**——一个 zip，是 deislet 平台上「一个版本」的唯一载体。格式由 [`docs/implementation-plan.zh.md` 第 2 节](../../../docs/implementation-plan.zh.md) 规定，写包的是 deis-build，验包的是 deis-control，装包的是 deis-runtime，三方共用 `deis-bundle` 里的同一份定义。
 
 其余三个目标产出的是「别人平台的可部署物」（Worker、Deno Deploy 项目、EdgeOne 函数），这个目标产出的是自家平台的。
 

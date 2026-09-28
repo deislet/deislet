@@ -43,14 +43,12 @@ cargo build -p deis-build
 ```bash
 deis validate
 deis build                      # 全部目标
-deis build --vendor cloudflare
-cargo run -p deis-build -- node-npm-limits  # 以 JSON 查询构建上限
+deis build --target cloudflare
 ```
 
-`deis-build` 自己也有一个同名二进制，参数相同，用于不带平台侧功能时直接调编译器。
-`node-npm-limits` 不读取项目、不产生副作用，在构建前给出精确的 Node/npm 工具链、
-package/file/octet、展开倍率、超时与在线监控上限；库调用方读取
-`deis_build::node_npm_build_limits()` 可得到同一结构。
+这个 crate 没有自己的二进制，命令行只有 `deis`。
+`deis_build::node_npm_build_limits()` 不读取项目，给出构建强制执行的 Node/npm 工具链、
+package/file/octet、展开倍率、超时与在线监控上限。
 
 ### 作为库使用
 
@@ -75,7 +73,7 @@ let result = compiler.build().await?;
 
 | 文档 | 说明 |
 |------|------|
-| [快速开始](./docs/quickstart.zh.md) | 5 分钟上手指南 |
+| [Quick Start](../deis/QUICKSTART.md) | 从 `deis init` 到部署 |
 | [库使用指南](./docs/library-usage.zh.md) | 作为 Rust 库集成使用 |
 | [输出模式](./docs/output-modes.zh.md) | Files/Memory/Both 三种输出模式 |
 | [基础服务](./docs/basic-services.zh.md) | KV Storage 和 Cache API 说明 |
@@ -119,13 +117,13 @@ deis-build/
 └── docs/                # 文档，*.md 与 *.zh.md 并排
 
 ../deis-build-core/               # 核心类型和目标产物实现覆盖
-../deis-build-adapter-cloudflare/   # --vendor cloudflare
-../deis-build-adapter-deno/         # --vendor deno
-../deis-build-adapter-tencent/      # --vendor tencent（腾讯 EdgeOne）
-../deis-build-adapter-deislet/      # --vendor deislet（应用包）
+../deis-build-adapter-cloudflare/   # --target cloudflare
+../deis-build-adapter-deno/         # --target deno
+../deis-build-adapter-tencent/      # --target tencent（腾讯 EdgeOne）
+../deis-build-adapter-deislet/      # --target deislet（应用包）
 ```
 
-适配器 crate 名就是 `--vendor` 的取值本身，一一对应，不用查表；每个适配器里的
+适配器 crate 名就是 `--target` 的取值本身，一一对应，不用查表；每个适配器里的
 `VENDOR` 常量与一条比对 `CARGO_PKG_NAME` 的测试，是防止这条对应关系走样的东西。
 
 ## 🤝 贡献

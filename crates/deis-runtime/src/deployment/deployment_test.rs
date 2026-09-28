@@ -46,7 +46,7 @@ export default async function handler(context) {
 }
 "#;
 
-/// Build a bundle the way `deis build --vendor deislet` lays one out.
+/// Build a bundle the way `deis build --target deislet` lays one out.
 fn bundle(app: &str, code: &str, assets: &[(&str, &str)], env: &[(&str, &str)]) -> TestBundle {
     bundle_with_services(app, code, assets, env, &[])
 }

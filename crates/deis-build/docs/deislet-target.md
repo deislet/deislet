@@ -1,6 +1,6 @@
 # The deislet target
 
-`deis-build build --vendor deislet` produces an **application bundle**: one zip,
+`deis build --target deislet` produces an **application bundle**: one zip,
 which is the only carrier of a version on the deislet platform. The format is
 defined in [`docs/implementation-plan.zh.md` section 2](../../../docs/implementation-plan.zh.md).
 deis-build writes it, deis-control verifies it, deis-runtime loads it, and all

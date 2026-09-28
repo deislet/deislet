@@ -8,7 +8,7 @@ description = "Universal Edge Function Compiler - Transform standard code to pla
 repository = "https://github.com/deislet/deislet"
 homepage = "https://github.com/deislet/deislet"
 keywords = ["edge", "serverless", "compiler", "cloudflare", "deno"]
-categories = ["command-line-utilities", "development-tools", "web-programming"]
+categories = ["development-tools", "web-programming"]
 readme = "README.md"
 documentation = "https://docs.rs/deis-build"
 
@@ -16,10 +16,6 @@ documentation = "https://docs.rs/deis-build"
 name = "deis_build"
 path = "src/lib.rs"
 crate-type = ["lib"]
-
-[[bin]]
-name = "deis-build"
-path = "src/main.rs"
 
 [dependencies]
 deis-artifact = { version = "0.1.0", path = "../deis-artifact" }
@@ -31,16 +27,13 @@ deis-build-adapter-deislet = { version = "0.1.0", path = "../deis-build-adapter-
 deis-bundle = { path = "../deis-bundle" }
 deis-wire = { workspace = true }
 
-clap = { version = "4.4", features = ["derive", "cargo"] }
 colored = "2.1"
-indicatif = "0.17"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_jcs = "0.2.0"
 tokio = { version = "1.35", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = "0.3"
 walkdir = "2.4"
 pathdiff = "0.2"
 unicode-normalization = "0.1"

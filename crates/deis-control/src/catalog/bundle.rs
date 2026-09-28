@@ -1,6 +1,6 @@
 //! Bundle storage on the control plane.
 //!
-//! A bundle is the zip produced by `deis build --vendor deislet` and is
+//! A bundle is the zip produced by `deis build --target deislet` and is
 //! the only carrier of a version (see docs/implementation-plan.zh.md
 //! section 2). Accepting one means: hash it, read `manifest.json` out of
 //! it, check the manifest actually describes the app it was uploaded for,

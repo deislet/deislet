@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-/// Internal source-adapter target. It is never accepted from `--vendor` and
+/// Internal source-adapter target. It is never accepted from `--target` and
 /// never appears in the provider build map.
 const CANONICAL_TARGET: &str = "canonical";
 

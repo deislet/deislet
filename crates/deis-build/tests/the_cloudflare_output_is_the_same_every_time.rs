@@ -17,7 +17,7 @@
 //! removed: `--outdir` is now a scratch directory outside the output tree,
 //! removed when the build returns.
 //!
-//! The test drives the real binary with a stub `wrangler` on `PATH`, so it
+//! The test drives the real compiler with a stub `wrangler` on `PATH`, so it
 //! proves the property on a machine that has no wrangler as well as on one
 //! that does - and so that what the stub writes is loud and dated, rather than
 //! depending on what a particular wrangler release happens to put in its
@@ -28,6 +28,8 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+use deis_build::{Compiler, CompilerOptions};
 
 /// A `wrangler` that answers `--version` and, on a dry run, writes a file with
 /// the current nanosecond into whatever `--outdir` names.
@@ -106,19 +108,28 @@ fn tree(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     out
 }
 
-fn build(project: &Path, bin: &Path) {
+/// Put the stub first on `PATH`, where the compiler looks for `wrangler`.
+///
+/// This file holds one test, so nothing else in the process reads `PATH`
+/// while it changes.
+fn put_first_on_path(bin: &Path) {
     let path = format!(
         "{}:{}",
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_deis-build"))
-        .args(["build", "--vendor", "cloudflare"])
-        .current_dir(project)
-        .env("PATH", path)
-        .status()
-        .expect("run the build");
-    assert!(status.success(), "the build has to succeed: {status}");
+    std::env::set_var("PATH", path);
+}
+
+async fn build(project: &Path) {
+    let result = Compiler::with_options(CompilerOptions {
+        project_dir: project.to_string_lossy().into_owned(),
+        ..Default::default()
+    })
+    .compile(project, vec!["cloudflare".to_string()], true)
+    .await
+    .expect("the build has to succeed");
+    assert!(result.success, "the build has to succeed");
 }
 
 fn provider_payload_root(project: &Path) -> PathBuf {
@@ -138,18 +149,19 @@ fn provider_payload_root(project: &Path) -> PathBuf {
     root
 }
 
-#[test]
-fn two_builds_of_one_source_produce_one_tree() {
+#[tokio::test]
+async fn two_builds_of_one_source_produce_one_tree() {
     let project = tempfile::tempdir().expect("a temporary project");
     let bin = project.path().join("stub-bin");
     let log = project.path().join("dry-runs.log");
     stub_wrangler(&bin, &log);
+    put_first_on_path(&bin);
     stage(project.path());
 
-    build(project.path(), &bin);
+    build(project.path()).await;
     let first_root = provider_payload_root(project.path());
     let first = tree(&first_root);
-    build(project.path(), &bin);
+    build(project.path()).await;
     let second_root = provider_payload_root(project.path());
     let second = tree(&second_root);
     assert_eq!(

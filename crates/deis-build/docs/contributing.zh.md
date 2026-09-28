@@ -346,8 +346,6 @@ async fn test_build_cloudflare() {
 docs/
 ├── README.md           # 英文文档导航
 ├── README.zh.md        # 中文文档导航
-├── quickstart.md       # 英文快速开始
-├── quickstart.zh.md    # 中文快速开始
 ├── library-usage.md    # 英文库使用指南
 ├── library-usage.zh.md # 中文库使用指南
 └── ...

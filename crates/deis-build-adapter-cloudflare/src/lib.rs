@@ -1,7 +1,7 @@
 //! The Cloudflare Workers adapter.
 //!
-//! One adapter per vendor, and the crate is named after the `--vendor` value
-//! it answers for: `deis build --vendor cloudflare` is served by
+//! One adapter per target, and the crate is named after the `--target` value
+//! it answers for: `deis build --target cloudflare` is served by
 //! `deis-build-adapter-cloudflare`. That correspondence is the whole naming
 //! rule, and [`VENDOR`] plus the test at the bottom of this file is what
 //! keeps a rename from quietly breaking it.
@@ -15,7 +15,7 @@
 //! provider tool runs - so the build never invents a resource identifier,
 //! and nothing it emits can deploy against the wrong one.
 
-/// The `--vendor` value this adapter answers for.
+/// The `--target` value this adapter answers for.
 ///
 /// `deis-build` dispatches on it, so the string here and the crate name are
 /// the same fact written twice; `the_crate_is_named_after_the_vendor` fails

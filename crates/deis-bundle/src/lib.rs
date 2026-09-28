@@ -1,6 +1,6 @@
 //! The Deislet application bundle format.
 //!
-//! A bundle is the zip that `deis build --vendor deislet` produces, and it is
+//! A bundle is the zip that `deis build --target deislet` produces, and it is
 //! the only carrier of a version (see `docs/implementation-plan.zh.md`
 //! section 2):
 //!
