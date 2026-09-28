@@ -1,6 +1,7 @@
 # Proxy
 
-Managed multi-site reverse proxy and load balancer for the Deislet platform.
+The traffic entry of the Deislet platform: TLS termination, application
+routing and load balancing in front of the nodes.
 
 Proxy is the traffic entry point: it terminates HTTP/1.1, HTTP/2 and TLS,
 decides which application a request belongs to, and forwards it to a
@@ -13,6 +14,17 @@ The data plane is [Pingora](https://github.com/cloudflare/pingora). Proxy
 adds application routing, configuration management and the control
 integration on top of it; it does not implement its own HTTP parsing,
 socket handling or process model.
+
+## Where applications come from
+
+Three sources, each answering a different question. The words are the
+platform's [glossary](../../docs/glossary.md).
+
+| Source | What it is | Who writes it | What it decides |
+|---|---|---|---|
+| **The catalog's routing table** | Every route and every environment of every application, fetched from the control plane over the machine channel (`FetchRoutingTable`) and kept on disk in `routing.cache_path` | The control plane, from `deis deploy`, routes and hostname grants | Which application and environment a request belongs to. The only routing source a platform deployment uses - the demo and `deis deploy` never write anything else. |
+| **The application list** | Per-host policy records (`id`, `domains`, `certificates`, `enabled`, `cache`, `environment`) pushed by the control plane as `ConfigUpdate` keys `apps` / `app.<id>` and persisted in the SQLite `database` | An operator, through `/api/platform/configs` (there is no `deis` command for it) | What to do with a request once its application is known: which certificate files to present, whether the application is disabled, whether to redirect to HTTPS, and which names ACME certifies. A host the catalog does not claim is also routed by it, which is what a proxy running without a catalog uses. |
+| **Nothing** | No `[control]` section and an empty application list | - | A plain reverse proxy: every request is forwarded unchanged to the upstream pool. |
 
 ## Request flow
 
