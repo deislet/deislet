@@ -243,7 +243,7 @@ API key 能不能从控制面领到那张令牌。
 |---|---|---|
 | CLI 部署 | `deis deploy` 的报告 + 打一发真请求 | 一条命令从源码走到对外服务：建应用、建环境、传版本、指针指过去，节点收下并真的在应答 |
 | | `deis versions` | 两版都列出来了，且标出 production 跑的是哪一版——版本不会自称「当前」，是环境指向它 |
-| 编译器 | 拿另一个小项目跑一次 `deis build -v all` | 四个目标各出一份、各是那个宿主要的形状：deislet 的 `bundle.zip`、Cloudflare 的 `index.js` + `wrangler.toml` + `package.json`、Deno 的处理函数 + 生成的路由 + `deno.json`、EdgeOne 的 `edge-functions/index.js` + `edgeone.json`。每一份都带着处理函数自己的标记，而 Cloudflare 那份和 EdgeOne 那份彼此不同——所以是四个适配器各自生成的，不是同一份输出拷了四遍。这一项不部署：四个目标里有三个是别的平台 |
+| 编译器 | 拿另一个小项目跑一次 `deis build --target all` | 四个目标各出一份、各是那个宿主要的形状：deislet 的 `bundle.zip`、Cloudflare 的 `index.js` + `wrangler.toml` + `package.json`、Deno 的处理函数 + 生成的路由 + `deno.json`、EdgeOne 的 `edge-functions/index.js` + `edgeone.json`。每一份都带着处理函数自己的标记，而 Cloudflare 那份和 EdgeOne 那份彼此不同——所以是四个适配器各自生成的，不是同一份输出拷了四遍。这一项不部署：四个目标里有三个是别的平台 |
 | | 对一个用 `new WebSocketPair()` 的处理函数跑 `deis deploy` | 构建在第一步就拒绝，先于应用、环境、版本的存在：错误点名 `EC_STREAM_WEBSOCKET_NONPORTABLE` 与 `WebSocketPair`，项目下没有 `dist/`，目录里也没有这个应用。标准没有给 WebSocket 应用留可移植的形状，所以平台对这种处理函数的承诺是这次拒绝，而不是一个 101 |
 | 资产优先 | `GET /` | 返回的是包里那个文件本身，没起 Isolate；ETag 是资产自身的 sha256 |
 | | 带 `If-None-Match` 再打一次 | 回 304 且零字节 |

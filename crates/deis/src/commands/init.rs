@@ -49,12 +49,13 @@ pub async fn execute(name: String, template: String) -> Result<()> {
         // dead-lettered.
         "queues": [],
         "vendors": {
-            // This platform's own target, on by default: a new project should
-            // be deployable to it without editing configuration first.
+            // The two supported targets, on by default: a new project should
+            // be deployable to this platform and to Cloudflare without
+            // editing configuration first. Deno and EdgeOne are frozen and
+            // are left out; `deis build --target deno` still builds one when
+            // asked.
             "deislet": { "enabled": true },
-            "cloudflare": { "enabled": true },
-            "deno": { "enabled": true },
-            "tencent": { "enabled": false }
+            "cloudflare": { "enabled": true }
         },
         "build": {
             "outDir": "./dist",

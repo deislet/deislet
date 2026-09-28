@@ -1,23 +1,57 @@
 //! `deis deploy` - build the bundle, record it as a version, and point an
 //! environment at it.
 //!
-//! This deploys to *this* platform by default. With `--vendor <name>`, the
-//! control plane routes the deployment through the provider driver lifecycle
-//! (preflight, plan, prepare, upload, verify, activate). The driver binary
-//! for that vendor must be installed on the control plane node.
-//!
-//! Building for other platforms is `deis build --vendor <name>` followed by
-//! `deis deploy --vendor <name>`.
+//! `--target deislet` (the default) deploys to this platform: the version is
+//! delivered to this platform's nodes. `--target cloudflare` records the same
+//! version, uploads the Cloudflare payload built from the same canonical
+//! artifact, and asks the control plane for a provider deployment: the
+//! Cloudflare provider driver installed on the control plane runs its steps
+//! (preflight, plan, prepare, upload, verify, activate) and this command
+//! follows the workflow until it settles. The environment must hold a grant
+//! on a Cloudflare provider target (`POST
+//! /api/v1/apps/{app}/environments/{env}/provider-target-grants`).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
+use deis_wire::CanonicalId;
 
-use crate::commands::{Session, build, project_dir};
-use crate::platform::{DeliveryReport, DeploymentResponse};
+use crate::commands::{Session, build, escaped, project_dir};
+use crate::platform::{
+    DeliveryReport, DeploymentResponse, ProviderArtifactRef, ProviderTargetGrant,
+};
 use crate::render::{Output, compatibility_line, short_digest};
 use crate::settings::Overrides;
+
+/// Where a deployment runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum DeployTarget {
+    /// This platform's own nodes.
+    #[default]
+    Deislet,
+    /// Cloudflare Workers, through the control plane's Cloudflare provider
+    /// driver.
+    Cloudflare,
+}
+
+impl DeployTarget {
+    /// The build target that produces this target's payload.
+    fn build_target(self) -> &'static str {
+        match self {
+            Self::Deislet => build::DEISLET_VENDOR,
+            Self::Cloudflare => "cloudflare",
+        }
+    }
+
+    /// The provider backend id a provider target of this kind drives.
+    fn backend_id(self) -> &'static str {
+        match self {
+            Self::Deislet => "deislet",
+            Self::Cloudflare => "cloudflare-workers-pages",
+        }
+    }
+}
 
 pub struct Args {
     pub app: Option<String>,
@@ -28,12 +62,10 @@ pub struct Args {
     /// Use the bundle the last build left behind instead of building again.
     pub no_build: bool,
     pub no_minify: bool,
-    /// Deploy to an external platform through its provider driver.
-    /// The control plane runs the driver binary and orchestrates the
-    /// lifecycle (preflight, plan, prepare, upload, verify, activate).
-    /// The driver binary for this vendor must be installed on the
-    /// control plane node that runs the workflow.
-    pub vendor: Option<String>,
+    pub target: DeployTarget,
+    /// Which provider target, by name or id, when the environment holds
+    /// grants on more than one of the chosen kind.
+    pub provider_target: Option<String>,
 }
 
 pub async fn execute(args: Args, output: Output) -> Result<()> {
@@ -46,18 +78,24 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     let environment = session.environment()?.to_string();
     let dir = project_dir()?;
 
-    // `--vendor` routes through the provider driver lifecycle on the
-    // control plane (preflight, plan, prepare, upload, verify, activate).
-    // The driver binary for that vendor must be installed on the control
-    // plane node that picks up the workflow. See `deis provider-deployments`
-    // for monitoring.
-    if args.vendor.is_some() {
-        bail!(
-            "`deis deploy --vendor` is not yet available in the CLI; use `deis build --vendor` \
-             to produce the artifact and initiate a provider deployment through the control \
-             plane API. The provider driver binary (`deis-provider-driver-cloudflare`) must \
-             be installed on the control plane node."
-        );
+    if args.target != DeployTarget::Deislet {
+        if args.bundle.is_some() || args.no_build {
+            bail!(
+                "--bundle and --no-build deploy a prebuilt Deislet bundle; a {} deployment builds \
+                 the bundle and the provider payload together so both derive from one canonical \
+                 artifact",
+                args.target.build_target()
+            );
+        }
+        if args.note.is_some() {
+            bail!(
+                "--note is recorded on a Deislet deployment; provider deployments do not carry one"
+            );
+        }
+        return deploy_to_provider(&session, &app, &environment, &dir, &args, output).await;
+    }
+    if args.provider_target.is_some() {
+        bail!("--provider-target chooses among provider targets; pass it with --target cloudflare");
     }
 
     output.line(format!(
@@ -251,6 +289,256 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     fail_on_incomplete_delivery(deployment.delivery.as_ref(), &environment)
 }
 
+/// Deploy through a provider driver: build, record the version and the
+/// provider payload, start a provider deployment and follow it.
+async fn deploy_to_provider(
+    session: &Session,
+    app: &str,
+    environment: &str,
+    dir: &Path,
+    args: &Args,
+    output: Output,
+) -> Result<()> {
+    let target = args.target;
+    output.line(format!(
+        "\n{} {} {} {} {} {}",
+        "Deploying".bold(),
+        app.cyan(),
+        "to".bold(),
+        environment.cyan(),
+        "on".bold(),
+        target.build_target().cyan()
+    ));
+    output.line(format!(
+        "  control plane  {}",
+        session.control.base_url().dimmed()
+    ));
+
+    let (bundle, payload) = {
+        let _quiet = output.json.then(crate::quiet::StdoutToStderr::start);
+        build::build_for_deploy(dir, Some(target.build_target()), !args.no_minify).await?
+    };
+    let payload = payload.expect("a provider build returns its payload");
+    let lineage = bundle
+        .lineage
+        .as_ref()
+        .expect("a fresh build always carries its lineage");
+    if bundle.manifest.app != app {
+        bail!(
+            "the bundle was built for application {:?} but this deploy is for {:?}; change \
+             \"name\" in .config.json or drop --app",
+            bundle.manifest.app,
+            app
+        );
+    }
+    output.line(format!(
+        "  {} built {} payload {} from canonical {}",
+        "✓".green(),
+        target.build_target(),
+        short_digest(&payload.payload_root_sha256),
+        short_digest(&lineage.artifact_sha256)
+    ));
+
+    // Resolved before anything is written: an environment that may not
+    // deploy to this kind of target should not collect versions it can
+    // never deploy there.
+    session.control.ensure_app(app).await?;
+    session.control.ensure_environment(app, environment).await?;
+    let grant = choose_provider_target(
+        &session
+            .control
+            .list_provider_target_grants(app, environment)
+            .await?,
+        target,
+        args.provider_target.as_deref(),
+        app,
+        environment,
+    )?;
+
+    let artifact = session
+        .control
+        .upload_canonical_artifact(app, bundle.canonical_transport()?, &lineage.artifact_sha256)
+        .await?;
+    if artifact.artifact.canonical_output.artifact_sha256 != lineage.artifact_sha256
+        || artifact.artifact.canonical_output.content_root_sha256 != lineage.content_root_sha256
+    {
+        bail!("the control plane recorded a different canonical artifact identity");
+    }
+    let upload = session
+        .control
+        .upload_version_with_lineage(
+            app,
+            artifact.artifact.artifact_id,
+            bundle.provider_envelope()?,
+            &bundle.digest,
+        )
+        .await?;
+    if upload.version.canonical_artifact_id != Some(artifact.artifact.artifact_id)
+        || upload.version.provider_derivation_sha256.as_deref()
+            != Some(lineage.derivation_manifest_sha256.as_str())
+    {
+        bail!("the control plane version does not preserve the uploaded artifact lineage");
+    }
+    let version_id = upload.version.canonical_id.ok_or_else(|| {
+        anyhow::anyhow!("the control plane answered the version without its canonical id")
+    })?;
+    output.line(format!(
+        "  {} version {} ({})",
+        "✓".green(),
+        upload.version.number,
+        if upload.created { "recorded" } else { "reused" }
+    ));
+    let stored = session
+        .control
+        .upload_provider_payload(app, artifact.artifact.artifact_id, payload.envelope()?)
+        .await?;
+    if stored.payload_root_sha256 != payload.payload_root_sha256
+        || stored.manifest_sha256 != payload.derivation_manifest_sha256
+        || stored.provider != payload.provider
+    {
+        bail!("the control plane recorded a different provider payload identity");
+    }
+    output.line(format!(
+        "  {} {} payload {}",
+        "✓".green(),
+        stored.provider,
+        if stored.created {
+            "stored"
+        } else {
+            "already stored"
+        }
+    ));
+
+    let accepted = session
+        .control
+        .begin_provider_deployment(
+            app,
+            environment,
+            grant.provider_target_id,
+            &ProviderArtifactRef {
+                artifact_version_id: version_id,
+                canonical_artifact_sha256: lineage.artifact_sha256.clone(),
+                provider_payload_sha256: payload.payload_root_sha256.clone(),
+            },
+        )
+        .await?;
+    output.line(format!(
+        "  {} provider deployment {} started on target {}",
+        "✓".green(),
+        accepted.operation_id.to_string().cyan(),
+        escaped(&grant.target_name)
+    ));
+    output.line(format!(
+        "\n  waiting for {} to finish...",
+        accepted.operation_id
+    ));
+    let settled = session
+        .control
+        .wait_for_provider_deployment(app, environment, accepted.operation_id)
+        .await?;
+    let succeeded = settled.operation.state == deis_wire::OperationState::Succeeded.as_str();
+
+    if output.json {
+        output.emit(&serde_json::json!({
+            "app": app,
+            "environment": environment,
+            "target": target.build_target(),
+            "providerTargetId": grant.provider_target_id,
+            "version": {
+                "number": upload.version.number,
+                "id": version_id,
+                "created": upload.created,
+            },
+            "artifact": {
+                "artifactVersionId": version_id,
+                "canonicalArtifactSha256": lineage.artifact_sha256,
+                "providerPayloadSha256": payload.payload_root_sha256,
+            },
+            "providerDeployment": settled,
+        }))?;
+    } else if succeeded {
+        println!(
+            "\n  {} {} of {} is deployed on {} ({})",
+            "✓".green(),
+            environment.cyan(),
+            app.cyan(),
+            target.build_target(),
+            accepted.operation_id
+        );
+    }
+    if !succeeded {
+        let reason = settled
+            .operation
+            .error
+            .as_ref()
+            .map(|error| format!(": {} {}", error.code, error.message))
+            .unwrap_or_default();
+        bail!(
+            "provider deployment {} ended {}{reason}; `deis provider-deployments get {}` shows \
+             every step",
+            accepted.operation_id,
+            settled.operation.state,
+            accepted.operation_id
+        );
+    }
+    Ok(())
+}
+
+/// Pick the one provider target of `target`'s kind this environment may
+/// deploy to, or the one `requested` names.
+fn choose_provider_target(
+    grants: &[ProviderTargetGrant],
+    target: DeployTarget,
+    requested: Option<&str>,
+    app: &str,
+    environment: &str,
+) -> Result<ProviderTargetGrant> {
+    let usable: Vec<&ProviderTargetGrant> = grants
+        .iter()
+        .filter(|grant| {
+            grant.backend_id == target.backend_id()
+                && grant.status == "active"
+                && grant.target_status == "active"
+        })
+        .collect();
+    let chosen: Vec<&ProviderTargetGrant> = match requested {
+        Some(requested) => {
+            let id = requested.parse::<CanonicalId>().ok();
+            usable
+                .iter()
+                .copied()
+                .filter(|grant| {
+                    Some(grant.provider_target_id) == id || grant.target_name == requested
+                })
+                .collect()
+        }
+        None => usable.clone(),
+    };
+    match chosen.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!(
+            "{environment} of {app} holds no active grant on a {} provider target{}. An operator \
+             registers the target (POST /api/v1/providers/installations/{{id}}/targets) and grants \
+             it to this environment (POST \
+             /api/v1/apps/{app}/environments/{environment}/provider-target-grants)",
+            target.build_target(),
+            requested
+                .map(|requested| format!(" named {}", escaped(requested)))
+                .unwrap_or_default()
+        ),
+        many => bail!(
+            "{environment} of {app} may deploy to {} {} provider targets ({}); choose one with \
+             --provider-target <name or id>",
+            many.len(),
+            target.build_target(),
+            many.iter()
+                .map(|grant| escaped(&grant.target_name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 /// Resolve only the non-secret values selected at deployment time. The
 /// bundle's declaration remains authoritative: a stale project file cannot
 /// silently attach values to a canonical artifact built from another set of
@@ -369,7 +657,7 @@ pub fn default_bundle_path(project_dir: &Path) -> Result<PathBuf> {
         build::DEISLET_VENDOR,
     )
     .context(
-        "resolving the last fully verified deislet build; run `deis build --vendor deislet` first",
+        "resolving the last fully verified deislet build; run `deis build --target deislet` first",
     )?;
     Ok(payload.join(deis_build::adapter_deislet::BUNDLE_FILE_NAME))
 }
@@ -437,6 +725,83 @@ mod tests {
     fn a_full_delivery_succeeds() {
         let delivery = report(&["node-a", "node-b"], &[], None);
         fail_on_incomplete_delivery(Some(&delivery), "production").unwrap();
+    }
+
+    fn grant(name: &str, backend: &str) -> ProviderTargetGrant {
+        ProviderTargetGrant {
+            grant_id: CanonicalId::new_v7(),
+            provider_target_id: CanonicalId::new_v7(),
+            backend_id: backend.to_string(),
+            target_name: name.to_string(),
+            target_status: "active".to_string(),
+            status: "active".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_one_cloudflare_grant_is_chosen_and_others_are_ignored() {
+        let grants = [
+            grant("edge", "cloudflare-workers-pages"),
+            grant("eo", "tencent-edgeone-makers"),
+        ];
+        let chosen = choose_provider_target(
+            &grants,
+            DeployTarget::Cloudflare,
+            None,
+            "demo",
+            "production",
+        )
+        .unwrap();
+        assert_eq!(chosen.target_name, "edge");
+    }
+
+    #[test]
+    fn no_grant_says_how_to_get_one_and_many_ask_which() {
+        let error = choose_provider_target(&[], DeployTarget::Cloudflare, None, "demo", "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider-target-grants"), "{error}");
+
+        let grants = [
+            grant("eu", "cloudflare-workers-pages"),
+            grant("us", "cloudflare-workers-pages"),
+        ];
+        let error = choose_provider_target(&grants, DeployTarget::Cloudflare, None, "demo", "prod")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--provider-target"), "{error}");
+        let by_name = choose_provider_target(
+            &grants,
+            DeployTarget::Cloudflare,
+            Some("us"),
+            "demo",
+            "prod",
+        )
+        .unwrap();
+        assert_eq!(by_name.target_name, "us");
+        let id = grants[0].provider_target_id.to_string();
+        let by_id =
+            choose_provider_target(&grants, DeployTarget::Cloudflare, Some(&id), "demo", "prod")
+                .unwrap();
+        assert_eq!(by_id.target_name, "eu");
+    }
+
+    #[test]
+    fn a_revoked_or_disabled_target_is_not_chosen() {
+        let mut revoked = grant("old", "cloudflare-workers-pages");
+        revoked.status = "revoked".to_string();
+        let mut disabled = grant("off", "cloudflare-workers-pages");
+        disabled.target_status = "disabled".to_string();
+        assert!(
+            choose_provider_target(
+                &[revoked, disabled],
+                DeployTarget::Cloudflare,
+                None,
+                "demo",
+                "prod"
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -59,7 +59,7 @@ provider_payload_dir() {
 # What the build's own log says was verified against a vendor's tool and what
 # was not, one clause per vendor target, for the evidence line below.
 #
-# `deis build -v all` runs `wrangler deploy --dry-run` and `deno check` when
+# `deis build --target all` runs `wrangler deploy --dry-run` and `deno check` when
 # those tools are on PATH and says at ⚠ when they are not; the tencent target
 # has no local dry-run at all and says so every time. The files and markers
 # the check asserts on are the same either way, so a ✓ that did not quote
@@ -116,9 +116,9 @@ check_every_compiler_target_is_built() {
   mkdir -p "$dir"
   cp -R "${PORTABLE_SRC_DIR}/." "$dir/"
 
-  if ! ( cd "$dir" && "${BIN_DIR}/deis" build -v all ) > "$log" 2>&1; then
+  if ! ( cd "$dir" && "${BIN_DIR}/deis" build --target all ) > "$log" 2>&1; then
     fail_check "$title" \
-      "deis build -v all failed: $(tail -n 6 "$log" | tr '\n' ' ' | head -c 300)"
+      "deis build --target all failed: $(tail -n 6 "$log" | tr '\n' ' ' | head -c 300)"
     return
   fi
 
@@ -191,12 +191,12 @@ BUNDLE
   faults=$(echo "$faults" | sed 's/^ *//; s/ *$//')
   if [ -n "$faults" ]; then
     fail_check "$title" \
-      "deis build -v all reported success, but: ${faults}. The build said: $(tail -n 5 "$log" | tr '\n' ' ' | head -c 200)"
+      "deis build --target all reported success, but: ${faults}. The build said: $(tail -n 5 "$log" | tr '\n' ' ' | head -c 200)"
     return
   fi
 
   pass_check "$title" \
-    "one \`deis build -v all\` over ${PORTABLE_SRC_DIR} published one canonical parent and four immutable payload directories under dist/providers/<vendor>/<digest>. Deislet carries bundle.zip, Cloudflare carries index.js plus the wrangler.toml naming \"portable\", Deno carries the reconstructed canonical module and its generated catch-all router, and EdgeOne carries edge-functions/index.js plus edgeone.json. Every entry carries the handler's own marker, and Cloudflare's and EdgeOne's differ from one another, so each packager built the shape its host expects from the same parent rather than copying one output four times. The files are this compiler's own work; what a vendor's tool said about them on this machine, from the build log: ${verified}. A target marked NOT verified was verified nowhere in this run"
+    "one \`deis build --target all\` over ${PORTABLE_SRC_DIR} published one canonical parent and four immutable payload directories under dist/providers/<vendor>/<digest>. Deislet carries bundle.zip, Cloudflare carries index.js plus the wrangler.toml naming \"portable\", Deno carries the reconstructed canonical module and its generated catch-all router, and EdgeOne carries edge-functions/index.js plus edgeone.json. Every entry carries the handler's own marker, and Cloudflare's and EdgeOne's differ from one another, so each packager built the shape its host expects from the same parent rather than copying one output four times. The files are this compiler's own work; what a vendor's tool said about them on this machine, from the build log: ${verified}. A target marked NOT verified was verified nowhere in this run"
 }
 
 # The application the check below tries, and fails, to deploy. A name of its

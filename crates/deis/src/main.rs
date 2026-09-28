@@ -4,9 +4,10 @@
 //!
 //! * `init` / `dev` / `validate` / `build` work on the project on disk and
 //!   `targets` reads the locked conformance registry; they need no running
-//!   platform. `build --vendor cloudflare|deno|tencent`
-//!   produces what that vendor's own tooling deploys; this CLI never pushes
-//!   to them.
+//!   platform. `build --target cloudflare` produces the Cloudflare payload;
+//!   `deploy --target cloudflare` hands it to the control plane's Cloudflare
+//!   provider driver. The frozen Deno and EdgeOne targets are built only when
+//!   named and are never deployed by this CLI.
 //! * `deploy` / `versions` / `deployments` / `rollback` / `status` /
 //!   `routes` / `domains` / `secret` / `logs` /
 //!   `tail` / `trace` / `kv` / `db` / `blob` talk to a Deislet platform - a
@@ -188,10 +189,14 @@ enum Commands {
     },
 
     /// Compile the project for one or more targets.
+    ///
+    /// Without --target, builds every target .config.json enables except the
+    /// frozen ones (deno, tencent), which are built only when named.
     Build {
-        /// Targets: deislet, cloudflare, deno, tencent, or all.
-        #[arg(short, long, default_values_t = vec!["all".to_string()])]
-        vendor: Vec<String>,
+        /// Targets: deislet, cloudflare, deno, tencent, or all (every enabled
+        /// target, frozen ones included). Repeatable.
+        #[arg(short, long = "target", value_name = "TARGET")]
+        targets: Vec<String>,
 
         /// Not implemented, and refused rather than ignored: `deis dev`
         /// is what rebuilds and reloads on every change.
@@ -203,10 +208,13 @@ enum Commands {
         no_minify: bool,
     },
 
-    /// Build, upload as a version, and point an environment at it.
+    /// Build, upload as a version, and deploy it.
     ///
-    /// This deploys to this platform. For Cloudflare, Deno or EdgeOne run
-    /// `deis build --vendor <name>` and then that vendor's own tool.
+    /// `--target deislet` (the default) points an environment of this
+    /// platform at the version. `--target cloudflare` also uploads the
+    /// Cloudflare payload and runs a provider deployment through the control
+    /// plane's Cloudflare provider driver, following it until it settles; the
+    /// environment needs a grant on a Cloudflare provider target.
     Deploy {
         #[command(flatten)]
         target: Target,
@@ -230,13 +238,14 @@ enum Commands {
         #[arg(long)]
         no_minify: bool,
 
-        /// Deploy to an external platform through its provider driver.
-        #[arg(
-            long,
-            value_name = "VENDOR",
-            help = "Provider driver vendor (e.g., cloudflare)"
-        )]
-        vendor: Option<String>,
+        /// Where to deploy.
+        #[arg(long = "target", value_enum, default_value_t = commands::deploy::DeployTarget::Deislet)]
+        deploy_target: commands::deploy::DeployTarget,
+
+        /// The provider target (name or id) to deploy to, when the
+        /// environment holds grants on more than one of the chosen kind.
+        #[arg(long, value_name = "NAME_OR_ID")]
+        provider_target: Option<String>,
     },
 
     /// List an application's versions and which environments run them.
@@ -1282,10 +1291,10 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Validate { strict } => commands::validate::execute(strict).await,
 
         Commands::Build {
-            vendor,
+            targets,
             watch,
             no_minify,
-        } => commands::build::execute(vendor, watch, !no_minify).await,
+        } => commands::build::execute(targets, watch, !no_minify).await,
 
         Commands::Deploy {
             target,
@@ -1294,7 +1303,8 @@ async fn run(cli: Cli) -> Result<()> {
             bundle,
             no_build,
             no_minify,
-            vendor,
+            deploy_target,
+            provider_target,
         } => {
             commands::deploy::execute(
                 commands::deploy::Args {
@@ -1304,7 +1314,8 @@ async fn run(cli: Cli) -> Result<()> {
                     bundle,
                     no_build,
                     no_minify,
-                    vendor,
+                    target: deploy_target,
+                    provider_target,
                 },
                 format.into(),
             )
@@ -2041,17 +2052,37 @@ mod tests {
         );
     }
 
-    /// Deploying a vendor routes through the provider driver on the
-    /// control plane (preflight/plan/prepare/upload/verify/activate).
+    /// Both `build` and `deploy` choose where with `--target`; `--vendor`
+    /// is not a flag anywhere, and `deploy` knows only the targets it can
+    /// actually deploy to.
     #[test]
-    fn deploy_accepts_vendor_flag() {
+    fn build_and_deploy_choose_a_target() {
+        let Ok(Cli {
+            command: Commands::Deploy { deploy_target, .. },
+            ..
+        }) = Cli::try_parse_from(["deis", "deploy", "--target", "cloudflare"])
+        else {
+            panic!("deploy --target cloudflare must parse");
+        };
+        assert_eq!(deploy_target, commands::deploy::DeployTarget::Cloudflare);
+        let Ok(Cli {
+            command: Commands::Deploy { deploy_target, .. },
+            ..
+        }) = Cli::try_parse_from(["deis", "deploy"])
+        else {
+            panic!("a bare deploy must parse");
+        };
+        assert_eq!(deploy_target, commands::deploy::DeployTarget::Deislet);
+        for frozen in ["deno", "tencent"] {
+            assert!(
+                Cli::try_parse_from(["deis", "deploy", "--target", frozen]).is_err(),
+                "deploy accepted the frozen target {frozen}"
+            );
+        }
+        assert!(Cli::try_parse_from(["deis", "deploy", "--vendor", "cloudflare"]).is_err());
+        assert!(Cli::try_parse_from(["deis", "build", "--vendor", "cloudflare"]).is_err());
         assert!(
-            Cli::try_parse_from(["deis", "deploy", "--vendor", "cloudflare"]).is_ok(),
-            "deploy must not accept --vendor"
-        );
-        assert!(
-            Cli::try_parse_from(["deis", "build", "--vendor", "cloudflare"]).is_ok(),
-            "build is where a vendor is chosen"
+            Cli::try_parse_from(["deis", "build", "-t", "cloudflare", "-t", "deislet"]).is_ok()
         );
     }
 
