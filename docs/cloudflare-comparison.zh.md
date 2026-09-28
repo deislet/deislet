@@ -4,18 +4,32 @@
 > 合规矩阵。`edge-canon.next` 的证据成熟度与认证只能由独立 Edge Canon
 > conformance registry 给出；当前入口见 [`docs/product/README.md`](product/README.md)。
 >
-> **口径更新（2026-09-25，T5-2）：** Cloudflare 已从「只生成无状态函数产物」升级为
-> 支持目标：`deis build --target cloudflare` 现按 binding plan 把 named KV/SQL/Blob/Queue
-> 绑定映射到 `[[kv_namespaces]]`/`[[d1_databases]]`/`[[r2_buckets]]`/`[[queues.*]]`、
-> 把 `cron` 写进 `[triggers]`、生成 `queue`/`scheduled` 导出（资源 ID 是占位引用，由
-> provider driver 在 prepare 阶段回填，见 [ADR-008](adr/008-logical-resource-bindings.md)
-> 的差异处理表）。相应地，本文表格里 Deislet 侧的若干数值上限已按共享标准收敛到
-> 与 Cloudflare 一致：KV key 512B、metadata 1 KiB、TTL ≥ 60 秒、list 单页 1000；
-> SQL 单值 2,000,000 字节、单条语句 100,000 字节；Queue 消息 128 KB、投递次数默认 3。
-> 「SQL：交互式事务 ✅（比 CF D1 强）」这一行改为：交互式事务仍是 deislet 自有能力的超集，
-> 但已不再是标准面的一部分——Edge Canon proposal（`standards/proposals/0002-*.zh.md`）
-> 建议标准 SQL 仅含 `prepare/bind/first/all/run/batch`；proposal 通过前，使用
-> `transaction()` 的应用编译到 Cloudflare 报 `EC_BINDING_TARGET_UNIMPLEMENTED`，
+> **口径更新（2026-09-28）：** Cloudflare 是两个支持目标之一（另一个是自托管的 Deislet）。现状分三层，
+> 按已验证的程度写：
+>
+> - **构建（已实现，本地测试覆盖）：** `deis build --target cloudflare` 按 binding plan 把 named
+>   KV/SQL/Blob/Queue 绑定映射到 `[[kv_namespaces]]`/`[[d1_databases]]`/`[[r2_buckets]]`/`[[queues.*]]`，
+>   把 `cron` 写进 `[triggers]`，生成 `queue`/`scheduled` 导出。资源 ID 在产物里是
+>   `deis:unresolved/<kind>/<name>` 占位引用，由 provider driver 在 prepare 阶段创建按应用与环境
+>   加命名空间的资源后回填（见 [ADR-008](adr/008-logical-resource-bindings.md) 的差异处理表）。
+> - **部署（已实现，只对假 wrangler 验证过）：** `deis deploy --target cloudflare` 在同一次编译里产出
+>   Deislet bundle 与 Cloudflare payload，上传 canonical artifact、版本与 payload
+>   （`POST /api/v1/apps/{app_id}/artifacts/{artifact_id}/provider-payloads`），再调用 control 的
+>   provider deployment API；control 把按摘要复核过的 payload 放进每次操作私有的工作目录交给
+>   `deis-provider-driver-cloudflare`，由它驱动 wrangler 走 preflight → plan → prepare → upload →
+>   verify → activate → observe。这条链路的测试用的是记录调用、返回真实 wrangler 输出与退出码的
+>   假 wrangler 可执行文件，**尚未在真实 Cloudflare 账号上验证**。真实账号验证用
+>   [`scripts/cloudflare-smoke.sh`](../scripts/cloudflare-smoke.sh)（或手动触发的
+>   `.github/workflows/cloudflare-smoke.yml`），跑通之前不应把 Cloudflare 部署当作已验证能力。
+>   运维接入步骤见 [`docs/operations/cloudflare.md`](operations/cloudflare.md)。
+> - **未做：** D1 迁移（ADR-008 T5-3）；control 目前不把环境的 secret 与部署期配置值交给 driver。
+>
+> 相应地，本文表格里 Deislet 侧的若干数值上限已按共享标准收敛到与 Cloudflare 一致：KV key 512B、
+> metadata 1 KiB、TTL ≥ 60 秒、list 单页 1000；SQL 单值 2,000,000 字节、单条语句 100,000 字节；
+> Queue 消息 128 KB、投递次数默认 3。「SQL：交互式事务 ✅（比 CF D1 强）」这一行改为：交互式事务
+> 仍是 deislet 自有能力的超集，但已不再是标准面的一部分——Edge Canon proposal
+> （`standards/proposals/0002-*.zh.md`）建议标准 SQL 仅含 `prepare/bind/first/all/run/batch`；
+> proposal 通过前，使用 `transaction()` 的应用编译到 Cloudflare 报 `EC_BINDING_TARGET_UNIMPLEMENTED`，
 > 编译到 deislet 不受影响。本文以下正文保留 2026-08-31 快照原文，不逐行改写。
 
 日期：2026-08-31。对照的代码是 `3753cb2`。

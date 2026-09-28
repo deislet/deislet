@@ -89,7 +89,7 @@
     {
       "id": "tencent-edgeone-makers",
       "displayName": "Tencent EdgeOne Makers",
-      "role": "first-class",
+      "role": "experimental",
       "lifecycle": "frozen",
       "implementation": {
         "repository": "https://github.com/deislet/deislet",

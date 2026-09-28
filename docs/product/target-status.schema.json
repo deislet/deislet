@@ -121,6 +121,10 @@
       },
       "allOf": [
         {
+          "if": {"properties": {"lifecycle": {"const": "frozen"}}},
+          "then": {"properties": {"role": {"const": "experimental"}}}
+        },
+        {
           "if": {"properties": {"certification": {"properties": {"supported": {"const": true}}}}},
           "then": {"properties": {"certification": {"properties": {"compliant": {"const": true}}}}}
         },
