@@ -104,10 +104,10 @@ bundle_sha + 环境表），节点自己用 HTTP 把包拉下来、校验 sha256
 
 ```
 scripts/demo-assets/example-app/
-  .config.json                     声明服务（kv + queue）、具名绑定（`HOT` / `COLD` 两个
-                                   kv 命名空间，`AUTH` 一个指向 demo-auth 的服务绑定）、
+  .config.json                     具名绑定（`KV` / `HOT` / `COLD` 三个 kv 命名空间、`jobs`
+                                   队列，`AUTH` 一个指向 demo-auth 的服务绑定）、
                                    队列 jobs（batchSize 10、maxConcurrency 2）、cron「每分钟」、
-                                   密钥名 DEMO_SECRET、变量 BUILD_LABEL 与 ASSETS、
+                                   密钥名 DEMO_SECRET、配置项 BUILD_LABEL 与 LOG_LEVEL、
                                    资产目录与 notFound、limits（timeoutMs / memoryMb /
                                    maxSubrequests）与 compatibilityDate（见下文）
   public/index.html                静态资产，`/` 直接命中它，不起 Isolate
@@ -173,11 +173,11 @@ manifest，版本加载时编译一次，之后每个请求在**起 Isolate 之�
 `_redirects` 与 `_headers` 本身不会进包，否则任何人问一句 `/_redirects` 就能把作者的
 路由表读走。函数路由仍然优先：`/hello/world` 走的是处理函数，不会被 404 页面吃掉。
 
-`.config.json` 里的 `environment.variables.ASSETS` 是**故意声明的**：`ASSETS` 是平台
-保留名，节点在把这张表交给 `context.env` 之前会把它摘掉，再把 `env.ASSETS` 这个绑定
-装上去。所以应用声明同名变量拿不到自己那串字符串，拿到的仍是绑定——
-`functions/api/asset.ts` 把 `env.ASSETS` 到底是什么一并回报出来，`verify` 就是照这个
-判的。
+`ASSETS` 是平台保留名：应用在 `environment.declarations` 里声明同名项，构建就以
+`EC_ENV_NAMESPACE_COLLISION` 拒绝，所以示例应用没有、也不可能有这个声明。`verify` 另起
+一个声明了 `ASSETS` 的小项目去部署，确认它被构建拒绝、什么都没留下；再由
+`functions/api/asset.ts` 回报示例应用里 `env.ASSETS` 到底是什么——带 `fetch()` 的平台
+绑定。
 
 `.config.json` 里的 `limits` 是应用给自己提的**上限申请**：这里写 `timeoutMs: 1000`
 （节点自己允许 30000）与 `memoryMb: 32`（节点自己允许 256）。方向是单向的——应用只能
@@ -251,7 +251,7 @@ API key 能不能从控制面领到那张令牌。
 | | `GET /css/app.css` 与 `GET /` 各一发 | `_headers` 里 `/css/*` 那一块的强缓存只落在它点名的文件上，`/` 保持节点自己的默认；`/*` 那一块的头两边都有。只问一个文件分不出「按路径匹配」和「全都加上」 |
 | | `GET /no-such-page` | 无人认领的路径按应用自己选的 `notFound` 回：404 状态 + 包里那份 `404.html`（页面上有个别处没有的标记）。函数路由不受影响，`/hello/world` 仍走处理函数 |
 | | `GET /api/asset?path=/css/app.css` | 处理函数里 `env.ASSETS.fetch()` 取回的就是本版包里那个文件：字节数与磁盘上那份一致、内容摘要一致。这条不走网络，字节自版本加载起就在节点内存里 |
-| | 同一处理函数回报的 `env.ASSETS` 是什么 | 应用在自己的 `environment.variables` 里声明了 `ASSETS`，节点在交出 `context.env` 之前把它摘掉并记了一行日志；Isolate 里 `env.ASSETS` 仍是那个带 `fetch()` 的绑定，不是应用发的字符串 |
+| | 同一处理函数回报的 `env.ASSETS` 是什么 | 另一个在 `environment.declarations` 里声明了 `ASSETS` 的项目被构建以 `EC_ENV_NAMESPACE_COLLISION` 拒绝，控制面里也查不到它；示例应用 Isolate 里的 `env.ASSETS` 是那个带 `fetch()` 的平台绑定 |
 | 路由 | `GET /hello/world` | 路由占位符进了 `context.params` |
 | | 同一个域名下不同路径前缀各打一发，经 deis-proxy | 前门是按**域名加路径前缀**选应用的，不是只看域名——目录里的路由表真的影响了去向 |
 | 流式响应 | 经 `deis-proxy` 取一条 5 帧的 SSE，逐帧记到达时间 | 头 13 毫秒就到了，5 帧分别在 13/165/316/470/621 毫秒到——处理函数每帧之间停 150 毫秒，所以这个间隔不可能出自一个先攒齐再发的响应体。最后收到了结束块，客户端看到的是一次完整的响应 |

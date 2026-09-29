@@ -172,7 +172,6 @@ bundle as an immutable version, and point the environment at it.
 deis deploy
 deis deploy -e preview --note "trying the new cache"
 deis deploy --no-build            # use the bundle the last build left
-deis deploy --bundle path/to/bundle.zip
 ```
 
 It prints the version number, the digest, and which nodes took it. **A node

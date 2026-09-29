@@ -151,8 +151,8 @@ deis-runtime 只认一个默认导出，每个请求调一次。生成的入口�
 4. 只有 handler 与响应正文生命周期都结束后才关闭 `waitUntil` 登记；已登记任务逐项独立结算；
 5. 谁都没匹配上时返回 404。
 
-具名逻辑资源从 `context.env.<NAME>` 访问。原生遗留的 `context.services`、
-`context.bindings`，以及 `context.path` 等便利字段不会进入标准 context。
+具名逻辑资源从 `context.env.<NAME>` 访问。`context.path`、`context.services`、
+`context.bindings` 等便利字段不属于标准 context，handler 读取它们时构建直接拒绝。
 
 ## `.config.json` 里与本目标相关的字段
 
@@ -162,14 +162,16 @@ deis-runtime 只认一个默认导出，每个请求调一次。生成的入口�
   "functionRoot": "./functions",
   "assets": { "dir": "./public", "notFound": "single-page-app" },
   "environment": {
-    "variables": { "LOG_LEVEL": "info" },
-    "secrets": ["API_KEY"]
+    "declarations": [
+      { "name": "LOG_LEVEL", "kind": "config", "valueType": "string", "required": true },
+      { "name": "API_KEY", "kind": "secret", "valueType": "string", "required": true }
+    ],
+    "values": { "LOG_LEVEL": "info" }
   },
-  "services": {
-    "kv": { "enabled": true },
-    "database": { "enabled": true },
-    "blob": { "enabled": false },
-    "queue": { "enabled": false }
+  "bindings": {
+    "CACHE": { "kind": "kv" },
+    "DB": { "kind": "database" },
+    "jobs": { "kind": "queue" }
   },
   "cron": ["0 */6 * * *"],
   "queues": [{ "name": "jobs", "batchSize": 10 }],
@@ -181,7 +183,8 @@ deis-runtime 只认一个默认导出，每个请求调一次。生成的入口�
 - `name` 就是控制面里的 `app_id`，包会归档在这个应用名下。
 - `assets.dir` 不写也生效，默认 `./public`；目录不存在就是没有静态文件，不算错误。
 - `assets.notFound` 就是上面那三选一；不写时按包里有没有 `404.html` 推断。
-- `secrets` **只有名字进包**，值永远由控制面持有，部署时才下发给节点。
+- `environment.declarations` 声明 `context.env` 里能有什么。`config` 的值写在 `environment.values`；`secret` **只有名字进包**，值永远由控制面持有，部署时才下发给节点。
+- `bindings` 是具名逻辑资源，以 `context.env.<NAME>` 访问。
 - `cron` / `queues` 原样进 manifest，调度是控制面的事。
 - `limits` 是应用给自己提的上限申请，方向**只能是收紧**：`memoryMb`、`timeoutMs`、`cpuTimeLimitMs`、`rateLimitOpsPerSec`、`resourceTableMax`，每个都可不写，不写就是「节点的默认值」。它会译成 manifest 里的同名块，控制面在上传时校验，每个节点再对着自己的天花板夹一次——要得比节点宽的，拿到的是节点那个数，外加一行同时写着两个数字的日志。字段名写错是构建失败而不是被丢掉：作者以为设上了、其实从没生效的上限，正是这个字段存在要防的那件事。写 0 同样被拒，因为在线上 0 就是「没设」的意思。
 

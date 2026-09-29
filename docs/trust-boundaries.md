@@ -138,9 +138,8 @@ The control plane's human listener still carries `EstablishChannel` as well,
 and it admits nobody there: that listener has no acceptor, so no connection on
 it proves a name, and the handshake message says so rather than checking a
 field (`crates/deis-control/src/api/grpc.rs`). The HTTP routes a node used to
-call are not mounted anywhere - `deis_wire::conventions::NODE_REGISTRATION_ROUTE`,
-`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`, `/api/routing-table` and the
-bundle download all answer **404** on the human listener, to every caller, with
+call are not mounted anywhere - node registration, the assignment list,
+`/api/routing-table` and the bundle download all answer **404** on the human listener, to every caller, with
 or without a credential. Not 401: a credential cannot bring them back.
 
 ## How a person proves who they are
@@ -547,9 +546,9 @@ looks like a missing filter and is not one.
 takes a `node_id`, uses it for log lines, and builds the answer from
 `list_assignments()` - the whole catalog. The machine channel does check that a
 caller asks for its *own* id and refuses a mismatch, so no node can ask for
-another node's list. But the list it gets for itself carries every
-application's decrypted secrets, and adding a filter there would change
-nothing: a deployment plan's `target_ids` comes from
+another node's list. But the list it gets for itself names every
+application's deployment, and with it every secret revision the node may then
+fetch with `FetchSecretValues`; adding a filter there would change nothing: a deployment plan's `target_ids` comes from
 `Deliverer::serving_target_ids` (`crates/deis-control/src/delivery/mod.rs`),
 which is every node the control plane knows of. There is no placement model in
 this release - no way to say that an application runs on some nodes and not

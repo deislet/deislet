@@ -4,9 +4,10 @@ How the logical resources exposed through `context.env.<NAME>` reach Deislet's
 runtime services: which op talks to which backend, what crosses the Rust/JS
 boundary as bytes versus text, and what happens when a resource was never
 wired up for this deployment. The runtime still contains an unnamed
-`context.services.*` layer for schema-1 migration and non-HTTP event internals;
-it is not part of the standard HTTP context and new applications must not use
-it.
+`context.services.*` layer, which the queue and scheduled handlers' context
+still carries. It is not part of the standard HTTP context, the build refuses
+an HTTP handler that reads it, and applications must not use it; removing it
+is outstanding work.
 
 | Service | Backend | Where |
 |---|---|---|

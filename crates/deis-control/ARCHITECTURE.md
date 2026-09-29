@@ -179,9 +179,10 @@ points at it. That is what makes a rollback a pointer move.
 ### 5. Delivery (`src/delivery/`)
 
 Turns a catalog change into an `ApplyDeployment` call on every node in the
-fleet: app, version, environment, bundle URL, digest, and the env map
-(manifest variables plus secrets decrypted at send time). The bundle itself is
-fetched by the node over HTTP. Deploy, rollback and secret change all end here,
+fleet: app, version, environment, bundle URL, digest, and the environment
+snapshot the deployment pins (declarations and config values, never a secret
+value). The node fetches the bundle over the machine channel and the secret
+values by revision with `FetchSecretValues`, under its own name. Deploy, rollback and secret change all end here,
 and the response says which nodes took it and which did not.
 
 ### 6. Scheduler (`src/scheduler/`)
