@@ -23,16 +23,11 @@ English: [README.md](README.md)。
 | `ENVIRONMENT_HEADER`（`x-deis-environment`） | 是这个应用的哪个环境；不带就是 `DEFAULT_ENVIRONMENT` |
 | `DEFAULT_ENVIRONMENT`（`production`） | 让还不知道有「环境」这回事的调用方也能落到一个说得通的地方 |
 | `BINDING_HEADER`（`x-deis-binding`） | 存储调用要租户里的哪个命名空间；租户本身由调用携带的 capability 决定 |
-| `tenant_id(app, env)` / `split_tenant` / `is_valid_tenant_part` | telemetry 用来归属记录的 `demo.production` 标签；存储改按 `CanonicalTenantId` 键控 |
+| `tenant_id(app, env)` / `split_tenant` / `is_valid_tenant_part` | 记录展示时用的可读标签 `demo.production`；存储与 telemetry 都按 `CanonicalTenantId` 归属数据 |
 | `MAX_GRPC_MESSAGE_BYTES`（16 MB） | 一个上限，两个方向，全部服务通用 |
 | `STREAM_CHUNK_BYTES`（1 MB） | blob 上传下载的分块大小 |
 | `STORE_ENDPOINT_ENV` / `QUEUE_ENDPOINT_ENV` | 装存储地址的保留 env 键，进 Isolate 之前会被取走 |
-| `NODE_REGISTRATION_ROUTE` / `NODE_ASSIGNMENTS_ROUTE` | axum 的 `:id` 路由模板 |
-| `node_registration_path(id)` / `node_assignments_path(id)` | 客户端拼具体路径的那一半 |
 | `ASSIGNMENTS_COMPLETE_HEADER` / `ASSIGNMENTS_WITHHELD_HEADER` | 这份清单是不是这个节点的全部真相 |
-
-那两个路由常量之所以存在，是因为它们曾经不存在：节点去请求 `/register`，控制面提供的
-是 `/registration`，两边都编译得过，唯一的症状是一支里面一个节点都没有的机队。
 
 ## 节点链路
 

@@ -102,4 +102,4 @@ pub use client::{CatalogClient, FetchError, routing_table_client};
 pub use persist::{CacheError, RoutingTableCache, StoredRoutingTable};
 pub use service::CatalogPoller;
 pub use table::{CatalogRoutes, Match, MatchSource, PreviewZone, Target};
-pub use wire::{ROUTING_TABLE_PATH, RoutingTableDocument};
+pub use wire::RoutingTableDocument;

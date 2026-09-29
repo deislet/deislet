@@ -223,33 +223,6 @@ pub const STORE_ENDPOINT_ENV: &str = "DEIS_STORE_ENDPOINT";
 /// `http://127.0.0.1:8091`. Same contract as [`STORE_ENDPOINT_ENV`].
 pub const QUEUE_ENDPOINT_ENV: &str = "DEIS_QUEUE_ENDPOINT";
 
-// ---- the node-facing control plane (legacy HTTP routes) ---------------
-//
-// These path constants were once the contract between deis-control
-// (which served them on its human HTTP listener) and deis-runtime
-// (which called them with bearer credentials).  Since the machine
-// channel landed (ADR-025), node registration, assignment fetch,
-// and routing-table delivery moved to the machine listener's gRPC
-// surface (`deis.machine.MachineChannel`).  The constants remain as
-// documentation anchors — they are no longer mounted as HTTP routes
-// anywhere in the production code path.
-//
-// The function counterparts `node_registration_path` and
-// `node_assignments_path` were deleted because nothing called them
-// after the HTTP fallback paths were gated behind a startup check.
-
-/// Route template for a node's registration (no longer mounted).
-pub const NODE_REGISTRATION_ROUTE: &str = "/api/nodes/:id/registration";
-
-/// Route template for a node's assignment list (no longer mounted).
-pub const NODE_ASSIGNMENTS_ROUTE: &str = "/api/nodes/:id/assignments";
-
-/// Path the control plane once served its routing table on, and deis-proxy
-/// once polled.  The routing table is now delivered via
-/// `deis.machine.MachineChannel/FetchRoutingTable`; deis-proxy's wire
-/// module keeps this constant for contract tests.
-pub const ROUTING_TABLE_ROUTE: &str = "/api/routing-table";
-
 /// Response header on an assignment list saying whether the list is the whole
 /// truth for that node.
 ///

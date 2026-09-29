@@ -1,4 +1,5 @@
-//! The document `deis-control` serves at [`ROUTING_TABLE_PATH`], and the
+//! The routing table `deis-control` hands out over the machine channel's
+//! `FetchRoutingTable`, and the
 //! rules a copy of it has to pass before any of it is believed.
 //!
 //! Validation here is deliberately all-or-nothing. Every field below ends up
@@ -14,14 +15,6 @@
 //! put a document it accepted into a file byte for byte.
 
 use serde::{Deserialize, Serialize};
-
-/// Path the control plane serves the routing table on.
-///
-/// The one definition lives in `deis_wire::conventions`, which is also what
-/// `deis-control` mounts the route from. The two crates do not depend on
-/// each other, so a path each spelled for itself would compile perfectly
-/// while the edge polled an address nothing served.
-pub const ROUTING_TABLE_PATH: &str = deis_wire::conventions::ROUTING_TABLE_ROUTE;
 
 /// One route: a host and path prefix bound to one environment of one app.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -306,18 +299,10 @@ mod tests {
 
     /// The half of the contract this crate owns.
     ///
-    /// deis-control serves this path from the same
-    /// `deis_wire::conventions::ROUTING_TABLE_ROUTE`, so the address itself
-    /// can no longer drift. The field names still can: nothing type-checks
-    /// the JSON across the two crates, so this test and its twin over there
-    /// are what hold the shape together.
+    /// Nothing type-checks the JSON across the two crates, so this test and
+    /// its twin in deis-control are what hold the shape together.
     #[test]
     fn the_wire_contract_is_the_one_deis_control_serves() {
-        assert_eq!(
-            ROUTING_TABLE_PATH, "/api/routing-table",
-            "deis-control mounts this path from the same deis_wire constant"
-        );
-
         // Written out the way the control plane serialises it, field for
         // field, rather than built with the types under test.
         let document: RoutingTableDocument = serde_json::from_str(
