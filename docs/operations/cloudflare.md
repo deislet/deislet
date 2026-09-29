@@ -119,6 +119,15 @@ row saying so (`secret.provider-delivery`, naming the revisions and a count,
 never a value) is durable: if the audit log cannot be written, the step is
 not started and waits to be retried.
 
+What that does not hide: the driver process holds the values in its own
+environment block for as long as it runs, so they are readable from
+`/proc/<pid>/environ` by the control plane's own uid (and root) while a step
+is in flight. The driver zeroizes the copy it parses and starts wrangler
+with a cleared environment, handing the secrets over on stdin, but zeroizing
+a copied string does not rewrite the environment block the kernel exposes.
+Run the control plane under a uid nothing else uses; anything that can read
+that uid's processes can already read the control plane's secret key.
+
 ## How a deployment reaches Cloudflare
 
 Each lifecycle step is one wrangler 4.129.0 command (the full table is at the
@@ -201,8 +210,11 @@ The Worker is removed and the data is kept. To destroy the data as well, the
 request carries `"purgeData": {"environment": "<environment name>"}` (`deis
 undeploy --purge-data <environment>`); the name must be the environment in
 the request path, so a consent written for one environment can never be
-applied to another. The consent is recorded on the workflow (`purgeData`)
-and handed to the driver for that workflow's steps only.
+applied to another. Purging also needs `admin:<app>/<env>`: a deploy-scoped
+token (a CI token, say) may take a deployment down but may not destroy the
+environment's KV, D1, R2 and queue contents. The consent is recorded on the
+workflow (`purgeData`) and handed to the driver for that workflow's steps
+only.
 
 ## D1 migrations
 

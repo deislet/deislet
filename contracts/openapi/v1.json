@@ -7320,7 +7320,7 @@
               },
               {
                 "$ref": "#/components/schemas/PurgeDataConsent",
-                "description": "Consent to destroy the environment's provider data - KV namespaces,\ndatabases, buckets and queues - along with the deployment. Left out,\nonly the deployment is removed and the data is kept."
+                "description": "Consent to destroy the environment's provider data - KV namespaces,\ndatabases, buckets and queues - along with the deployment. Left out,\nonly the deployment is removed and the data is kept. Purging needs\nadmin over the environment; undeploying alone needs deploy."
               }
             ]
           }

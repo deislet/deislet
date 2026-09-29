@@ -56,7 +56,7 @@ use crate::{
         ProviderTargetGrantMutationContext, ProviderTargetGrantSpec,
         ProviderTargetGrantStatusFilter, ProviderTargetSpec, ProviderUndeploySpec, SecretsBackend,
     },
-    identity::Principal,
+    identity::{Demand, Principal, Selector, Verb},
 };
 
 const REQUEST_ID: &str = "x-request-id";
@@ -180,7 +180,8 @@ pub struct UndeployProviderDeploymentRequest {
     pub provider_target_id: Option<CanonicalId>,
     /// Consent to destroy the environment's provider data - KV namespaces,
     /// databases, buckets and queues - along with the deployment. Left out,
-    /// only the deployment is removed and the data is kept.
+    /// only the deployment is removed and the data is kept. Purging needs
+    /// admin over the environment; undeploying alone needs deploy.
     #[serde(default)]
     pub purge_data: Option<PurgeDataConsent>,
 }
@@ -2390,6 +2391,25 @@ pub async fn undeploy_provider_deployment(
             )));
         }
     };
+    if purge_data {
+        // Taking a deployment down is a deployer's call; destroying the
+        // environment's provider data is not. A deploy-scoped CI token must
+        // not be able to erase KV, D1, R2 and queue contents by naming the
+        // environment, so purging needs admin over this application and
+        // environment on top of the route's own deploy requirement.
+        let demand = Demand {
+            verb: Verb::Admin,
+            app: Selector::One(&app_id),
+            environment: Selector::One(&env_name),
+        };
+        if let Err(denial) = principal.permits(&demand) {
+            return Err(ApiError::insufficient_scope(
+                &demand.required_scope(),
+                "Destroying an environment's provider data needs admin over that environment; undeploying without purgeData needs only deploy",
+            )
+            .audited_as(denial.to_string()));
+        }
+    }
     let context = operation_context(
         &headers,
         &principal,
@@ -4531,6 +4551,44 @@ pub(crate) mod tests {
             .to_owned();
         assert!(message.contains("already exists"), "{message}");
         assert!(!message.starts_with("idempotency-key-reused"), "{message}");
+        assert_eq!(idempotency_record_count(&harness.state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn purging_provider_data_needs_admin_not_just_deploy() {
+        let harness = harness(true).await;
+        harness.state.store.create_app("demo").await.unwrap();
+        harness
+            .state
+            .store
+            .create_environment("demo", "production")
+            .await
+            .unwrap();
+        let deployer = crate::api::catalog::router("/api", harness.state.clone()).layer(Extension(
+            Principal {
+                kind: crate::identity::PrincipalKind::Account,
+                account: Some("ci".to_string()),
+                role: Some(crate::identity::Role::Deployer),
+                credential_id: Some("token-ci".to_string()),
+                authority: crate::identity::Authority::Unscoped,
+            },
+        ));
+        let response = deployer
+            .oneshot(keyed_json_request(
+                Method::POST,
+                "/api/apps/demo/environments/production/provider-undeployments",
+                "undeploy-purge-by-deployer",
+                json!({
+                    "providerTargetId": CanonicalId::new_v7(),
+                    "purgeData": {"environment": "production"}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response_json(response).await;
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("admin:demo/production"), "{body:#}");
         assert_eq!(idempotency_record_count(&harness.state).await, 0);
     }
 
