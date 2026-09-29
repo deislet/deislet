@@ -109,8 +109,8 @@ pub struct CatalogState {
 /// and the CLI call about applications. The caller merges it into the
 /// API-key-guarded router.
 ///
-/// `prefix` is where the routes are mounted: `"/api"` for the legacy flat
-/// tree, `""` inside a `/api/v1` nest. The one catalog route that is not
+/// `prefix` is where the routes are mounted: `"/api"` mounts them flat, which
+/// only the unit-test harnesses do, and `""` inside a `/api/v1` nest. The one catalog route that is not
 /// about an application, the global route table, is [`platform_router`].
 pub fn router(prefix: &str, state: CatalogState) -> Router {
     let at = |path: &str| format!("{prefix}{path}");
@@ -206,6 +206,10 @@ pub fn router(prefix: &str, state: CatalogState) -> Router {
         .route(
             &at("/apps/:app_id/environments/:env/provider-deployments/:operation_id"),
             get(providers::get_provider_deployment),
+        )
+        .route(
+            &at("/apps/:app_id/environments/:env/provider-undeployments"),
+            post(providers::undeploy_provider_deployment),
         )
         .route(
             &at("/apps/:app_id/environments/:env/provider-deployments/:operation_id/cancel"),
@@ -465,6 +469,30 @@ pub(crate) mod tests {
                     .unwrap();
             deis_queue::proto::queue::queue_client::QueueClient::new(channel)
         }
+
+        /// `message` as a call to the harness queue for one environment,
+        /// carrying the queue capability this control plane issues for it.
+        pub(crate) async fn queue_request<T>(
+            &self,
+            app_id: &str,
+            environment: &str,
+            message: T,
+        ) -> tonic::Request<T> {
+            let app = self.state.store.get_app(app_id).await.unwrap();
+            let env = self
+                .state
+                .store
+                .get_environment(app_id, environment)
+                .await
+                .unwrap();
+            let tenant = deis_wire::CanonicalTenantId::new(app.canonical_id, env.canonical_id);
+            let token = self.state.storage.queue_token_for(&tenant).await.unwrap();
+            let mut request = tonic::Request::new(message);
+            request
+                .metadata_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            request
+        }
     }
 
     struct PreparedRuntime;
@@ -590,6 +618,22 @@ pub(crate) mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("https://{}", listener.local_addr().unwrap());
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        let issuer =
+            crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test");
+        // Guarded like deis-queue is: the tenant of a call is the one its
+        // capability names.
+        let queue_auth =
+            deis_queue::auth::QueueAuth::new(deis_capability::KeyRing::from_keys([issuer
+                .verifying_key()
+                .await]));
+        // deis-queue refuses every capability until it has adopted a
+        // revocation list; this one is empty.
+        queue_auth
+            .verifier()
+            .lock()
+            .unwrap()
+            .apply_revocation_list(deis_capability::RevocationList::new("iss", 0, vec![]))
+            .unwrap();
         // Served over TLS with a queue's certificate, as deis-queue is: the
         // control plane's own calls refuse anything else.
         let fleet = deis_identity_test_pki::TestFleet::new();
@@ -610,9 +654,11 @@ pub(crate) mod tests {
                 },
             );
             tonic::transport::Server::builder()
-                .add_service(deis_queue::proto::queue::queue_server::QueueServer::new(
-                    queue,
-                ))
+                .add_service(
+                    deis_queue::proto::queue::queue_server::QueueServer::with_interceptor(
+                        queue, queue_auth,
+                    ),
+                )
                 .serve_with_incoming_shutdown(incoming, async move {
                     let _ = shutdown_rx.await;
                 })
@@ -624,7 +670,7 @@ pub(crate) mod tests {
                 queue_endpoint: Some(endpoint.clone()),
                 ..Default::default()
             },
-            crate::capability_issuer::CapabilityIssuer::for_test("spiffe://deislet/control/test"),
+            issuer,
         )
         .with_service_trust(Some(deis_identity::ServiceTrust::from_identity(
             control_identity,
@@ -1109,7 +1155,9 @@ pub(crate) mod tests {
 
         // A second, different bundle becomes version 2.
         let bundle2 = crate::catalog::bundle::tests::bundle_with_manifest(
-            r#"{"schema":1,"app":"demo","entry":"worker/index.js","env":{"LOG_LEVEL":"debug"}}"#,
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js","env":{"LOG_LEVEL":"debug"}}"#,
+            ),
             true,
         );
         let (status, body) = call(
@@ -1201,7 +1249,7 @@ pub(crate) mod tests {
         assert!(assignments[0]["bundle_sha"].as_str().unwrap().len() == 64);
         // The list carries the environment a push would have carried. Without
         // it a node that restarts loads the right code with no storage
-        // address and no secret, and only its ctx.services calls tell it so.
+        // address and no secret, and only its missing bindings tell it so.
         assert_eq!(
             assignments[0]["env"][deis_wire::conventions::STORE_ENDPOINT_ENV],
             "http://127.0.0.1:8090"
@@ -1346,7 +1394,9 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let second_bundle = crate::catalog::bundle::tests::bundle_with_manifest(
-            r#"{"schema":1,"app":"pagination-alpha","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"pagination-alpha","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            ),
             true,
         );
         let (status, _) = call(
@@ -1445,7 +1495,9 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let v1 = body["version"]["id"].as_str().unwrap().to_string();
         let second_bundle = crate::catalog::bundle::tests::bundle_with_manifest(
-            r#"{"schema":1,"app":"paged","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"paged","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            ),
             true,
         );
         let (status, body) = call(

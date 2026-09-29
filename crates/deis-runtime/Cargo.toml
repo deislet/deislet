@@ -68,9 +68,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 
-# Time
-chrono = "0.4"
-
 # Concurrent data structures
 dashmap = "5.5"
 
@@ -128,6 +125,9 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 # deis-identity resolves the certificate per connection for exactly that
 # reason, and it needs a client that will take a connector.
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
+# The per-isolate ArrayBuffer allocator (runtime/recycle.rs) allocates with
+# malloc/calloc/free: V8 hands the length back on free, but not the alignment.
+libc = "0.2"
 # Named directly for the request, response and IO traits that client deals in.
 hyper = { version = "1.7", features = ["client", "http1"] }
 # Reading that response body frame by frame, so the bundle is hashed and

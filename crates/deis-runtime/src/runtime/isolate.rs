@@ -17,6 +17,7 @@ use super::ops::{
 use super::queue_client::LeasedMessage;
 use super::queue_consumer::BatchOutcome;
 use super::rate_limit::RateLimiter;
+use super::recycle::{ArrayBufferBudget, RecycleLatch, RecycleReason};
 use super::response_stream::{
     record_broken_body, response_streams, ResponseBody, ResponseStreams, StreamOwner,
 };
@@ -459,6 +460,7 @@ impl Watchdog {
         isolate: deno_core::v8::IsolateHandle,
         app_id: String,
         metrics: Arc<MetricsRegistry>,
+        recycle: Arc<RecycleLatch>,
     ) -> Result<Self> {
         // Read on the thread the isolate will run on, which is the only thread
         // that can name its own `/proc` entry; see the field's documentation.
@@ -595,6 +597,13 @@ impl Watchdog {
                         CutOffKind::CpuTime => metrics.record_cpu_cutoff(&app_id_in_thread),
                     }
                     warn_cut_off(&app_id_in_thread, &watch, &cut_off);
+                    // Before the terminate, so the runtime thread can never
+                    // see the execution end without the mark that says the
+                    // isolate it ran in is finished.
+                    recycle.latch(match cut_off.kind {
+                        CutOffKind::WallClock => RecycleReason::Timeout,
+                        CutOffKind::CpuTime => RecycleReason::CpuTime,
+                    });
                     isolate.terminate_execution();
                 }
             })
@@ -1021,17 +1030,17 @@ pub struct IsolateSpec {
     /// Values visible to the app through `Deno.env` / `ctx.env`.
     pub env: HashMap<String, String>,
     pub standard_env: Option<std::collections::BTreeMap<String, serde_json::Value>>,
-    /// Explicit process.env projection. Production deployment construction
-    /// always supplies this, including `Some(empty)`. Direct legacy callers
-    /// may leave it absent to retain the historical env-derived projection.
+    /// Explicit process.env projection. Every deployment supplies this,
+    /// including `Some(empty)`; an isolate built without a deployment (tests)
+    /// may leave it absent, and then projects `env` minus the reserved keys.
     pub node_process_env: Option<HashMap<String, String>>,
 
     /// Storage authority presented by KV, SQL, blob and queue clients.
     ///
-    /// Kept separate from the runtime's `app_id`: the latter is the rolling-
+    /// The canonical tenant `v1/<application id>/<environment id>`. Kept
+    /// separate from the runtime's `app_id`: the latter is the rolling-
     /// upgrade placement and telemetry key, while this field is the data
-    /// boundary. `None` preserves callers that do not use the deployment
-    /// pipeline; deployed versions always set it explicitly.
+    /// boundary. `None` for an application that reaches no storage service.
     pub storage_tenant: Option<String>,
 
     /// Net and env permissions granted to the isolate.
@@ -1152,19 +1161,24 @@ pub struct AppRuntime {
     /// the code that next explains a failure. Whichever stretch the cut-off
     /// fired in, the producers it killed are explained by it.
     op_ceiling_fired: Arc<std::sync::atomic::AtomicBool>,
-    /// Set by the near-heap-limit callback the moment this isolate's V8 heap
-    /// ceiling is tripped, and never cleared for the life of the isolate.
+    /// Set by whichever guard terminates an execution in this isolate -- the
+    /// near-heap-limit callback, the watchdog's CPU and wall-clock cut-offs,
+    /// the op rate limiter -- and never cleared for the life of the isolate.
     ///
-    /// The callback must return a raised limit to give V8 room to unwind the
-    /// terminated execution, and V8 offers no way to lower a heap limit back,
-    /// so an isolate that has been here is permanently more generous than its
-    /// configuration says -- and, worse, is an isolate whose next ceiling is
-    /// whatever the last escape left. It is therefore not reused: the runtime
-    /// thread that hosts it reads this flag when the invocation ends, drops
-    /// the isolate, and serves the application's next request on a freshly
-    /// built one. See [`RuntimePool`]'s recycle path and
+    /// V8 terminates an isolate, not an invocation, so an isolate that has
+    /// been cut off is not reused (ADR-010, D-7): the runtime thread that
+    /// hosts it reads this latch once the message it was handling is done,
+    /// drops the isolate and builds a fresh one before taking the next
+    /// message. A heap cut-off has one more reason of its own: the callback
+    /// must return a raised limit to give V8 room to unwind, and V8 offers no
+    /// way to lower a heap limit back. See [`RuntimePool`]'s recycle path and
     /// [`super::metrics::ISOLATE_RECYCLES_TOTAL`] for how that is counted.
-    heap_poisoned: Arc<std::sync::atomic::AtomicBool>,
+    recycle: Arc<RecycleLatch>,
+    /// This isolate's ledger of `ArrayBuffer` backing store; see
+    /// [`ArrayBufferBudget`]. Held here only so tests can read it: V8 owns
+    /// the allocator that writes it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    array_buffers: Arc<ArrayBufferBudget>,
     /// Where this isolate's request, error, execution-time and cut-off
     /// counters go. See `super::metrics`.
     metrics: Arc<MetricsRegistry>,
@@ -1246,7 +1260,7 @@ impl AppRuntime {
     /// live; only the declared ones are constructed, and none of them dials
     /// anything until the app makes a call. Pass
     /// [`ServiceWiring::default()`] for an isolate that should reach no
-    /// storage at all -- every `ctx.services` call then answers "service not
+    /// storage at all -- every storage call then answers "service not
     /// available", which is what an app that declared nothing should get.
     /// Must be called from inside a tokio runtime context. V8 posts delayed
     /// tasks while the isolate is being built, and deno_core hands those to
@@ -1307,7 +1321,21 @@ impl AppRuntime {
             &app_id,
         );
 
-        let mut create_params = deno_core::v8::CreateParams::default();
+        // Backing stores live outside the V8 heap, so the heap ceiling alone
+        // never saw `new ArrayBuffer(2 ** 31)`: that was an allocation the
+        // whole node paid for. Each isolate gets an allocator with a ledger
+        // of its own, held to the same ceiling as its heap (the node's
+        // `memory_limit_mb`, or less if the application narrowed it); a
+        // buffer past it is refused with a `RangeError` in the application.
+        // An isolate with no heap ceiling -- only ever a test -- gets no
+        // buffer ceiling either.
+        let array_buffers = ArrayBufferBudget::new(
+            memory_limit_mb
+                .map(|mb| mb.saturating_mul(1024 * 1024))
+                .unwrap_or(usize::MAX),
+        );
+        let mut create_params = deno_core::v8::CreateParams::default()
+            .array_buffer_allocator(array_buffers.allocator());
         if let Some(mb) = memory_limit_mb {
             create_params = create_params.heap_limits(0, mb * 1024 * 1024);
         }
@@ -1352,7 +1380,8 @@ impl AppRuntime {
         // baseline was taken and was invisible to it.
         let op_ceiling_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let op_ceiling_fired_for_limiter = op_ceiling_fired.clone();
-        let heap_poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let recycle = Arc::new(RecycleLatch::default());
+        let recycle_for_limiter = recycle.clone();
         let isolate_handle_cell = Arc::new(OnceCell::<deno_core::v8::IsolateHandle>::new());
         let isolate_handle_cell_clone = isolate_handle_cell.clone();
         let app_id_clone = app_id.clone();
@@ -1366,6 +1395,7 @@ impl AppRuntime {
             let app_id = app_id_clone.clone();
             let metrics = metrics_for_limiter.clone();
             let op_ceiling_fired = op_ceiling_fired_for_limiter.clone();
+            let recycle = recycle_for_limiter.clone();
             let op_name = decl.name.to_string();
             // One op is not the application's work and is not charged to it.
             //
@@ -1402,6 +1432,7 @@ impl AppRuntime {
                     if !limiter.check() {
                         metrics.record_rate_limit_cutoff(&app_id);
                         op_ceiling_fired.store(true, std::sync::atomic::Ordering::Release);
+                        recycle.latch(RecycleReason::OpRate);
                         tracing::warn!(
                             target: "app",
                             app_id = %app_id,
@@ -1423,18 +1454,19 @@ impl AppRuntime {
         // that is not a tenant, fails the load outright rather than after V8
         // has been spun up. An address that is merely unreachable is not a
         // failure here: the channels are lazy.
-        let storage_tenant = storage_tenant.as_deref().unwrap_or(&app_id);
-        let services = AppServices::connect(storage_tenant, wiring)?;
-        if services.is_empty() && !wiring.declaration.is_empty() {
-            tracing::warn!(
-                app_id = %app_id,
-                declared = %wiring.declaration.to_csv(),
-                "App {} declared services ({}) but none could be bound; ctx.services calls will \
-                 fail with \"service not available\"",
-                app_id,
-                wiring.declaration.to_csv()
-            );
-        }
+        // No canonical tenant is only an error for an application that
+        // actually reaches a storage service, and `connect` says so then.
+        let storage_tenant = storage_tenant.unwrap_or_default();
+        // Tests name their tenants by label (`"kv_app.production"`) and the
+        // test store mints capabilities for the canonical tenant each label
+        // stands for; this is the one place the two meet.
+        #[cfg(test)]
+        let storage_tenant = crate::runtime::tenant::test_tenant(if storage_tenant.is_empty() {
+            &app_id
+        } else {
+            &storage_tenant
+        });
+        let services = AppServices::connect(&storage_tenant, wiring)?;
 
         let startup_snapshot = load_or_create_startup_snapshot()?;
         let (residual_lazy_js_sources, residual_lazy_esm_sources) = if startup_snapshot.is_some() {
@@ -1734,7 +1766,9 @@ impl AppRuntime {
             // zero however often this fired, which reads to an operator as
             // "this never happens" - worse than having no metric at all.
             let metrics_for_cutoff = metrics.clone();
-            let heap_poisoned_for_callback = heap_poisoned.clone();
+            let recycle_for_callback = recycle.clone();
+
+            let array_buffers_for_callback = array_buffers.clone();
 
             runtime.add_near_heap_limit_callback(move |current, initial| {
                 // Latched once and never cleared: the limit this return
@@ -1742,7 +1776,27 @@ impl AppRuntime {
                 // isolate is not fit to be reused even if the terminated
                 // invocation is the only one that ever trips it. The pool
                 // reads the flag when the invocation ends and rebuilds.
-                heap_poisoned_for_callback.store(true, std::sync::atomic::Ordering::Release);
+                recycle_for_callback.latch(RecycleReason::Memory);
+
+                // V8 answers a refused backing store with last-resort
+                // garbage collections before it throws the `RangeError`, and
+                // those collections come through here although the heap
+                // itself is nowhere near its ceiling. The refusal already
+                // kept the memory out; terminating as well would turn a
+                // catchable `RangeError` into a dead invocation. The limit
+                // still has to be raised for V8 to carry on, so the isolate
+                // is still recycled once the message is done.
+                if array_buffers_for_callback.take_refusal() {
+                    tracing::warn!(
+                        target: "app",
+                        app_id = %app_id_clone,
+                        "App {} asked for an ArrayBuffer past its memory ceiling; the allocation \
+                         was refused with a RangeError in the application, and its isolate will \
+                         be rebuilt after this invocation",
+                        app_id_clone
+                    );
+                    return current + 10 * 1024 * 1024;
+                }
                 tracing::error!(
                     target: "app",
                     app_id = %app_id_clone,
@@ -1765,6 +1819,7 @@ impl AppRuntime {
             runtime.v8_isolate().thread_safe_handle(),
             app_id.clone(),
             metrics.clone(),
+            recycle.clone(),
         )?;
 
         Ok(Self {
@@ -1783,7 +1838,8 @@ impl AppRuntime {
             cpu_time_limit_ms,
             rate_limit_ops_per_sec,
             op_ceiling_fired,
-            heap_poisoned,
+            recycle,
+            array_buffers,
             metrics,
             execution_deadline,
             subrequest_budget,
@@ -1876,14 +1932,23 @@ impl AppRuntime {
         self.trace.borrow().clone()
     }
 
-    /// Whether this isolate's V8 heap ceiling has been tripped.
-    ///
-    /// Once true, the isolate is finished: its heap limit was raised by the
-    /// cut-off and cannot be brought back, so the hosting thread drops it
-    /// rather than reuses it. See [`Self::heap_poisoned`], the field.
-    pub fn heap_poisoned(&self) -> bool {
-        self.heap_poisoned
-            .load(std::sync::atomic::Ordering::Acquire)
+    /// Why this isolate may not be reused, once an execution in it has been
+    /// terminated. See [`Self::recycle`], the field.
+    pub fn recycle_reason(&self) -> Option<RecycleReason> {
+        self.recycle.reason()
+    }
+
+    /// Whether this isolate's V8 heap ceiling has been tripped. The one
+    /// recycle reason that also changes how an invocation ends: see
+    /// [`Self::end_invocation`].
+    fn heap_poisoned(&self) -> bool {
+        self.recycle_reason() == Some(RecycleReason::Memory)
+    }
+
+    /// Bytes of `ArrayBuffer` backing store this isolate holds right now.
+    #[cfg(test)]
+    pub fn array_buffer_bytes(&self) -> usize {
+        self.array_buffers.used()
     }
 
     /// Start one invocation: a request, a queue batch, a cron tick, one
@@ -2066,8 +2131,16 @@ impl AppRuntime {
         self.execution_deadline.set(None);
     }
 
-    /// Clear V8's termination flag, so a cut-off costs one execution and not
-    /// the isolate.
+    /// Clear V8's termination flag, so the rest of this invocation's own
+    /// cleanup -- the timer sweep, the reply -- still runs after a cut-off.
+    ///
+    /// Clearing the flag does not make the isolate reusable. A real cut-off
+    /// latches [`Self::recycle`] before it terminates, and the hosting thread
+    /// discards the isolate once the message is done (ADR-010, D-7): what
+    /// was halfway through when V8 stopped it is never run again. The flag
+    /// still has to go, because the cleanup below is script, and because a
+    /// stray termination that no guard latched must not take the isolate
+    /// down with it.
     ///
     /// `terminate_execution` is not spent when the execution it killed
     /// returns. deno_core cancels the flag only long enough to build the error

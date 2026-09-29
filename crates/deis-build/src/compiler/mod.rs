@@ -12,7 +12,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-/// Internal source-adapter target. It is never accepted from `--vendor` and
+/// Internal source-adapter target. It is never accepted from `--target` and
 /// never appears in the provider build map.
 const CANONICAL_TARGET: &str = "canonical";
 
@@ -176,11 +176,6 @@ impl Compiler {
 
             let code = fs::read_to_string(&handler_path)?;
 
-            // Parse handler
-            let handler_info = self.parser.parse(
-                &code,
-                &Self::portable_display_path(Path::new(&handler_path)),
-            )?;
             let relative_path = Path::new(&handler_path).strip_prefix(
                 function_root
                     .as_deref()
@@ -188,6 +183,13 @@ impl Compiler {
             )?;
             let handler_kind =
                 deis_build_core::routes::handler_kind(&relative_path.to_string_lossy());
+
+            // Parse handler
+            let handler_info = self.parser.parse_handler(
+                &code,
+                &Self::portable_display_path(Path::new(&handler_path)),
+                handler_kind,
+            )?;
 
             // Validate handler
             self.validator.validate(
@@ -1275,7 +1277,14 @@ impl Compiler {
         Ok(())
     }
 
-    fn refuse_non_standard_context_fields(path: &str, info: &HandlerInfo) -> anyhow::Result<()> {
+    /// Stop a build over a handler that reads a field its context does not
+    /// have; see [`deis_build_core::routes::HandlerKind::refuses_context_field`]
+    /// for which fields that is on each kind. The parser records only those.
+    fn refuse_non_standard_context_fields(
+        path: &str,
+        kind: deis_build_core::routes::HandlerKind,
+        info: &HandlerInfo,
+    ) -> anyhow::Result<()> {
         if info.non_standard_context_references.is_empty() {
             return Ok(());
         }
@@ -1290,6 +1299,11 @@ impl Compiler {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        if kind != deis_build_core::routes::HandlerKind::Http {
+            return Err(anyhow::anyhow!(
+                "EC_WEB_CONTEXT_FIELD_NONSTANDARD: {references}. A handler reaches the platform's logical resources only as env.<NAME>: declare a binding and read it from the env parameter or from context.env"
+            ));
+        }
         Err(anyhow::anyhow!(
             "EC_WEB_CONTEXT_FIELD_NONSTANDARD: {references}. The selected Edge Canon HTTP context has exactly request, env, params, and waitUntil. Read method and headers from context.request; parse path and query from new URL(context.request.url); use console for logs; and declare logical resources under context.env.<NAME>"
         ))
@@ -1380,29 +1394,10 @@ impl Compiler {
         // Whether a backend conforms to their standard semantics is decided
         // by the Edge Canon suite, not assumed here.
 
-        // Detect extended service configuration
-        if let Some(ref services) = config.services {
-            if let Some(ref db) = services.database {
-                if db.enabled {
-                    features.push(Feature::SQLDatabase);
-                }
-            }
-            if let Some(ref blob) = services.blob {
-                if blob.enabled {
-                    features.push(Feature::ObjectStorage);
-                }
-            }
-            if let Some(ref queue) = services.queue {
-                if queue.enabled {
-                    features.push(Feature::Queues);
-                }
-            }
-        }
-
         // A declared consumer or schedule is a use of the feature just as much
         // as a binding is: an app whose cron never fires is broken whether or
         // not it also calls a service.
-        if !config.queues.is_empty() && !features.contains(&Feature::Queues) {
+        if !config.queues.is_empty() {
             features.push(Feature::Queues);
         }
         if !config.cron.is_empty() {
@@ -1643,8 +1638,6 @@ impl Compiler {
         derived_config.environment = Some(deis_build_core::EnvironmentConfig {
             declarations: environment.declarations.clone(),
             values: None,
-            variables: None,
-            secrets: None,
         });
         derived_config.vendors = None;
         derived_config.build = Some(deis_build_core::BuildConfig {
@@ -2036,27 +2029,6 @@ impl Compiler {
             .iter()
             .map(|(name, binding)| format!("{name} ({})", binding.kind))
             .collect::<Vec<_>>();
-        if let Some(services) = &config.services {
-            for (name, enabled) in [
-                ("kv", services.kv.as_ref().is_some_and(|item| item.enabled)),
-                (
-                    "database",
-                    services.database.as_ref().is_some_and(|item| item.enabled),
-                ),
-                (
-                    "blob",
-                    services.blob.as_ref().is_some_and(|item| item.enabled),
-                ),
-                (
-                    "queue",
-                    services.queue.as_ref().is_some_and(|item| item.enabled),
-                ),
-            ] {
-                if enabled {
-                    declarations.push(format!("legacy service {name}"));
-                }
-            }
-        }
         if !config.callable_by.is_empty() {
             declarations.push("service-binding ingress policy".into());
         }
@@ -2232,18 +2204,18 @@ impl Compiler {
 
             let code = fs::read_to_string(&handler_path)?;
             let handler_name = Self::portable_display_path(&source_path);
-            let parsed = self.parser.parse(&code, &handler_name)?;
+            let handler_kind =
+                deis_build_core::routes::handler_kind(&relative_path.to_string_lossy());
+            let parsed = self
+                .parser
+                .parse_handler(&code, &handler_name, handler_kind)?;
             Self::refuse_interactive_transactions(vendor, &handler_name, &code)?;
             Self::refuse_a_handler_with_no_default_export(&handler_name, Some(&parsed))?;
             Self::refuse_non_literal_module_loads(&handler_name, &parsed)?;
             Self::refuse_external_runtime_module_edges(&handler_name, &parsed)?;
             Self::refuse_provider_only_globals(&handler_name, &parsed)?;
             Self::refuse_non_portable_stream_constructors(&handler_name, &parsed)?;
-            if deis_build_core::routes::handler_kind(&relative_path.to_string_lossy())
-                == deis_build_core::routes::HandlerKind::Http
-            {
-                Self::refuse_non_standard_context_fields(&handler_name, &parsed)?;
-            }
+            Self::refuse_non_standard_context_fields(&handler_name, handler_kind, &parsed)?;
             module_references.push((handler_name.clone(), parsed.module_references.clone()));
             handler_specifiers.push((handler_name.clone(), parsed.imports.clone()));
             module_queue.push_back((source_path.clone(), parsed.imports));
@@ -2560,16 +2532,6 @@ impl Compiler {
             );
         }
 
-        if let Some(ref kv) = artifacts.kv_adapter_code {
-            fs::write(adapters_dir.join("kv-adapter.ts"), kv)?;
-            if should_collect_memory {
-                memory_system_files.insert(
-                    "_deis_internal/adapters/kv-adapter.ts".to_string(),
-                    kv.clone(),
-                );
-            }
-        }
-
         // Handle Code (Bundle or Skip)
         let (entry_code, entry_filename) = if vendor != deis_build_adapter_deno::VENDOR
             || uses_node_npm
@@ -2638,7 +2600,11 @@ impl Compiler {
                     Self::refuse_external_runtime_module_edges(&derived_path, &derived)?;
                     Self::refuse_provider_only_globals(&derived_path, &derived)?;
                     Self::refuse_non_portable_stream_constructors(&derived_path, &derived)?;
-                    Self::refuse_non_standard_context_fields(&derived_path, &derived)?;
+                    Self::refuse_non_standard_context_fields(
+                        &derived_path,
+                        deis_build_core::routes::HandlerKind::Http,
+                        &derived,
+                    )?;
                     validate_node_npm_project(
                         &project_root,
                         &[(derived_path, derived.module_references)],
@@ -3653,7 +3619,7 @@ impl Compiler {
         let standard_version = Self::locked_standard_version()?;
         let environment =
             deis_build_core::resolve_environment_declarations(config, &standard_version)?;
-        let manifest = deis_build_adapter_deislet::build_manifest_with_environment(
+        let manifest = deis_build_adapter_deislet::build_manifest(
             config,
             &function_paths,
             &assets,

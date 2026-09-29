@@ -18,18 +18,11 @@ listen = "127.0.0.1:8091"
 # a token names a key not yet fetched - so a key rotation on the control plane
 # needs nothing done on this host.
 
-# Enables the separate BackendMigration gRPC service used by Control to
-# acquire durable queue writer fences and collect deterministic inventory.
-# Calls must send `Authorization: Bearer <token>` even on loopback.
-# migration_admin_token = "put a different long random string here"
-
 # Directory holding queue.sqlite.
 #
-# A tenant is one application in one environment, spelled "<app>.<environment>"
-# (for example "demo.production"). A database written before that was true is
-# keyed by bare application ids and cannot be read now; there is no migration,
-# and the service refuses to start on one rather than reporting every queue
-# empty.
+# A tenant is one application in one environment, keyed by canonical ids
+# ("v1/<application id>/<environment id>") and named by the capability on each
+# call, never by the caller.
 data_dir = "./data"
 
 # Connections in the SQLite pool, and the ceiling on blocking threads this

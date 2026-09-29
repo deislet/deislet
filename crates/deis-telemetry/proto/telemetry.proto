@@ -119,6 +119,14 @@ message LogEntry {
 
     // Span ID
     string span_id = 8;
+
+    // The canonical tenant the record belongs to,
+    // `v1/<application id>/<environment id>`: set whenever app_id is, empty
+    // on a node's own records. This, not app_id, decides who may push the
+    // record and who may read it back - an application deleted and created
+    // again under the same name is another tenant and sees none of the old
+    // one's records. Refused over 1 KiB.
+    string tenant = 9;
 }
 
 // Push logs request
@@ -309,6 +317,14 @@ message TraceRecord {
     // the record. trace_id, app_id, environment, node and method are refused
     // over 1 KiB.
     map<string, string> attributes = 13;
+
+    // The canonical tenant the record belongs to,
+    // `v1/<application id>/<environment id>`: set whenever app_id is, empty
+    // on a node's own records. This, not app_id, decides who may push the
+    // record and who may read it back - an application deleted and created
+    // again under the same name is another tenant and sees none of the old
+    // one's records. Refused over 1 KiB.
+    string tenant = 14;
 }
 
 // Push trace records.
@@ -433,6 +449,14 @@ message MetricSample {
     // the metric retention window is refused, for the reasons
     // LogEntry.timestamp_us gives.
     int64 timestamp_us = 5;
+
+    // The canonical tenant the record belongs to,
+    // `v1/<application id>/<environment id>`: set whenever app_id is, empty
+    // on a node's own records. This, not app_id, decides who may push the
+    // record and who may read it back - an application deleted and created
+    // again under the same name is another tenant and sees none of the old
+    // one's records. Refused over 1 KiB.
+    string tenant = 6;
 }
 
 // Push metric samples request

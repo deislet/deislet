@@ -109,7 +109,7 @@ async fn a_queue_handler_reads_text_as_text_and_anything_else_as_bytes() {
 /// broke.
 const SENDING_APP: &str = r#"
 export default async function handler(ctx) {
-  const q = ctx.services.queue;
+  const q = ctx.env.QUEUE;
   const out = [];
   for (const [name, value] of [
     ["string", "text"],
@@ -128,6 +128,15 @@ export default async function handler(ctx) {
 }
 "#;
 
+fn queue_binding() -> ServiceWiring {
+    let mut wiring = ServiceWiring::default();
+    wiring.bindings.insert(
+        "QUEUE",
+        deis_bundle::Binding::storage(deis_bundle::BindingKind::Queue),
+    );
+    wiring
+}
+
 #[tokio::test]
 async fn every_shape_queue_send_accepts_reaches_the_op_as_bytes() {
     let mut runtime = AppRuntime::new(
@@ -135,7 +144,9 @@ async fn every_shape_queue_send_accepts_reaches_the_op_as_bytes() {
         SENDING_APP.to_string(),
         None,
         IsolateSpec::default(),
-        &ServiceWiring::default(),
+        // A queue binding and no queue address: every send reaches the op and
+        // is refused there, which is where the bytes are inspected.
+        &queue_binding(),
         // No pool behind this isolate, so a service call it made would be
         // refused as "not deployed on this node", which is what it is.
         ServiceRouter::detached(),

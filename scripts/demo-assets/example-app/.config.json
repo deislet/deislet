@@ -6,18 +6,30 @@
   "functionRoot": "./functions",
   "compatibilityDate": "2026-09-01",
   "environment": {
-    "variables": {
-      "BUILD_LABEL": "v1",
-      "LOG_LEVEL": "info"
-    },
     "declarations": [
+      {
+        "name": "BUILD_LABEL",
+        "kind": "config",
+        "valueType": "string",
+        "required": true
+      },
       {
         "name": "DEMO_SECRET",
         "kind": "secret",
         "valueType": "string",
         "required": false
+      },
+      {
+        "name": "LOG_LEVEL",
+        "kind": "config",
+        "valueType": "string",
+        "required": true
       }
-    ]
+    ],
+    "values": {
+      "BUILD_LABEL": "v1",
+      "LOG_LEVEL": "info"
+    }
   },
   "bindings": {
     "KV": {

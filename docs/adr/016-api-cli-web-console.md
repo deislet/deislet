@@ -345,7 +345,7 @@ Linux、macOS、Windows 通过 provider 80/80、pagination 21/21、authz 39/39�
 而 CI 停摆期间无人发现的两处产品回归（所有 schema-2 应用的 `env.ASSETS` 为 undefined；编译器为观察响应结束重新包装每个
 响应体，导致所有应用应答丢失 `Content-Length`）。与本 ADR 直接相关的落点：`GET /api/platform/runtime`（fleet 列表）改为
 要求 `read:*/*`，因为它的行携带节点管理地址、密钥状态与指纹，本 ADR「Fleet scope 仅平台操作者可见」此前并未在授权表上
-成立；`POST /api/v1/apps/{app}/identity-migration` 真正读取它一直声明为必填的 `If-Match`（缺失 428、畸形 400、过期 412）；
+成立；`POST /api/v1/apps/{app}/identity-migration`（该接口后已随身份迁移子系统删除）当时真正读取它一直声明为必填的 `If-Match`（缺失 428、畸形 400、过期 412）；
 每个 operation 记录 500、每个带 JSON body 的 operation 记录 415，从不发出 422 的六条路由删除该记录；`ProductOperation`
 的 state 与 kind 从 `deis_wire` 渲染以杜绝漂移，`progress` 明确为 0..=10000 的基点；axum extractor 的拒绝在 v1 与 platform
 也走结构化信封；每个后端故障构成的 5xx 一律不透明；跨作用域与不存在的 provider id 返回逐字节相同的 404。

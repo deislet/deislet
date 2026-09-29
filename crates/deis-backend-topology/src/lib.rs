@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
-use deis_backend_migration::TenantWriteFences;
 use deis_wire::{
     BACKEND_RESTORE_REPORT_SCHEMA_V1, BACKEND_RESTORE_SET_SCHEMA_V1, BackendRestoreExecutionReport,
     BackendRestoreExecutionState, BackendRestoreSet, BackendRestoredComponent, CanonicalId,
@@ -33,7 +32,6 @@ use tokio::process::Command;
 const JOURNAL_VERSION: u32 = 1;
 const SNAPSHOT_CAPTURE_JOURNAL_VERSION: u32 = 1;
 const SNAPSHOT_CAPTURE_JOURNAL: &str = "snapshot-capture.json";
-const FENCE_JOURNAL: &str = "migration-fences.sqlite";
 const MANIFEST_NAME: &str = "snapshot.json";
 
 #[derive(Clone, Deserialize)]
@@ -406,7 +404,7 @@ async fn capture_restore_set_inner(
         ];
         let store_manifest = deis_store::snapshot::take(&config.store.data_dir, &snapshot_dirs[0])?;
         ensure!(
-            store_manifest.source_backend_incarnation_id == Some(source_ids[0]),
+            store_manifest.source_backend_incarnation_id == source_ids[0],
             "store changed identity while its stopped snapshot was captured"
         );
         let store_captured_at = Utc::now();
@@ -440,7 +438,6 @@ async fn capture_restore_set_inner(
                     source_backend_incarnation_id: source_ids[index],
                     size_bytes: tree_bytes(&snapshot_dirs[index])?,
                     captured_at: captured_at[index],
-                    contains_fence_journal: false,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1155,10 +1152,10 @@ fn stage_component(
     let (source, restored) = match component.backend {
         RestoreBackend::DeisStore => {
             let report = deis_store::snapshot::restore(&snapshot, stage_dir)?;
-            let source = report.source_backend_incarnation_id.ok_or_else(|| {
-                anyhow!("store snapshot is legacy and cannot prove its source incarnation")
-            })?;
-            (source, report.restored_backend_incarnation_id)
+            (
+                report.source_backend_incarnation_id,
+                report.restored_backend_incarnation_id,
+            )
         }
         RestoreBackend::DeisQueue => {
             let report = deis_queue::snapshot::restore(&snapshot, stage_dir)?;
@@ -1589,15 +1586,15 @@ fn current_incarnation(data_dir: &Path) -> Result<Option<CanonicalId>> {
     if !data_dir.exists() || directory_is_empty(data_dir)? {
         return Ok(None);
     }
-    let journal = data_dir.join(FENCE_JOURNAL);
+    let incarnation = deis_wire::incarnation::read(data_dir)
+        .with_context(|| format!("cannot read the incarnation of {}", data_dir.display()))?;
     ensure!(
-        journal.is_file(),
-        "non-empty backend data directory {} has no {FENCE_JOURNAL}",
-        data_dir.display()
+        incarnation.is_some(),
+        "non-empty backend data directory {} has no {}",
+        data_dir.display(),
+        deis_wire::incarnation::INCARNATION_FILE
     );
-    Ok(Some(
-        TenantWriteFences::open_blocking(journal)?.backend_incarnation_id(),
-    ))
+    Ok(incarnation)
 }
 
 fn reset_temporary_directory(path: &Path, operation_id: CanonicalId, suffix: &str) -> Result<()> {
@@ -1960,9 +1957,7 @@ mod tests {
 
     fn initialize_backend(path: &Path) -> CanonicalId {
         fs::create_dir_all(path).unwrap();
-        TenantWriteFences::open_blocking(path.join(FENCE_JOURNAL))
-            .unwrap()
-            .backend_incarnation_id()
+        deis_wire::incarnation::load_or_create(path).unwrap()
     }
 
     struct Fixture {
@@ -2032,8 +2027,7 @@ mod tests {
                     },
                     "sourceBackendIncarnationId": source_ids[index],
                     "sizeBytes": tree_bytes(snapshot).unwrap(),
-                    "capturedAt": format!("2026-09-03T20:50:{}Z", 20 + index * 10),
-                    "containsFenceJournal": false
+                    "capturedAt": format!("2026-09-03T20:50:{}Z", 20 + index * 10)
                 })
             })
             .collect::<Vec<_>>();
@@ -2305,7 +2299,7 @@ mod tests {
             assert!(
                 !output
                     .join(component.backend.as_str())
-                    .join(FENCE_JOURNAL)
+                    .join(deis_wire::incarnation::INCARNATION_FILE)
                     .exists()
             );
         }

@@ -7,7 +7,7 @@
   "required": [
     "schemaVersion", "contractVersion", "status", "standardLock",
     "identifierScheme", "documents", "operationTransitions", "fixtures",
-    "requiredProviderOperations", "identityMigrationPhases"
+    "requiredProviderOperations"
   ],
   "properties": {
     "$schema": {"type": "string"},
@@ -17,7 +17,7 @@
     "standardLock": {"const": "standards/edge-canon.lock.json"},
     "identifierScheme": {"const": "uuidv7-lowercase"},
     "documents": {
-      "type": "array", "minItems": 18, "maxItems": 18,
+      "type": "array", "minItems": 16, "maxItems": 16,
       "items": {
         "type": "object", "additionalProperties": false,
         "required": ["id", "schema"],
@@ -31,10 +31,6 @@
     "fixtures": {"const": "contracts/v1/fixtures.json"},
     "requiredProviderOperations": {
       "type": "array", "minItems": 12, "maxItems": 12, "uniqueItems": true,
-      "items": {"type": "string", "pattern": "^[a-z][a-z-]+$"}
-    },
-    "identityMigrationPhases": {
-      "type": "array", "minItems": 8, "maxItems": 8, "uniqueItems": true,
       "items": {"type": "string", "pattern": "^[a-z][a-z-]+$"}
     }
   },

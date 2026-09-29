@@ -286,10 +286,10 @@ impl Validatable for MachineIdentityConfig {
         // to nodes' data ports and has no control plane to dial. Demanding an
         // endpoint there would make the data port's mutual TLS unusable
         // without inventing a control plane to name.
-        if !self.control_endpoint.is_empty() {
-            if let Err(reason) = check_control_endpoint(&self.control_endpoint) {
-                return refuse(reason);
-            }
+        if !self.control_endpoint.is_empty()
+            && let Err(reason) = check_control_endpoint(&self.control_endpoint)
+        {
+            return refuse(reason);
         }
         if let Err(error) = self.expected_control_identity() {
             return refuse(format!(

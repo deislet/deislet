@@ -49,6 +49,7 @@ use crate::catalog::{
 };
 use crate::runtime_client::{RuntimeNodeManager, proto};
 use deis_capability::resources_for_audience;
+use deis_wire::CanonicalTenantId;
 
 /// How the control plane names itself, once for each audience that is given
 /// an absolute URL.
@@ -191,9 +192,9 @@ pub fn bundle_url(base: &str, app_id: &str, version_id: &str) -> String {
 /// deployment message can be replayed as access to a tenant.
 ///
 /// An unset address means "this platform has no such service": the deployment
-/// still goes out, the application still loads, and only its `ctx.services`
-/// calls fail - which is better than refusing to deploy an application that
-/// declared a service it never actually calls.
+/// still goes out, the application still loads, and only its storage
+/// bindings are missing - which is better than refusing to deploy an
+/// application that declared a binding it never actually uses.
 #[derive(Clone)]
 pub struct StorageWiring {
     /// deis-store: KV, per-app SQL and blobs.
@@ -287,21 +288,15 @@ impl StorageWiring {
     /// The capability this control plane presents to deis-queue for one
     /// tenant.
     ///
-    /// The tenant is the whole `<app>.<environment>` pair, the same string
-    /// that travels in [`deis_wire::conventions::TENANT_HEADER`]: deis-queue
-    /// checks the token names that tenant, the `queue` audience and the
-    /// `queue` binding, so a token minted for anything else is refused.
-    pub async fn queue_token_for(
-        &self,
-        app_id: &str,
-        environment: &str,
-    ) -> anyhow::Result<String> {
-        let tenant = deis_wire::conventions::tenant_id(app_id, environment);
+    /// It names the canonical tenant, the `queue` audience and the `queue`
+    /// binding; deis-queue acts for exactly the tenant it names, so nothing
+    /// in the request has to say which one.
+    pub async fn queue_token_for(&self, tenant: &CanonicalTenantId) -> anyhow::Result<String> {
         self.issuer
             .issue(
                 AUD_QUEUE,
-                &format!("spiffe://deislet/control/{app_id}"),
-                resources_for_audience(&tenant, AUD_QUEUE),
+                &format!("spiffe://deislet/control/{}", tenant.application_id()),
+                resources_for_audience(&tenant.to_string(), AUD_QUEUE),
             )
             .await
             .map_err(|error| anyhow::anyhow!("could not issue a queue capability: {error}"))
@@ -354,8 +349,7 @@ impl StorageWiring {
     /// leases without admitting the candidate before pointer commit.
     pub async fn prepare_consumer_generation(
         &self,
-        app_id: &str,
-        environment: &str,
+        tenant: &CanonicalTenantId,
         deployment_id: &str,
         generation: &str,
         expected_previous_generation: Option<&str>,
@@ -366,7 +360,6 @@ impl StorageWiring {
         };
 
         let channel = self.queue_channel()?;
-        let tenant = deis_wire::conventions::tenant_id(app_id, environment);
         let mut request = tonic::Request::new(PrepareConsumerGenerationRequest {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
@@ -375,14 +368,7 @@ impl StorageWiring {
                 .to_string(),
             expected_previous_deployment_id: expected_previous_deployment_id.map(str::to_string),
         });
-        request.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            tenant.parse().map_err(|error| {
-                anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
-            })?,
-        );
-        self.stamp_queue_capability(&mut request, app_id, environment)
-            .await?;
+        self.stamp_queue_capability(&mut request, tenant).await?;
         Ok(QueueClient::new(channel)
             .prepare_consumer_generation(request)
             .await?
@@ -392,21 +378,19 @@ impl StorageWiring {
     /// Admit a queue generation whose pre-commit barrier completed.
     pub async fn activate_consumer_generation(
         &self,
-        app_id: &str,
-        environment: &str,
+        tenant: &CanonicalTenantId,
         deployment_id: &str,
         generation: &str,
     ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
         use deis_queue::proto::queue::{
             ActivateConsumerGenerationRequest, queue_client::QueueClient,
         };
-        let (channel, tenant) = self.queue_channel_and_tenant(app_id, environment)?;
+        let channel = self.queue_channel()?;
         let mut request = tonic::Request::new(ActivateConsumerGenerationRequest {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
         });
-        self.authorize_queue_request(&mut request, app_id, environment, &tenant)
-            .await?;
+        self.stamp_queue_capability(&mut request, tenant).await?;
         Ok(QueueClient::new(channel)
             .activate_consumer_generation(request)
             .await?
@@ -416,52 +400,21 @@ impl StorageWiring {
     /// Cancel an uncommitted queue barrier and restore old Pull admission.
     pub async fn abort_consumer_generation(
         &self,
-        app_id: &str,
-        environment: &str,
+        tenant: &CanonicalTenantId,
         deployment_id: &str,
         generation: &str,
     ) -> anyhow::Result<deis_queue::proto::queue::AbortConsumerGenerationResponse> {
         use deis_queue::proto::queue::{AbortConsumerGenerationRequest, queue_client::QueueClient};
-        let (channel, tenant) = self.queue_channel_and_tenant(app_id, environment)?;
+        let channel = self.queue_channel()?;
         let mut request = tonic::Request::new(AbortConsumerGenerationRequest {
             deployment_id: deployment_id.to_string(),
             generation: generation.to_string(),
         });
-        self.authorize_queue_request(&mut request, app_id, environment, &tenant)
-            .await?;
+        self.stamp_queue_capability(&mut request, tenant).await?;
         Ok(QueueClient::new(channel)
             .abort_consumer_generation(request)
             .await?
             .into_inner())
-    }
-
-    fn queue_channel_and_tenant(
-        &self,
-        app_id: &str,
-        environment: &str,
-    ) -> anyhow::Result<(tonic::transport::Channel, String)> {
-        let channel = self.queue_channel()?;
-        Ok((
-            channel,
-            deis_wire::conventions::tenant_id(app_id, environment),
-        ))
-    }
-
-    async fn authorize_queue_request<T>(
-        &self,
-        request: &mut tonic::Request<T>,
-        app_id: &str,
-        environment: &str,
-        tenant: &str,
-    ) -> anyhow::Result<()> {
-        request.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            tenant.parse().map_err(|error| {
-                anyhow::anyhow!("queue tenant is not valid gRPC metadata: {error}")
-            })?,
-        );
-        self.stamp_queue_capability(request, app_id, environment)
-            .await
     }
 
     /// Put this control plane's queue capability in `Authorization: Bearer`,
@@ -469,10 +422,9 @@ impl StorageWiring {
     async fn stamp_queue_capability<T>(
         &self,
         request: &mut tonic::Request<T>,
-        app_id: &str,
-        environment: &str,
+        tenant: &CanonicalTenantId,
     ) -> anyhow::Result<()> {
-        let token = self.queue_token_for(app_id, environment).await?;
+        let token = self.queue_token_for(tenant).await?;
         request.metadata_mut().insert(
             "authorization",
             format!("Bearer {token}").parse().map_err(|error| {
@@ -514,10 +466,9 @@ impl DeliveryReason {
 /// `FetchSecretValues`.
 pub struct DeploymentPayload {
     pub app_id: String,
-    /// Permanent application identity. The legacy name above remains for
-    /// routing during a rolling migration; storage authority is derived from
-    /// this id and `canonical_environment_id` once the migration fence cuts
-    /// the environment over.
+    /// Permanent application identity. The name above is what routing and
+    /// application code read; storage authority is derived from this id and
+    /// `canonical_environment_id`.
     pub canonical_application_id: deis_wire::CanonicalId,
     pub version_id: String,
     /// Environment *name*, never the id: this is what application code
@@ -527,22 +478,18 @@ pub struct DeploymentPayload {
     pub canonical_environment_id: deis_wire::CanonicalId,
     pub bundle_url: String,
     pub bundle_sha: String,
-    /// Plain variables from the manifest. The application's own
-    /// environment, and nothing the platform added; never a secret value.
-    env: BTreeMap<String, String>,
     /// Which secrets the snapshot binds. Names only - they are safe to log,
     /// the values are not.
     secret_names: Vec<String>,
     /// Standard declaration and snapshot are public only to the internal
     /// delivery/runtime boundary. Neither contains secret plaintext.
-    environment_declarations: Option<deis_wire::EnvironmentDeclarations>,
-    environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
+    environment_declarations: deis_wire::EnvironmentDeclarations,
+    environment_snapshot: deis_wire::EnvironmentBindingSnapshot,
     /// Canonical wire documents are prepared while the payload can still
-    /// fail. `to_request` must never turn a serialization error into three
-    /// empty fields that look like a legacy deployment.
-    environment_declarations_json: Option<String>,
-    environment_snapshot_json: Option<String>,
-    environment_snapshot_id: Option<String>,
+    /// fail, so `to_request` never has a serialization error to hide.
+    environment_declarations_json: String,
+    environment_snapshot_json: String,
+    environment_snapshot_id: String,
     /// The only standard secret plaintext carrier, keyed by immutable
     /// revision rather than name. Never serialized to management APIs/logs.
     pub secret_values_by_revision: BTreeMap<String, String>,
@@ -641,23 +588,15 @@ impl DeploymentPayload {
         self.action
     }
 
-    /// Names of the entries that came from the manifest rather than from a
-    /// secret. Safe to log.
+    /// Names of the config values the snapshot binds. Safe to log.
     pub fn variable_names(&self) -> Vec<&str> {
-        if let Some(snapshot) = &self.environment_snapshot {
-            return snapshot
-                .bindings
-                .iter()
-                .filter_map(|binding| match binding {
-                    deis_wire::EnvironmentBinding::Config(config) => Some(config.name.as_str()),
-                    deis_wire::EnvironmentBinding::Secret(_) => None,
-                })
-                .collect();
-        }
-        self.env
-            .keys()
-            .map(String::as_str)
-            .filter(|name| !self.secret_names.iter().any(|s| s == name))
+        self.environment_snapshot
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding {
+                deis_wire::EnvironmentBinding::Config(config) => Some(config.name.as_str()),
+                deis_wire::EnvironmentBinding::Secret(_) => None,
+            })
             .collect()
     }
 
@@ -665,17 +604,16 @@ impl DeploymentPayload {
         &self.secret_names
     }
 
-    pub fn environment_snapshot(&self) -> Option<&deis_wire::EnvironmentBindingSnapshot> {
-        self.environment_snapshot.as_ref()
+    pub fn environment_snapshot(&self) -> &deis_wire::EnvironmentBindingSnapshot {
+        &self.environment_snapshot
     }
 
     /// Secret heads observed while a fresh standard snapshot was prepared.
     /// Absence is meaningful for optional declarations: activation must fail
     /// if a concurrent writer creates that head before the pointer commits.
-    pub fn expected_secret_heads(&self) -> Option<BTreeMap<String, Option<String>>> {
-        let declarations = self.environment_declarations.as_ref()?;
-        let snapshot = self.environment_snapshot.as_ref()?;
-        let selected = snapshot
+    pub fn expected_secret_heads(&self) -> BTreeMap<String, Option<String>> {
+        let selected = self
+            .environment_snapshot
             .bindings
             .iter()
             .filter_map(|binding| match binding {
@@ -685,34 +623,33 @@ impl DeploymentPayload {
                 deis_wire::EnvironmentBinding::Config(_) => None,
             })
             .collect::<BTreeMap<_, _>>();
-        Some(
-            declarations
-                .declarations
-                .iter()
-                .filter(|declaration| declaration.kind == deis_wire::EnvironmentKind::Secret)
-                .map(|declaration| {
-                    (
-                        declaration.name.clone(),
-                        selected
-                            .get(declaration.name.as_str())
-                            .map(|revision| (*revision).to_string()),
-                    )
-                })
-                .collect(),
-        )
+        self.environment_declarations
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.kind == deis_wire::EnvironmentKind::Secret)
+            .map(|declaration| {
+                (
+                    declaration.name.clone(),
+                    selected
+                        .get(declaration.name.as_str())
+                        .map(|revision| (*revision).to_string()),
+                )
+            })
+            .collect()
     }
 
     pub fn standard_environment_for_wire(
         &self,
-    ) -> Option<(
+    ) -> (
         deis_wire::EnvironmentDeclarations,
         deis_wire::EnvironmentBindingSnapshot,
         String,
-    )> {
-        let declarations = self.environment_declarations.clone()?;
-        let snapshot = self.environment_snapshot.clone()?;
-        let identity = self.environment_snapshot_id.clone()?;
-        Some((declarations, snapshot, identity))
+    ) {
+        (
+            self.environment_declarations.clone(),
+            self.environment_snapshot.clone(),
+            self.environment_snapshot_id.clone(),
+        )
     }
 
     pub fn variable_count(&self) -> usize {
@@ -723,22 +660,22 @@ impl DeploymentPayload {
         self.secret_names.len()
     }
 
-    /// The complete environment a node should see: the application's own
-    /// variables and the platform's storage addresses.
+    /// The platform's wiring a node needs beside the snapshot: the storage
+    /// addresses.
     ///
-    /// No secret value and no credential is in it: secrets reach a node
-    /// through the snapshot and `FetchSecretValues`, and storage
-    /// capabilities through the node's own `IssueCapability` calls.
+    /// No application value, secret or credential is in it: config values
+    /// and secret revisions travel in the snapshot, secret values through
+    /// `FetchSecretValues`, and storage capabilities through the node's own
+    /// `IssueCapability` calls.
     pub fn env_for_wire(&self) -> BTreeMap<String, String> {
-        let mut env: BTreeMap<String, String> = self.env.clone();
-        // Written last, so an application variable spelled like a reserved
-        // key cannot point the app's storage client somewhere else.
+        let mut env = BTreeMap::new();
         self.storage.write_into(&self.app_id, &mut env);
         env
     }
 
-    /// Build the wire message. It carries the application's variables but
-    /// no secret value; still, hand it straight to the RPC rather than a log.
+    /// Build the wire message. It carries the application's config values
+    /// but no secret value; still, hand it straight to the RPC rather than a
+    /// log.
     pub fn to_request(&self) -> proto::ApplyDeploymentRequest {
         let env = self.env_for_wire();
 
@@ -753,12 +690,9 @@ impl DeploymentPayload {
             compatibility: Some(compatibility_to_wire(&self.compatibility)),
             canonical_application_id: self.canonical_application_id.to_string(),
             canonical_environment_id: self.canonical_environment_id.to_string(),
-            environment_declarations_json: self
-                .environment_declarations_json
-                .clone()
-                .unwrap_or_default(),
-            environment_snapshot_json: self.environment_snapshot_json.clone().unwrap_or_default(),
-            environment_snapshot_id: self.environment_snapshot_id.clone().unwrap_or_default(),
+            environment_declarations_json: self.environment_declarations_json.clone(),
+            environment_snapshot_json: self.environment_snapshot_json.clone(),
+            environment_snapshot_id: self.environment_snapshot_id.clone(),
             deployment_id: self.deployment_id.clone().unwrap_or_default(),
             routing_generation: self.routing_generation.clone().unwrap_or_default(),
             action: self.action as i32,
@@ -775,9 +709,7 @@ impl DeploymentPayload {
 /// turn the behaviour back on.
 ///
 /// Always sent, including for a version that declares nothing: an empty date
-/// with no flags is a complete answer ("the oldest behaviour"), and an absent
-/// message would be indistinguishable from an older control plane that has no
-/// opinion, which would leave a node guessing.
+/// with no flags is a complete answer ("the oldest behaviour").
 fn compatibility_to_wire(declared: &DeclaredCompatibility) -> proto::CompatibilityDeclaration {
     proto::CompatibilityDeclaration {
         date: declared
@@ -786,6 +718,16 @@ fn compatibility_to_wire(declared: &DeclaredCompatibility) -> proto::Compatibili
             .unwrap_or_default(),
         flags: declared.flags.clone(),
     }
+}
+
+/// What [`DeploymentDeliverer::prepare_environment_snapshot`] settles for
+/// one deployment. The values are held only to be handed to the node or
+/// driver the snapshot is for; `Debug` is not derived on purpose.
+pub struct PreparedEnvironmentSnapshot {
+    pub declarations: deis_wire::EnvironmentDeclarations,
+    pub snapshot: deis_wire::EnvironmentBindingSnapshot,
+    pub secret_names: Vec<String>,
+    pub secret_values_by_revision: BTreeMap<String, String>,
 }
 
 pub fn decrypt_secret(
@@ -866,10 +808,11 @@ pub struct DeliveryReport {
     pub skipped: Option<String>,
 }
 
-/// Result of preparing a secret-head change. Standard deployments return a
+/// Result of preparing a secret-head change. A running deployment gets a
 /// candidate payload before either the secret head or production pointer is
-/// changed; legacy/undeployed cases finish locally and retain their explicit
-/// delivery report.
+/// changed; a change nothing running reads (an environment never deployed, a
+/// secret the running version does not declare) finishes locally with an
+/// explicit delivery report.
 pub enum SecretChangePreparation {
     Finished(DeliveryReport),
     Prepared {
@@ -989,16 +932,29 @@ impl DeploymentDeliverer {
         self.storage.requires_consumer_fence(version)
     }
 
+    /// The canonical tenant of `environment`: what a store or queue
+    /// capability for it names.
+    async fn canonical_tenant(
+        &self,
+        environment: &Environment,
+    ) -> CatalogResult<CanonicalTenantId> {
+        let app = self.store.get_app(&environment.app_id).await?;
+        Ok(CanonicalTenantId::new(
+            app.canonical_id,
+            environment.canonical_id,
+        ))
+    }
+
     pub async fn prepare_consumer_generation(
         &self,
         environment: &Environment,
         plan: &crate::catalog::DeploymentPlan,
     ) -> anyhow::Result<deis_queue::proto::queue::PrepareConsumerGenerationResponse> {
+        let tenant = self.canonical_tenant(environment).await?;
         let progress = self
             .storage
             .prepare_consumer_generation(
-                &environment.app_id,
-                &environment.name,
+                &tenant,
                 &plan.id,
                 &plan.routing_generation.to_string(),
                 plan.previous_generation.as_deref(),
@@ -1020,14 +976,10 @@ impl DeploymentDeliverer {
         environment: &Environment,
         plan: &crate::catalog::DeploymentPlan,
     ) -> anyhow::Result<deis_queue::proto::queue::ActivateConsumerGenerationResponse> {
+        let tenant = self.canonical_tenant(environment).await?;
         let progress = self
             .storage
-            .activate_consumer_generation(
-                &environment.app_id,
-                &environment.name,
-                &plan.id,
-                &plan.routing_generation.to_string(),
-            )
+            .activate_consumer_generation(&tenant, &plan.id, &plan.routing_generation.to_string())
             .await?;
         validate_activate_consumer_generation_response(
             &progress,
@@ -1044,14 +996,10 @@ impl DeploymentDeliverer {
         environment: &Environment,
         plan: &crate::catalog::DeploymentPlan,
     ) -> anyhow::Result<deis_queue::proto::queue::AbortConsumerGenerationResponse> {
+        let tenant = self.canonical_tenant(environment).await?;
         let progress = self
             .storage
-            .abort_consumer_generation(
-                &environment.app_id,
-                &environment.name,
-                &plan.id,
-                &plan.routing_generation.to_string(),
-            )
+            .abort_consumer_generation(&tenant, &plan.id, &plan.routing_generation.to_string())
             .await?;
         validate_abort_consumer_generation_response(
             &progress,
@@ -1128,9 +1076,9 @@ impl DeploymentDeliverer {
         config_values: BTreeMap<String, serde_json::Value>,
         prepared_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
     ) -> CatalogResult<DeploymentPayload> {
-        // The legacy foreign key on the environment names the app row; read
-        // that durable row so the wire carries its permanent identity rather
-        // than deriving authority from the mutable display name.
+        // The environment's foreign key names the app row; read that durable
+        // row so the wire carries its permanent identity rather than
+        // deriving authority from the mutable display name.
         let app = self.store.get_app(&env.app_id).await?;
         let version_id = version.id.as_str();
         let manifest = deis_bundle::Manifest::parse(&version.manifest).map_err(|e| {
@@ -1145,8 +1093,6 @@ impl DeploymentDeliverer {
                 "stored manifest of version {version_id} no longer parses: {e}"
             ))
         })?;
-
-        let mut env_map: BTreeMap<String, String> = manifest.env.clone();
 
         // The same block the upload already accepted, read again here because
         // this is the message that carries it to a node. A version stored by
@@ -1228,205 +1174,30 @@ impl DeploymentDeliverer {
         }
         let compatibility = manifest.compatibility.clone().unwrap_or_default();
 
-        let mut secret_names = Vec::new();
-        let mut environment_declarations = None;
-        let mut environment_snapshot = None;
-        let mut secret_values_by_revision = BTreeMap::new();
+        let PreparedEnvironmentSnapshot {
+            declarations: environment_declarations,
+            snapshot: environment_snapshot,
+            secret_names,
+            secret_values_by_revision,
+        } = self
+            .prepare_environment_snapshot(env, version, &manifest, config_values, prepared_snapshot)
+            .await?;
 
-        if let Some(declarations) = manifest.environment.clone() {
-            env_map.clear();
-            declarations
-                .validate(
-                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
-                    manifest.bindings.all_names(),
-                )
-                .map_err(|error| CatalogError::invalid(error.to_string()))?;
-            let declaration_identity = declarations
-                .identity()
-                .map_err(|error| CatalogError::invalid(error.to_string()))?;
-            let mut available_revisions = BTreeSet::new();
-            let snapshot = if let Some(snapshot) = prepared_snapshot {
-                if !config_values.is_empty() {
-                    return Err(CatalogError::invalid(
-                        "EC_ENV_SNAPSHOT_INVALID: config values cannot replace a historical snapshot",
-                    ));
-                }
-                for binding in &snapshot.bindings {
-                    if let deis_wire::EnvironmentBinding::Secret(secret) = binding {
-                        let stored = self
-                            .store
-                            .secret_revision_ciphertext(&env.id, &secret.name, &secret.revision)
-                            .await
-                            .map_err(|_| {
-                                CatalogError::invalid(
-                                    "EC_ENV_SECRET_REVISION_UNAVAILABLE: historical secret revision is unavailable",
-                                )
-                            })?;
-                        let value = decrypt_secret(self.secrets.as_ref(), &env.id, &stored)?;
-                        deis_wire::validate_secret_value(&value)
-                            .map_err(|error| CatalogError::invalid(error.to_string()))?;
-                        available_revisions.insert(stored.revision.clone());
-                        secret_values_by_revision.insert(stored.revision, value);
-                        secret_names.push(stored.name);
-                    }
-                }
-                snapshot
-            } else {
-                let current = self
-                    .store
-                    .secret_ciphertexts(&env.id)
-                    .await?
-                    .into_iter()
-                    .map(|stored| (stored.name.clone(), stored))
-                    .collect::<BTreeMap<_, _>>();
-                let declared = declarations.by_name();
-                for name in config_values.keys() {
-                    let Some(declaration) = declared.get(name.as_str()) else {
-                        return Err(CatalogError::invalid(
-                            "EC_ENV_BINDING_UNDECLARED: deployment config contains an undeclared name",
-                        ));
-                    };
-                    if declaration.kind != deis_wire::EnvironmentKind::Config {
-                        return Err(CatalogError::invalid(
-                            "EC_ENV_BINDING_TYPE_MISMATCH: deployment config supplies a secret declaration",
-                        ));
-                    }
-                }
-
-                let mut bindings = Vec::new();
-                for declaration in &declarations.declarations {
-                    match declaration.kind {
-                        deis_wire::EnvironmentKind::Config => {
-                            if let Some(value) = config_values.get(&declaration.name) {
-                                bindings.push(deis_wire::EnvironmentBinding::Config(
-                                    deis_wire::EnvironmentConfigBinding::new(
-                                        &declaration.name,
-                                        declaration.value_type,
-                                        value.clone(),
-                                    )
-                                    .map_err(|error| CatalogError::invalid(error.to_string()))?,
-                                ));
-                            } else if declaration.required {
-                                return Err(CatalogError::invalid(
-                                    "EC_ENV_REQUIRED_MISSING: required config binding is unavailable",
-                                ));
-                            }
-                        }
-                        deis_wire::EnvironmentKind::Secret => {
-                            if let Some(stored) = current.get(&declaration.name) {
-                                let value = decrypt_secret(self.secrets.as_ref(), &env.id, stored)?;
-                                deis_wire::validate_secret_value(&value)
-                                    .map_err(|error| CatalogError::invalid(error.to_string()))?;
-                                available_revisions.insert(stored.revision.clone());
-                                secret_values_by_revision.insert(stored.revision.clone(), value);
-                                secret_names.push(stored.name.clone());
-                                bindings.push(deis_wire::EnvironmentBinding::Secret(
-                                    deis_wire::EnvironmentSecretBinding::new(
-                                        &stored.name,
-                                        &stored.revision,
-                                    ),
-                                ));
-                            } else if declaration.required {
-                                return Err(CatalogError::invalid(
-                                    "EC_ENV_REQUIRED_MISSING: required secret binding is unavailable",
-                                ));
-                            }
-                        }
-                    }
-                }
-                deis_wire::EnvironmentBindingSnapshot::new(
-                    declarations.standard_version.clone(),
-                    version_id,
-                    env.canonical_id.to_string(),
-                    declaration_identity,
-                    bindings,
-                )
-            };
-            snapshot
-                .validate(
-                    &declarations,
-                    deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
-                    |revision| available_revisions.contains(revision),
-                )
-                .map_err(|error| CatalogError::invalid(error.to_string()))?;
-            environment_declarations = Some(declarations);
-            environment_snapshot = Some(snapshot);
-        } else {
-            // No `environment` declarations: nothing binds a secret, so none
-            // is delivered. A secret value reaches a node only through a
-            // snapshot and `FetchSecretValues`, never in the deployment's env.
-            let stored = self.store.secret_ciphertexts(&env.id).await?.len();
-            if stored > 0 || !manifest.secrets.is_empty() {
-                warn!(
-                    app_id = %env.app_id,
-                    environment = %env.name,
-                    version_id = %version_id,
-                    stored_secrets = stored,
-                    manifest_secrets = manifest.secrets.len(),
-                    "This version's manifest has no `environment` declarations, so it binds no secret and none is delivered; declare each secret under `environment` to have the node fetch it"
-                );
-            }
-        }
-
-        // The node builds its storage tenant from this pair
-        // (`conventions::tenant_id`), and deis-store rejects a tenant id it
-        // cannot split back into exactly two legal parts. Names created
-        // today cannot break that rule; a row written before the rule
-        // existed can, and the only symptom on the node would be every
-        // ctx.services call failing with an opaque error from the store.
-        if deis_wire::conventions::split_tenant(&deis_wire::conventions::tenant_id(
-            &env.app_id,
-            &env.name,
-        ))
-        .is_none()
-        {
-            error!(
-                app_id = %env.app_id,
-                environment = %env.name,
-                version_id = %version_id,
-                "This app and environment do not form a storage tenant id, so deis-store and deis-queue will reject every call this deployment makes; the code still loads and serves, but its kv, database, blob and queue bindings are unusable until the environment is recreated with a name of letters, digits, '-' and '_'"
-            );
-        }
-
-        let (environment_declarations_json, environment_snapshot_json, environment_snapshot_id) =
-            match (&environment_declarations, &environment_snapshot) {
-                (Some(declarations), Some(snapshot)) => {
-                    let declarations_json = String::from_utf8(
-                        declarations
-                            .canonical_json()
-                            .map_err(|error| CatalogError::invalid(error.to_string()))?,
+        let invalid = |error: deis_wire::EnvironmentError| CatalogError::invalid(error.to_string());
+        let environment_declarations_json =
+            String::from_utf8(environment_declarations.canonical_json().map_err(invalid)?)
+                .map_err(|_| {
+                    CatalogError::invalid(
+                        "EC_ENV_DOCUMENT_INVALID: canonical declaration is not UTF-8",
                     )
-                    .map_err(|_| {
-                        CatalogError::invalid(
-                            "EC_ENV_DOCUMENT_INVALID: canonical declaration is not UTF-8",
-                        )
-                    })?;
-                    let snapshot_json = String::from_utf8(
-                        snapshot
-                            .canonical_json()
-                            .map_err(|error| CatalogError::invalid(error.to_string()))?,
-                    )
-                    .map_err(|_| {
-                        CatalogError::invalid(
-                            "EC_ENV_SNAPSHOT_INVALID: canonical snapshot is not UTF-8",
-                        )
-                    })?;
-                    let snapshot_id = snapshot
-                        .identity()
-                        .map_err(|error| CatalogError::invalid(error.to_string()))?;
-                    (
-                        Some(declarations_json),
-                        Some(snapshot_json),
-                        Some(snapshot_id),
-                    )
-                }
-                (None, None) => (None, None, None),
-                _ => {
-                    return Err(CatalogError::invalid(
-                        "EC_ENV_SNAPSHOT_INVALID: declaration and snapshot must be prepared together",
-                    ));
-                }
-            };
+                })?;
+        let environment_snapshot_json = String::from_utf8(
+            environment_snapshot.canonical_json().map_err(invalid)?,
+        )
+        .map_err(|_| {
+            CatalogError::invalid("EC_ENV_SNAPSHOT_INVALID: canonical snapshot is not UTF-8")
+        })?;
+        let environment_snapshot_id = environment_snapshot.identity().map_err(invalid)?;
 
         Ok(DeploymentPayload {
             app_id: env.app_id.clone(),
@@ -1436,7 +1207,6 @@ impl DeploymentDeliverer {
             canonical_environment_id: env.canonical_id,
             bundle_url: bundle_url(base_url, &env.app_id, version_id),
             bundle_sha: version.bundle_sha.clone(),
-            env: env_map,
             secret_names,
             environment_declarations,
             environment_snapshot,
@@ -1453,13 +1223,155 @@ impl DeploymentDeliverer {
         })
     }
 
+    /// The environment snapshot a deployment of `version` to `env` binds:
+    /// the version's declarations, the `config_values` given for this
+    /// deployment and the secret revisions at the environment's heads - or
+    /// exactly `prepared_snapshot`, re-checked, when one is given.
+    ///
+    /// Every bound secret is decrypted and validated here, so a snapshot
+    /// that names a revision this control plane cannot read is refused
+    /// before anything is recorded against it.
+    pub async fn prepare_environment_snapshot(
+        &self,
+        env: &Environment,
+        version: &Version,
+        manifest: &deis_bundle::Manifest,
+        config_values: BTreeMap<String, serde_json::Value>,
+        prepared_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
+    ) -> CatalogResult<PreparedEnvironmentSnapshot> {
+        let declarations = manifest.environment.clone();
+        let version_id = version.id.as_str();
+        let mut secret_names = Vec::new();
+        let mut secret_values_by_revision = BTreeMap::new();
+        declarations
+            .validate(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                manifest.bindings.all_names(),
+            )
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        let declaration_identity = declarations
+            .identity()
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        let mut available_revisions = BTreeSet::new();
+        let snapshot = if let Some(snapshot) = prepared_snapshot {
+            if !config_values.is_empty() {
+                return Err(CatalogError::invalid(
+                    "EC_ENV_SNAPSHOT_INVALID: config values cannot replace a historical snapshot",
+                ));
+            }
+            for binding in &snapshot.bindings {
+                if let deis_wire::EnvironmentBinding::Secret(secret) = binding {
+                    let stored = self
+                        .store
+                        .secret_revision_ciphertext(&env.id, &secret.name, &secret.revision)
+                        .await
+                        .map_err(|_| {
+                            CatalogError::invalid(
+                                "EC_ENV_SECRET_REVISION_UNAVAILABLE: historical secret revision is unavailable",
+                            )
+                        })?;
+                    let value = decrypt_secret(self.secrets.as_ref(), &env.id, &stored)?;
+                    deis_wire::validate_secret_value(&value)
+                        .map_err(|error| CatalogError::invalid(error.to_string()))?;
+                    available_revisions.insert(stored.revision.clone());
+                    secret_values_by_revision.insert(stored.revision, value);
+                    secret_names.push(stored.name);
+                }
+            }
+            snapshot
+        } else {
+            let current = self
+                .store
+                .secret_ciphertexts(&env.id)
+                .await?
+                .into_iter()
+                .map(|stored| (stored.name.clone(), stored))
+                .collect::<BTreeMap<_, _>>();
+            let declared = declarations.by_name();
+            for name in config_values.keys() {
+                let Some(declaration) = declared.get(name.as_str()) else {
+                    return Err(CatalogError::invalid(
+                        "EC_ENV_BINDING_UNDECLARED: deployment config contains an undeclared name",
+                    ));
+                };
+                if declaration.kind != deis_wire::EnvironmentKind::Config {
+                    return Err(CatalogError::invalid(
+                        "EC_ENV_BINDING_TYPE_MISMATCH: deployment config supplies a secret declaration",
+                    ));
+                }
+            }
+
+            let mut bindings = Vec::new();
+            for declaration in &declarations.declarations {
+                match declaration.kind {
+                    deis_wire::EnvironmentKind::Config => {
+                        if let Some(value) = config_values.get(&declaration.name) {
+                            bindings.push(deis_wire::EnvironmentBinding::Config(
+                                deis_wire::EnvironmentConfigBinding::new(
+                                    &declaration.name,
+                                    declaration.value_type,
+                                    value.clone(),
+                                )
+                                .map_err(|error| CatalogError::invalid(error.to_string()))?,
+                            ));
+                        } else if declaration.required {
+                            return Err(CatalogError::invalid(
+                                "EC_ENV_REQUIRED_MISSING: required config binding is unavailable",
+                            ));
+                        }
+                    }
+                    deis_wire::EnvironmentKind::Secret => {
+                        if let Some(stored) = current.get(&declaration.name) {
+                            let value = decrypt_secret(self.secrets.as_ref(), &env.id, stored)?;
+                            deis_wire::validate_secret_value(&value)
+                                .map_err(|error| CatalogError::invalid(error.to_string()))?;
+                            available_revisions.insert(stored.revision.clone());
+                            secret_values_by_revision.insert(stored.revision.clone(), value);
+                            secret_names.push(stored.name.clone());
+                            bindings.push(deis_wire::EnvironmentBinding::Secret(
+                                deis_wire::EnvironmentSecretBinding::new(
+                                    &stored.name,
+                                    &stored.revision,
+                                ),
+                            ));
+                        } else if declaration.required {
+                            return Err(CatalogError::invalid(
+                                "EC_ENV_REQUIRED_MISSING: required secret binding is unavailable",
+                            ));
+                        }
+                    }
+                }
+            }
+            deis_wire::EnvironmentBindingSnapshot::new(
+                declarations.standard_version.clone(),
+                version_id,
+                env.canonical_id.to_string(),
+                declaration_identity,
+                bindings,
+            )
+        };
+        snapshot
+            .validate(
+                &declarations,
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                |revision| available_revisions.contains(revision),
+            )
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        Ok(PreparedEnvironmentSnapshot {
+            declarations,
+            snapshot,
+            secret_names,
+            secret_values_by_revision,
+        })
+    }
+
     /// Build the payload for one assignment row, the way a push would.
     ///
     /// The assignment list is the other half of a node's life: a node that
     /// restarts asks for it and loads what it names. Until it carried an
     /// environment, an app that came back this way came back with no secrets
     /// and - worse, because it is silent - no storage addresses, so its
-    /// `ctx.services` calls failed until someone deployed again.
+    /// storage bindings were missing until someone deployed again.
     ///
     /// Errors are the caller's to report per row: one environment whose
     /// secrets will not decrypt must not stop a node from loading the rest.
@@ -1479,13 +1391,13 @@ impl DeploymentDeliverer {
             .store
             .get_version(&assignment.app_id, &assignment.version_id)
             .await?;
-        let mut payload = if let Some(snapshot_id) = &assignment.snapshot_id {
-            let snapshot = self.store.get_environment_snapshot(snapshot_id).await?;
-            self.payload_for_snapshot(&env, &version, base_url, snapshot)
-                .await
-        } else {
-            self.payload(&env, &version, base_url).await
-        }?;
+        let snapshot = self
+            .store
+            .get_environment_snapshot(&assignment.snapshot_id)
+            .await?;
+        let mut payload = self
+            .payload_for_snapshot(&env, &version, base_url, snapshot)
+            .await?;
         payload.set_instruction(
             &assignment.deployment_id,
             &assignment.routing_generation,
@@ -1498,7 +1410,9 @@ impl DeploymentDeliverer {
                 Some("preparing" | "prepared" | "activating" | "reconciling" | "degraded") => {
                     proto::DeploymentAction::Prepare
                 }
-                Some("active") | None => proto::DeploymentAction::Unspecified,
+                // `None` is a pointer committed outside a plan, which only
+                // `CatalogStore::activate_deployment` writes; it is active.
+                Some("active") | None => proto::DeploymentAction::Activate,
                 Some(state) => {
                     return Err(CatalogError::conflict(format!(
                         "current deployment {} has terminal or unknown plan state {state}",
@@ -1583,7 +1497,7 @@ impl DeploymentDeliverer {
             proto::DeploymentAction::Activate => "activate",
             proto::DeploymentAction::Abort => "abort",
             proto::DeploymentAction::Drain => "drain",
-            proto::DeploymentAction::Unspecified => "apply",
+            proto::DeploymentAction::Unspecified => "unspecified",
         };
         let mut report = DeliveryReport {
             reason,
@@ -1840,108 +1754,8 @@ impl DeploymentDeliverer {
         report
     }
 
-    /// Build and push in one step for the version an environment runs now.
-    ///
-    /// This is the secret-change path: nothing about the version moved, but
-    /// the values the nodes hold in memory are stale, so the same version
-    /// is delivered again with a fresh env map.
-    ///
-    /// Never fails: the change that triggered it is already recorded, so
-    /// anything that goes wrong here is reported in the returned report
-    /// and in the log rather than handed back to the caller as if the
-    /// change had not happened.
-    pub async fn reload_current(
-        &self,
-        env: &Environment,
-        base_url: &str,
-        reason: DeliveryReason,
-    ) -> DeliveryReport {
-        let skipped = |version_id: String, text: String| DeliveryReport {
-            reason,
-            phase: "legacy_apply",
-            app_id: env.app_id.clone(),
-            environment: env.name.clone(),
-            version_id,
-            delivered: Vec::new(),
-            failed: Vec::new(),
-            skipped: Some(text),
-        };
-
-        let deployment = match self.store.current_deployment(&env.id).await {
-            Ok(Some(deployment)) => deployment,
-            Ok(None) => {
-                let text = format!(
-                    "environment {} of app {} has never been deployed, so there is nothing to reload; the change takes effect on its first deployment",
-                    env.name, env.app_id
-                );
-                info!(
-                    app_id = %env.app_id,
-                    environment = %env.name,
-                    reason = reason.as_str(),
-                    "{text}"
-                );
-                return skipped(String::new(), text);
-            }
-            Err(e) => {
-                error!(
-                    app_id = %env.app_id,
-                    environment = %env.name,
-                    reason = reason.as_str(),
-                    error = %e,
-                    "Could not read which version this environment runs, so the nodes were not updated; they keep serving the values they already hold until the next deployment"
-                );
-                return skipped(String::new(), e.to_string());
-            }
-        };
-
-        let version = match self
-            .store
-            .get_version(&env.app_id, &deployment.version_id)
-            .await
-        {
-            Ok(version) => version,
-            Err(e) => {
-                error!(
-                    app_id = %env.app_id,
-                    environment = %env.name,
-                    version_id = %deployment.version_id,
-                    error = %e,
-                    "The version this environment points at could not be read, so the nodes were not updated and keep serving the values they already hold"
-                );
-                return skipped(deployment.version_id.clone(), e.to_string());
-            }
-        };
-
-        let payload = if let Some(snapshot_id) = &deployment.snapshot_id {
-            match self.store.get_environment_snapshot(snapshot_id).await {
-                Ok(snapshot) => {
-                    self.payload_for_snapshot(env, &version, base_url, snapshot)
-                        .await
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            self.payload(env, &version, base_url).await
-        };
-        match payload {
-            Ok(payload) => self.push(&payload, reason).await,
-            Err(e) => {
-                error!(
-                    app_id = %env.app_id,
-                    environment = %env.name,
-                    version_id = %version.id,
-                    reason = reason.as_str(),
-                    error = %e,
-                    "The change is recorded but could not be turned into a deployment payload, so no node was updated; every node keeps the environment it already had"
-                );
-                skipped(version.id.clone(), e.to_string())
-            }
-        }
-    }
-
     /// Activate a new snapshot for a secret rotation/deletion without changing
-    /// the application version. Legacy schema-1 deployments keep their old
-    /// reload behavior; schema-2 deployments always append a pointer row.
+    /// the application version: the change always appends a pointer row.
     pub async fn prepare_secret_change(
         &self,
         env: &Environment,
@@ -1953,7 +1767,7 @@ impl DeploymentDeliverer {
         let reason = DeliveryReason::SecretChange;
         let skipped = |version_id: String, text: String| DeliveryReport {
             reason,
-            phase: "legacy_apply",
+            phase: "none",
             app_id: env.app_id.clone(),
             environment: env.name.clone(),
             version_id,
@@ -1974,14 +1788,7 @@ impl DeploymentDeliverer {
                 )));
             }
         };
-        let Some(snapshot_id) = deployment.snapshot_id.as_deref() else {
-            self.store
-                .promote_secret_change(env, name, revision, expected_secret_revision)
-                .await?;
-            return Ok(SecretChangePreparation::Finished(
-                self.reload_current(env, base_url, reason).await,
-            ));
-        };
+        let snapshot_id = deployment.snapshot_id.as_str();
         let version = self
             .store
             .get_version(&env.app_id, &deployment.version_id)
@@ -1992,11 +1799,7 @@ impl DeploymentDeliverer {
                 version.id
             ))
         })?;
-        let Some(declarations) = manifest.environment else {
-            return Err(CatalogError::invalid(
-                "EC_ENV_SNAPSHOT_INVALID: deployment snapshot exists but its bundle has no environment declaration",
-            ));
-        };
+        let declarations = manifest.environment;
         let Some(declaration) = declarations
             .declarations
             .iter()
@@ -2129,9 +1932,9 @@ mod tests {
     use crate::database::Database;
     use chrono::Utc;
 
-    const MANIFEST: &str = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
-        "env":{"LOG_LEVEL":"info","API_KEY":"placeholder-from-manifest"},
-        "secrets":["API_KEY","MISSING_ONE"]}"#;
+    static MANIFEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        deis_bundle::complete_manifest_json(r#"{"app":"demo","entry":"worker/index.js"}"#)
+    });
 
     #[test]
     fn queue_barrier_observations_are_bound_to_both_generation_and_deployment_owner() {
@@ -2256,11 +2059,7 @@ mod tests {
     }
 
     async fn deliverer(secrets_ready: bool) -> (DeploymentDeliverer, Arc<CatalogStore>) {
-        deliverer_with(
-            secrets_ready,
-            authenticated_wiring(),
-        )
-        .await
+        deliverer_with(secrets_ready, authenticated_wiring()).await
     }
 
     /// A test identity whose signing key is deterministic, so two tests
@@ -2346,7 +2145,7 @@ mod tests {
             .unwrap();
 
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
 
@@ -2361,19 +2160,22 @@ mod tests {
         // A value is stored, but nothing in this manifest binds it: a secret
         // reaches a node only through a snapshot and `FetchSecretValues`.
         assert!(payload.secret_names().is_empty());
-        assert_eq!(payload.variable_names(), ["API_KEY", "LOG_LEVEL"]);
+        assert!(payload.variable_names().is_empty());
 
         let request = payload.to_request();
-        assert_eq!(request.env.get("LOG_LEVEL").unwrap(), "info");
-        assert_eq!(
-            request.env.get("API_KEY").unwrap(),
-            "placeholder-from-manifest"
+        assert!(
+            request
+                .env
+                .keys()
+                .all(|key| key.starts_with(deis_wire::conventions::RESERVED_PLATFORM_PREFIX)),
+            "the deployment's env carries only the platform's wiring: {:?}",
+            request.env.keys().collect::<Vec<_>>()
         );
         assert!(
             request.env.values().all(|value| value != "s3cr3t"),
             "a decrypted secret travelled in the deployment's env"
         );
-        assert!(request.environment_snapshot_json.is_empty());
+        assert!(!request.environment_snapshot_json.is_empty());
         assert_eq!(request.bundle_sha, "abc123");
         assert_eq!(
             request.canonical_application_id,
@@ -2522,8 +2324,10 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
 
-        let manifest = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
-            "compatibility":{"date":"2026-09-01"}}"#;
+        let manifest = &deis_bundle::complete_manifest_json(
+            r#"{"app":"demo","entry":"worker/index.js",
+            "compatibility":{"date":"2026-09-01"}}"#,
+        );
 
         let payload = deliverer
             .payload(&env, &version(manifest), "http://control.test")
@@ -2556,8 +2360,10 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
 
-        let manifest = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
-            "compatibility":{"date":"2026-09-01","flags":["single_set_cookie_header"]}}"#;
+        let manifest = &deis_bundle::complete_manifest_json(
+            r#"{"app":"demo","entry":"worker/index.js",
+            "compatibility":{"date":"2026-09-01","flags":["single_set_cookie_header"]}}"#,
+        );
 
         let wire = deliverer
             .payload(&env, &version(manifest), "http://control.test")
@@ -2582,7 +2388,7 @@ mod tests {
         let env = environment(&store).await;
 
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
 
@@ -2606,8 +2412,10 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
 
-        let manifest = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
-            "compatibility":{"date":"2099-01-01"}}"#;
+        let manifest = &deis_bundle::complete_manifest_json(
+            r#"{"app":"demo","entry":"worker/index.js",
+            "compatibility":{"date":"2099-01-01"}}"#,
+        );
 
         let err = deliverer
             .payload(&env, &version(manifest), "http://control.test")
@@ -2626,9 +2434,11 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
 
-        let manifest = r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+        let manifest = &deis_bundle::complete_manifest_json(
+            r#"{"app":"demo","entry":"worker/index.js",
             "limits":{"timeout_ms":2000,"cpu_time_limit_ms":250,"memory_mb":48,
-                      "rate_limit_ops_per_sec":40.0,"resource_table_max":16}}"#;
+                      "rate_limit_ops_per_sec":40.0,"resource_table_max":16}}"#,
+        );
 
         let payload = deliverer
             .payload(&env, &version(manifest), "http://control.test")
@@ -2661,7 +2471,7 @@ mod tests {
         let env = environment(&store).await;
 
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
 
@@ -2682,8 +2492,9 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
 
-        let manifest =
-            r#"{"schema":1,"app":"demo","entry":"worker/index.js","limits":{"timeout_ms":0}}"#;
+        let manifest = &deis_bundle::complete_manifest_json(
+            r#"{"app":"demo","entry":"worker/index.js","limits":{"timeout_ms":0}}"#,
+        );
 
         let payload = deliverer
             .payload(&env, &version(manifest), "http://control.test")
@@ -2696,19 +2507,18 @@ mod tests {
     #[tokio::test]
     async fn the_wire_message_carries_the_storage_addresses_the_app_never_declared() {
         // Without these two keys deis-runtime builds no storage client at
-        // all and every ctx.services call answers "service not available".
+        // all, and no storage binding is published to the application.
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
 
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
 
         // The report stays about the application: the addresses are the
-        // platform's, not a variable someone wrote in a manifest. No secret
-        // is stored here, so API_KEY is still a plain manifest variable.
-        assert_eq!(payload.variable_names(), ["API_KEY", "LOG_LEVEL"]);
+        // platform's, not a value the application declared.
+        assert!(payload.variable_names().is_empty());
 
         let request = payload.to_request();
         assert_eq!(
@@ -2718,28 +2528,6 @@ mod tests {
         assert_eq!(
             request.env.get(deis_wire::conventions::QUEUE_ENDPOINT_ENV),
             Some(&"http://127.0.0.1:8091".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn an_application_cannot_point_its_storage_client_somewhere_else() {
-        let (deliverer, store) = deliverer(true).await;
-        let env = environment(&store).await;
-        let manifest = format!(
-            r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"http://attacker.invalid"}}}}"#,
-            deis_wire::conventions::STORE_ENDPOINT_ENV
-        );
-
-        let request = deliverer
-            .payload(&env, &version(&manifest), "http://control.test")
-            .await
-            .unwrap()
-            .to_request();
-
-        assert_eq!(
-            request.env.get(deis_wire::conventions::STORE_ENDPOINT_ENV),
-            Some(&"http://127.0.0.1:8090".to_string()),
-            "the platform address must win over anything the bundle declared"
         );
     }
 
@@ -2755,7 +2543,7 @@ mod tests {
 
         for env in [&production, &preview] {
             let request = deliverer
-                .payload(env, &version(MANIFEST), "http://control.test")
+                .payload(env, &version(&MANIFEST), "http://control.test")
                 .await
                 .unwrap()
                 .to_request();
@@ -2766,7 +2554,11 @@ mod tests {
                     env.name
                 );
             }
-            assert!(request.env.contains_key(deis_wire::conventions::STORE_ENDPOINT_ENV));
+            assert!(
+                request
+                    .env
+                    .contains_key(deis_wire::conventions::STORE_ENDPOINT_ENV)
+            );
         }
     }
 
@@ -2778,22 +2570,28 @@ mod tests {
         let issuer = wiring.issuer.clone();
         let mut request = tonic::Request::new(());
         wiring
-            .stamp_queue_capability(&mut request, "demo", "production")
+            .stamp_queue_capability(
+                &mut request,
+                &CanonicalTenantId::derived_from_label("demo.production"),
+            )
             .await
             .unwrap();
-        assert!(
-            request
-                .metadata()
-                .get(deis_wire::conventions::STORAGE_TOKEN_HEADER)
-                .is_none()
-        );
-        let header = request.metadata().get("authorization").unwrap().to_str().unwrap();
+        let header = request
+            .metadata()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
         let token = header.strip_prefix("Bearer ").expect("a bearer credential");
-        deis_capability::CapabilityVerifier::new(issuer.verifying_key().await)
+        let mut verifier = deis_capability::CapabilityVerifier::new(issuer.verifying_key().await);
+        verifier
+            .apply_revocation_list(deis_capability::RevocationList::new("iss", 0, vec![]))
+            .unwrap();
+        verifier
             .verify(
                 token,
                 AUD_QUEUE,
-                &deis_wire::conventions::tenant_id("demo", "production"),
+                &CanonicalTenantId::derived_from_label("demo.production").to_string(),
                 "queue",
             )
             .expect("deis-queue accepts it");
@@ -2811,12 +2609,12 @@ mod tests {
     #[tokio::test]
     async fn a_control_plane_without_storage_configured_sends_no_addresses() {
         // A valid setup: the deployment still goes out, and only the app's
-        // ctx.services calls fail.
+        // storage bindings are missing.
         let (deliverer, store) = deliverer_with(true, no_services_wiring()).await;
         let env = environment(&store).await;
 
         let request = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap()
             .to_request();
@@ -2831,38 +2629,6 @@ mod tests {
                 .env
                 .contains_key(deis_wire::conventions::QUEUE_ENDPOINT_ENV)
         );
-    }
-
-    /// Without a configured address the platform has nothing to overwrite
-    /// the manifest's value with, so the key has to be *removed*. Leaving
-    /// it would let a bundle name the host its own kv, database and blob
-    /// clients dial.
-    #[tokio::test]
-    async fn an_application_cannot_name_a_storage_address_the_platform_never_configured() {
-        let (deliverer, store) = deliverer_with(true, no_services_wiring()).await;
-        let env = environment(&store).await;
-        let manifest = format!(
-            r#"{{"schema":1,"app":"demo","entry":"worker/index.js","env":{{"{}":"http://attacker.invalid","{}":"http://attacker.invalid","KEEP":"mine"}}}}"#,
-            deis_wire::conventions::STORE_ENDPOINT_ENV,
-            deis_wire::conventions::QUEUE_ENDPOINT_ENV
-        );
-
-        let request = deliverer
-            .payload(&env, &version(&manifest), "http://control.test")
-            .await
-            .unwrap()
-            .to_request();
-
-        for key in [
-            deis_wire::conventions::STORE_ENDPOINT_ENV,
-            deis_wire::conventions::QUEUE_ENDPOINT_ENV,
-        ] {
-            assert!(
-                !request.env.contains_key(key),
-                "{key} reached the node as the bundle declared it"
-            );
-        }
-        assert_eq!(request.env.get("KEEP").unwrap(), "mine");
     }
 
     /// Deleting an application has to reach the fleet: a node only ever
@@ -2931,16 +2697,29 @@ mod tests {
             .await
             .unwrap();
 
+        let declaring = serde_json::json!({
+            "app": "demo",
+            "entry": "worker/index.js",
+            "environment": deis_wire::EnvironmentDeclarations::new(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                vec![deis_wire::EnvironmentDeclaration {
+                    name: "API_KEY".to_string(),
+                    kind: deis_wire::EnvironmentKind::Secret,
+                    value_type: deis_wire::EnvironmentValueType::String,
+                    required: true,
+                }],
+            ),
+        });
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(
+                &env,
+                &version(&deis_bundle::complete_manifest_json(&declaring.to_string())),
+                "http://control.test",
+            )
             .await
             .unwrap();
         let rendered = format!("{payload:?}");
         assert!(!rendered.contains("s3cr3t"), "got {rendered}");
-        assert!(
-            !rendered.contains("placeholder-from-manifest"),
-            "{rendered}"
-        );
         assert!(
             rendered.contains("API_KEY"),
             "secret names are safe to show; got {rendered}"
@@ -2960,11 +2739,11 @@ mod tests {
         let env = environment(&store).await;
 
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
         assert_eq!(payload.secret_count(), 0);
-        assert_eq!(payload.variable_count(), 2);
+        assert_eq!(payload.variable_count(), 0);
     }
 
     /// With a declared secret stored but no usable key, the deployment must
@@ -3036,7 +2815,7 @@ mod tests {
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
 
@@ -3072,7 +2851,7 @@ mod tests {
         );
 
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
         let report = deliverer.push(&payload, DeliveryReason::Deployment).await;
@@ -3176,7 +2955,7 @@ mod tests {
         );
 
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
         let report = deliverer.push(&payload, DeliveryReason::Deployment).await;
@@ -3213,7 +2992,7 @@ mod tests {
         );
 
         let payload = deliverer
-            .payload(&env, &version(MANIFEST), "http://control.test")
+            .payload(&env, &version(&MANIFEST), "http://control.test")
             .await
             .unwrap();
         let report = deliverer.push(&payload, DeliveryReason::Deployment).await;
@@ -3308,17 +3087,6 @@ mod tests {
         );
         assert!(nodes.departed().is_empty());
         assert_eq!(nodes.deregister("node-b"), None);
-    }
-
-    #[tokio::test]
-    async fn reloading_an_environment_that_was_never_deployed_is_not_an_error() {
-        let (deliverer, store) = deliverer(true).await;
-        let env = environment(&store).await;
-
-        let report = deliverer
-            .reload_current(&env, "http://control.test", DeliveryReason::SecretChange)
-            .await;
-        assert!(report.skipped.unwrap().contains("never been deployed"));
     }
 
     #[test]

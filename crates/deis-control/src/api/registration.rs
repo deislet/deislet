@@ -122,5 +122,6 @@ pub fn registration_refusal(error: RegistrationError) -> tonic::Status {
         RegistrationError::IdHeldByAnotherMachine { .. } => {
             tonic::Status::already_exists(error.to_string())
         }
+        RegistrationError::Revoked => tonic::Status::permission_denied(error.to_string()),
     }
 }

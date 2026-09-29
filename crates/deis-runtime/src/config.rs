@@ -2489,7 +2489,7 @@ mod tests {
             data_listen: "localhost:8000".to_string(),
             ..Default::default()
         };
-        let err = config.validate().err().expect("a hostname is refused");
+        let err = config.validate().expect_err("a hostname is refused");
         assert!(err.to_string().contains("data_listen"), "{err}");
     }
 
@@ -2499,7 +2499,7 @@ mod tests {
             data_listen: "127.0.0.1:0".to_string(),
             ..Default::default()
         };
-        let err = config.validate().err().expect("port 0 is refused");
+        let err = config.validate().expect_err("port 0 is refused");
         assert!(err.to_string().contains("port 0"), "{err}");
     }
 

@@ -7,13 +7,11 @@
 //! control plane parses, and the symptom - a bundle that uploads and then does
 //! not run - would show up a long way from the cause.
 
-use std::collections::BTreeMap;
-
 use anyhow::{bail, Result};
 use deis_build_core::ProjectConfig;
 use deis_bundle::{
     Asset, Binding, BindingKind, DeclaredBindings, DeclaredCompatibility, DeclaredLimits, Manifest,
-    QueueConsumer, Route, MIN_SUPPORTED_SCHEMA, SUPPORTED_SCHEMA,
+    QueueConsumer, Route, SUPPORTED_SCHEMA,
 };
 
 use crate::assets::StagedAsset;
@@ -33,14 +31,6 @@ pub use deis_bundle::WORKER_ENTRY;
 /// bindings deis-runtime has to hand the isolate. There is one profile today.
 pub const RUNTIME_PROFILE: &str = "standard-v1";
 
-/// The four legacy unnamed services a bundle can declare.
-///
-/// They remain in the native manifest for bundles from before named logical
-/// resources existed. The standard HTTP context has exactly four fields and
-/// does not expose `context.services`; new applications declare a binding and
-/// receive it as `context.env.<NAME>`.
-const SERVICE_NAMES: [&str; 4] = ["kv", "database", "blob", "queue"];
-
 /// Assemble the manifest for one build.
 ///
 /// `function_paths` is the set of URL paths the application's code answers,
@@ -55,10 +45,15 @@ const SERVICE_NAMES: [&str; 4] = ["kv", "database", "blob", "queue"];
 /// table, which for a derived build is the canonical routing document's, and
 /// the manifest keeps meaning what a node reads it to mean: these paths are
 /// the function's, everything else is the site's.
+///
+/// `environment` is the verified canonical environment document: which
+/// config values and secrets the application reads. No deployment value is
+/// copied into the bundle.
 pub fn build_manifest(
     config: &ProjectConfig,
     function_paths: &[String],
     assets: &[StagedAsset],
+    environment: deis_wire::EnvironmentDeclarations,
 ) -> Result<Manifest> {
     let app = config.name.trim();
     if app.is_empty() {
@@ -74,16 +69,13 @@ pub fn build_manifest(
     let site = build_site_config(config, assets)?;
 
     let manifest = Manifest {
-        schema: MIN_SUPPORTED_SCHEMA,
+        schema: SUPPORTED_SCHEMA,
         app: app.to_string(),
         entry: WORKER_ENTRY.to_string(),
         runtime: Some(RUNTIME_PROFILE.to_string()),
-        services: services(config),
         bindings: bindings(config)?,
         callable_by: callable_by(config),
-        env: environment(config),
-        secrets: secret_names(config),
-        environment: None,
+        environment,
         routes: function_paths
             .iter()
             .map(|pattern| Route {
@@ -126,23 +118,6 @@ pub fn build_manifest(
     // than finding out when a deploy is rejected.
     manifest.validate()?;
 
-    Ok(manifest)
-}
-
-/// Assemble a schema 2 native bundle manifest from the verified canonical
-/// environment document. No deployment value is copied into the bundle.
-pub fn build_manifest_with_environment(
-    config: &ProjectConfig,
-    function_paths: &[String],
-    assets: &[StagedAsset],
-    environment: deis_wire::EnvironmentDeclarations,
-) -> Result<Manifest> {
-    let mut manifest = build_manifest(config, function_paths, assets)?;
-    manifest.schema = SUPPORTED_SCHEMA;
-    manifest.env.clear();
-    manifest.secrets.clear();
-    manifest.environment = Some(environment);
-    manifest.validate()?;
     Ok(manifest)
 }
 
@@ -298,65 +273,6 @@ fn callable_by(config: &ProjectConfig) -> Vec<String> {
     names
 }
 
-/// Which platform services the app declares it uses.
-///
-/// All four are written out, including the false ones, so the manifest reads
-/// as a complete answer rather than leaving a reader to wonder whether a
-/// missing key means "no" or "the builder forgot".
-fn services(config: &ProjectConfig) -> BTreeMap<String, bool> {
-    let declared = config.services.as_ref();
-    let enabled = |service: Option<&deis_build_core::ServiceConfig>| {
-        service.map(|s| s.enabled).unwrap_or(false)
-    };
-
-    SERVICE_NAMES
-        .iter()
-        .map(|name| {
-            let on = match *name {
-                "kv" => enabled(declared.and_then(|s| s.kv.as_ref())),
-                "database" => enabled(declared.and_then(|s| s.database.as_ref())),
-                "blob" => enabled(declared.and_then(|s| s.blob.as_ref())),
-                "queue" => enabled(declared.and_then(|s| s.queue.as_ref())),
-                _ => false,
-            };
-            (name.to_string(), on)
-        })
-        .collect()
-}
-
-fn environment(config: &ProjectConfig) -> BTreeMap<String, String> {
-    config
-        .environment
-        .as_ref()
-        .and_then(|env| env.variables.as_ref())
-        .map(|vars| {
-            vars.iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Secret *names*, sorted and deduplicated. Values never enter a bundle: the
-/// control plane holds them and hands them to a node at deploy time.
-fn secret_names(config: &ProjectConfig) -> Vec<String> {
-    let mut names: Vec<String> = config
-        .environment
-        .as_ref()
-        .and_then(|env| env.secrets.as_ref())
-        .map(|secrets| {
-            secrets
-                .iter()
-                .map(|name| name.trim().to_string())
-                .filter(|name| !name.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    names.sort();
-    names.dedup();
-    names
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +290,23 @@ mod tests {
         serde_json::from_value(json).expect("config parses")
     }
 
+    /// The manifest for a project that declares no environment.
+    fn build_manifest(
+        config: &ProjectConfig,
+        function_paths: &[String],
+        assets: &[StagedAsset],
+    ) -> Result<Manifest> {
+        super::build_manifest(
+            config,
+            function_paths,
+            assets,
+            deis_wire::EnvironmentDeclarations::new(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                Vec::new(),
+            ),
+        )
+    }
+
     fn route(pattern: &str) -> String {
         pattern.to_string()
     }
@@ -382,61 +315,13 @@ mod tests {
     fn the_entry_points_at_the_bundled_worker() {
         let manifest = build_manifest(&config(serde_json::json!({})), &[], &[]).unwrap();
         assert_eq!(manifest.entry, WORKER_ENTRY);
-        assert_eq!(manifest.schema, MIN_SUPPORTED_SCHEMA);
+        assert_eq!(manifest.schema, SUPPORTED_SCHEMA);
         assert_eq!(manifest.app, "demo");
         assert_eq!(manifest.runtime.as_deref(), Some(RUNTIME_PROFILE));
     }
 
     #[test]
-    fn every_service_is_answered_yes_or_no() {
-        let manifest = build_manifest(
-            &config(serde_json::json!({
-                "services": {
-                    "kv": { "enabled": true },
-                    "database": { "enabled": true },
-                    "blob": { "enabled": false }
-                }
-            })),
-            &[],
-            &[],
-        )
-        .unwrap();
-
-        assert!(manifest.uses_service("kv"));
-        assert!(manifest.uses_service("database"));
-        assert!(!manifest.uses_service("blob"));
-        // Undeclared, but still written down as a no.
-        assert_eq!(manifest.services.get("queue"), Some(&false));
-    }
-
-    #[test]
-    fn secret_values_never_reach_the_manifest() {
-        let manifest = build_manifest(
-            &config(serde_json::json!({
-                "environment": {
-                    "variables": { "LOG_LEVEL": "info" },
-                    "secrets": ["API_KEY", "API_KEY", " DB_PASSWORD "]
-                }
-            })),
-            &[],
-            &[],
-        )
-        .unwrap();
-
-        assert_eq!(manifest.secrets, vec!["API_KEY", "DB_PASSWORD"]);
-        assert_eq!(
-            manifest.env.get("LOG_LEVEL").map(String::as_str),
-            Some("info")
-        );
-        let json = serde_json::to_string(&manifest).unwrap();
-        assert!(
-            !json.contains("password"),
-            "no value ever accompanies a name"
-        );
-    }
-
-    #[test]
-    fn standard_environment_builds_schema_two_without_runtime_values() {
+    fn the_environment_document_is_carried_without_runtime_values() {
         let project = config(serde_json::json!({
             "environment": {
                 "declarations": [
@@ -451,13 +336,10 @@ mod tests {
             "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
         )
         .unwrap();
-        let manifest =
-            build_manifest_with_environment(&project, &[], &[], declarations.clone()).unwrap();
+        let manifest = super::build_manifest(&project, &[], &[], declarations.clone()).unwrap();
 
         assert_eq!(manifest.schema, SUPPORTED_SCHEMA);
-        assert_eq!(manifest.environment, Some(declarations));
-        assert!(manifest.env.is_empty());
-        assert!(manifest.secrets.is_empty());
+        assert_eq!(manifest.environment, declarations);
         assert!(!serde_json::to_string(&manifest)
             .unwrap()
             .contains("must-not-enter"));

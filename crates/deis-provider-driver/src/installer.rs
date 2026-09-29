@@ -9,9 +9,6 @@ use std::{
 use sha2::{Digest as _, Sha256};
 use tempfile::Builder as TempDirBuilder;
 
-#[cfg(windows)]
-use std::sync::Arc;
-
 use crate::{
     DriverHostDistribution, DriverReleaseComponentRole, DriverReleaseError, HostOperatingSystem,
     PinnedExecutable, Sha256Digest, ValidatedProviderDriverManifest,
@@ -24,8 +21,6 @@ const STAGING_PREFIX: &str = ".driver-staging.";
 #[derive(Clone, Debug)]
 pub struct DriverReleaseInstaller {
     root: PathBuf,
-    #[cfg(windows)]
-    _root_guard: Arc<File>,
 }
 
 #[derive(Clone, Debug)]
@@ -56,16 +51,7 @@ impl DriverReleaseInstaller {
         let root = fs::canonicalize(root).map_err(|error| {
             DriverInstallationError::io("canonicalize installation root", error)
         })?;
-        #[cfg(windows)]
-        let root_guard = Arc::new(
-            crate::windows_security::open_private_directory(&root)
-                .map_err(installation_security_error)?,
-        );
-        Ok(Self {
-            root,
-            #[cfg(windows)]
-            _root_guard: root_guard,
-        })
+        Ok(Self { root })
     }
 
     pub fn install(
@@ -375,55 +361,6 @@ fn set_removal_permissions(path: &Path, directory: bool) -> Result<(), DriverIns
     .map_err(|error| DriverInstallationError::io("make stale driver staging removable", error))
 }
 
-#[cfg(windows)]
-fn set_removal_permissions(path: &Path, _directory: bool) -> Result<(), DriverInstallationError> {
-    set_windows_writable(path)
-        .map_err(|error| DriverInstallationError::io("make stale driver staging removable", error))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn set_removal_permissions(path: &Path, _directory: bool) -> Result<(), DriverInstallationError> {
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| DriverInstallationError::io("inspect stale driver permissions", error))?
-        .permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    permissions.set_readonly(false);
-    fs::set_permissions(path, permissions)
-        .map_err(|error| DriverInstallationError::io("make stale driver staging removable", error))
-}
-
-#[cfg(windows)]
-fn set_windows_writable(path: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_READONLY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, SetFileAttributesW,
-    };
-
-    let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-    if encoded.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Windows provider driver path contains NUL",
-        ));
-    }
-    encoded.push(0);
-
-    // SAFETY: `encoded` is NUL-terminated and remains alive for the call.
-    let attributes = unsafe { GetFileAttributesW(encoded.as_ptr()) };
-    if attributes == INVALID_FILE_ATTRIBUTES {
-        return Err(io::Error::last_os_error());
-    }
-    if attributes & FILE_ATTRIBUTE_READONLY == 0 {
-        return Ok(());
-    }
-    // SAFETY: the path pointer is valid as above, and the attributes came from
-    // the same path with only FILE_ATTRIBUTE_READONLY cleared.
-    if unsafe { SetFileAttributesW(encoded.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
 fn validate_installation_root_permissions(
     _path: &Path,
@@ -437,38 +374,6 @@ fn validate_installation_root_permissions(
         ));
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn validate_installation_root_permissions(
-    path: &Path,
-    _metadata: &fs::Metadata,
-) -> Result<(), DriverInstallationError> {
-    crate::windows_security::open_private_directory(path)
-        .map(drop)
-        .map_err(installation_security_error)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn validate_installation_root_permissions(
-    _path: &Path,
-    _metadata: &fs::Metadata,
-) -> Result<(), DriverInstallationError> {
-    Ok(())
-}
-
-#[cfg(windows)]
-fn installation_security_error(
-    error: crate::windows_security::WindowsSecurityError,
-) -> DriverInstallationError {
-    match error {
-        crate::windows_security::WindowsSecurityError::Io(error) => {
-            DriverInstallationError::io("validate Windows installation-root security", error)
-        }
-        crate::windows_security::WindowsSecurityError::Insecure(message) => {
-            DriverInstallationError::Invalid(message)
-        }
-    }
 }
 
 fn open_and_verify_archive(
@@ -793,32 +698,10 @@ fn set_file_read_only(path: &Path, executable: bool) -> Result<(), DriverInstall
     .map_err(|error| DriverInstallationError::io("set driver file permissions", error))
 }
 
-#[cfg(not(unix))]
-fn set_file_read_only(path: &Path, _executable: bool) -> Result<(), DriverInstallationError> {
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| DriverInstallationError::io("inspect driver file permissions", error))?
-        .permissions();
-    permissions.set_readonly(true);
-    fs::set_permissions(path, permissions)
-        .map_err(|error| DriverInstallationError::io("set driver file permissions", error))
-}
-
 #[cfg(unix)]
 fn set_directory_read_only(path: &Path) -> Result<(), DriverInstallationError> {
     use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o555))
-        .map_err(|error| DriverInstallationError::io("set driver directory permissions", error))
-}
-
-#[cfg(not(unix))]
-fn set_directory_read_only(path: &Path) -> Result<(), DriverInstallationError> {
-    let mut permissions = fs::metadata(path)
-        .map_err(|error| {
-            DriverInstallationError::io("inspect driver directory permissions", error)
-        })?
-        .permissions();
-    permissions.set_readonly(true);
-    fs::set_permissions(path, permissions)
         .map_err(|error| DriverInstallationError::io("set driver directory permissions", error))
 }
 
@@ -838,20 +721,6 @@ fn file_is_read_only_and_executable(
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn file_is_read_only_and_executable(
-    _path: &Path,
-    metadata: &fs::Metadata,
-    _executable: bool,
-) -> Result<(), DriverInstallationError> {
-    if !metadata.permissions().readonly() {
-        return Err(DriverInstallationError::Invalid(
-            "installed provider driver file is writable",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
 fn directory_is_read_only(
     _path: &Path,
@@ -866,29 +735,11 @@ fn directory_is_read_only(
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn directory_is_read_only(
-    _path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<(), DriverInstallationError> {
-    if !metadata.permissions().readonly() {
-        return Err(DriverInstallationError::Invalid(
-            "installed provider driver directory is writable",
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), DriverInstallationError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| DriverInstallationError::io("sync driver installation directory", error))
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), DriverInstallationError> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1095,14 +946,6 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    #[cfg(windows)]
-    fn make_test_install_root_private(path: &Path) {
-        crate::windows_security::set_private_acl_for_test(path, true, false, true).unwrap();
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn make_test_install_root_private(_path: &Path) {}
-
     #[cfg(unix)]
     fn set_cleanup_permissions(path: &Path, directory: bool) {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1112,38 +955,10 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
-    fn set_cleanup_permissions(path: &Path, _directory: bool) {
-        let _ = set_windows_writable(path);
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn set_cleanup_permissions(path: &Path, _directory: bool) {
-        if let Ok(metadata) = fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = fs::set_permissions(path, permissions);
-        }
-    }
-
     #[cfg(unix)]
     fn make_test_file_writable(path: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    #[cfg(windows)]
-    fn make_test_file_writable(path: &Path) {
-        set_windows_writable(path).unwrap();
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn make_test_file_writable(path: &Path) {
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -1268,33 +1083,6 @@ mod tests {
                 )
                 .is_err()
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn refuses_unprotected_or_untrusted_windows_installation_roots_and_pins_the_root() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("windows-private-root");
-        fs::create_dir(&root).unwrap();
-
-        crate::windows_security::set_private_acl_for_test(&root, true, false, false).unwrap();
-        assert!(matches!(
-            DriverReleaseInstaller::new(&root),
-            Err(DriverInstallationError::Invalid(message)) if message.contains("protected")
-        ));
-
-        crate::windows_security::set_private_acl_for_test(&root, true, true, true).unwrap();
-        assert!(matches!(
-            DriverReleaseInstaller::new(&root),
-            Err(DriverInstallationError::Invalid(message)) if message.contains("untrusted")
-        ));
-
-        crate::windows_security::set_private_acl_for_test(&root, true, false, true).unwrap();
-        let installer = DriverReleaseInstaller::new(&root).unwrap();
-        let moved = temporary.path().join("moved-root");
-        assert!(fs::rename(&root, &moved).is_err());
-        drop(installer);
-        fs::rename(&root, &moved).unwrap();
     }
 
     #[test]

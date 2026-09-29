@@ -13,6 +13,31 @@ control section) and [ADR-024](adr/024-coordinated-embedded-backend-restore.md)
 (the coordinated restore of the three data-plane backends, which is a different
 procedure for different data).
 
+## Two kinds of data, two tools
+
+An installation's state lives in two places, and each has its own backup tool.
+They do not overlap and neither replaces the other:
+
+| Data | Tool | Recovery point |
+|---|---|---|
+| The control plane: `control.db`, bundles, keys, machine identity | Litestream plus file copies (this document) | continuous, about one second behind |
+| The data services: deis-store, deis-queue and deis-telemetry directories | `deis-backend-topology` ([ADR-024](adr/024-coordinated-embedded-backend-restore.md)) | the barrier time of the chosen snapshot set |
+
+- **Litestream covers the control plane only.** It replicates one SQLite file
+  written by one process. It knows nothing about the three data services, whose
+  databases are many files per tenant, written by other processes.
+- **`deis-backend-topology` covers the data services only.** It takes a
+  snapshot of all three under one write barrier (so a queue message and the KV
+  write it refers to come from the same moment) and restores all three
+  together, with a journal that survives a crash half way through. It never
+  touches `control.db`.
+- Both assume a single installation: one control process, and one store, one
+  queue and one telemetry service on the same host as the driver. A restore
+  runs inside that one control process; there is no second control instance
+  to hand it over to. If control stops half way through a restore, the next
+  start picks the operation up again from its durable state and the driver's
+  journal.
+
 ## The restore set
 
 A restore that has the database and not the rest comes up healthy, answers
@@ -75,12 +100,16 @@ list is what the configuration resolves to on its own.
 another disk or to S3-compatible object storage, one second at a time, and does
 not need the control plane to be stopped to do it.
 
-The samples in this repository:
+The files in this repository:
 
 - [`scripts/canary/litestream.yml`](../scripts/canary/litestream.yml) - the
-  service's configuration, installed as `/etc/litestream.yml`.
+  service's configuration, installed verbatim as `/etc/litestream.yml`. It
+  replicates the canary's database, `/var/lib/deis/control/deis-control.db`,
+  and reads the replica URL from `LITESTREAM_REPLICA_URL`.
 - [`scripts/canary/systemd/litestream.service`](../scripts/canary/systemd/litestream.service) -
-  the unit, installed beside the other Deislet units.
+  the unit, installed beside the other Deislet units. Its `EnvironmentFile`,
+  `/etc/deis/litestream.env`, names the replica and holds any bucket
+  credentials; the unit refuses to start without it.
 
 Both are written for the **0.5 series, pinned at 0.5.17**. The 0.5 and 0.3
 series differ in the configuration format (`replica`, one object, replaced the
@@ -89,19 +118,35 @@ drill uses. Moving between them is a change to the backup, not an upgrade of a
 tool: read <https://litestream.io/docs/migration/> first and treat it as a
 release of its own.
 
+**The canary installs all of it.** `scripts/canary-release.sh` fetches the
+pinned release, checks it against the SHA-256 digests recorded in the script
+(the ones v0.5.17 publishes in its `checksums.txt`) and ships the binary with
+the payload; `scripts/canary/remote-install.sh` installs the binary and
+`/etc/litestream.yml`, writes `/etc/deis/litestream.env` on the first install,
+enables `litestream.service` and restarts it with the control plane. The first
+install replicates to `LITESTREAM_REPLICA_URL` if it is set, and otherwise to
+`file:///var/backups/deis-control` on the same machine - which proves the
+pipeline and is no protection against losing the disk, as the installer's log
+says. Point it somewhere off the host by editing `/etc/deis/litestream.env`
+and restarting the unit; later releases leave that file alone.
+
+Any other installation does the same by hand:
+
 ```bash
 # The binary, at the pinned version, verified against the release checksums.
 curl -fsSLo /tmp/litestream.tar.gz \
   https://github.com/benbjohnson/litestream/releases/download/v0.5.17/litestream-0.5.17-linux-x86_64.tar.gz
-curl -fsSL https://github.com/benbjohnson/litestream/releases/download/v0.5.17/checksums.txt \
-  | grep 'litestream-0.5.17-linux-x86_64.tar.gz' > /tmp/checksums.txt
-(cd /tmp && sha256sum -c checksums.txt)   # adjust the file name if the host is not x86_64
+echo 'cfb371176d164437ae869f8351cfde49bd1804ae71c61923f75c9cba9c9c006d  /tmp/litestream.tar.gz' \
+  | sha256sum -c   # arm64: f8ca4a050095c1efbda2c4365172e61bf9d955ea0d9ac42f448b52e51819baa5
 tar -xzf /tmp/litestream.tar.gz -C /tmp litestream
 install -o root -g root -m 755 /tmp/litestream /usr/local/bin/litestream
 
-# The configuration: set `path` to <data_dir>/control.db and `url` to the
-# replica (s3://bucket/prefix or file:///mnt/backup/deis-control).
+# The configuration: if the database is not the canary's, change `path` to
+# the file deis-control opens (<data_dir>/control.db unless --database says
+# otherwise).
 install -o root -g root -m 644 scripts/canary/litestream.yml /etc/litestream.yml
+install -o root -g root -m 600 /dev/null /etc/deis/litestream.env
+echo 'LITESTREAM_REPLICA_URL=s3://bucket/prefix' >> /etc/deis/litestream.env
 install -o root -g root -m 644 scripts/canary/systemd/litestream.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now litestream
@@ -110,11 +155,10 @@ litestream status          # replication lag and last sync per database
 journalctl -u litestream -f
 ```
 
-Credentials for S3-compatible storage belong in the unit's environment
-(`LITESTREAM_ACCESS_KEY_ID`, `LITESTREAM_SECRET_ACCESS_KEY`) or in the unit's
-`EnvironmentFile`, never in `/etc/litestream.yml`, which anyone who can read
-`/etc` can read. Whatever the account is, it needs write access to the replica
-prefix and nothing else.
+Credentials for S3-compatible storage belong in `/etc/deis/litestream.env`
+(`LITESTREAM_ACCESS_KEY_ID`, `LITESTREAM_SECRET_ACCESS_KEY`), never in
+`/etc/litestream.yml`, which anyone who can read `/etc` can read. Whatever the
+account is, it needs write access to the replica prefix and nothing else.
 
 The unit is ordered after `deis-control.service` and is *not* tied to it: the
 control plane can be restarted - including both halves of a blue-green switch,

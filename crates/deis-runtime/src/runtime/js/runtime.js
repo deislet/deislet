@@ -3,7 +3,7 @@
 // The standard web globals -- fetch, crypto, the streams, Request/Response,
 // URL, the timers -- are bound in `js/bootstrap.js`, which runs before this
 // file. What is here is the part that is this platform rather than the web:
-// the service bindings behind `ctx.services`, the WebSocket bridge, the Cache
+// the storage bindings behind `context.env.<NAME>`, the WebSocket bridge, the Cache
 // API, the console bridge, and the entry points the Rust side calls into.
 //
 // # Why the whole file is a closure
@@ -14,7 +14,7 @@
 // includes the application's own. `DenoCore` was declared that way, so until
 // this closure existed an application could write `DenoCore.ops.op_fetch(...)`
 // and reach every op in the isolate directly: past the outbound fetch policy,
-// past `ctx.services`, past everything. Inside a closure none of these names
+// past the bindings, past everything. Inside a closure none of these names
 // exist outside this file, and the only way in is the handful of properties
 // explicitly written onto `globalThis` below.
 //
@@ -758,10 +758,8 @@ globalThis.WebSocketPair = WebSocketPair;
 
 // The Cache API, which Edge Canon makes a basic feature every application may
 // assume (SPECIFICATION_BASIC.md section 7): put a Response away under a
-// request's URL, read it back, drop it. The default cache is reached two ways,
-// both of them the same namespace: `context.services.cache`, which is what the
-// canon specifies, and `globalThis.caches.default`, which is what a handler
-// ported from Cloudflare reaches for. `caches.open(name)` gives an application
+// request's URL, read it back, drop it. The default cache is
+// `globalThis.caches.default`, and `caches.open(name)` gives an application
 // caches of its own beside it.
 //
 // Scope: one store per isolate, so an entry is visible to later requests for
@@ -1811,10 +1809,8 @@ function notStored(why) {
 
 class Cache {
   // `name` is the namespace this instance reads and writes; see
-  // `runtime/cache_ops.rs`. `caches.default` and `ctx.services.cache` are the
-  // one named "default", so an application that writes through one and reads
-  // through the other sees its own entry, and a cache opened by any other
-  // name shares nothing with them.
+  // `runtime/cache_ops.rs`. `caches.default` is the one named "default", and a
+  // cache opened by any other name shares nothing with it.
   constructor(name) {
     this.name = name;
   }
@@ -2207,17 +2203,13 @@ class Cache {
   }
 }
 
-// The namespace `caches.default` and `context.services.cache` share.
+// The namespace `caches.default` reaches.
 //
 // Named once here rather than on both sides of the boundary: the ops take
 // whatever name they are given and know nothing about which one is the
-// default, so this is the only place the two spellings could ever come apart
-// and there is only one of it.
+// default.
 const DEFAULT_CACHE_NAME = "default";
 
-// One instance, reached under both names, so an application that writes
-// through `caches.default` and reads through `context.services.cache` sees
-// its own entry.
 const defaultCache = new Cache(DEFAULT_CACHE_NAME);
 
 // The one name `caches.open` and `caches.delete` will not take.
@@ -2226,7 +2218,7 @@ const defaultCache = new Cache(DEFAULT_CACHE_NAME);
 // an ordinary string, so an application opening a cache under a name it took
 // from a request -- a tenant, a locale, a path segment, anything a caller can
 // choose -- handed a caller who sent "default" the namespace every other part
-// of that application reads and writes through `context.services.cache`. It
+// of that application reads and writes through `caches.default`. It
 // could read what was cached there and, through `caches.delete`, empty it.
 //
 // Refused rather than renamed to something unguessable, because an application
@@ -2240,7 +2232,7 @@ function reserveTheDefaultName(verb, name) {
   if (name !== DEFAULT_CACHE_NAME) return;
   throw new TypeError(
     "caches." + verb + ": \"" + DEFAULT_CACHE_NAME + "\" is the name of the " +
-      "cache reached as caches.default and context.services.cache, so it is " +
+      "cache reached as caches.default, so it is " +
       "not a name an application may " + verb + " -- a name taken from a " +
       "request would otherwise reach the namespace the rest of this " +
       "application caches into. Use caches.default, or choose another name"
@@ -2368,13 +2360,10 @@ function kvEncode(value) {
 // Named bindings
 // ---------------------------------------------------------
 //
-// Every storage object below carries the name of the namespace it speaks for,
-// and hands that name to the op as its first argument. The empty string is the
-// tenant's *unnamed* namespace: the one `context.services.kv` reaches, the one
-// deis-store keys by the tenant alone, and the one every application deployed
-// before named bindings existed has been reading and writing all along. A
-// named one is a second namespace beside it, inside the same tenant, and it is
-// empty on the day it is declared.
+// Every storage object below carries the name of the binding it speaks for,
+// and hands that name to the op as its first argument. The name is the
+// namespace inside the tenant, and there is no namespace without one: an op
+// handed a name the manifest did not declare answers "not available".
 //
 // The name lives on the object rather than being passed at each call site so
 // that a handle taken out of one - a prepared statement, an open transaction -
@@ -2387,17 +2376,15 @@ function kvEncode(value) {
 // objects below are built by `createServiceContext` out of the manifest's own
 // table, so a name reaching this file has already been through
 // `deis_bundle::DeclaredBindings::validate` at build, at upload and at load.
-const UNNAMED_NAMESPACE = "";
-
 class NativeKV {
-  // Which namespace this object speaks for. See UNNAMED_NAMESPACE.
+  // Which binding this object speaks for.
   #binding;
 
   constructor(binding) {
-    this.#binding = binding || UNNAMED_NAMESPACE;
+    this.#binding = binding;
   }
 
-  // The binding name, or "" for the tenant's unnamed namespace.
+  // The binding name.
   // Readable so a handler can log which namespace it is writing to.
   get binding() {
     return this.#binding;
@@ -2680,7 +2667,7 @@ class NativeTransaction {
 
   constructor(state, expiresInMs, binding) {
     this.#state = state;
-    this.#binding = binding || UNNAMED_NAMESPACE;
+    this.#binding = binding;
     // How long deis-store granted this transaction, counted from when it
     // answered. A handler with slow work to do can look before it starts.
     this.expiresInMs = expiresInMs;
@@ -2726,14 +2713,13 @@ class NativeTransaction {
 
 class NativeDB {
   // Which namespace this object speaks for. A binding is a database file of its own in deis-store, not a schema inside one.
-  // See UNNAMED_NAMESPACE.
   #binding;
 
   constructor(binding) {
-    this.#binding = binding || UNNAMED_NAMESPACE;
+    this.#binding = binding;
   }
 
-  // The binding name, or "" for the tenant's unnamed namespace.
+  // The binding name.
   get binding() {
     return this.#binding;
   }
@@ -2753,7 +2739,7 @@ class NativeDB {
   }
   // Runs several statements as one transaction, in one round trip.
   //
-  //   const [stock, order] = await ctx.services.database.batch([
+  //   const [stock, order] = await env.DB.batch([
   //     { sql: "UPDATE items SET stock = stock - 1 WHERE id = ? AND stock > 0", params: [id] },
   //     { sql: "INSERT INTO orders (item, buyer) VALUES (?, ?)", params: [id, buyer] }
   //   ]);
@@ -2827,7 +2813,7 @@ class NativeDB {
   // Runs `callback` inside one interactive transaction and resolves to
   // whatever the callback returned.
   //
-  //   const total = await ctx.services.database.transaction(async (tx) => {
+  //   const total = await env.DB.transaction(async (tx) => {
   //     const [row] = await tx.query("SELECT balance FROM accounts WHERE id = ?", [id]);
   //     await tx.execute("UPDATE accounts SET balance = ? WHERE id = ?", [row.balance - 10, id]);
   //     return row.balance - 10;
@@ -2844,7 +2830,7 @@ class NativeDB {
   // code produced. Either way `tx` is spent when the callback settles and
   // using it after that throws rather than writing outside the transaction.
   //
-  // What it does not do. `ctx.services.database` is not redirected while the
+  // What it does not do. `env.DB` is not redirected while the
   // callback runs. A statement run on the outer handle inside the callback
   // goes to a different connection, is not part of this transaction, and
   // commits on its own -- a rollback will not take it back. That is the
@@ -3002,14 +2988,13 @@ function blobCondition(call, options) {
 
 class BlobStore {
   // Which namespace this object speaks for. A binding is an object-storage namespace of its own inside this tenant.
-  // See UNNAMED_NAMESPACE.
   #binding;
 
   constructor(binding) {
-    this.#binding = binding || UNNAMED_NAMESPACE;
+    this.#binding = binding;
   }
 
-  // The binding name, or "" for the tenant's unnamed namespace.
+  // The binding name.
   get binding() {
     return this.#binding;
   }
@@ -3267,7 +3252,7 @@ function queueMessageBytes(message) {
 }
 
 class Queue {
-  constructor(name = "default") {
+  constructor(name) {
     this.name = name;
   }
   async send(message) {
@@ -3345,8 +3330,8 @@ class Queue {
 
     await DenoCore.ops.op_queue_send_batch(this.name, joined, lengths);
   }
-  // A queue other than this app's default one, e.g.
-  // ctx.services.queue.to("jobs").send({ ... }).
+  // A queue other than the one this binding names, e.g.
+  // env.QUEUE.to("jobs").send({ ... }).
   //
   // The name has to match a queue some app declares as a consumer, or the
   // messages are stored and never read.
@@ -3390,8 +3375,8 @@ function redact(obj) {
 // behind it, a catch-all that answers `/` from `index.html`, an API that falls
 // back to the single-page shell.
 //
-// It is a *binding*, not a service. `ctx.services.*` is what a manifest
-// declares and what the control plane hands down an address for; nothing is
+// It is not a storage binding. Those are what a manifest declares and what the
+// control plane hands down an address for; nothing is
 // declared or dialled here, because the bundle is this version's own and is
 // already in memory. So it lives where the other env-shaped things live, under
 // the name Cloudflare uses, and code written against Pages reads the same.
@@ -3481,7 +3466,7 @@ const assetsBinding = ObjectFreeze({
 // Service bindings: calling another application on this platform
 // ---------------------------------------------------------
 //
-// `context.bindings.AUTH.fetch("/verify", { method: "POST", body })` -- the
+// `context.env.AUTH.fetch("/verify", { method: "POST", body })` -- the
 // same shape as any other fetch, so a handler that already talks to an HTTP
 // service moves to a service binding by changing what it calls, not how.
 //
@@ -3657,7 +3642,7 @@ class ServiceBinding {
   }
 }
 
-// Build the table `context.bindings` publishes, out of what the manifest
+// Build the table of named bindings (`context.env.<NAME>`), out of what the manifest
 // declared.
 //
 // The names come from the platform, never from the application: `op_get_bindings`
@@ -3693,7 +3678,7 @@ function createBindings() {
         platformConsole.warn(
           "binding " + JSON.stringify(entry.name) + " is of kind " +
             JSON.stringify(entry.kind) + ", which this node has no binding for; " +
-            "it is not published on context.bindings or on env"
+            "it is not published on env"
         );
     }
   }
@@ -3701,7 +3686,7 @@ function createBindings() {
 }
 
 // The half of the context that does not depend on there being a request:
-// the environment, the platform services, `log` and waitUntil. Shared by the
+// the environment with its bindings, `log` and waitUntil. Shared by the
 // fetch path, the queue path and the cron path so a queue or scheduled handler
 // reaches storage - and writes a log line - exactly the same way a request
 // handler does.
@@ -3755,14 +3740,9 @@ function createServiceContext() {
   // environment reaches its own static files through exactly the same name a
   // Cloudflare Pages handler does.
   //
-  // The named bindings are published twice, on purpose, and they are the same
-  // object either way:
-  //
-  //   context.bindings.HOT   the platform's table, and the honest place: only
-  //                          bindings are in it, so a reader knows what they
-  //                          are looking at;
-  //   env.HOT                where code written for Cloudflare reaches for it,
-  //                          so a project ported from there needs no rewrite.
+  // The named bindings are published on `env` and nowhere else: `env.HOT` is
+  // Edge Canon's `context.env.<NAME>`, which is also where code written for
+  // Cloudflare reaches for it.
   //
   // A variable or a secret named after one of those is refused at build, at
   // upload and at load (`Manifest::validate`) exactly as `ASSETS` is; if one
@@ -3787,18 +3767,6 @@ function createServiceContext() {
 
   return {
     env,
-    bindings,
-    services: {
-      // The tenant's *unnamed* namespaces: what an application has had since
-      // before bindings existed, and what its data is still in. A named
-      // binding is a second namespace beside these, never a renaming of them.
-      kv: new NativeKV(),
-      database: new NativeDB(),
-      blob: new BlobStore(),
-      queue: new Queue("default"),
-      // Basic feature: available to every application, declared by none.
-      cache: defaultCache,
-    },
     log: {
       debug: (...args) => platformConsole.debug(...args),
       info: (...args) => platformConsole.info(...args),
@@ -3968,7 +3936,7 @@ globalThis.__deis_runtime_wait_until_all = async function() {
 // that is the shape the canon fixes and the shape a handler ported from
 // another platform is written against. Passing only two arguments, as this
 // did, put the context where a handler expected `env` and left it reading
-// `context.services` off the environment table.
+// its bindings off the wrong object.
 //
 // `batch` is { queue, messages: [...] }; each message carries id, body,
 // attempts and timestamp, plus bytes() and json(). `body` is the message

@@ -1,6 +1,6 @@
 # The deislet target
 
-`deis-build build --vendor deislet` produces an **application bundle**: one zip,
+`deis build --target deislet` produces an **application bundle**: one zip,
 which is the only carrier of a version on the deislet platform. The format is
 defined in [`docs/implementation-plan.zh.md` section 2](../../../docs/implementation-plan.zh.md).
 deis-build writes it, deis-control verifies it, deis-runtime loads it, and all
@@ -227,9 +227,11 @@ into an app:
    independently;
 5. answers 404 when nothing matched.
 
-Named logical resources are reached as `context.env.<NAME>`. Legacy native
-`context.services` and `context.bindings`, and conveniences such as
-`context.path`, are deliberately not copied into the standard context.
+Named logical resources are reached as `context.env.<NAME>`. Conveniences
+such as `context.path` are not part of the standard HTTP context, and the
+build refuses an HTTP handler that reads them. `context.services` and
+`context.bindings` do not exist on this runtime at all, and the build refuses
+a handler of any kind - HTTP, queue or scheduled - that reads them.
 
 ## The `.config.json` keys this target reads
 
@@ -239,14 +241,16 @@ Named logical resources are reached as `context.env.<NAME>`. Legacy native
   "functionRoot": "./functions",
   "assets": { "dir": "./public", "notFound": "single-page-app" },
   "environment": {
-    "variables": { "LOG_LEVEL": "info" },
-    "secrets": ["API_KEY"]
+    "declarations": [
+      { "name": "LOG_LEVEL", "kind": "config", "valueType": "string", "required": true },
+      { "name": "API_KEY", "kind": "secret", "valueType": "string", "required": true }
+    ],
+    "values": { "LOG_LEVEL": "info" }
   },
-  "services": {
-    "kv": { "enabled": true },
-    "database": { "enabled": true },
-    "blob": { "enabled": false },
-    "queue": { "enabled": false }
+  "bindings": {
+    "CACHE": { "kind": "kv" },
+    "DB": { "kind": "database" },
+    "jobs": { "kind": "queue" }
   },
   "cron": ["0 */6 * * *"],
   "queues": [{ "name": "jobs", "batchSize": 10 }],
@@ -260,8 +264,12 @@ Named logical resources are reached as `context.env.<NAME>`. Legacy native
   directory simply means no static files, not a build failure.
 - `assets.notFound` is the not-found behaviour above; absent, it is inferred
   from whether a `404.html` is there.
-- `secrets` carries **names only**. Values stay with the control plane and are
-  delivered to a node at deploy time.
+- `environment.declarations` names what `context.env` may carry. A `config`
+  value is given under `environment.values`; a `secret` carries **its name
+  only** - the value stays with the control plane and is delivered to a node
+  at deploy time.
+- `bindings` are the named logical resources, reached as
+  `context.env.<NAME>`.
 - `cron` and `queues` are copied verbatim into the manifest; scheduling is the
   control plane's job.
 - `limits` is a request to be held to **less** than the node allows, and only

@@ -145,9 +145,9 @@ fn range(
 pub struct GetArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub key: String,
     pub file: Option<PathBuf>,
@@ -276,9 +276,9 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
 pub struct PutArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub key: String,
     /// The object's bytes. Absent means read them from stdin, which is what
@@ -375,9 +375,9 @@ fn describe_condition(condition: &BlobCondition) -> String {
 pub struct DeleteArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub key: String,
     pub yes: bool,
@@ -432,9 +432,9 @@ pub async fn delete(args: DeleteArgs, output: Output) -> Result<()> {
 pub struct HeadArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub key: String,
 }
@@ -501,9 +501,9 @@ pub async fn head(args: HeadArgs, output: Output) -> Result<()> {
 pub struct ListArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub prefix: String,
     /// Roll keys up at this separator, so one folder is one line.

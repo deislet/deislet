@@ -27,11 +27,8 @@ pub mod tls;
 
 pub use audit::{AuditEntry, AuditQuery, AuditRecord, AuditStore, Outcome as AuditOutcome};
 pub use catalog::{
-    App, Assignment, BackendAttemptState, BackendMigrationAttempt, BackendMigrationEvidence,
-    BundleManifest, BundleStore, CatalogError, CatalogIdentityInventory,
-    CatalogProviderCredentialVault, CatalogStore, DeployedVersion, Deployment, Environment,
-    IdentityMigrationCoordinator, IdentityMigrationPlan, IdentityMigrationRun,
-    IdentityMigrationState, MigrationCoordinatorError, OperationRequestContext,
+    App, Assignment, BundleManifest, BundleStore, CatalogError, CatalogProviderCredentialVault,
+    CatalogStore, DeployedVersion, Deployment, Environment, OperationRequestContext,
     ProviderCredentialAuditEvent, ProviderCredentialBinding, ProviderCredentialBindingSpec,
     ProviderDriverDispatcher, ProviderDriverReleaseAuditEvent, ProviderDriverReleaseRecord,
     ProviderDriverReleaseRegistry, ResolvedProviderDriverRelease, Route, SecretCipher,

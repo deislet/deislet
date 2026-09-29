@@ -326,8 +326,7 @@ mod tests {
             "018f2518-7e38-7f80-8000-000000000003"
         );
         // A line recorded before ids existed keeps its old wire form: the
-        // member is left out, never sent as null, so the legacy list is
-        // byte for byte what it was for those rows.
+        // member is left out, never sent as null.
         assert!(first["items"][0].get("requestId").is_none());
 
         let (status, demo) = json(&router, "GET", "/api/audit?app=demo&limit=1", Value::Null).await;

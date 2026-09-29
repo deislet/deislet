@@ -479,7 +479,13 @@ mod tests {
     }
 
     /// A read capability for `tenants`, signed by `key`.
-    fn minted(key: &ed25519_dalek::SigningKey, tenants: &[&str]) -> TelemetryCredential {
+    /// A read capability for the environments `labels` name, minted the way
+    /// the control plane mints it: for their canonical tenants.
+    fn minted(key: &ed25519_dalek::SigningKey, labels: &[&str]) -> TelemetryCredential {
+        let tenants: Vec<String> = labels
+            .iter()
+            .map(|label| deis_wire::CanonicalTenantId::derived_from_label(label).to_string())
+            .collect();
         let claims = CapabilityClaims::new(
             AUD_TELEMETRY,
             "spiffe://deis.test/deislet/control/main",
@@ -495,11 +501,8 @@ mod tests {
                 })
                 .collect(),
         );
-        TelemetryCredential::new(
-            &encode(&claims, key),
-            tenants.iter().map(|t| t.to_string()).collect(),
-        )
-        .expect("a v1 capability is a legal header value")
+        TelemetryCredential::new(&encode(&claims, key), tenants)
+            .expect("a v1 capability is a legal header value")
     }
 
     /// A credential must not be printable, in a panic or anywhere else.
@@ -509,7 +512,9 @@ mod tests {
         let token = credential.bearer.to_str().unwrap().to_string();
         let rendered = format!("{credential:?}");
         assert!(rendered.contains("<present>"), "{rendered}");
-        assert!(rendered.contains("demo.production"), "{rendered}");
+        let tenant =
+            deis_wire::CanonicalTenantId::derived_from_label("demo.production").to_string();
+        assert!(rendered.contains(&tenant), "{rendered}");
         assert!(!rendered.contains(&token["Bearer ".len()..]), "{rendered}");
     }
 
@@ -543,7 +548,17 @@ mod tests {
             certificate: files.certificate,
             private_key: files.private_key,
             trust_root: files.trust_root,
-            control_endpoint: "http://127.0.0.1:1".to_string(),
+            // A stand-in control plane serving revocation lists signed with
+            // the control key; the collector refuses everything until it has
+            // adopted one.
+            control_endpoint: {
+                static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+                    std::sync::OnceLock::new();
+                CONTROL
+                    .get_or_init(|| deis_capability::testing::FakeControl::start(control_key()))
+                    .url()
+                    .to_string()
+            },
             identity_reload_seconds: 60,
         }
     }
@@ -593,17 +608,24 @@ mod tests {
             .await
             .expect("and follows it");
 
-        // Another application: refused, and the message says what the
-        // capability reads.
-        let error = logs
+        // Another application: the capability names tenants by id, so the
+        // name is not refused, and nothing of bank comes back.
+        let page = logs
             .query(QueryRequest {
                 app_id: "bank".to_string(),
                 ..Default::default()
             })
             .await
-            .expect_err("a capability for demo does not read bank")
+            .expect("a named read is answered");
+        assert!(page.entries.is_empty(), "a capability for demo read bank");
+        // A read naming no application is refused, and the message says
+        // what the capability reads.
+        let error = logs
+            .query(QueryRequest::default())
+            .await
+            .expect_err("a narrow capability reads named applications only")
             .to_string();
-        assert!(error.contains("reads only demo.production"), "{error}");
+        assert!(error.contains("reads only"), "{error}");
 
         // A capability some other key signed: refused as unauthenticated, and
         // the message points at the collector's trust in the control plane.

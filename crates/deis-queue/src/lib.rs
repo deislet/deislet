@@ -1,26 +1,21 @@
 //! Deislet message queue: durable enqueue plus lease-based consumption.
 //!
 //! The service is deliberately "dumb". It knows exactly one thing about the
-//! world outside itself: a tenant id, carried in the `x-deis-tenant` gRPC
-//! metadata header. It has no idea what a version, an environment, a
-//! deployment or a node is, and it never calls anything back. Consumers come
-//! to it; it does not push to them, because pushing would mean the queue had
-//! to know which node runs which application.
+//! world outside itself: a tenant, which the capability on each call names.
+//! It has no idea what a version, an environment, a deployment or a node is,
+//! and it never calls anything back. Consumers come to it; it does not push
+//! to them, because pushing would mean the queue had to know which node runs
+//! which application.
 //!
 //! # What a tenant is here, and what it is not
 //!
-//! The platform above builds the tenant id out of an application and an
-//! environment (`deis_wire::conventions::tenant_id`), so `demo.production`
-//! and `demo.preview-7` are two tenants of one application with two separate
-//! sets of queues. To this service that is invisible: it sees one opaque key,
-//! one tenant dimension, and it never takes the value apart for any purpose
-//! other than validating it. That is the point - a preview deployment must
-//! not be able to consume the work production enqueued, and the cheapest way
-//! to guarantee it is that the two never name the same rows here.
-//!
-//! Note which header carries it. `x-deis-app-id` names the *application* on
-//! the data path and is not the storage tenant; a call that stamps only that
-//! one is refused rather than served from a default namespace.
+//! A tenant is one application environment, keyed by canonical ids:
+//! `v1/<application id>/<environment id>`, so a preview and production of the
+//! same application have two separate sets of queues, and a preview cannot
+//! consume the work production enqueued. This service validates the key and
+//! never takes it apart for any other purpose. No request header names a
+//! tenant; a call whose capability names none for the `queue` binding is
+//! refused.
 //!
 //! # Delivery semantics
 //!
@@ -60,31 +55,16 @@
 //! queue.sqlite    messages and dead letters, both partitioned by tenant
 //! ```
 //!
-//! # A data directory from before this change is not readable
+//! # Trust model: the capability names the tenant
 //!
-//! Rows used to be keyed by a bare application id in an `app_id` column. That
-//! column no longer exists and nothing looks for it, so an old `queue.sqlite`
-//! holds messages that would never be delivered again. There is no migration,
-//! and there will not be one: this is a development platform with no deployed
-//! data, and inventing an environment for an old message would be inventing
-//! where to deliver it.
-//!
-//! What there is instead is a refusal: the service checks at startup and will
-//! not serve over a database in the old shape, because the alternative is a
-//! queue that looks healthy while every pull answers "nothing ready". See
-//! [`legacy`].
-//!
-//! # Trust model: a tenant is claimed in a header and proved with a token
-//!
-//! Every request names its tenant in the `x-deis-tenant` header. On its own
-//! that is a claim: the header says which queues the caller wants, not that
-//! the caller is entitled to them. What goes with the claim is a capability
-//! in `Authorization: Bearer`, signed by deis-control with Ed25519 for the
-//! `queue` audience, naming the tenant and the `queue` binding, and valid for
-//! 15 minutes. It is checked against the keys this service reads from the
-//! control plane's machine channel under its own machine identity, and
-//! against the signed revocation list read the same way, so a token that
-//! leaked out of one application reaches nothing in another. See [`auth`].
+//! Every call carries a capability in `Authorization: Bearer`, signed by
+//! deis-control with Ed25519 for the `queue` audience, naming one canonical
+//! tenant and the `queue` binding, and valid for 15 minutes. It is checked
+//! against the keys this service reads from the control plane's machine
+//! channel under its own machine identity, and against the signed revocation
+//! list read the same way. The tenant a call acts for is the one the
+//! capability names; nothing in the request names it, so a token that leaked
+//! out of one application reaches nothing in another. See [`auth`].
 //!
 //! There is no mode without the check and no loopback exception: whatever
 //! the address, every call carries a capability, and the listener speaks TLS
@@ -101,8 +81,6 @@ pub use deis_wire::conventions::MAX_GRPC_MESSAGE_BYTES;
 pub mod auth;
 pub mod config;
 pub mod error;
-pub mod legacy;
-pub mod migration;
 pub mod proto;
 pub mod queue;
 pub mod server;

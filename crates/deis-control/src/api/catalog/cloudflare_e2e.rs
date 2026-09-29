@@ -36,9 +36,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use deis_build_core::BindingKind;
 use deis_provider_driver::{
-    ArtifactVersionRef, CredentialMaterial, DriverOperation, DriverOrchestrationOutcome,
-    DriverOrchestrator, DriverOrchestratorConfig, DriverRequest, DriverWorkspaceRoot,
-    ExecutableProviderDriverConfig, ProviderNeutralPlan, ProviderTargetRef,
+    ArtifactVersionRef, CredentialMaterial, DriverOperation, DriverOrchestratorConfig,
+    DriverWorkspaceRoot, ExecutableProviderDriverConfig, ProviderTargetRef,
 };
 use deis_wire::{CanonicalId, OperationState};
 use serde_json::Value;
@@ -46,7 +45,6 @@ use sha2::{Digest as _, Sha256};
 use tower::ServiceExt as _;
 
 use super::tests::{Harness, call, harness, json};
-use crate::catalog::bundle::tests::sample_bundle;
 use crate::catalog::provider_driver_release::tests::Fixture;
 use crate::catalog::{
     CatalogPayloadSource, OperationRequestContext, ProviderCredentialBindingSpec,
@@ -103,9 +101,40 @@ fn project() -> deis_build_core::ProjectConfig {
         },
         "queues": [{"name": "ORDERS"}],
         "cron": ["*/5 * * * *"],
-        "environment": {"secrets": ["API_KEY"]}
+        "environment": {
+            "declarations": [
+                {"name": "API_KEY", "kind": "secret", "valueType": "string", "required": true},
+                {"name": "GREETING", "kind": "config", "valueType": "string", "required": true}
+            ]
+        }
     }))
     .expect("sample project parses")
+}
+
+/// The secret the environment holds when the first deployment begins, and
+/// the one it is rotated to before the second.
+const FIRST_SECRET: &str = "e2e-secret-first-4d1b";
+const SECOND_SECRET: &str = "e2e-secret-second-8a2e";
+const GREETING: &str = "hello from the control plane";
+
+/// The Deislet bundle of the sample project: its manifest declares the same
+/// environment the Cloudflare payload was built with.
+fn project_bundle() -> Vec<u8> {
+    let declarations = deis_build_core::resolve_environment_declarations(
+        &project(),
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+    )
+    .expect("the sample project's declarations resolve");
+    crate::catalog::bundle::tests::bundle_with_manifest(
+        &serde_json::json!({
+            "schema": 2,
+            "app": "shop",
+            "entry": "worker/index.js",
+            "environment": declarations,
+        })
+        .to_string(),
+        true,
+    )
 }
 
 /// A fake Cloudflare account, the fake `node` that fronts it, and the
@@ -345,7 +374,7 @@ async fn upload_application(harness: &Harness) -> ArtifactVersionRef {
         .to_owned();
 
     // The Deislet version, which is what a provider deployment names.
-    let bundle = sample_bundle("shop");
+    let bundle = project_bundle();
     let bundle_dir = tempfile::tempdir().unwrap();
     fs::write(bundle_dir.path().join("bundle.zip"), &bundle).unwrap();
     let store = tempfile::tempdir().unwrap();
@@ -454,6 +483,19 @@ async fn register_provider(
     fake: &FakeCloudflare,
     work_root: &Path,
 ) -> ProviderSetup {
+    let audit = Arc::new(crate::audit::AuditStore::new(
+        harness.state.store.database(),
+    ));
+    register_provider_with_audit(harness, fake, work_root, audit).await
+}
+
+/// [`register_provider`], with the secret deliveries written to `audit`.
+async fn register_provider_with_audit(
+    harness: &Harness,
+    fake: &FakeCloudflare,
+    work_root: &Path,
+    audit: Arc<crate::audit::AuditStore>,
+) -> ProviderSetup {
     let store = harness.state.store.as_ref().clone();
     let fixture = Fixture::with_driver_executable(fake.driver_entrypoint());
     let registry = ProviderDriverReleaseRegistry::new(
@@ -545,6 +587,11 @@ async fn register_provider(
     let dispatcher = ProviderDriverDispatcher::new(
         registry,
         vault,
+        Arc::new(crate::catalog::CatalogOperationInputs::new(
+            store.clone(),
+            Arc::clone(&harness.state.secrets),
+            audit,
+        )),
         workspaces,
         ExecutableProviderDriverConfig::default(),
     )
@@ -570,7 +617,7 @@ async fn deploy(
     setup: &ProviderSetup,
     artifact: &ArtifactVersionRef,
     key: &str,
-) -> OperationState {
+) -> Value {
     let (status, accepted) = post_with_key(
         harness,
         "/api/apps/shop/environments/production/provider-deployments",
@@ -578,10 +625,32 @@ async fn deploy(
         serde_json::json!({
             "providerTargetId": setup.target.provider_target_id,
             "artifact": artifact,
+            "configValues": {"GREETING": GREETING},
         }),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    drive_to_success(harness, setup, &accepted).await
+}
+
+/// Take `shop/production` down over the API, with `body` as the request,
+/// and drive the undeploy until it settles.
+async fn undeploy(harness: &Harness, setup: &ProviderSetup, key: &str, body: Value) -> Value {
+    let (status, accepted) = post_with_key(
+        harness,
+        "/api/apps/shop/environments/production/provider-undeployments",
+        key,
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    drive_to_success(harness, setup, &accepted).await
+}
+
+/// Drive the workflow of the `accepted` operation the way the background
+/// dispatcher does, until it settles, and read it back the way `deis`
+/// waits for it.
+async fn drive_to_success(harness: &Harness, setup: &ProviderSetup, accepted: &Value) -> Value {
     let operation_id: CanonicalId = accepted["operationId"].as_str().unwrap().parse().unwrap();
     for _ in 0..40 {
         let outcome = harness
@@ -609,7 +678,7 @@ async fn deploy(
                     .await
                     .unwrap();
                 panic!(
-                    "deployment is waiting on the provider at step {}: {:#?}",
+                    "the workflow is waiting on the provider at step {}: {:#?}",
                     workflow.next_step_index,
                     record.map(|record| (record.driver_error, record.contract_failure))
                 )
@@ -618,7 +687,6 @@ async fn deploy(
             | ProviderDeploymentDriveOutcome::Advanced(_) => {}
         }
     }
-    // Read back the way `deis deploy` waits for it.
     let (status, settled) = json(
         &harness.router,
         "GET",
@@ -630,7 +698,7 @@ async fn deploy(
     let state: OperationState =
         serde_json::from_value(settled["operation"]["state"].clone()).unwrap();
     assert_eq!(state, OperationState::Succeeded, "{settled:#}");
-    state
+    settled
 }
 
 #[tokio::test]
@@ -647,6 +715,7 @@ async fn deis_deploys_to_cloudflare_through_the_driver_process_and_deletes_the_w
     let worker = scope.worker_name();
 
     // ── first deployment ────────────────────────────────────────────────
+    set_secret(&harness, FIRST_SECRET).await;
     deploy(&harness, &setup, &artifact, "cloudflare-e2e-deploy-1").await;
 
     // Every resource was created under this application/environment's
@@ -717,6 +786,25 @@ async fn deis_deploys_to_cloudflare_through_the_driver_process_and_deletes_the_w
     );
     assert!(fake.account().join("subdomain").join(&worker).is_file());
 
+    // The deployment's config value filled its `[vars]` placeholder, and
+    // the secret the environment snapshot binds went to wrangler on stdin
+    // with the upload - never on argv, never in the rendered file.
+    assert!(
+        toml.contains(&format!("GREETING = \"{GREETING}\"")),
+        "{toml}"
+    );
+    assert!(!toml.contains(FIRST_SECRET), "{toml}");
+    assert_eq!(
+        upload_secrets(&fake, 0),
+        serde_json::json!({"API_KEY": FIRST_SECRET})
+    );
+    assert!(fake.argv().iter().all(|line| !line.contains(FIRST_SECRET)));
+    // The delivery is on the audit log, by revision and never by value.
+    let deliveries = secret_deliveries(&harness).await;
+    assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+    assert!(deliveries[0].contains("count=1"), "{deliveries:?}");
+    assert!(!deliveries[0].contains(FIRST_SECRET), "{deliveries:?}");
+
     // The token reached wrangler only through its environment, never argv,
     // and the process environment held nothing else of the Control's.
     let env_log = fs::read_to_string(fake.account().join("env.log")).unwrap();
@@ -732,7 +820,15 @@ async fn deis_deploys_to_cloudflare_through_the_driver_process_and_deletes_the_w
     assert_eq!(fs::read_dir(&operations).unwrap().count(), 0);
 
     // ── second deployment: the resources are found, not created again ──
+    // The secret was rotated in between; the new deployment binds the new
+    // revision, and only it.
+    set_secret(&harness, SECOND_SECRET).await;
     deploy(&harness, &setup, &artifact, "cloudflare-e2e-deploy-2").await;
+    assert_eq!(
+        upload_secrets(&fake, 1),
+        serde_json::json!({"API_KEY": SECOND_SECRET})
+    );
+    assert_eq!(secret_deliveries(&harness).await.len(), 2);
     assert_eq!(fake.names("kv"), vec![kv.clone()]);
     assert_eq!(fake.names("d1"), vec![d1.clone()]);
     assert_eq!(fake.names("r2"), vec![r2.clone()]);
@@ -752,57 +848,202 @@ async fn deis_deploys_to_cloudflare_through_the_driver_process_and_deletes_the_w
     let second = fake.toml_seen_by_call(fake.call_index("versions upload", 1));
     assert_eq!(second, toml, "the re-deploy binds the same resources");
 
-    // ── delete: the Worker goes, the data stays without purge consent ──
-    let delete = DriverRequest {
-        schema_version: 1,
-        operation_id: CanonicalId::new_v7(),
-        operation: DriverOperation::Delete,
-        desired_state_digest: "c".repeat(64).parse().unwrap(),
-        application_id: setup.application_id,
-        environment_id: setup.environment_id,
-        target: setup.target.clone(),
-        artifact: None,
-        plan: ProviderNeutralPlan::default(),
-        rollback_target: None,
-        reconciles: None,
-    };
-    let operation_id = delete.operation_id;
-    harness
-        .state
-        .store
-        .begin_provider_driver_operation(
-            delete,
-            operation_context("cloudflare-e2e-delete", "POST\n/provider-operations\nv1"),
-        )
-        .await
-        .unwrap();
-    let driver = setup
-        .dispatcher
-        .driver_for_target(setup.target.provider_target_id)
-        .await
-        .unwrap();
-    let outcome = DriverOrchestrator::new(
-        harness.state.store.as_ref().clone(),
-        DriverOrchestratorConfig::default(),
+    // ── undeploy: the Worker goes, the data stays without purge consent ──
+    let undeployed = undeploy(
+        &harness,
+        &setup,
+        "cloudflare-e2e-undeploy-1",
+        serde_json::json!({}),
     )
-    .unwrap()
-    .execute(operation_id, CanonicalId::new_v7(), &driver)
-    .await
-    .unwrap();
-    assert!(
-        matches!(outcome, DriverOrchestrationOutcome::Succeeded(_)),
-        "{outcome:?}"
-    );
+    .await;
+    assert_eq!(undeployed["kind"], "undeploy", "{undeployed:#}");
+    assert_eq!(undeployed["purgeData"], false, "{undeployed:#}");
+    assert_eq!(undeployed["operation"]["kind"], "delete", "{undeployed:#}");
     assert_eq!(
         fake.calls(&format!("delete {worker}")),
         vec![format!("delete {worker} --force")]
     );
     assert!(!fake.account().join("workers").join(&worker).exists());
     assert!(!fake.account().join("schedules").join(&worker).exists());
-    assert_eq!(fake.names("kv"), vec![kv]);
-    assert_eq!(fake.names("d1"), vec![d1]);
-    assert_eq!(fake.names("r2"), vec![r2]);
-    assert_eq!(fake.names("queues"), vec![queue]);
+    assert_eq!(fake.names("kv"), vec![kv.clone()]);
+    assert_eq!(fake.names("d1"), vec![d1.clone()]);
+    assert_eq!(fake.names("r2"), vec![r2.clone()]);
+    assert_eq!(fake.names("queues"), vec![queue.clone()]);
+
+    // Consent to purge has to name this environment; one written for
+    // another is refused before anything is recorded.
+    let (status, refused) = post_with_key(
+        &harness,
+        "/api/apps/shop/environments/production/provider-undeployments",
+        "cloudflare-e2e-undeploy-elsewhere",
+        serde_json::json!({"purgeData": {"environment": "staging"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(fake.names("kv"), vec![kv.clone()]);
+
+    // ── undeploy with consent: the environment's data goes too ──
+    let purged = undeploy(
+        &harness,
+        &setup,
+        "cloudflare-e2e-undeploy-purge",
+        serde_json::json!({"purgeData": {"environment": "production"}}),
+    )
+    .await;
+    assert_eq!(purged["purgeData"], true, "{purged:#}");
+    for kind in ["kv", "d1", "r2", "queues"] {
+        assert!(
+            fake.names(kind).is_empty(),
+            "{kind}: {:?}",
+            fake.names(kind)
+        );
+    }
+    for deleted in [
+        "kv namespace delete".to_owned(),
+        format!("d1 delete {d1}"),
+        format!("r2 bucket delete {r2}"),
+        format!("queues delete {queue}"),
+    ] {
+        assert_eq!(
+            fake.calls(&deleted).len(),
+            1,
+            "{deleted}: {:?}",
+            fake.argv()
+        );
+    }
+}
+
+/// A secret delivery the audit log cannot record does not happen: the
+/// upload is never run, nothing reaches wrangler, and the step waits to be
+/// retried instead of failing the deployment.
+#[tokio::test]
+async fn no_secret_reaches_the_driver_when_its_delivery_cannot_be_audited() {
+    let harness = harness(true).await;
+    let fake = FakeCloudflare::new();
+    let work = tempfile::tempdir().unwrap();
+    let artifact = upload_application(&harness).await;
+    // An audit log that refuses every write.
+    let broken = tempfile::tempdir().unwrap();
+    let database = Arc::new(
+        crate::database::Database::init(&broken.path().join("audit.db"))
+            .await
+            .unwrap(),
+    );
+    database
+        .with_connection(|connection| {
+            connection.execute_batch("DROP TABLE audit_log")?;
+            Ok::<_, crate::catalog::CatalogError>(())
+        })
+        .await
+        .unwrap();
+    let setup = register_provider_with_audit(
+        &harness,
+        &fake,
+        &work.path().join("provider-work"),
+        Arc::new(crate::audit::AuditStore::new(database)),
+    )
+    .await;
+    set_secret(&harness, FIRST_SECRET).await;
+
+    let (status, accepted) = post_with_key(
+        &harness,
+        "/api/apps/shop/environments/production/provider-deployments",
+        "cloudflare-e2e-unaudited",
+        serde_json::json!({
+            "providerTargetId": setup.target.provider_target_id,
+            "artifact": artifact,
+            "configValues": {"GREETING": GREETING},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted}");
+    let operation_id: CanonicalId = accepted["operationId"].as_str().unwrap().parse().unwrap();
+    let mut waiting = None;
+    for _ in 0..40 {
+        match harness
+            .state
+            .store
+            .drive_provider_deployment_once(
+                operation_id,
+                CanonicalId::new_v7(),
+                &setup.dispatcher,
+                DriverOrchestratorConfig::default(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+        {
+            ProviderDeploymentDriveOutcome::Waiting(workflow) => {
+                waiting = Some(workflow);
+                break;
+            }
+            ProviderDeploymentDriveOutcome::Busy(_)
+            | ProviderDeploymentDriveOutcome::Advanced(_) => {}
+            other => panic!("the deployment settled without its upload: {other:?}"),
+        }
+    }
+    let workflow = waiting.expect("the upload waits for the audit log");
+    let step = &workflow.steps[workflow.next_step_index];
+    assert_eq!(step.operation, DriverOperation::Upload);
+    let record = harness
+        .state
+        .store
+        .provider_driver_operation(step.child_operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = record.driver_error.expect("the step records why it waits");
+    assert_eq!(error.code, "DRIVER_INPUTS_UNAVAILABLE", "{error:?}");
+    assert!(error.retryable, "{error:?}");
+    assert!(
+        fake.calls("versions upload").is_empty(),
+        "{:?}",
+        fake.argv()
+    );
+    assert!(fake.argv().iter().all(|line| !line.contains(FIRST_SECRET)));
+}
+
+/// Put `value` at the head of `shop/production`'s `API_KEY`.
+async fn set_secret(harness: &Harness, value: &str) {
+    let (status, body) = json(
+        &harness.router,
+        "PUT",
+        "/api/apps/shop/environments/production/secrets/API_KEY",
+        serde_json::json!({"value": value}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// What the `occurrence`-th `versions upload` read from stdin: the secrets
+/// file wrangler was pointed at.
+fn upload_secrets(fake: &FakeCloudflare, occurrence: usize) -> Value {
+    let index = fake.call_index("versions upload", occurrence);
+    let line = &fake.argv()[index - 1];
+    assert!(line.contains("--secrets-file /dev/stdin"), "{line}");
+    let stdin = fs::read_to_string(fake.account().join(format!("stdin.{index}"))).unwrap();
+    serde_json::from_str(&stdin).unwrap_or_else(|_| panic!("stdin was not JSON: {stdin:?}"))
+}
+
+/// The detail of every provider secret delivery on the audit log.
+async fn secret_deliveries(harness: &Harness) -> Vec<String> {
+    harness
+        .state
+        .store
+        .database()
+        .with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT detail FROM audit_log WHERE action = ?1 AND outcome = 'accepted' ORDER BY id",
+            )?;
+            let rows = statement
+                .query_map([crate::catalog::PROVIDER_SECRET_DELIVERY_ACTION], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok::<_, crate::catalog::CatalogError>(rows)
+        })
+        .await
+        .unwrap()
 }
 
 #[test]

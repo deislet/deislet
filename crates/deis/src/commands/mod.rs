@@ -21,6 +21,7 @@ pub mod status;
 pub mod targets;
 pub mod token;
 pub mod trace;
+pub mod undeploy;
 pub mod validate;
 pub mod versions;
 
@@ -196,14 +197,15 @@ impl Session {
     /// looked at and not which of its namespaces, which is exactly the thing
     /// named bindings make ambiguous.
     ///
-    /// It is the same spelling deis-store keys the data by
-    /// (`deis_wire::conventions::namespace_id`), so what is printed here is
-    /// findable on disk.
+    /// deis-store keys the data by the canonical tenant instead
+    /// (`ct1_<application id>_<environment id>[@BINDING]`); this is the name
+    /// an operator knows it by.
     pub fn namespace(&self) -> Result<String> {
-        Ok(deis_wire::conventions::namespace_id(
-            &self.tenant()?,
-            self.binding.as_deref(),
-        ))
+        let tenant = self.tenant()?;
+        Ok(match self.binding.as_deref() {
+            Some(binding) => format!("{tenant}@{binding}"),
+            None => tenant,
+        })
     }
 
     /// The application this command is about, checked against the naming rule

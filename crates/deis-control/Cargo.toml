@@ -103,11 +103,11 @@ utoipa = { version = "5.5", features = ["axum_extras", "uuid", "chrono", "preser
 # Control Wire SDK
 deis-wire = { path = "../deis-wire" }
 deis-capability = { path = "../deis-capability" }
-deis-backend-migration = { path = "../deis-backend-migration" }
 deis-queue = { path = "../deis-queue" }
 # Drives the node session lifecycle (src/session.rs) and the command
 # lifecycle (src/database/command_status.rs).
 yasm = { workspace = true }
+zeroize = "1.8"
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -117,7 +117,6 @@ protoc-bin-vendored = "=3.2.0"
 [dev-dependencies]
 # Mints the certificates the machine-channel tests hold real handshakes with.
 deis-identity-test-pki = { path = "../deis-identity-test-pki" }
-deis-provider-driver = { path = "../deis-provider-driver", features = ["test-support"] }
 # The Cloudflare end-to-end test runs the real driver and build adapter.
 deis-provider-driver-cloudflare = { path = "../deis-provider-driver-cloudflare" }
 deis-build-adapter-cloudflare = { path = "../deis-build-adapter-cloudflare" }

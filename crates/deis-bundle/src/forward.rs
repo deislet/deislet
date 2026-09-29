@@ -157,7 +157,8 @@
 //! record a pointer; `check_service_bindings` has exactly one caller, the
 //! upload handler), so rolling a control plane back does not make an accepted
 //! version undeployable. Today no such kind exists; the gate is here so that
-//! the day one does, the older control plane fails closed instead of open.
+//! the day one does, a control plane that predates it fails closed instead of
+//! open.
 //!
 //! # Applying this to a field that is not one of the six
 //!
@@ -249,11 +250,8 @@ pub const MANIFEST_FIELDS: &[&str] = &[
     "app",
     "entry",
     "runtime",
-    "services",
     "bindings",
     "callable_by",
-    "env",
-    "secrets",
     "environment",
     "routes",
     "cron",
@@ -610,21 +608,16 @@ mod tests {
         let mut bindings = DeclaredBindings::default();
         bindings.insert("HOT", Binding::storage(BindingKind::Kv));
         Manifest {
-            schema: 1,
+            schema: crate::SUPPORTED_SCHEMA,
             app: "demo".to_string(),
             entry: "worker/index.js".to_string(),
             runtime: Some("standard-v1".to_string()),
-            services: [("kv".to_string(), true)].into_iter().collect(),
             bindings,
             callable_by: vec!["storefront".to_string()],
-            env: [("LOG_LEVEL".to_string(), "info".to_string())]
-                .into_iter()
-                .collect(),
-            secrets: vec!["API_KEY".to_string()],
-            environment: Some(deis_wire::EnvironmentDeclarations::new(
+            environment: deis_wire::EnvironmentDeclarations::new(
                 "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
                 Vec::new(),
-            )),
+            ),
             routes: vec![Route {
                 pattern: "/api/users/:id".to_string(),
                 methods: vec!["GET".to_string()],
@@ -708,7 +701,7 @@ mod tests {
     #[test]
     fn unknown_keys_are_reported_by_path_and_in_a_stable_order() {
         let json = r#"{
-            "schema": 1, "app": "demo", "entry": "worker/index.js",
+            "schema": 2, "app": "demo", "entry": "worker/index.js",
             "observability": {"sampling": 0.1},
             "limits": {"timeout_ms": 1500, "max_open_sockets": 8},
             "compatibility": {"date": "2026-09-01", "profile": "strict"},
@@ -736,7 +729,7 @@ mod tests {
     /// maintenance page, a `410 Gone` rule, a wildcard inside a segment, a
     /// behaviour flag.
     const FROM_A_NEWER_BUILDER: &str = r#"{
-        "schema": 1, "app": "demo", "entry": "worker/index.js",
+        "schema": 2, "app": "demo", "entry": "worker/index.js",
         "bindings": {"SEARCH": {"kind": "vector"}},
         "callable_by": ["storefront", "checkout/production"],
         "site": {
@@ -800,9 +793,10 @@ mod tests {
         // documentation - "it never refuses the document" - run against the
         // code for all six paths at once, so a refusal creeping back into any
         // one of them fails here by name.
-        let manifest = Manifest::parse(FROM_A_NEWER_BUILDER).unwrap_or_else(|e| {
-            panic!("a manifest from a newer builder must still parse; it was refused: {e}")
-        });
+        let manifest = Manifest::parse(&crate::complete_manifest_json(FROM_A_NEWER_BUILDER))
+            .unwrap_or_else(|e| {
+                panic!("a manifest from a newer builder must still parse; it was refused: {e}")
+            });
 
         assert!(manifest.bindings.get("SEARCH").is_none());
         assert_eq!(
@@ -890,7 +884,7 @@ mod tests {
         .expect("serialises");
         assert!(
             unreadable_values(&format!(
-                r#"{{"schema":1,"app":"d","entry":"e.js","callable_by":["*"," shop "],"site":{with_rules}}}"#
+                r#"{{"schema":2,"app":"d","entry":"e.js","callable_by":["*"," shop "],"site":{with_rules}}}"#
             ))
             .is_empty(),
             "{with_rules}"
@@ -920,7 +914,8 @@ mod tests {
         );
 
         // `schema`: the whole manifest, in `validate`.
-        let future = FROM_A_NEWER_BUILDER.replace("\"schema\": 1", "\"schema\": 3");
+        let future = crate::complete_manifest_json(FROM_A_NEWER_BUILDER)
+            .replace("\"schema\":2", "\"schema\":3");
         assert!(matches!(
             Manifest::parse(&future),
             Err(BundleError::UnsupportedSchema {
@@ -931,7 +926,9 @@ mod tests {
 
         // `compatibility.date`: the manifest parses, the profile refuses, the
         // refusal names both days.
-        let later = FROM_A_NEWER_BUILDER.replace("2026-09-01", "2099-01-01");
+        let later = crate::complete_manifest_json(
+            &FROM_A_NEWER_BUILDER.replace("2026-09-01", "2099-01-01"),
+        );
         let manifest = Manifest::parse(&later).expect("only the compatibility answer is refused");
         let err = manifest
             .compatibility_profile()
@@ -945,13 +942,14 @@ mod tests {
         // `site.headers[].pattern`: the whole manifest, in `validate`, with a
         // refusal that says it is deliberate and which release ends it.
         let headers = r#"{
-            "schema": 1, "app": "demo", "entry": "worker/index.js",
+            "schema": 2, "app": "demo", "entry": "worker/index.js",
             "site": {"headers": [
                 {"pattern": "/*", "set": [{"name": "x-frame-options", "value": "DENY"}]},
                 {"pattern": "/*.js", "set": [{"name": "cache-control", "value": "immutable"}]}
             ]}
         }"#;
-        let err = Manifest::parse(headers).expect_err("a header pattern this build cannot compile");
+        let err = Manifest::parse(&crate::complete_manifest_json(headers))
+            .expect_err("a header pattern this build cannot compile");
         let message = err.to_string();
         assert!(matches!(err, BundleError::InvalidManifest(_)), "{message}");
         assert!(message.contains("/*.js"), "{message}");
@@ -973,7 +971,8 @@ mod tests {
         // (`api::bindings::tests::a_binding_kind_this_control_plane_cannot_read_is_refused_whatever_the_credential_holds`).
         // What this crate can check is the half it owns: the node's reading
         // is narrow, and the gate has the entry to look at.
-        let manifest = Manifest::parse(FROM_A_NEWER_BUILDER).expect("narrow on a node");
+        let manifest = Manifest::parse(&crate::complete_manifest_json(FROM_A_NEWER_BUILDER))
+            .expect("narrow on a node");
         let unreadable: Vec<(&str, &Value)> = manifest.bindings.unreadable_entries().collect();
         assert_eq!(unreadable.len(), 1);
         assert_eq!(unreadable[0].0, "SEARCH");

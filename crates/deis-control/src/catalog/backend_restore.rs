@@ -1,8 +1,8 @@
 //! Durable planning for a coordinated embedded-backend restore.
 //!
 //! Planning is deliberately separate from execution.  Control validates and
-//! freezes the restore set, reserves the installation against identity
-//! migration, and creates the standard ProductOperation.  A topology driver
+//! freezes the restore set, reserves the installation against a second
+//! restore, and creates the standard ProductOperation.  A topology driver
 //! must later stage, quiesce, switch, verify, or roll back the physical data
 //! directories; this module never treats three file copies as success.
 
@@ -25,7 +25,7 @@ use super::{CatalogError, CatalogResult};
 
 const RESTORE_COLUMNS: &str = "restore_id, operation_id, restore_set_id, installation_id, \
     expected_installation_revision, restore_set_sha256, restore_set_json, state, attempt_count, \
-    coordinator_id, lease_expires_at, execution_report_json, last_error, created_at, updated_at";
+    execution_report_json, last_error, created_at, updated_at";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -100,11 +100,6 @@ pub struct BackendRestorePlan {
     pub restore_set: BackendRestoreSet,
     pub state: BackendRestoreState,
     pub attempt_count: u64,
-    #[serde(skip_serializing)]
-    #[schema(value_type = Option<String>, format = Uuid)]
-    pub(crate) coordinator_id: Option<CanonicalId>,
-    #[serde(skip_serializing)]
-    pub(crate) lease_expires_at_unix_seconds: Option<i64>,
     #[schema(value_type = Option<crate::api::openapi::BackendRestoreExecutionReportDocument>)]
     pub execution_report: Option<BackendRestoreExecutionReport>,
     pub last_error: Option<String>,
@@ -166,11 +161,6 @@ impl CatalogStore {
                     return Ok(existing);
                 }
 
-                if let Some(operation_id) = active_operation(&tx, OperationKind::Migrate)? {
-                    return Err(CatalogError::conflict(format!(
-                        "backend restore cannot overlap active identity migration operation {operation_id}"
-                    )));
-                }
                 if let Some(operation_id) = active_operation(&tx, OperationKind::Restore)? {
                     return Err(CatalogError::conflict(format!(
                         "installation already has active backend restore operation {operation_id}"
@@ -213,11 +203,10 @@ impl CatalogStore {
                     "INSERT INTO backend_restore_plans
                        (restore_id, operation_id, restore_set_id, installation_id,
                         expected_installation_revision, restore_set_sha256, restore_set_json,
-                        state, attempt_count, coordinator_id, lease_expires_at,
-                        execution_report_json, last_error,
+                        state, attempt_count, execution_report_json, last_error,
                         created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planned', 0,
-                             NULL, NULL, NULL, NULL, ?8, ?8)",
+                             NULL, NULL, ?8, ?8)",
                     params![
                         restore_id.to_string(),
                         operation_id.to_string(),
@@ -284,17 +273,21 @@ impl CatalogStore {
             .await
     }
 
+    /// Every restore the driver still has to run or reconcile. Control is a
+    /// single process, so a `staging` row found here belongs either to a run
+    /// this process already has in flight (the caller skips those) or to a
+    /// process that stopped part way, whose driver journal the same operation
+    /// reconciles.
     pub async fn resumable_backend_restores(&self) -> CatalogResult<Vec<BackendRestorePlan>> {
         self.database()
             .with_connection(|connection| {
                 let mut statement = connection.prepare(&format!(
                     "SELECT {RESTORE_COLUMNS} FROM backend_restore_plans
-                      WHERE state IN ('planned', 'waiting')
-                         OR (state = 'staging' AND lease_expires_at <= ?1)
+                      WHERE state IN ('planned', 'waiting', 'staging')
                       ORDER BY created_at, restore_id"
                 ))?;
                 statement
-                    .query_map([now_secs()], map_restore)?
+                    .query_map([], map_restore)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(Into::into)
             })
@@ -306,14 +299,7 @@ impl CatalogStore {
     pub async fn begin_backend_restore(
         &self,
         operation_id: CanonicalId,
-        coordinator_id: CanonicalId,
-        lease_seconds: u64,
     ) -> CatalogResult<(BackendRestorePlan, ProductOperation)> {
-        if !(5..=300).contains(&lease_seconds) {
-            return Err(CatalogError::invalid(
-                "backend restore coordinator lease must be 5..=300 seconds",
-            ));
-        }
         self.database()
             .with_connection(move |connection| {
                 let tx = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)?;
@@ -349,16 +335,11 @@ impl CatalogStore {
                             None,
                         )?;
                     }
-                    (BackendRestoreState::Staging, OperationState::Running)
-                        if plan.coordinator_id == Some(coordinator_id)
-                            || plan
-                                .lease_expires_at_unix_seconds
-                                .is_some_and(|expires_at| expires_at <= now_secs()) =>
-                    {
+                    (BackendRestoreState::Staging, OperationState::Running) => {
                         // A stopped Control may leave the external driver at
                         // any journalled point. Re-running the same operation
-                        // is the recovery protocol. An unexpired owner keeps
-                        // another Control replica from perturbing that run.
+                        // is the recovery protocol; the caller keeps one run
+                        // per operation in flight inside this process.
                     }
                     _ => {
                         return Err(CatalogError::conflict(format!(
@@ -367,24 +348,12 @@ impl CatalogStore {
                         )));
                     }
                 }
-                let now = now_secs();
-                let lease_seconds = i64::try_from(lease_seconds)
-                    .map_err(|_| CatalogError::invalid("restore lease exceeds SQLite range"))?;
-                let lease_expires_at = now
-                    .checked_add(lease_seconds)
-                    .ok_or_else(|| CatalogError::invalid("restore lease timestamp overflow"))?;
                 let changed = tx.execute(
                     "UPDATE backend_restore_plans
                         SET state = 'staging', attempt_count = attempt_count + 1,
-                            coordinator_id = ?2, lease_expires_at = ?3,
-                            last_error = NULL, updated_at = ?4
+                            last_error = NULL, updated_at = ?2
                       WHERE operation_id = ?1 AND state IN ('planned', 'staging', 'waiting')",
-                    params![
-                        operation_id.to_string(),
-                        coordinator_id.to_string(),
-                        lease_expires_at,
-                        now
-                    ],
+                    params![operation_id.to_string(), now_secs()],
                 )?;
                 if changed != 1 {
                     return Err(CatalogError::conflict(format!(
@@ -409,53 +378,12 @@ impl CatalogStore {
             .await
     }
 
-    pub async fn renew_backend_restore_lease(
-        &self,
-        operation_id: CanonicalId,
-        coordinator_id: CanonicalId,
-        lease_seconds: u64,
-    ) -> CatalogResult<()> {
-        if !(5..=300).contains(&lease_seconds) {
-            return Err(CatalogError::invalid(
-                "backend restore coordinator lease must be 5..=300 seconds",
-            ));
-        }
-        self.database()
-            .with_connection(move |connection| {
-                let now = now_secs();
-                let lease_seconds = i64::try_from(lease_seconds)
-                    .map_err(|_| CatalogError::invalid("restore lease exceeds SQLite range"))?;
-                let expires_at = now
-                    .checked_add(lease_seconds)
-                    .ok_or_else(|| CatalogError::invalid("restore lease timestamp overflow"))?;
-                let changed = connection.execute(
-                    "UPDATE backend_restore_plans
-                        SET lease_expires_at = ?3
-                      WHERE operation_id = ?1 AND state = 'staging'
-                        AND coordinator_id = ?2",
-                    params![
-                        operation_id.to_string(),
-                        coordinator_id.to_string(),
-                        expires_at
-                    ],
-                )?;
-                if changed != 1 {
-                    return Err(CatalogError::conflict(format!(
-                        "backend restore operation {operation_id} is no longer leased by coordinator {coordinator_id}"
-                    )));
-                }
-                Ok::<_, CatalogError>(())
-            })
-            .await
-    }
-
     /// Preserve an unknown external outcome as waiting. The operation can be
     /// resumed with the same immutable input; it is never guessed failed or
     /// succeeded from a timeout or process exit alone.
     pub async fn defer_backend_restore(
         &self,
         operation_id: CanonicalId,
-        coordinator_id: CanonicalId,
         expected_operation_revision: u64,
         reason: String,
     ) -> CatalogResult<ProductOperation> {
@@ -476,12 +404,6 @@ impl CatalogStore {
                         plan.restore_id, plan.state
                     )));
                 }
-                if plan.coordinator_id != Some(coordinator_id) {
-                    return Err(CatalogError::conflict(format!(
-                        "backend restore {} is leased by another coordinator",
-                        plan.restore_id
-                    )));
-                }
                 transition_operation_tx(
                     &tx,
                     operation_id,
@@ -492,19 +414,13 @@ impl CatalogStore {
                 )?;
                 let changed = tx.execute(
                     "UPDATE backend_restore_plans
-                        SET state = 'waiting', coordinator_id = NULL,
-                            lease_expires_at = NULL, last_error = ?3, updated_at = ?4
-                      WHERE operation_id = ?1 AND state = 'staging' AND coordinator_id = ?2",
-                    params![
-                        operation_id.to_string(),
-                        coordinator_id.to_string(),
-                        reason,
-                        now_secs()
-                    ],
+                        SET state = 'waiting', last_error = ?2, updated_at = ?3
+                      WHERE operation_id = ?1 AND state = 'staging'",
+                    params![operation_id.to_string(), reason, now_secs()],
                 )?;
                 if changed != 1 {
                     return Err(CatalogError::conflict(format!(
-                        "backend restore {} lost its coordinator lease before deferral",
+                        "backend restore {} changed before deferral",
                         plan.restore_id
                     )));
                 }
@@ -525,7 +441,6 @@ impl CatalogStore {
     pub async fn complete_backend_restore(
         &self,
         report: BackendRestoreExecutionReport,
-        coordinator_id: CanonicalId,
         expected_operation_revision: u64,
     ) -> CatalogResult<ProductOperation> {
         let operation_id = report.operation_id;
@@ -541,12 +456,6 @@ impl CatalogStore {
                     return Err(CatalogError::conflict(format!(
                         "backend restore {} cannot accept a {:?} report from {:?}",
                         plan.restore_id, report.state, plan.state
-                    )));
-                }
-                if plan.coordinator_id != Some(coordinator_id) {
-                    return Err(CatalogError::conflict(format!(
-                        "backend restore {} is leased by another coordinator",
-                        plan.restore_id
                     )));
                 }
                 validate_execution_report(
@@ -581,15 +490,9 @@ impl CatalogStore {
                 let plan_changed = tx.execute(
                     "UPDATE backend_restore_plans
                         SET state = 'succeeded', execution_report_json = ?2,
-                            coordinator_id = NULL, lease_expires_at = NULL,
-                            last_error = NULL, updated_at = ?4
-                      WHERE operation_id = ?1 AND state = 'staging' AND coordinator_id = ?3",
-                    params![
-                        operation_id.to_string(),
-                        report_json,
-                        coordinator_id.to_string(),
-                        now
-                    ],
+                            last_error = NULL, updated_at = ?3
+                      WHERE operation_id = ?1 AND state = 'staging'",
+                    params![operation_id.to_string(), report_json, now],
                 )?;
                 if plan_changed != 1 {
                     return Err(CatalogError::conflict(format!(
@@ -623,7 +526,6 @@ impl CatalogStore {
     pub async fn fail_backend_restore_rolled_back(
         &self,
         report: BackendRestoreExecutionReport,
-        coordinator_id: CanonicalId,
         expected_operation_revision: u64,
         reason: String,
     ) -> CatalogResult<ProductOperation> {
@@ -647,12 +549,6 @@ impl CatalogStore {
                         plan.restore_id, report.state, plan.state
                     )));
                 }
-                if plan.coordinator_id != Some(coordinator_id) {
-                    return Err(CatalogError::conflict(format!(
-                        "backend restore {} is leased by another coordinator",
-                        plan.restore_id
-                    )));
-                }
                 validate_execution_report(
                     &report,
                     operation_id,
@@ -669,16 +565,9 @@ impl CatalogStore {
                 let changed = tx.execute(
                     "UPDATE backend_restore_plans
                         SET state = 'failed', execution_report_json = ?2,
-                            coordinator_id = NULL, lease_expires_at = NULL,
-                            last_error = ?4, updated_at = ?5
-                      WHERE operation_id = ?1 AND state = 'staging' AND coordinator_id = ?3",
-                    params![
-                        operation_id.to_string(),
-                        report_json,
-                        coordinator_id.to_string(),
-                        reason,
-                        now
-                    ],
+                            last_error = ?3, updated_at = ?4
+                      WHERE operation_id = ?1 AND state = 'staging'",
+                    params![operation_id.to_string(), report_json, reason, now],
                 )?;
                 if changed != 1 {
                     return Err(CatalogError::conflict(format!(
@@ -864,15 +753,13 @@ fn map_restore(row: &Row<'_>) -> rusqlite::Result<BackendRestorePlan> {
     let restore_set_json: String = row.get(6)?;
     let state_text: String = row.get(7)?;
     let attempt_count: i64 = row.get(8)?;
-    let coordinator_id = optional_canonical_sql(row, 9, "restore coordinator")?;
-    let lease_expires_at: Option<i64> = row.get(10)?;
-    let execution_report_json: Option<String> = row.get(11)?;
-    let last_error: Option<String> = row.get(12)?;
+    let execution_report_json: Option<String> = row.get(9)?;
+    let last_error: Option<String> = row.get(10)?;
     if last_error.as_deref().is_some_and(|value| {
         value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control)
     }) {
         return Err(rusqlite::Error::FromSqlConversionFailure(
-            12,
+            10,
             rusqlite::types::Type::Text,
             "backend restore last error is not a bounded printable diagnostic".into(),
         ));
@@ -912,7 +799,7 @@ fn map_restore(row: &Row<'_>) -> rusqlite::Result<BackendRestorePlan> {
         .map(|json| {
             serde_json::from_str::<BackendRestoreExecutionReport>(&json).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    11,
+                    9,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
@@ -929,22 +816,9 @@ fn map_restore(row: &Row<'_>) -> rusqlite::Result<BackendRestorePlan> {
     };
     if !report_state_is_valid {
         return Err(rusqlite::Error::FromSqlConversionFailure(
-            11,
-            rusqlite::types::Type::Text,
-            "backend restore state and execution report disagree".into(),
-        ));
-    }
-    let lease_state_is_valid = match state {
-        BackendRestoreState::Staging
-        | BackendRestoreState::Switching
-        | BackendRestoreState::Verifying => coordinator_id.is_some() && lease_expires_at.is_some(),
-        _ => coordinator_id.is_none() && lease_expires_at.is_none(),
-    };
-    if !lease_state_is_valid {
-        return Err(rusqlite::Error::FromSqlConversionFailure(
             9,
             rusqlite::types::Type::Text,
-            "backend restore state and coordinator lease disagree".into(),
+            "backend restore state and execution report disagree".into(),
         ));
     }
     if let Some(report) = &execution_report {
@@ -957,7 +831,7 @@ fn map_restore(row: &Row<'_>) -> rusqlite::Result<BackendRestorePlan> {
         )
         .map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                11,
+                9,
                 rusqlite::types::Type::Text,
                 error.to_string().into(),
             )
@@ -988,12 +862,10 @@ fn map_restore(row: &Row<'_>) -> rusqlite::Result<BackendRestorePlan> {
                 Box::new(error),
             )
         })?,
-        coordinator_id,
-        lease_expires_at_unix_seconds: lease_expires_at,
         execution_report,
         last_error,
-        created_at_unix_seconds: row.get(13)?,
-        updated_at_unix_seconds: row.get(14)?,
+        created_at_unix_seconds: row.get(11)?,
+        updated_at_unix_seconds: row.get(12)?,
     })
 }
 
@@ -1054,25 +926,6 @@ fn canonical_sql(row: &Row<'_>, index: usize, label: &str) -> rusqlite::Result<C
             format!("invalid {label} canonical ID {value:?}: {error}").into(),
         )
     })
-}
-
-fn optional_canonical_sql(
-    row: &Row<'_>,
-    index: usize,
-    label: &str,
-) -> rusqlite::Result<Option<CanonicalId>> {
-    let value: Option<String> = row.get(index)?;
-    value
-        .map(|value| {
-            value.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    index,
-                    rusqlite::types::Type::Text,
-                    format!("invalid {label} canonical ID {value:?}: {error}").into(),
-                )
-            })
-        })
-        .transpose()
 }
 
 fn parse_id(value: &str, label: &str) -> CatalogResult<CanonicalId> {
@@ -1178,7 +1031,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restore_set_scope_and_concurrent_lifecycle_work_fail_closed() {
+    async fn a_restore_set_from_another_installation_is_refused() {
         let (_directory, store) = store().await;
         let mut wrong = restore_set(&store).await;
         wrong.scope.installation_id = CanonicalId::new_v7();
@@ -1189,22 +1042,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("not this organization")
-        );
-
-        store.create_app("shop").await.unwrap();
-        store
-            .create_environment("shop", "production")
-            .await
-            .unwrap();
-        let migration = store.plan_identity_migration("shop").await.unwrap();
-        let error = store
-            .plan_backend_restore(restore_set(&store).await, context("restore-set-key-003"))
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains(&migration.operation_id.to_string())
         );
     }
 
@@ -1259,9 +1096,8 @@ mod tests {
             .plan_backend_restore(restore_set(&store).await, context("restore-set-key-007"))
             .await
             .unwrap();
-        let coordinator_id = CanonicalId::new_v7();
         let (running_plan, running) = store
-            .begin_backend_restore(planned.operation_id, coordinator_id, 30)
+            .begin_backend_restore(planned.operation_id)
             .await
             .unwrap();
         assert_eq!(running.state, OperationState::Running);
@@ -1280,7 +1116,7 @@ mod tests {
         );
         let report = execution_report(&running_plan, BackendRestoreExecutionState::Succeeded);
         let completed = store
-            .complete_backend_restore(report.clone(), coordinator_id, running.revision)
+            .complete_backend_restore(report.clone(), running.revision)
             .await
             .unwrap();
         assert_eq!(completed.state, OperationState::Succeeded);
@@ -1306,15 +1142,13 @@ mod tests {
             .plan_backend_restore(restore_set(&store).await, context("restore-set-key-008"))
             .await
             .unwrap();
-        let coordinator_id = CanonicalId::new_v7();
         let (_, running) = store
-            .begin_backend_restore(planned.operation_id, coordinator_id, 30)
+            .begin_backend_restore(planned.operation_id)
             .await
             .unwrap();
         let waiting = store
             .defer_backend_restore(
                 planned.operation_id,
-                coordinator_id,
                 running.revision,
                 "driver outcome is not terminal".to_string(),
             )
@@ -1340,7 +1174,7 @@ mod tests {
             OperationState::Waiting
         );
         let (resumed_plan, resumed) = store
-            .begin_backend_restore(planned.operation_id, coordinator_id, 30)
+            .begin_backend_restore(planned.operation_id)
             .await
             .unwrap();
         assert_eq!(resumed.state, OperationState::Running);
@@ -1350,7 +1184,6 @@ mod tests {
         let failed = store
             .fail_backend_restore_rolled_back(
                 report.clone(),
-                coordinator_id,
                 resumed.revision,
                 "injected switch failure".to_string(),
             )
@@ -1379,70 +1212,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_lease_excludes_peers_and_expired_work_is_takeable() {
+    async fn a_restore_left_staging_by_a_stopped_control_is_resumed() {
         let (_directory, store) = store().await;
         let planned = store
             .plan_backend_restore(restore_set(&store).await, context("restore-set-key-009"))
             .await
             .unwrap();
-        let first_owner = CanonicalId::new_v7();
-        let second_owner = CanonicalId::new_v7();
         let (_, running) = store
-            .begin_backend_restore(planned.operation_id, first_owner, 30)
-            .await
-            .unwrap();
-        let conflict = store
-            .begin_backend_restore(planned.operation_id, second_owner, 30)
-            .await
-            .unwrap_err();
-        assert!(
-            conflict
-                .to_string()
-                .contains("cannot enter driver execution")
-        );
-        store
-            .renew_backend_restore_lease(planned.operation_id, first_owner, 30)
+            .begin_backend_restore(planned.operation_id)
             .await
             .unwrap();
 
-        let operation_id = planned.operation_id;
-        store
-            .database()
-            .with_connection(move |connection| {
-                connection.execute(
-                    "UPDATE backend_restore_plans SET lease_expires_at = ?2 WHERE operation_id = ?1",
-                    params![operation_id.to_string(), now_secs() - 1],
-                )?;
-                Ok::<_, CatalogError>(())
-            })
-            .await
-            .unwrap();
-        let (claimed, reclaimed_operation) = store
-            .begin_backend_restore(planned.operation_id, second_owner, 30)
-            .await
-            .unwrap();
-        assert_eq!(claimed.coordinator_id, Some(second_owner));
-        assert_eq!(claimed.attempt_count, 2);
-        assert_eq!(reclaimed_operation.revision, running.revision);
-        assert!(
-            store
-                .defer_backend_restore(
-                    planned.operation_id,
-                    first_owner,
-                    running.revision,
-                    "stale owner".to_string(),
-                )
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("another coordinator")
+        // Control stopped while the driver ran: the next process finds the
+        // row still staging and re-enters the same operation at once.
+        let resumable = store.resumable_backend_restores().await.unwrap();
+        assert_eq!(
+            resumable
+                .iter()
+                .map(|plan| plan.operation_id)
+                .collect::<Vec<_>>(),
+            vec![planned.operation_id]
         );
+        let (resumed, resumed_operation) = store
+            .begin_backend_restore(planned.operation_id)
+            .await
+            .unwrap();
+        assert_eq!(resumed.state, BackendRestoreState::Staging);
+        assert_eq!(resumed.attempt_count, 2);
+        assert_eq!(resumed_operation.revision, running.revision);
         store
             .defer_backend_restore(
                 planned.operation_id,
-                second_owner,
                 running.revision,
-                "new owner reconciles".to_string(),
+                "driver journal is not terminal yet".to_string(),
             )
             .await
             .unwrap();

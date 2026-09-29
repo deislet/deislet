@@ -4,7 +4,8 @@
 //! independently-timed snapshots are not automatically one consistent
 //! platform recovery point.  This type admits a set only when all three were
 //! captured after the same full-platform outage barrier.  A topology driver
-//! can then stage and switch them without reusing the source fence journals.
+//! can then stage and switch them, and each restored directory starts a new
+//! backend incarnation rather than claiming its source's.
 
 use std::{collections::BTreeSet, fmt};
 
@@ -82,7 +83,6 @@ pub struct RestoreComponent {
     pub source_backend_incarnation_id: CanonicalId,
     pub size_bytes: u64,
     pub captured_at: DateTime<Utc>,
-    pub contains_fence_journal: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -206,10 +206,6 @@ impl BackendRestoreSet {
             require(
                 component.size_bytes > 0 && component.size_bytes <= JCS_SAFE_INTEGER_MAX,
                 "restore set snapshot size must be a positive JCS/I-JSON safe integer",
-            )?;
-            require(
-                !component.contains_fence_journal,
-                "restore set must not contain a migration fence journal",
             )?;
             require(
                 component.captured_at >= barrier.all_services_stopped_at
@@ -390,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn credentials_and_fence_journals_cannot_enter_restore_input() {
+    fn credentials_cannot_enter_restore_input() {
         let mut restore_set = valid_set();
         restore_set.components[0].snapshot_uri =
             "https://token@example.invalid/store.snapshot".to_string();
@@ -411,16 +407,6 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("query")
-        );
-
-        let mut restore_set = valid_set();
-        restore_set.components[0].contains_fence_journal = true;
-        assert!(
-            restore_set
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("fence journal")
         );
     }
 }

@@ -133,10 +133,7 @@ impl MachineChannelService {
     /// deregistration until an operator lifts the revocation. A ledger that
     /// cannot be read refuses too - "could not tell" is not "not revoked".
     async fn refuse_if_revoked(&self, node_id: &str) -> Result<(), Status> {
-        let Some(ledger) = self.issuer.ledger() else {
-            return Ok(());
-        };
-        match ledger.is_node_revoked(node_id).await {
+        match self.issuer.ledger().is_node_revoked(node_id).await {
             Ok(false) => Ok(()),
             Ok(true) => {
                 warn!(node = %node_id, "Refused a machine call from a revoked node");
@@ -479,15 +476,7 @@ impl MachineChannel for MachineChannelService {
                     .refuse_secret_fetch(&proved, Some(&entry.deployment_id), refusal)
                     .await);
             };
-            let Some(snapshot_id) = deployment.snapshot_id.as_deref() else {
-                let refusal = Status::permission_denied(format!(
-                    "deployment {} binds no secret revisions",
-                    entry.deployment_id
-                ));
-                return Err(self
-                    .refuse_secret_fetch(&proved, Some(&entry.deployment_id), refusal)
-                    .await);
-            };
+            let snapshot_id = deployment.snapshot_id.as_str();
             let revisions: BTreeSet<String> = entry.revisions.iter().cloned().collect();
             wanted.push((entry, deployment.env_id.as_str(), snapshot_id, revisions));
         }
@@ -1256,7 +1245,7 @@ mod tests {
         let snapshot = h
             .state
             .store
-            .get_environment_snapshot(current.snapshot_id.as_deref().unwrap())
+            .get_environment_snapshot(&current.snapshot_id)
             .await
             .unwrap();
         let plan = h
@@ -1266,7 +1255,7 @@ mod tests {
                 &env,
                 &version,
                 crate::catalog::store::DeploymentPlanSpec {
-                    snapshot: Some(snapshot),
+                    snapshot,
                     expected_secret_heads: Default::default(),
                     compare_secret_heads: false,
                     target_ids: vec!["runtime-test".to_string()],
@@ -1315,6 +1304,19 @@ mod tests {
         }
     }
 
+    /// The canonical tenant of `app`'s production environment: what a node
+    /// names in a store or queue capability request.
+    async fn production_tenant(state: &CatalogState, app: &str) -> String {
+        let env = state
+            .store
+            .get_environment(app, "production")
+            .await
+            .unwrap();
+        crate::api::catalog::assignments::canonical_tenant_of(state, app, &env.id)
+            .await
+            .unwrap()
+    }
+
     async fn issuance_refusals(state: &CatalogState) -> Vec<crate::audit::AuditEntry> {
         AuditStore::new(state.store.database())
             .query_page(
@@ -1354,16 +1356,13 @@ mod tests {
         let h = harness(true).await;
         deployed_with_secret(&h).await;
         let service = make_service(h.state.clone());
+        let tenant = production_tenant(&h.state, "demo").await;
 
         for aud in [AUD_STORE, AUD_QUEUE] {
             let answer = service
                 .issue_capability(from(
                     &node("runtime-test"),
-                    capability_request(
-                        "runtime-test",
-                        aud,
-                        &resources_for_audience("demo.production", aud),
-                    ),
+                    capability_request("runtime-test", aud, &resources_for_audience(&tenant, aud)),
                 ))
                 .await
                 .expect("a node may have a capability for what it runs");
@@ -1398,8 +1397,11 @@ mod tests {
         deployed_with_secret(&h).await;
         let service = make_service(h.state.clone());
 
-        let mut asked = resources_for_audience("demo.production", AUD_STORE);
-        asked.extend(resources_for_audience("victim.production", AUD_STORE));
+        let victim =
+            deis_wire::CanonicalTenantId::derived_from_label("victim.production").to_string();
+        let mut asked =
+            resources_for_audience(&production_tenant(&h.state, "demo").await, AUD_STORE);
+        asked.extend(resources_for_audience(&victim, AUD_STORE));
         let refusal = service
             .issue_capability(from(
                 &node("runtime-test"),
@@ -1408,7 +1410,7 @@ mod tests {
             .await
             .expect_err("a node minted a capability for a tenant it does not run");
         assert_eq!(refusal.code(), tonic::Code::PermissionDenied);
-        assert!(refusal.message().contains("victim.production"));
+        assert!(refusal.message().contains(&victim));
         assert!(issued_jtis(&h.state).await.is_empty(), "nothing was issued");
 
         let lines = issuance_refusals(&h.state).await;
@@ -1481,13 +1483,14 @@ mod tests {
         let h = harness(true).await;
         let (deployment_id, revision) = deployed_with_secret(&h).await;
         let service = make_service(h.state.clone());
+        let tenant = production_tenant(&h.state, "demo").await;
         let ask = || {
             from(
                 &node("runtime-test"),
                 capability_request(
                     "runtime-test",
                     AUD_STORE,
-                    &resources_for_audience("demo.production", AUD_STORE),
+                    &resources_for_audience(&tenant, AUD_STORE),
                 ),
             )
         };
@@ -1496,7 +1499,7 @@ mod tests {
             .await
             .expect("issued before revocation");
 
-        let ledger = h.state.issuer.ledger().expect("the harness keeps a ledger");
+        let ledger = h.state.issuer.ledger();
         let revoked = ledger
             .revoke(crate::capability_ledger::RevocationScope::Node(
                 "runtime-test".into(),

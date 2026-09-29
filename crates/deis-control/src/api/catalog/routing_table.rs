@@ -41,14 +41,6 @@ use crate::catalog::{CatalogStore, DeploymentProxyObservation, now_secs};
 use crate::message::NodeRole;
 use crate::session::NodeState;
 
-/// Path this table is served on.
-///
-/// Defined once in `deis_wire::conventions`, which deis-proxy reads the same
-/// constant from: the two crates do not depend on each other, so a path each
-/// spelled for itself could drift without anything failing to compile.
-/// Re-exported here so this module still names the route it mounts.
-pub use deis_wire::conventions::ROUTING_TABLE_ROUTE;
-
 /// One route the edge should honour.
 ///
 /// `host: None` means "any domain", exactly as the catalog row says it.
@@ -497,19 +489,13 @@ mod tests {
 
     /// The half of the contract this crate owns.
     ///
-    /// deis-proxy spells the same path and the same field names in its
-    /// `catalog::wire`, and nothing type-checks the two against each other -
-    /// they are in crates that do not depend on one another. Until the names
-    /// move to `deis_wire::conventions`, this test and its twin over there
+    /// deis-proxy spells the same field names in its `catalog::wire`, and
+    /// nothing type-checks the two against each other - they are in crates
+    /// that do not depend on one another. This test and its twin over there
     /// are what hold them together: change either literal and one of them
     /// fails naming the other.
     #[tokio::test]
     async fn the_wire_contract_is_the_one_deis_proxy_reads() {
-        assert_eq!(
-            ROUTING_TABLE_ROUTE, "/api/routing-table",
-            "deis-proxy dials this path from the same deis_wire constant"
-        );
-
         let harness = harness(true).await;
         create_app(&harness.router, "shop").await;
         create_environment(&harness.router, "shop", "production").await;

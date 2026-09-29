@@ -134,85 +134,35 @@ copied into prose is a name that goes stale.
 
 ## HTTP API
 
-Everything below is on the single configured port.
+The human listener serves two surfaces and a scrape, and nothing else:
 
-### Catalog — the product model
+| Prefix | What |
+|---|---|
+| `/api/v1` | The product API: applications, versions, environments, deployments, routes, secrets, hostname grants, accounts, tokens, audit, providers, long operations |
+| `/api/platform` | Diagnostics: the fleet, sessions, events, node configuration and commands |
+| `/api/metrics` | Prometheus exposition |
 
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/apps` | GET, POST | List, create |
-| `/api/apps/:app_id` | GET, DELETE | |
-| `/api/apps/:app_id/versions` | GET, POST | List; upload a bundle as a new immutable version |
-| `/api/apps/:app_id/versions/:version_id` | GET | |
-| `/api/apps/:app_id/environments` | GET, POST | |
-| `/api/apps/:app_id/environments/:env` | GET | |
-| `/api/apps/:app_id/environments/:env/deployment` | GET | What this environment runs now |
-| `/api/apps/:app_id/environments/:env/deployments` | GET, POST | History; deploy (move the pointer) |
-| `/api/apps/:app_id/environments/:env/rollback` | POST | Move the pointer back |
-| `/api/apps/:app_id/environments/:env/routes` | GET, POST | |
-| `/api/apps/:app_id/environments/:env/routes/:route_id` | PUT, DELETE | |
-| `/api/apps/:app_id/environments/:env/secrets` | GET | Names and times only — no endpoint returns a value |
-| `/api/apps/:app_id/environments/:env/secrets/:name` | PUT, DELETE | |
-| `/api/routes` | GET | Every route in the catalog, keyed by `env_id`. The human-facing view; the data plane reads a different one, see below |
-| `/api/domains` | GET, POST | Who may claim which hostname. A hostname is the one global namespace here and no scope can spell one, so a route claim is refused unless a grant covers it. `admin:*/*` |
-| `/api/domains/:pattern` | DELETE | Withdraw a grant. The routes created under it keep serving; the claim can no longer be re-made |
-| `/api/apps/:app_id/environments/:env/storage-token` | GET | A capability token for this tenant, the store address, and the tenant name. What `deis kv` / `deis db` / `deis blob` call so nobody has to mint a token by hand. 409 when no `store_endpoint` is configured |
-
-An upload whose bytes are identical to an existing version reuses that version
-instead of burning a new number.
+A path outside them - including the flat `/api/apps` spelling of older
+builds - matches no route and is answered `404`. Every route, parameter,
+answer and refusal is in the OpenAPI contract,
+[`contracts/openapi/v1.json`](../../contracts/openapi/v1.json); the rules
+that hold across routes (errors, pagination, `ETag`/`If-Match`, idempotency,
+long operations) are in [API_DOCUMENTATION.md](API_DOCUMENTATION.md).
 
 Routes are consumed. deis-proxy fetches a second view of the same table —
 `deis.machine.MachineChannel`'s `FetchRoutingTable`, on the machine surface —
 and resolves an application by host and path prefix from it. That view is a
-different shape from `/api/routes` on purpose: it carries the environment's
-**name** rather than its `env_id` (the name is what travels in
-`x-deis-environment`), it lists **every** environment whether or not it has a
-route of its own (so the edge can offer one an automatic address), and it
-carries a version for the table as a whole (so a poller can tell "unchanged"
-from "changed" without diffing).
+different shape from `GET /api/platform/routes` on purpose: it carries the
+environment's **name** rather than its `env_id`, it lists **every**
+environment whether or not it has a route of its own (so the edge can offer
+one an automatic address), and it carries a version for the table as a whole
+(so a poller can tell "unchanged" from "changed" without diffing).
 
-### Fleet and nodes
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/runtime` | GET | The fleet: each node, and whether it is `configured` or `registered`; plus `lost`, the nodes that stopped refreshing their registration and are presumed to be still serving what they last received |
-| `/api/runtime/:node/status` | GET | Asked of the node itself: what it is really serving |
-| `/api/runtime/:node/apps/:app_id` | DELETE | Unload an application from one node |
-| `/api/sessions` | GET | Control channels currently open to this process |
-| `/api/sessions/:id` | GET | |
-| `/api/sessions/:id/heartbeats` | GET | |
-
-`/api/runtime` and `/api/sessions` answer two different questions, and the
-distinction is worth keeping straight. `/api/runtime` is the **fleet**: who
-receives deployments and cron fires, built from the configuration file plus
-self-registrations. `/api/sessions` is who is **holding a gRPC stream open**
-right now — in practice deis-proxy. The two lists overlap in nothing but the
-word "node", which is why the session routes are not under `/api/nodes`: that
-prefix belongs to the endpoints nodes themselves call.
-
-### Configuration, commands, events, metrics
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/configs` | GET | Every node's configuration |
-| `/api/configs/stats` | GET | |
-| `/api/configs/:node_id` | GET, POST, DELETE | |
-| `/api/configs/:node_id/history` | GET | |
-| `/api/configs/:node_id/:config_key` | GET, DELETE | |
-| `/api/configs/:node_id/:config_key/history` | GET | |
-| `/api/configs/:node_id/:config_key/rollback` | POST | |
-| `/api/configs/push/:node_id` | POST | Push everything to one node |
-| `/api/configs/push/:node_id/:config_key` | POST | Push one key |
-| `/api/commands` | GET | |
-| `/api/commands/execute/:node_id` | POST | |
-| `/api/commands/node/:node_id` | GET | |
-| `/api/commands/status/:command_id` | GET | |
-| `/api/commands/cancel/:command_id` | POST | |
-| `/api/events` | GET | |
-| `/api/events/stats` | GET | |
-| `/api/metrics` | GET | Prometheus text format |
-| `/api/metrics/summary` | GET | JSON |
-| `/health` | GET | Unauthenticated |
+`GET /api/platform/runtime` and `GET /api/platform/sessions` answer two
+different questions. The first is the **fleet**: who receives deployments and
+cron fires, built from the configuration file plus self-registrations. The
+second is who is **holding a gRPC stream open** right now — in practice
+deis-proxy.
 
 ## Node control channel (gRPC)
 
@@ -227,9 +177,11 @@ For runtime nodes the direction is the other way round — deis-control is the
 messages from deis-queue directly.
 
 `ApplyDeployment` carries a **pointer** — app, version, environment,
-`bundle_url`, `bundle_sha`, and the environment map with secrets decrypted at
-send time. The bundle itself never travels inside a gRPC message; the node
-fetches it over HTTP and verifies the digest.
+`bundle_url`, `bundle_sha`, and the environment's variables. Secret values
+never travel in it: the node fetches the revisions its snapshot binds over
+the machine channel, and each fetch is audited. The bundle itself never
+travels inside a gRPC message either; the node fetches it over HTTP and
+verifies the digest.
 
 ## Database
 

@@ -59,7 +59,6 @@ check_kv_roundtrip() {
   local direct direct_value
   direct=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${tenant}" \
     -H "authorization: Bearer $(storage_token)" \
     -H "x-deis-binding: KV" \
     -d "{\"key\":\"${key}\"}" \
@@ -139,14 +138,14 @@ check_named_bindings_are_separate_namespaces() {
   token=$(storage_token)
   direct_hot=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
+    -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: HOT" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
     | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
   direct_kv=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
+    -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: KV" \
     -d "{\"key\":\"${key}\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
@@ -176,42 +175,50 @@ check_a_binding_cannot_reach_another_tenant() {
   # Every shape that would have to work for a binding to escape its tenant:
   # the tenant separator, the namespace separator, a traversal, and a name
   # long enough to run past the ceiling. deis-store refuses each before it
-  # touches anything on disk, because the composed value is validated as a
-  # whole and neither half may contain the other's separator.
+  # touches anything on disk.
   local hostile refused=0 total=0 sample=""
   for hostile in ".." "a.b" "a@b" "../../etc" "$(printf 'x%.0s' $(seq 1 65))"; do
     total=$((total + 1))
     local answer
     answer=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
       -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-      -H "x-deis-tenant: ${tenant}" -H "authorization: Bearer ${token}" \
+      -H "authorization: Bearer ${token}" \
       -H "x-deis-binding: ${hostile}" \
       -d '{"key":"anything"}' \
       "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true)
-    if echo "$answer" | grep -qi "namespace id"; then
+    if echo "$answer" | grep -qi "namespace name"; then
       refused=$((refused + 1))
       [ -z "$sample" ] && sample=$(echo "$answer" | tr '\n' ' ' | head -c 160)
     fi
   done
 
-  # And the token itself: it is minted for the tenant, so it does not become a
-  # different token for a different binding. A call naming another tenant is
-  # refused whatever binding it asks for.
-  local cross
-  cross=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
+  # And the tenant itself: deis-store acts for the one tenant the capability
+  # names, so a request that names another tenant in a header is served from
+  # its own. Written with a forged x-deis-tenant naming the callee, the value
+  # lands in this tenant and reads back without any header.
+  local cross_key="cross-tenant-probe-$$" cross_value="stays-in-${APP_ID}"
+  grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
     -H "x-deis-tenant: ${CALLEE_APP_ID}.${ENV_NAME}" -H "authorization: Bearer ${token}" \
     -H "x-deis-binding: HOT" \
-    -d '{"key":"anything"}' \
-    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true)
+    -d "{\"key\":\"${cross_key}\",\"value\":\"$(printf '%s' "$cross_value" | openssl base64 -A)\"}" \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Set >/dev/null 2>&1 || true
+  local cross
+  cross=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
+    -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
+    -H "authorization: Bearer ${token}" \
+    -H "x-deis-binding: HOT" \
+    -d "{\"key\":\"${cross_key}\"}" \
+    "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 \
+    | jq -r '.value // empty' 2>/dev/null | openssl base64 -d -A 2>/dev/null || true)
 
-  if [ "$refused" -eq "$total" ] && echo "$cross" | grep -q "Code: PermissionDenied"; then
+  if [ "$refused" -eq "$total" ] && [ "$cross" = "$cross_value" ]; then
     pass_check "$title" \
-      "deis-store refused all ${total} hostile binding names for tenant ${tenant} (\"${sample}\"), and the capability token minted for ${tenant} was refused when it named ${CALLEE_APP_ID}.${ENV_NAME} even with a legal binding: the token authorises the tenant and the binding only chooses a namespace inside it"
+      "deis-store refused all ${total} hostile binding names for tenant ${tenant} (\"${sample}\"), and a write whose request named ${CALLEE_APP_ID}.${ENV_NAME} in x-deis-tenant landed in ${tenant}'s own HOT namespace: the capability decides the tenant and the binding only chooses a namespace inside it"
     return
   fi
   fail_check "$title" \
-    "${refused} of ${total} hostile binding names were refused, and the cross-tenant call answered: $(echo "$cross" | tr '\n' ' ' | head -c 200)"
+    "${refused} of ${total} hostile binding names were refused, and the value written with a forged tenant header read back from ${tenant} as: ${cross:-<nothing>}"
 }
 
 check_cli_reads_a_named_binding() {
@@ -269,7 +276,6 @@ check_storage_capability_token() {
   local out rc
   out=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${tenant}" \
     -d "{\"key\":\"whatever-this-key-is-does-not-matter\"}" \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1) && rc=0 || rc=$?
 
@@ -300,13 +306,11 @@ check_storage_serves_tls_only() {
   local plain plain_rc stranger stranger_rc
   plain=$(grpcurl -plaintext -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${tenant}" \
     -H "authorization: Bearer $(storage_token)" \
     -d '{"key":"tls-only"}' \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1) && plain_rc=0 || plain_rc=$?
   stranger=$(grpcurl -cacert "${PKI_DIR}/rogue-ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-    -H "x-deis-tenant: ${tenant}" \
     -d '{"key":"tls-only"}' \
     "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1) && stranger_rc=0 || stranger_rc=$?
 
@@ -346,7 +350,6 @@ check_a_revoked_capability_is_refused() {
   kv_get_as() {
     grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
       -import-path "${ROOT_DIR}/crates/deis-store/proto" -proto storage.proto \
-      -H "x-deis-tenant: ${tenant}" \
       -H "authorization: Bearer $1" \
       -d '{"key":"revocation-probe"}' \
       "127.0.0.1:${DEIS_STORE_PORT}" deis.storage.KvStore/Get 2>&1 || true
@@ -663,12 +666,12 @@ check_storage_token_route_requires_a_credential() {
   token_length=$(jq -r '.token // empty' < "$minted" 2>/dev/null | tr -d '\n' | wc -c)
 
   if [ "$anonymous" = "401" ] && [ "$authorised" = "200" ] \
-    && [ "$tenant" = "${APP_ID}.${ENV_NAME}" ] && [ "${token_length:-0}" -gt 0 ]; then
+    && [ "${tenant#v1/}" != "$tenant" ] && [ "${token_length:-0}" -gt 0 ]; then
     pass_check "$title" \
       "GET ${route} with no credential answered HTTP ${anonymous} and no token; the same request carrying the demo's operator credential answered HTTP ${authorised} with tenant ${tenant}, store_endpoint ${endpoint} and a ${token_length}-character token, which is not printed here - it reads and writes that tenant's data directly against deis-store and does not expire"
   else
     fail_check "$title" \
-      "anonymous GET ${route} answered HTTP ${anonymous} (expected 401) and the authenticated one HTTP ${authorised} for tenant '${tenant:-<none>}' with a ${token_length:-0}-character token (expected 200 for ${APP_ID}.${ENV_NAME})"
+      "anonymous GET ${route} answered HTTP ${anonymous} (expected 401) and the authenticated one HTTP ${authorised} for tenant '${tenant:-<none>}' with a ${token_length:-0}-character token (expected 200 and a canonical v1/<application id>/<environment id> tenant for ${APP_ID}/${ENV_NAME})"
   fi
 }
 
@@ -788,12 +791,13 @@ check_a_tenants_sql_cannot_reach_another_tenants_tables_or_files() {
   local title="one tenant's SQL cannot read another tenant's tables, or name its file"
   local table="tenant_isolation_probe"
   local marker="only-${ENV_NAME}-may-read-this-$$-${RANDOM}"
-  # Where deis-store keeps this tenant's file: <data_dir>/db/<tenant>.sqlite,
+  # Where deis-store keeps this tenant's file: <data_dir>/db/<tenant key>.sqlite,
   # the layout crates/deis-store/src/database.rs documents. Spelled out here
   # because the whole point is that the other tenant names a path that really
   # exists and really holds the rows below - a refusal to open a file that was
   # not there would prove nothing.
-  local victim_file="${DEMO_DIR}/deis-store-data/db/${APP_ID}.${ENV_NAME}.sqlite"
+  local victim_file
+  victim_file="${DEMO_DIR}/deis-store-data/db/$(canonical_tenant_key).sqlite"
   local answer rc message
 
   answer=$(tenant_sql "$ENV_NAME" execute \

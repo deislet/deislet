@@ -24,8 +24,11 @@ fn stage(root: &Path) {
           "functionRoot": "./functions",
           "compatibilityDate": "2026-09-01",
           "environment": {
-            "variables": {"PUBLIC_NAME": "EC_RUNTIME_VALUE_MUST_NOT_ENTER_ARTIFACT"},
-            "secrets": ["TOKEN"]
+            "declarations": [
+              {"name": "PUBLIC_NAME", "kind": "config", "valueType": "string", "required": true},
+              {"name": "TOKEN", "kind": "secret", "valueType": "string", "required": true}
+            ],
+            "values": {"PUBLIC_NAME": "EC_RUNTIME_VALUE_MUST_NOT_ENTER_ARTIFACT"}
           },
           "bindings": {"SESSIONS": {"kind": "kv"}},
           "vendors": {"cloudflare": {"enabled": true}},
@@ -175,9 +178,12 @@ async fn provider_payload_is_bound_to_the_exact_canonical_parent() {
         std::fs::read(Path::new(&provider.output_path).join("bundle.zip")).expect("native bundle");
     let native = deis_bundle::read_manifest(&bundle).expect("schema two native bundle");
     assert_eq!(native.manifest.schema, 2);
-    assert!(native.manifest.environment.is_some());
-    assert!(native.manifest.env.is_empty());
-    assert!(native.manifest.secrets.is_empty());
+    assert!(
+        !serde_json::to_string(&native.manifest)
+            .unwrap()
+            .contains("\"env\""),
+        "a native manifest carries declarations, never runtime values"
+    );
 
     std::fs::write(
         Path::new(&provider.output_path).join("bundle.zip"),

@@ -18,23 +18,17 @@ pub const MAX_SECRET_NAME_LEN: usize = 128;
 /// Longest accepted route path prefix.
 pub const MAX_PATH_PREFIX_LEN: usize = 512;
 
-/// An application. During the identity migration, `id` remains the legacy
-/// app name used by existing routes and tenants while `canonical_id` is the
-/// permanent product identity. New code must not derive authority or storage
-/// isolation from the display name.
-///
-/// The dumb services (deis-store, deis-queue) see a single opaque tenant id
-/// built from the pair by `deis_wire::conventions::tenant_id`, so a preview
-/// deployment cannot read or overwrite what production stored while those
-/// services still understand exactly one tenant dimension.
+/// An application. `id` is its name, used by routes, bundle paths and
+/// telemetry; `canonical_id` is the permanent product identity. Storage
+/// isolation comes from the canonical ids alone: deis-store and deis-queue
+/// key a tenant by `v1/<application id>/<environment id>`, so a preview
+/// cannot read or overwrite what production stored and a re-created
+/// application of the same name never sees the old one's data.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct App {
     pub id: String,
     #[schema(value_type = String, format = Uuid)]
     pub canonical_id: CanonicalId,
-    /// Monotonic catalog revision used to fence identity migration. It moves
-    /// whenever an environment, version, deployment, route or secret changes.
-    pub revision: i64,
     pub created_at: i64,
 }
 
@@ -55,8 +49,8 @@ pub struct Version {
     pub bundle_path: String,
     /// Verbatim `manifest.json` text as it was found inside the bundle.
     pub manifest: String,
-    /// Exact provider-neutral parent. `None` identifies an upload made
-    /// through the legacy raw-bundle endpoint before lineage was recorded.
+    /// Exact provider-neutral parent. `None` for a native bundle uploaded
+    /// directly, without a canonical artifact.
     pub canonical_artifact_id: Option<CanonicalId>,
     /// SHA-256 identity of the immutable provider derivation manifest.
     pub provider_derivation_sha256: Option<String>,
@@ -117,10 +111,7 @@ pub struct Deployment {
     pub created_at: i64,
     pub note: Option<String>,
     /// Immutable Edge Canon environment snapshot selected with this pointer.
-    /// Absent only on deployments written by the legacy schema-1 path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub snapshot_id: Option<String>,
+    pub snapshot_id: String,
 }
 
 /// Immutable deployment intent plus its durable coordinator state.
@@ -132,9 +123,8 @@ pub struct DeploymentPlan {
     pub app_id: String,
     pub env_id: String,
     pub version_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub snapshot_id: Option<String>,
+    /// The environment snapshot this plan activates.
+    pub snapshot_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub previous_deployment_id: Option<String>,
@@ -280,12 +270,12 @@ pub struct Assignment {
     pub environment: String,
     pub version_id: String,
     pub bundle_sha: String,
-    pub snapshot_id: Option<String>,
+    pub snapshot_id: String,
     pub deployment_id: String,
     pub routing_generation: String,
-    /// Durable coordinator state for this pointer. `None` identifies a
-    /// deployment written before plans existed and is treated as active for
-    /// rolling compatibility.
+    /// Durable coordinator state for this pointer. `None` is a pointer
+    /// committed outside a plan (`CatalogStore::activate_deployment`), which
+    /// is active.
     pub deployment_state: Option<String>,
 }
 
@@ -390,8 +380,8 @@ impl RetiredAppName {
         self.released_at.is_none()
     }
 
-    /// The tenant ids whose data is still in deis-store and deis-queue,
-    /// spelled the way those services see them.
+    /// The `<app>.<environment>` labels of the environments whose data is
+    /// still in deis-store and deis-queue, under their canonical tenants.
     pub fn tenants(&self) -> Vec<String> {
         self.environments
             .iter()
@@ -412,7 +402,7 @@ impl RetiredAppName {
         } else {
             format!(
                 "the kv, database, object and queue data of {} is still in deis-store and \
-                 deis-queue under tenant(s) {}",
+                 deis-queue under the canonical tenant(s) of {}",
                 self.app_id,
                 tenants.join(", ")
             )

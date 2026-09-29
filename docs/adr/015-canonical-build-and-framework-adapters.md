@@ -52,8 +52,8 @@ validator 后才把目录按 application UUIDv7 与 manifest SHA-256 原子发�
 canonical artifact record 和 provider derivation；新构建的 Deislet version 必须同时引用精确 parent
 与 derivation，数据库 trigger 拒绝跨应用、跨 provider、半截或事后改写的 lineage。CLI 上传 parent
 后再上传包含精确 derivation record 与 native bundle 的 provider envelope，并对返回 identity 复核。
-旧 `--bundle` 仍显式走无 lineage 的兼容入口，不会被伪装成新链路；删除应用会同时回收受约束的
-内容寻址目录与对应 catalog 行。
+CLI 不再接受没有 lineage 的 bundle（`--bundle` 已删除）；控制面的 native bundle 直传入口上传的
+版本不带 lineage，不会被伪装成新链路。删除应用会同时回收受约束的内容寻址目录与对应 catalog 行。
 所有 protobuf 代码生成入口显式使用 Cargo.lock 固定的 `protoc-bin-vendored` 3.2.0；构建脚本把
 对应平台的可执行文件直接交给 `prost-build`，不读取宿主 PATH 中的 `protoc`。CI 也不预装系统
 protobuf compiler，因而无法用 runner 的偶然状态掩盖未声明工具链输入。

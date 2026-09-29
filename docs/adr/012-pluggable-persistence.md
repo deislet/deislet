@@ -248,11 +248,10 @@ Production readiness 至少验证：
 | control | `control.db` | WAL | `FULL`（2） | 写入量低，存的是目录、密钥修订、部署计划等权威状态；丢失一个已确认的提交会让控制面与已通知它的节点不一致。`busy_timeout = 5s`，为两个进程共用一个文件和 Litestream 读时短暂持锁而留；外键约束开启（`foreign_keys = ON`）。见下节 |
 | queue | `queue.sqlite` | WAL | `FULL`（2） | at-least-once 的承诺主要落在 Send 上：Send 已确认却因掉电丢失就是丢消息，违反承诺；Ack 丢失只导致重投，在语义之内。Send 在 `IMMEDIATE` 事务里逐条提交，改 `FULL` 后的吞吐开销有实测数字，见 `crates/deis-queue/README.md` |
 | store | KV、SQL 与 Blob 元数据 | WAL | `NORMAL`（1），默认 | 默认接受「主机掉电可能丢失最近已确认的元数据写入」换取每个提交少一次 fsync；需要与 queue 同等保证时设 `durability = "full"` |
-| 迁移 fence journal | `migration-fences.sqlite`（queue 与 store 各一份） | WAL | `FULL`（2） | 迁移围栏状态必须比数据更耐久，回滚一个已确认的 fence 比丢数据更糟（ADR-023） |
 
 掉电窗口：WAL + `NORMAL` 下，提交的 WAL 帧要到 checkpoint 才 fsync，所以主机掉电可能丢失最近若干秒「已确认」的写入（对 store 就是最近的 KV/Blob 元数据）；数据库不会损坏，恢复时不完整的 WAL 帧整体丢弃而不是半应用。WAL + `FULL` 则每个提交 fsync 一次，掉电丢失窗口归零，代价就是上表中 queue 实测的吞吐折损。
 
-另外两条与部署相关的边界：WAL 依赖共享内存文件（`-shm`）与共享写锁，**不支持网络文件系统**（NFS/SMB），四个文件都必须在本地盘上；`-wal`、`-shm` 与主库是同一份状态，备份与恢复必须把它们当作一个整体（见下节与 `docs/control-backup-and-restore.md`）。
+另外两条与部署相关的边界：WAL 依赖共享内存文件（`-shm`）与共享写锁，**不支持网络文件系统**（NFS/SMB），这些文件都必须在本地盘上；`-wal`、`-shm` 与主库是同一份状态，备份与恢复必须把它们当作一个整体（见下节与 `docs/control-backup-and-restore.md`）。
 
 ### embedded 模式的 control：单实例 + Litestream 持续备份
 

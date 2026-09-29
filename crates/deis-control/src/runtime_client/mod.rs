@@ -432,6 +432,10 @@ pub enum RegistrationError {
         holder_addr: String,
         holder_hostname: String,
     },
+    /// The node is revoked as a principal; it may not rejoin the fleet
+    /// until an operator lifts the revocation.
+    #[error("node has been revoked; an operator must lift the revocation before it may register")]
+    Revoked,
 }
 
 /// A node id has to survive being put in a URL path and in a log line, and it
@@ -542,6 +546,18 @@ pub struct RuntimeNodeManager {
     health: DashMap<String, NodeHealth>,
     poll_interval: Duration,
     registration_ttl: Duration,
+    /// Nodes revoked as principals (see [`crate::capability_ledger`]), each
+    /// with the configured entry it was taken out of the fleet with, if it
+    /// was one, so lifting the revocation puts it back as the file says.
+    ///
+    /// A revoked node is on no fan-out, is dialled for nothing and may not
+    /// register. The check a registration makes against this set is made
+    /// under the fleet's write lock, and [`Self::revoke`] takes that same
+    /// lock to add to it and to take the node out, so a registration racing
+    /// a revocation either lands first and is removed by it or comes second
+    /// and is refused - it can never put the node back afterwards. Always
+    /// locked after `nodes`, never before.
+    revoked: std::sync::RwLock<std::collections::BTreeMap<String, Option<NodeEntry>>>,
 }
 
 impl RuntimeNodeManager {
@@ -592,6 +608,7 @@ impl RuntimeNodeManager {
             health,
             poll_interval: Duration::from_secs(poll_interval_secs.max(1)),
             registration_ttl: Duration::from_secs(registration_ttl_secs.max(1)),
+            revoked: std::sync::RwLock::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -689,6 +706,68 @@ impl RuntimeNodeManager {
         &self,
     ) -> std::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<String, DepartedNode>> {
         self.departed.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn revoked_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, std::collections::BTreeMap<String, Option<NodeEntry>>>
+    {
+        self.revoked.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn revoked_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, std::collections::BTreeMap<String, Option<NodeEntry>>> {
+        self.revoked.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take a revoked node out of the fleet and keep it out until
+    /// [`Self::lift_revocation`].
+    ///
+    /// Unlike [`Self::deregister`], a node named in `deis_runtime_nodes` is
+    /// taken out too: the file says the machine exists, not that it may be
+    /// driven after an operator revoked it. Nothing is pushed to it, no cron
+    /// fire is handed to it, no fan-out waits on it and it is not reported as
+    /// unreached. Answers whether it was on the fleet.
+    pub fn revoke(&self, id: &str) -> bool {
+        let mut nodes = self.write();
+        let mut revoked = self.revoked_write();
+        let removed = nodes.remove(id);
+        let configured = removed
+            .as_ref()
+            .filter(|entry| entry.source == NodeSource::Configured)
+            .cloned();
+        let stash = revoked.entry(id.to_string()).or_insert(None);
+        if stash.is_none() {
+            *stash = configured;
+        }
+        drop(revoked);
+        drop(nodes);
+        self.health.remove(id);
+        self.departed_write().remove(id);
+        self.forget_contested(id);
+        removed.is_some()
+    }
+
+    /// Lift a node's revocation: a configured node is back on the fleet at
+    /// once, as the file names it; any other may register again. Answers
+    /// whether it was revoked here.
+    pub fn lift_revocation(&self, id: &str) -> bool {
+        let mut nodes = self.write();
+        let Some(stash) = self.revoked_write().remove(id) else {
+            return false;
+        };
+        if let Some(entry) = stash {
+            nodes.insert(id.to_string(), entry);
+            drop(nodes);
+            self.health.insert(id.to_string(), NodeHealth::default());
+        }
+        true
+    }
+
+    /// Whether `id` is revoked here.
+    pub fn is_revoked(&self, id: &str) -> bool {
+        self.revoked_read().contains_key(id)
     }
 
     fn contested_write(
@@ -840,6 +919,11 @@ impl RuntimeNodeManager {
         }
 
         let mut nodes = self.write();
+        // Under the fleet's write lock, which is what makes this and
+        // [`Self::revoke`] one step each: see [`Self::revoked`].
+        if self.revoked_read().contains_key(id) {
+            return Err(RegistrationError::Revoked);
+        }
         match nodes.get_mut(id) {
             Some(entry) => {
                 let outcome = if entry.config.addr == addr {
@@ -2284,6 +2368,98 @@ mod tests {
         );
         assert_eq!(manager.ids(), vec!["from-file".to_string()]);
         assert_eq!(manager.deregister("never-seen"), None);
+    }
+
+    /// A revoked node is off every fan-out - a configured one included - and
+    /// may not register back; lifting the revocation restores the file's
+    /// entry and lets a registered node join again.
+    #[test]
+    fn a_revoked_node_is_off_the_fleet_until_lifted() {
+        let manager = manager(&["from-file"]);
+        let claim = |id: &str| NodeClaim {
+            addr: "http://10.0.0.5:8086".to_string(),
+            machine_addr: None,
+            version: None,
+            identity: certificate(id),
+        };
+        manager
+            .register("joined", claim("joined"), Utc::now())
+            .unwrap();
+
+        assert!(manager.revoke("from-file"));
+        assert!(manager.revoke("joined"));
+        assert!(
+            manager.ids().is_empty(),
+            "revoked nodes stay on the fan-out"
+        );
+        assert!(manager.call_order(0).is_empty());
+        assert!(
+            manager.node("from-file").is_none(),
+            "a revoked node is still dialled"
+        );
+        assert!(matches!(
+            manager.register("joined", claim("joined"), Utc::now()),
+            Err(RegistrationError::Revoked)
+        ));
+        assert!(matches!(
+            manager.register("from-file", claim("from-file"), Utc::now()),
+            Err(RegistrationError::Revoked)
+        ));
+        assert!(
+            !manager.revoke("from-file"),
+            "revoking twice finds nothing to take out"
+        );
+
+        assert!(manager.lift_revocation("from-file"));
+        assert_eq!(manager.ids(), vec!["from-file".to_string()]);
+        assert!(manager.lift_revocation("joined"));
+        assert!(!manager.lift_revocation("joined"));
+        manager
+            .register("joined", claim("joined"), Utc::now())
+            .unwrap();
+        assert_eq!(
+            manager.ids(),
+            vec!["from-file".to_string(), "joined".to_string()]
+        );
+    }
+
+    /// A registration racing a revocation can never leave the node on the
+    /// fleet: however the two interleave, the registration either lands first
+    /// and is taken out by the revocation, or comes second and is refused.
+    #[test]
+    fn a_registration_racing_a_revocation_never_puts_the_node_back() {
+        for _ in 0..50 {
+            let manager = Arc::new(manager(&[]));
+            let barrier = Arc::new(std::sync::Barrier::new(9));
+            let mut joins = Vec::new();
+            for _ in 0..8 {
+                let manager = Arc::clone(&manager);
+                let barrier = Arc::clone(&barrier);
+                joins.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    let _ = manager.register(
+                        "racer",
+                        NodeClaim {
+                            addr: "http://10.0.0.9:8086".to_string(),
+                            machine_addr: None,
+                            version: None,
+                            identity: certificate("racer"),
+                        },
+                        Utc::now(),
+                    );
+                }));
+            }
+            barrier.wait();
+            manager.revoke("racer");
+            for join in joins {
+                join.join().unwrap();
+            }
+            assert!(
+                manager.ids().is_empty(),
+                "a racing registration survived the revocation"
+            );
+            assert!(manager.is_revoked("racer"));
+        }
     }
 
     /// Two machines, one node id, and a fleet list with room for one entry.

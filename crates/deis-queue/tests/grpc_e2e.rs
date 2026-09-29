@@ -6,11 +6,12 @@
 //! the server, and the lease and dead letter behaviour a consumer will
 //! actually meet.
 //!
-//! Every call stamps `x-deis-tenant` with an `<app>.<environment>` value,
-//! which is what deis-runtime has to send. The tests below use
-//! `app-one.production` and `app-two.production` as two unrelated tenants,
-//! and one test pairs `app-one.production` with `app-one.preview` to check
-//! that two environments of the *same* application are also two namespaces.
+//! The tests name tenants by readable labels such as `app-one.production`
+//! and `app-two.production`; `canonical` turns each label into the
+//! canonical `v1/<application id>/<environment id>` tenant its capability
+//! names, which is the only place a tenant is ever stated. One test pairs
+//! `app-one.production` with `app-one.preview` to check that two environments
+//! of the *same* application are also two namespaces.
 //!
 //! Since this service always enforces capability-based auth, every well-formed
 //! call also carries an `Authorization: Bearer <capability>` header. The
@@ -23,10 +24,6 @@
 //! fixed pause is enough, so a broken lease fails the test instead of making
 //! it flaky.
 
-use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
-use deis_backend_migration::proto::{
-    AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
-};
 use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode as encode_capability};
 use deis_identity::{Protocol, ServiceKind};
 use deis_identity_test_pki::TestFleet;
@@ -37,9 +34,9 @@ use deis_queue::proto::queue::{
     PullRequest, QueueMessage, ReplayDeadLettersRequest, SendBatchRequest, SendRequest,
     queue_client::QueueClient,
 };
-use deis_queue::tenant::TENANT_HEADER;
 use deis_queue::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, tenant_id};
+use deis_wire::CanonicalTenantId;
+use deis_wire::conventions::{DEPLOYMENT_GENERATION_HEADER, tenant_id};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::oneshot;
@@ -69,9 +66,23 @@ fn test_signing_key() -> ed25519_dalek::SigningKey {
     ed25519_dalek::SigningKey::from_bytes(&seed)
 }
 
+/// The canonical tenant a test label stands for.
+fn canonical(label: &str) -> String {
+    CanonicalTenantId::derived_from_label(label).to_string()
+}
+
+/// The control plane these servers poll their revocation list from: a list
+/// signed with the key the tests sign capabilities with.
+fn fake_control() -> &'static deis_capability::testing::FakeControl {
+    static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+        std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| deis_capability::testing::FakeControl::start(test_signing_key()))
+}
+
 /// Mint a capability token for `tenant` with audience `"queue"` and binding
 /// `"queue"`.
 fn queue_capability(signing_key: &ed25519_dalek::SigningKey, tenant: &str) -> String {
+    let tenant = canonical(tenant);
     let claims = CapabilityClaims::new(
         "queue",
         "spiffe://deislet/control/main",
@@ -105,22 +116,19 @@ impl Harness {
         Self::start_with(Config::default()).await
     }
 
-    /// Start with a config that carries a migration admin token.
-    async fn start_migration_authenticated(token: &str) -> Self {
-        Self::start_with(Config {
-            migration_admin_token: Some(token.to_string()),
-            ..Config::default()
-        })
-        .await
-    }
-
     /// Start with a fully custom config.
     async fn start_with(config: Config) -> Self {
+        Self::start_listening_on("127.0.0.1:0", config).await
+    }
+
+    /// Start on `listen` instead of loopback. The endpoint the tests dial is
+    /// still `127.0.0.1:<port>`, which a wildcard bind answers as well.
+    async fn start_listening_on(listen: &str, config: Config) -> Self {
         let data = TempDir::new().unwrap();
         let signing_key = test_signing_key();
         let keys = KeyRing::from_keys([signing_key.verifying_key()]);
         let config = Config {
-            listen: "127.0.0.1:0".to_string(),
+            listen: listen.to_string(),
             data_dir: data.path().to_path_buf(),
             max_attempts: MAX_ATTEMPTS,
             max_body_bytes: MAX_BODY_BYTES,
@@ -129,7 +137,7 @@ impl Harness {
         // Bind first, so the port is known before anything is spawned and no
         // test has to wait for the server to come up.
         let listener = server::bind(&config).await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let port = listener.local_addr().unwrap().port();
         let (shutdown, rx) = oneshot::channel();
         let fleet = TestFleet::new();
         let identity = fleet.service_identity(ServiceKind::Queue);
@@ -141,6 +149,7 @@ impl Harness {
                     let _ = rx.await;
                 },
                 keys,
+                fake_control().client(),
                 identity,
             )
             .await
@@ -148,7 +157,7 @@ impl Harness {
         });
         Self {
             _data: data,
-            endpoint: format!("https://{addr}"),
+            endpoint: format!("https://127.0.0.1:{port}"),
             shutdown: Some(shutdown),
             signing_key,
             fleet,
@@ -174,12 +183,6 @@ impl Harness {
             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
-
-    async fn migration(&self) -> BackendMigrationClient<Channel> {
-        BackendMigrationClient::new(self.channel().await)
-            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-    }
 }
 
 impl Drop for Harness {
@@ -190,129 +193,10 @@ impl Drop for Harness {
     }
 }
 
-#[tokio::test]
-async fn migration_management_is_absent_by_default_and_freezes_queue_mutations() {
-    const ADMIN: &str = "migration-admin-token-000000000000000001";
-    const MIGRATION: &str = "01990f44-1000-7000-8000-000000000050";
-    const FENCE: &str = "migration-fence-token-00000000000000001";
-    const UNKNOWN_INCARNATION: &str = "01990f44-1000-7000-8000-000000000099";
-    let acquire = |backend_incarnation_id: &str| AcquireWriteFenceRequest {
-        tenant: "shop.production".to_string(),
-        migration_id: MIGRATION.to_string(),
-        expected_application_revision: 3,
-        fence_token: FENCE.to_string(),
-        expected_backend_incarnation_id: backend_incarnation_id.to_string(),
-    };
-
-    let without_management = Harness::start().await;
-    assert_eq!(
-        without_management
-            .migration()
-            .await
-            .acquire_write_fence(Request::new(acquire(UNKNOWN_INCARNATION)))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::Unimplemented
-    );
-    drop(without_management);
-
-    let harness = Harness::start_migration_authenticated(ADMIN).await;
-    let mut queue = harness.client().await;
-    queue
-        .send(as_tenant(
-            &harness,
-            "shop.production",
-            SendRequest {
-                queue_name: "jobs".to_string(),
-                message_body: b"one".to_vec(),
-            },
-        ))
-        .await
-        .unwrap();
-    let mut migration = harness.migration().await;
-    let backend_info = migration
-        .get_backend_info(as_migration_admin(ADMIN, GetBackendInfoRequest {}))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(backend_info.backend, "deis-queue");
-    let backend_incarnation_id = backend_info.backend_incarnation_id;
-    assert_eq!(
-        migration
-            .acquire_write_fence(Request::new(acquire(&backend_incarnation_id)))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::Unauthenticated
-    );
-    migration
-        .acquire_write_fence(as_migration_admin(ADMIN, acquire(&backend_incarnation_id)))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        queue
-            .pull(as_tenant(
-                &harness,
-                "shop.production",
-                PullRequest {
-                    queue_name: "jobs".to_string(),
-                    max_messages: 1,
-                    lease_seconds: 30,
-                },
-            ))
-            .await
-            .unwrap_err()
-            .code(),
-        Code::FailedPrecondition
-    );
-    let inventory = migration
-        .inspect_tenant(as_migration_admin(
-            ADMIN,
-            InspectTenantRequest {
-                tenant: "shop.production".to_string(),
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(inventory.backend, "deis-queue");
-    assert_eq!(inventory.components[0].item_count, 1);
-
-    migration
-        .release_write_fence(as_migration_admin(
-            ADMIN,
-            ReleaseWriteFenceRequest {
-                tenant: "shop.production".to_string(),
-                migration_id: MIGRATION.to_string(),
-                expected_application_revision: 3,
-                fence_token: FENCE.to_string(),
-                expected_backend_incarnation_id: backend_incarnation_id,
-            },
-        ))
-        .await
-        .unwrap();
-    queue
-        .send(as_tenant(
-            &harness,
-            "shop.production",
-            SendRequest {
-                queue_name: "jobs".to_string(),
-                message_body: b"two".to_vec(),
-            },
-        ))
-        .await
-        .unwrap();
-}
-
 /// Stamp the tenant the way deis-runtime has to. Also stamps a capability
 /// token so the call passes the interceptor.
 fn as_tenant<T>(harness: &Harness, tenant: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     let token = queue_capability(&harness.signing_key, tenant);
     request
         .metadata_mut()
@@ -322,37 +206,23 @@ fn as_tenant<T>(harness: &Harness, tenant: &str, message: T) -> Request<T> {
 
 /// Stamp *only* the tenant header, without a capability token. Used by tests
 /// that need to provoke an auth rejection.
-fn as_tenant_only<T>(tenant: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
-    request
+fn as_tenant_only<T>(_tenant: &str, message: T) -> Request<T> {
+    Request::new(message)
 }
 
-/// Stamp the tenant header and a capability token minted for `token_tenant`
-/// under the harness's signing key. The two tenants are separate arguments
-/// on purpose: presenting a token minted for one tenant on a call that
-/// claims another is exactly the attack the derivation is meant to defeat.
+/// Carry a capability minted for `token_tenant` and name `claimed` in the
+/// retired `x-deis-tenant` header, which the service must ignore.
 fn as_tenant_with_capability<T>(
     harness: &Harness,
-    tenant: &str,
+    claimed: &str,
     token_tenant: &str,
     message: T,
 ) -> Request<T> {
     let mut request = Request::new(message);
     request
         .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
+        .insert("x-deis-tenant", canonical(claimed).parse().unwrap());
     let token = queue_capability(&harness.signing_key, token_tenant);
-    request
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {token}").parse().unwrap());
-    request
-}
-
-fn as_migration_admin<T>(token: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
     request
         .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -1099,7 +969,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     assert_eq!(active.active_deployment_id, PLAN);
     assert!(active.pending_deployment_id.is_empty());
 
-    let legacy = as_tenant(
+    let unstamped = as_tenant(
         &harness,
         tenant,
         PullRequest {
@@ -1109,7 +979,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
         },
     );
     assert_eq!(
-        client.pull(legacy).await.unwrap_err().code(),
+        client.pull(unstamped).await.unwrap_err().code(),
         Code::FailedPrecondition,
         "an unstamped consumer must not cross the generation fence"
     );
@@ -1291,7 +1161,7 @@ async fn abort_consumer_generation_reopens_the_previous_generation_over_the_wire
 }
 
 #[tokio::test]
-async fn a_call_without_the_tenant_header_is_refused() {
+async fn a_call_without_one_capability_tenant_is_refused() {
     let harness = Harness::start().await;
     let mut client = harness.client().await;
 
@@ -1316,25 +1186,6 @@ async fn a_call_without_the_tenant_header_is_refused() {
         .expect_err("a call with no tenant must be refused");
     assert_eq!(status.code(), Code::Unauthenticated);
 
-    // The application header is not the storage tenant. A caller that stamps
-    // only `x-deis-app-id` - which is what every caller did before this
-    // change - is refused rather than served production's queue.
-    let mut request = Request::new(PullRequest {
-        queue_name: "jobs".to_string(),
-        max_messages: 10,
-        lease_seconds: 30,
-    });
-    request
-        .metadata_mut()
-        .insert(APP_ID_HEADER, "app-one".parse().unwrap());
-    let status = client
-        .pull(request)
-        .await
-        .expect_err("the application header alone must not identify a tenant");
-    // The app-id-only call has no Authorization header, so the interceptor
-    // refuses it with Unauthenticated.
-    assert_eq!(status.code(), Code::Unauthenticated);
-
     // A tenant header but no capability: the interceptor refuses it.
     let status = client
         .pull(as_tenant_only(
@@ -1349,33 +1200,45 @@ async fn a_call_without_the_tenant_header_is_refused() {
         .expect_err("a call with no capability token must be refused");
     assert_eq!(status.code(), Code::Unauthenticated);
 
-    // Malformed tenant values: the interceptor passes them (the capability
-    // matches what the header says) but the handler's tenant validation
-    // catches them.
-    for bad in [
-        // A bare application id names no environment, so it names no tenant.
-        "app-one",
-        "../../etc",
-        "a.b.c",
-        "app-one.",
+    // A capability whose tenant is not a canonical id, or that names two
+    // tenants, says nothing about whose queue the call is about.
+    for tenants in [
+        vec!["app-one.production".to_string()],
+        vec!["../../etc".to_string()],
+        vec![
+            canonical("app-one.production"),
+            canonical("app-two.production"),
+        ],
     ] {
-        let status = client
-            .pull(as_tenant(
-                &harness,
-                bad,
-                PullRequest {
-                    queue_name: "jobs".to_string(),
-                    max_messages: 10,
-                    lease_seconds: 30,
-                },
-            ))
-            .await
-            .expect_err("a malformed tenant must be refused");
-        assert_eq!(
-            status.code(),
-            Code::PermissionDenied,
-            "{bad} should be refused"
+        let claims = CapabilityClaims::new(
+            "queue",
+            "spiffe://deislet/control/main",
+            "spiffe://deislet/node/test",
+            1,
+            Duration::from_secs(900),
+            tenants
+                .iter()
+                .map(|tenant| CapabilityResource {
+                    tenant: tenant.clone(),
+                    binding: "queue".to_string(),
+                    generation: None,
+                })
+                .collect(),
         );
+        let token = encode_capability(&claims, &harness.signing_key);
+        let mut request = Request::new(PullRequest {
+            queue_name: "jobs".to_string(),
+            max_messages: 10,
+            lease_seconds: 30,
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let status = client
+            .pull(request)
+            .await
+            .expect_err("a capability without one canonical tenant must be refused");
+        assert_eq!(status.code(), Code::PermissionDenied, "{tenants:?}");
     }
 }
 
@@ -1521,8 +1384,6 @@ async fn concurrent_consumers_never_receive_the_same_message() {
                 max_messages: 5,
                 lease_seconds: 60,
             });
-            req.metadata_mut()
-                .insert(TENANT_HEADER, "app-one.production".parse().unwrap());
             let token = queue_capability(&sk, "app-one.production");
             req.metadata_mut()
                 .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -1616,23 +1477,24 @@ async fn a_call_with_no_token_is_refused() {
 }
 
 #[tokio::test]
-async fn a_token_minted_for_another_tenant_drains_nothing() {
+async fn a_tenant_named_in_the_request_drains_nothing() {
     // Draining is destructive: a message another tenant's consumer takes is
-    // one its owner never receives. This is the check that stops a token that
-    // leaked out of one application from being used to do that.
+    // one its owner never receives. The tenant is the one the capability
+    // names, so a token for one tenant that names another in a header drains
+    // its own queue and leaves the other's alone.
     let harness = Harness::start().await;
     let mine = tenant_id("app-one", "production");
+    let mut client = harness.client().await;
 
-    for claimed in [
+    for owner in [
         tenant_id("app-two", "production"),
         tenant_id("app-one", "preview"),
     ] {
-        let status = harness
-            .client()
-            .await
+        send(&mut client, &harness, &owner, "jobs", "theirs").await;
+        let pulled = client
             .pull(as_tenant_with_capability(
                 &harness,
-                &claimed,
+                &owner,
                 &mine,
                 PullRequest {
                     queue_name: "jobs".to_string(),
@@ -1641,12 +1503,26 @@ async fn a_token_minted_for_another_tenant_drains_nothing() {
                 },
             ))
             .await
-            .unwrap_err();
-        assert_eq!(
-            status.code(),
-            Code::PermissionDenied,
-            "a token for {mine} must not drain {claimed}"
+            .unwrap()
+            .into_inner();
+        assert!(
+            pulled.messages.is_empty(),
+            "a token for {mine} must not drain {owner}"
         );
+        let theirs = client
+            .pull(as_tenant(
+                &harness,
+                &owner,
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 10,
+                    lease_seconds: 30,
+                },
+            ))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(theirs.messages.len(), 1, "{owner} keeps its message");
     }
 }
 
@@ -1668,9 +1544,6 @@ async fn a_token_minted_under_a_different_key_is_refused() {
         max_messages: 10,
         lease_seconds: 30,
     });
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     let token = queue_capability(&other_key, &tenant);
     request
         .metadata_mut()
@@ -1693,7 +1566,7 @@ async fn a_wrong_audience_tokens_is_refused() {
         1,
         Duration::from_secs(900),
         vec![CapabilityResource {
-            tenant: tenant.clone(),
+            tenant: canonical(&tenant),
             binding: "queue".to_string(),
             generation: None,
         }],
@@ -1705,9 +1578,6 @@ async fn a_wrong_audience_tokens_is_refused() {
         max_messages: 10,
         lease_seconds: 30,
     });
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     request
         .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -1729,7 +1599,7 @@ async fn a_wrong_binding_tokens_is_refused() {
         1,
         Duration::from_secs(900),
         vec![CapabilityResource {
-            tenant: tenant.clone(),
+            tenant: canonical(&tenant),
             binding: "kv".to_string(), // wrong binding
             generation: None,
         }],
@@ -1743,9 +1613,6 @@ async fn a_wrong_binding_tokens_is_refused() {
     });
     request
         .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
-    request
-        .metadata_mut()
         .insert("authorization", format!("Bearer {token}").parse().unwrap());
 
     let status = harness.client().await.pull(request).await.unwrap_err();
@@ -1753,50 +1620,33 @@ async fn a_wrong_binding_tokens_is_refused() {
 }
 
 #[tokio::test]
-async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
-    // The fail-closed half. An operator who widens `listen` and changes
-    // nothing else gets a process that stops with an explanation, rather than
-    // one whose queues anyone on the network can drain.
-    let data = TempDir::new().unwrap();
-    let config = Config {
-        listen: "127.0.0.1:0".to_string(),
-        data_dir: data.path().to_path_buf(),
-        ..Config::default()
-    };
-    let public = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-    public.set_nonblocking(true).unwrap();
-    let public = tokio::net::TcpListener::from_std(public).unwrap();
+async fn a_public_bind_still_refuses_every_call_without_a_capability() {
+    // An operator who widens `listen` and changes nothing else must not get a
+    // queue anyone on the network can drain. Nothing about the bind address
+    // switches authentication on or off: the capability interceptor runs on
+    // every call, so the same tokenless call that loopback refuses is refused
+    // on the wildcard address too, and a capability still gets through.
+    let harness = Harness::start_listening_on("0.0.0.0:0", Config::default()).await;
+    let mut client = harness.client().await;
 
-    // The check for an unauthenticated public bind has been superseded by
-    // the capability interceptor, which always enforces auth regardless of
-    // bind address.
-    let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
-    let fleet = TestFleet::new();
-    let result = server::serve(
-        config,
-        public,
-        async {},
-        keys,
-        fleet.service_identity(ServiceKind::Queue),
-    )
-    .await;
-    // The serve call itself may still succeed (it was the old auth_secret
-    // check that failed; now auth is always enforced regardless of bind
-    // address). What matters is that the server starts and enforces
-    // capabilities on every call.
-    //
-    // If the server starts, verify that calls are refused without a token.
-    if result.is_ok() {
-        // The server started on the public interface. Verify that a call
-        // without a capability token is still refused, proving that auth
-        // is enforced regardless of bind address.
-        tracing::info!(
-            "serve() accepted a public bind with capability auth; auth is \
-             enforced by the interceptor on every call regardless of bind \
-             address"
-        );
-    }
-    // If the server refuses to start for another reason (e.g. the queue
-    // database can't be opened on the temp dir), that's also fine — the
-    // old auth_secret refusal no longer exists.
+    let status = client
+        .send(Request::new(SendRequest {
+            queue_name: "jobs".to_string(),
+            message_body: b"work".to_vec(),
+        }))
+        .await
+        .expect_err("a tokenless call on a public bind must be refused");
+    assert_eq!(status.code(), Code::Unauthenticated);
+
+    client
+        .send(as_tenant(
+            &harness,
+            "demo",
+            SendRequest {
+                queue_name: "jobs".to_string(),
+                message_body: b"work".to_vec(),
+            },
+        ))
+        .await
+        .expect("a call carrying a capability is served on the same bind");
 }

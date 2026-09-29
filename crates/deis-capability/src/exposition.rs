@@ -76,7 +76,9 @@ pub fn serve_metrics(
                 let mut head = Vec::with_capacity(512);
                 let mut buf = [0u8; 1024];
                 let read = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < MAX_REQUEST_HEAD {
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n")
+                        && head.len() < MAX_REQUEST_HEAD
+                    {
                         match socket.read(&mut buf).await {
                             Ok(0) | Err(_) => return false,
                             Ok(n) => head.extend_from_slice(&buf[..n]),
@@ -94,9 +96,17 @@ pub fn serve_metrics(
                 let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
                 let (status, content_type, body) =
                     if method == "GET" && (path == "/metrics" || path.starts_with("/metrics?")) {
-                        ("200 OK", "text/plain; version=0.0.4; charset=utf-8", render())
+                        (
+                            "200 OK",
+                            "text/plain; version=0.0.4; charset=utf-8",
+                            render(),
+                        )
                     } else {
-                        ("404 Not Found", "text/plain; charset=utf-8", "not found\n".to_string())
+                        (
+                            "404 Not Found",
+                            "text/plain; charset=utf-8",
+                            "not found\n".to_string(),
+                        )
                     };
                 let response = format!(
                     "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -118,7 +128,13 @@ mod tests {
     fn only_a_loopback_ip_literal_is_accepted() {
         assert!(require_loopback("metrics_listen", "127.0.0.1:9001").is_ok());
         assert!(require_loopback("metrics_listen", "[::1]:9001").is_ok());
-        for refused in ["0.0.0.0:9001", "10.0.0.5:9001", "[::]:9001", "localhost:9001", "9001"] {
+        for refused in [
+            "0.0.0.0:9001",
+            "10.0.0.5:9001",
+            "[::]:9001",
+            "localhost:9001",
+            "9001",
+        ] {
             let error = require_loopback("metrics_listen", refused).unwrap_err();
             assert!(error.contains("metrics_listen"), "{error}");
         }
@@ -139,7 +155,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body, "deis_up 1\n");
-        let missing = client.get(format!("http://{addr}/other")).send().await.unwrap();
+        let missing = client
+            .get(format!("http://{addr}/other"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(missing.status(), 404);
     }
 }

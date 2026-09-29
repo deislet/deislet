@@ -152,13 +152,13 @@ check_app_fetch_allowed() {
 
 # The check this whole arrangement exists for.
 #
-# deis-store trusts the tenant header it is given: it has to, because until an
-# application could open an outbound connection, nothing but the node could
-# reach it. The moment `fetch` exists, a handler that can reach deis-store can
-# read and delete any other application's keys, rows and blobs by asking with
-# a different `x-deis-tenant`. So the handler is pointed straight at it here,
-# and a call that gets through is a failure - not a curiosity, and not
-# something to note and move on from.
+# deis-store, deis-queue and the node's own management port are internal
+# services. The moment `fetch` exists, a handler that can reach them could
+# probe them directly, and a node that holds capabilities for several
+# tenants must never become the way one application reaches another's data.
+# So the handler is pointed straight at deis-store here, and a call that gets
+# through is a failure - not a curiosity, and not something to note and move
+# on from.
 #
 # Nothing is asserted about what the *handler* was told: no wording, no status
 # code, no particular refusal message. A refusal reaches an application as an

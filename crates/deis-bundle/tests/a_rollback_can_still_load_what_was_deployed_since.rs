@@ -38,8 +38,8 @@
 //! cannot compile.
 
 use deis_bundle::{
-    BundleError, MANIFEST_ENTRY, NotFound, SUPPORTED_SCHEMA, WORKER_ENTRY, read_manifest,
-    unknown_fields, unreadable_values,
+    BundleError, MANIFEST_ENTRY, NotFound, SUPPORTED_SCHEMA, WORKER_ENTRY, complete_manifest_json,
+    read_manifest, unknown_fields, unreadable_values,
 };
 use std::io::{Cursor, Write};
 
@@ -64,10 +64,9 @@ fn zip_with(files: &[(&str, &str)]) -> Vec<u8> {
 /// The added keys are deliberately plausible rather than nonsense. A key that
 /// breaks a rollback is never a hostile one; it is the next small feature.
 const FROM_A_NEWER_BUILDER: &str = r#"{
-  "schema": 1,
+  "schema": 2,
   "app": "demo",
   "entry": "worker/index.js",
-  "env": {"LOG_LEVEL": "info"},
   "cron": ["*/5 * * * *"],
   "routes": [{"pattern": "/hello/:name", "methods": ["GET"]}],
   "limits": {"timeout_ms": 1500, "max_open_sockets": 8},
@@ -79,7 +78,10 @@ const FROM_A_NEWER_BUILDER: &str = r#"{
 #[test]
 fn a_bundle_a_newer_builder_wrote_still_loads_here() {
     let bundle = zip_with(&[
-        (MANIFEST_ENTRY, FROM_A_NEWER_BUILDER),
+        (
+            MANIFEST_ENTRY,
+            &complete_manifest_json(FROM_A_NEWER_BUILDER),
+        ),
         (WORKER_ENTRY, "export default () => new Response('hi')"),
     ]);
 
@@ -95,10 +97,6 @@ fn a_bundle_a_newer_builder_wrote_still_loads_here() {
     let manifest = &parsed.manifest;
     assert_eq!(manifest.app, "demo");
     assert_eq!(manifest.entry, WORKER_ENTRY);
-    assert_eq!(
-        manifest.env.get("LOG_LEVEL").map(String::as_str),
-        Some("info")
-    );
     assert_eq!(manifest.cron, vec!["*/5 * * * *"]);
     assert_eq!(manifest.route_patterns(), vec!["/hello/:name"]);
     assert_eq!(
@@ -145,7 +143,8 @@ fn a_schema_this_build_does_not_know_is_still_refused_whole() {
     // change an older build could not have ignored safely takes a new schema
     // number, and then the refusal is total, immediate and by name rather
     // than an application running on half a manifest.
-    let future = FROM_A_NEWER_BUILDER.replace("\"schema\": 1", "\"schema\": 3");
+    let future =
+        complete_manifest_json(FROM_A_NEWER_BUILDER).replace("\"schema\":2", "\"schema\":3");
     let bundle = zip_with(&[(MANIFEST_ENTRY, &future), (WORKER_ENTRY, "export {}")]);
 
     let err = read_manifest(&bundle).expect_err("a schema this build does not know is refused");
@@ -170,10 +169,9 @@ fn a_schema_this_build_does_not_know_is_still_refused_whole() {
 /// consent, a maintenance page, a `410 Gone` rule, a wildcard inside a
 /// segment, a flag for a behaviour that did not exist yet.
 const VALUES_FROM_A_NEWER_BUILDER: &str = r#"{
-  "schema": 1,
+  "schema": 2,
   "app": "demo",
   "entry": "worker/index.js",
-  "env": {"LOG_LEVEL": "info"},
   "cron": ["*/5 * * * *"],
   "routes": [{"pattern": "/hello/:name", "methods": ["GET"]}],
   "bindings": {
@@ -198,7 +196,10 @@ const VALUES_FROM_A_NEWER_BUILDER: &str = r#"{
 #[test]
 fn a_value_a_newer_builder_wrote_costs_that_declaration_and_nothing_else() {
     let bundle = zip_with(&[
-        (MANIFEST_ENTRY, VALUES_FROM_A_NEWER_BUILDER),
+        (
+            MANIFEST_ENTRY,
+            &complete_manifest_json(VALUES_FROM_A_NEWER_BUILDER),
+        ),
         (WORKER_ENTRY, "export default () => new Response('hi')"),
     ]);
 
@@ -215,10 +216,6 @@ fn a_value_a_newer_builder_wrote_costs_that_declaration_and_nothing_else() {
     assert_eq!(manifest.app, "demo");
     assert_eq!(manifest.cron, vec!["*/5 * * * *"]);
     assert_eq!(manifest.route_patterns(), vec!["/hello/:name"]);
-    assert_eq!(
-        manifest.env.get("LOG_LEVEL").map(String::as_str),
-        Some("info")
-    );
 
     // A binding kind this build does not know: the entry is simply not
     // published, so `env.SEARCH` is undefined and the one handler that reaches
@@ -334,6 +331,7 @@ fn a_headers_pattern_this_build_cannot_compile_is_the_gate_it_says_it_is() {
         with_headers, VALUES_FROM_A_NEWER_BUILDER,
         "the fixture was not edited"
     );
+    let with_headers = complete_manifest_json(&with_headers);
     let bundle = zip_with(&[(MANIFEST_ENTRY, &with_headers), (WORKER_ENTRY, "export {}")]);
 
     let err = read_manifest(&bundle).expect_err("a header block this build cannot place");
@@ -353,7 +351,9 @@ fn a_headers_pattern_this_build_cannot_compile_is_the_gate_it_says_it_is() {
 /// release newer.
 #[test]
 fn a_date_this_build_cannot_honour_refuses_itself_and_not_the_manifest() {
-    let future = VALUES_FROM_A_NEWER_BUILDER.replace("\"2026-09-01\"", "\"2099-01-01\"");
+    let future = complete_manifest_json(
+        &VALUES_FROM_A_NEWER_BUILDER.replace("\"2026-09-01\"", "\"2099-01-01\""),
+    );
     let bundle = zip_with(&[(MANIFEST_ENTRY, &future), (WORKER_ENTRY, "export {}")]);
 
     let parsed = read_manifest(&bundle)

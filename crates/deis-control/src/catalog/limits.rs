@@ -63,16 +63,19 @@ mod tests {
     /// where a misspelled key is now caught and this module only sees what
     /// survived it.
     fn read(limits: &str) -> Result<Option<DeclaredLimits>, String> {
-        let json =
-            format!(r#"{{"schema":1,"app":"demo","entry":"worker/index.js","limits":{limits}}}"#);
+        let json = deis_bundle::complete_manifest_json(&format!(
+            r#"{{"app":"demo","entry":"worker/index.js","limits":{limits}}}"#
+        ));
         let manifest = Manifest::parse(&json).map_err(|e| e.to_string())?;
         declared_limits(&manifest)
     }
 
     #[test]
     fn a_manifest_without_a_limits_block_declares_nothing() {
-        let manifest =
-            Manifest::parse(r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#).unwrap();
+        let manifest = Manifest::parse(&deis_bundle::complete_manifest_json(
+            r#"{"app":"demo","entry":"worker/index.js"}"#,
+        ))
+        .unwrap();
         assert_eq!(declared_limits(&manifest), Ok(None));
     }
 
@@ -105,7 +108,9 @@ mod tests {
             .expect("declared");
         assert_eq!(limits.timeout_ms, Some(1500));
 
-        let json = r#"{"schema":1,"app":"demo","entry":"worker/index.js","limits":{"timeout_millis":1500}}"#;
+        let json = &deis_bundle::complete_manifest_json(
+            r#"{"app":"demo","entry":"worker/index.js","limits":{"timeout_millis":1500}}"#,
+        );
         assert_eq!(
             deis_bundle::unknown_fields(json),
             vec!["limits.timeout_millis".to_string()],

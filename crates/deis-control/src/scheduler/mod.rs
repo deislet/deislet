@@ -1010,7 +1010,9 @@ mod tests {
             .map(|c| format!("\"{c}\""))
             .collect::<Vec<_>>()
             .join(",");
-        format!(r#"{{"schema":1,"app":"demo","entry":"worker/index.js","cron":[{list}]}}"#)
+        deis_bundle::complete_manifest_json(&format!(
+            r#"{{"app":"demo","entry":"worker/index.js","cron":[{list}]}}"#
+        ))
     }
 
     /// Create an app plus environment and deploy a version whose manifest

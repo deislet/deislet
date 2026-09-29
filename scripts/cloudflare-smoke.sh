@@ -322,7 +322,7 @@ cleanup() {
     run_step delete no || echo "  delete failed; see above"
     # Purging data resources requires explicit consent naming this exact
     # environment; nothing else is ever destroyed.
-    run_step cleanup no DEIS_CLOUDFLARE_PURGE_DATA="$ENV_ID" || echo "  cleanup failed; see above"
+    run_step cleanup no DEIS_PROVIDER_PURGE_DATA="$ENV_ID" || echo "  cleanup failed; see above"
     local left
     left="$(leftovers)"
     if [ -n "$left" ]; then

@@ -5,14 +5,8 @@
 //!
 //! # Usage
 //!
-//! ## As a CLI
-//!
-//! ```bash
-//! cargo install deis-build
-//! deis-build build --vendor cloudflare
-//! ```
-//!
-//! ## As a library
+//! This is a library; the command line that drives it is `deis build
+//! --target <target>` in the `deis` crate.
 //!
 //! ```toml
 //! [dependencies]
@@ -60,14 +54,11 @@ pub mod compiler;
 // Parser module
 pub mod parser;
 
-// CLI command module (optional when used as a library)
-pub mod commands;
-
 // Re-export core types for external use
 pub use deis_build_core::{
     config::{
         resolve_environment_config_values, resolve_environment_declarations, ProjectConfig,
-        ServicesConfig, VendorsConfig,
+        VendorsConfig,
     },
     error::{DeniError, Result},
     target_artifact_coverage::{
@@ -79,8 +70,8 @@ pub use deis_build_core::{
     },
 };
 
-// Re-export the adapters. There is one per vendor, and the crate name is the
-// vendor value verbatim (`--vendor cloudflare` is served by
+// Re-export the adapters. There is one per target, and the crate name is the
+// target value verbatim (`--target cloudflare` is served by
 // `deis-build-adapter-cloudflare`), so no table has to be consulted to know
 // which crate answers for which target.
 pub use deis_build_adapter_cloudflare as adapter_cloudflare;

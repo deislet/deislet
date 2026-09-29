@@ -593,7 +593,9 @@ async fn run(
                 running
                     .running()
                     .into_iter()
-                    .map(|(key, _)| key.tenant_id())
+                    .filter_map(|(key, _)| {
+                        deis_runtime::telemetry::canonical_tenant(&key.tenant_id())
+                    })
                     .collect()
             },
         );
@@ -626,11 +628,13 @@ async fn run(
     // plane is unreachable, sealed under a key derived from its own private
     // key. Only a node that asks a control plane has anything to keep.
     let offline_cache = assignment_client.as_ref().map(|_| {
-        Arc::new(deis_runtime::deployment::offline_cache::OfflineCache::for_identity(
-            &config.data_dir,
-            &machine_identity,
-            node_id.clone(),
-        ))
+        Arc::new(
+            deis_runtime::deployment::offline_cache::OfflineCache::for_identity(
+                &config.data_dir,
+                &machine_identity,
+                node_id.clone(),
+            ),
+        )
     });
 
     // Runs for the life of the process: it registers this node, keeps it

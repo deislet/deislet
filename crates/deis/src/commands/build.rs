@@ -192,9 +192,10 @@ pub struct Bundle {
     pub digest: String,
     /// The manifest inside the archive, parsed with the shared reader.
     pub manifest: deis_bundle::Manifest,
-    /// Exact provider-neutral parent and derivation sidecar. A manually
-    /// supplied historical bundle has no such local evidence and therefore
-    /// uses the explicit compatibility upload path.
+    /// Exact provider-neutral parent and derivation sidecar. `None` only
+    /// while [`read_bundle`] has read the archive and before the build that
+    /// produced it attaches the evidence; `deis deploy` refuses a bundle that
+    /// still has none.
     pub lineage: Option<BundleLineage>,
 }
 
@@ -604,9 +605,9 @@ mod tests {
             path: root.path().join("bundle.zip"),
             digest: digest_of(&bytes),
             bytes: bytes.clone(),
-            manifest: deis_bundle::Manifest::parse(
-                r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#,
-            )
+            manifest: deis_bundle::Manifest::parse(&deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js"}"#,
+            ))
             .expect("manifest"),
             lineage: Some(BundleLineage {
                 canonical_root: root.path().to_path_buf(),

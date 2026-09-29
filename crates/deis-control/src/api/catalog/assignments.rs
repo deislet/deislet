@@ -131,12 +131,12 @@ pub struct AssignmentView {
     /// node would have to guess, which is the one thing this field exists to
     /// stop.
     pub compatibility: crate::catalog::DeclaredCompatibility,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment_declarations: Option<deis_wire::EnvironmentDeclarations>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment_snapshot_id: Option<String>,
+    /// The version's environment declaration, the deployment's snapshot and
+    /// its identity - the same three documents the push carries. Secret
+    /// values are not in them; a node fetches those by revision.
+    pub environment_declarations: deis_wire::EnvironmentDeclarations,
+    pub environment_snapshot: deis_wire::EnvironmentBindingSnapshot,
+    pub environment_snapshot_id: String,
 }
 
 /// GET /api/nodes/:id/assignments (machine channel)
@@ -287,15 +287,9 @@ pub(crate) async fn assignments_for(
             env,
             limits,
             compatibility,
-            environment_declarations: standard_environment
-                .as_ref()
-                .map(|(declarations, _, _)| declarations.clone()),
-            environment_snapshot: standard_environment
-                .as_ref()
-                .map(|(_, snapshot, _)| snapshot.clone()),
-            environment_snapshot_id: standard_environment
-                .as_ref()
-                .map(|(_, _, identity)| identity.clone()),
+            environment_declarations: standard_environment.0,
+            environment_snapshot: standard_environment.1,
+            environment_snapshot_id: standard_environment.2,
         });
     }
 
@@ -341,12 +335,12 @@ pub(crate) struct VisibleDeployment {
     /// Primary key of the environment row: the half of a secret revision's
     /// storage key and AAD that the snapshot does not carry.
     pub env_id: String,
-    /// `None` for a deployment that predates typed snapshots, which binds no
-    /// secret revisions and so has nothing to fetch.
-    pub snapshot_id: Option<String>,
-    /// `<app>.<environment>`, as `deis_wire::conventions::tenant_id` spells
-    /// it: the tenant a store, queue or telemetry capability names.
-    pub tenant: String,
+    /// The environment snapshot the deployment binds: the only secret
+    /// revisions a node may fetch for it.
+    pub snapshot_id: String,
+    /// `v1/<application id>/<environment id>`: the tenant a store, queue or
+    /// telemetry capability names.
+    pub canonical_tenant: String,
     /// The routing generation this deployment serves under.
     pub routing_generation: String,
 }
@@ -374,36 +368,46 @@ pub(crate) async fn deployments_visible_to(
     let mut visible = BTreeMap::new();
     if state.nodes.node(node_id).is_some() {
         for assignment in state.store.list_assignments().await?.assignments {
+            let canonical_tenant =
+                canonical_tenant_of(state, &assignment.app_id, &assignment.environment_id).await?;
             visible.insert(
                 assignment.deployment_id,
                 VisibleDeployment {
                     env_id: assignment.environment_id,
                     snapshot_id: assignment.snapshot_id,
-                    tenant: deis_wire::conventions::tenant_id(
-                        &assignment.app_id,
-                        &assignment.environment,
-                    ),
+                    canonical_tenant,
                     routing_generation: assignment.routing_generation,
                 },
             );
         }
     }
     for plan in state.store.nonterminal_deployment_plans().await? {
-        if !plan.target_ids.iter().any(|target| target == node_id)
-            || visible.contains_key(&plan.id)
+        if !plan.target_ids.iter().any(|target| target == node_id) || visible.contains_key(&plan.id)
         {
             continue;
         }
-        let environment = state.store.get_environment_by_id(&plan.env_id).await?;
+        let canonical_tenant = canonical_tenant_of(state, &plan.app_id, &plan.env_id).await?;
         visible.insert(
             plan.id,
             VisibleDeployment {
                 env_id: plan.env_id,
                 snapshot_id: plan.snapshot_id,
-                tenant: deis_wire::conventions::tenant_id(&plan.app_id, &environment.name),
+                canonical_tenant,
                 routing_generation: plan.routing_generation.to_string(),
             },
         );
     }
     Ok(visible)
+}
+
+/// The canonical tenant (`v1/<application id>/<environment id>`) of one
+/// environment: what a store or queue capability for it names.
+pub(crate) async fn canonical_tenant_of(
+    state: &CatalogState,
+    app_id: &str,
+    env_id: &str,
+) -> crate::catalog::CatalogResult<String> {
+    let app = state.store.get_app(app_id).await?;
+    let environment = state.store.get_environment_by_id(env_id).await?;
+    Ok(deis_wire::CanonicalTenantId::new(app.canonical_id, environment.canonical_id).to_string())
 }

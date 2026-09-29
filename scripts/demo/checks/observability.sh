@@ -165,11 +165,13 @@ check_cli_tail() {
 
 # What one environment's read capability reaches. deis-telemetry holds every
 # tenant's records in one store, so the capability is the only thing between
-# them: a reader minted for ${APP_ID}/${ENV_NAME} asking for another
-# application's logs is refused rather than answered with an empty page, and
-# so is a query that names no application at all. The same question asked
-# with the platform-wide capability an operator holding read:*/* gets is
-# answered, so the refusal is about the capability and not the query.
+# them. It names tenants by canonical id, not by application name, so a
+# reader minted for ${APP_ID}/${ENV_NAME} asking for another application's
+# logs is answered with nothing of it, and a query that names no application
+# at all is refused. The same reader asking for its own application is
+# answered with its lines, and the platform-wide capability an operator
+# holding read:*/* gets is answered for the other application, so the empty
+# page is the capability's doing and not a broken reader.
 check_a_telemetry_reader_sees_only_its_own_tenant() {
   local title="a telemetry read capability for one environment cannot read another application"
 
@@ -186,21 +188,23 @@ check_a_telemetry_reader_sees_only_its_own_tenant() {
       "127.0.0.1:${DEIS_TELEMETRY_PORT}" deis.telemetry.LogService/Query 2>&1 || true
   }
 
-  local reader platform other unnamed operator
+  local reader platform other own unnamed operator
   reader=$(telemetry_token "$ENV_NAME")
   platform=$(telemetry_token --platform)
   other=$(query_logs_as "$reader" "{\"app_id\":\"${CALLEE_APP_ID}\",\"limit\":5}")
+  own=$(query_logs_as "$reader" "{\"app_id\":\"${APP_ID}\",\"limit\":5}")
   unnamed=$(query_logs_as "$reader" '{"limit":5}')
   operator=$(query_logs_as "$platform" "{\"app_id\":\"${CALLEE_APP_ID}\",\"limit\":5}")
 
-  if echo "$other" | grep -q 'Code: PermissionDenied' \
+  if ! echo "$other" | grep -q 'Code:' && ! echo "$other" | grep -q '"entries"' \
+    && echo "$own" | grep -q '"entries"' \
     && echo "$unnamed" | grep -q 'Code: PermissionDenied' \
     && [ -n "$platform" ] && ! echo "$operator" | grep -q 'Code:'; then
     pass_check "$title" \
-      "the reader minted for ${APP_ID}/${ENV_NAME} asked for ${CALLEE_APP_ID}'s logs and was refused ($(echo "$other" | grep -m1 'Message:' | sed 's/^ *Message: *//' | head -c 120)); a query naming no application was refused too. The platform capability asked the same question and was answered"
+      "the reader minted for ${APP_ID}/${ENV_NAME} asked for ${CALLEE_APP_ID}'s logs and got none of them back ($(echo "$other" | tr -d '\n ' | head -c 80)), while the same reader asking for ${APP_ID} got its lines; a query naming no application was refused ($(echo "$unnamed" | grep -m1 'Message:' | sed 's/^ *Message: *//' | head -c 100)). The platform capability asked about ${CALLEE_APP_ID} and was answered"
   else
     fail_check "$title" \
-      "other application: $(echo "$other" | tr '\n' ' ' | head -c 160); no application: $(echo "$unnamed" | tr '\n' ' ' | head -c 120); platform: $(echo "$operator" | tr '\n' ' ' | head -c 120)"
+      "other application: $(echo "$other" | tr '\n' ' ' | head -c 160); own application: $(echo "$own" | tr '\n' ' ' | head -c 80); no application: $(echo "$unnamed" | tr '\n' ' ' | head -c 120); platform: $(echo "$operator" | tr '\n' ' ' | head -c 120)"
   fi
 }
 

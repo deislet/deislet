@@ -7,16 +7,13 @@
 //! actually registered on the server, and that a caller refuses a server the
 //! fleet's authority did not sign for as a store.
 //!
-//! Every call stamps `x-deis-tenant` with an `<app>.<environment>` value,
-//! which is what deis-runtime has to send. The tests below use
-//! `app-one.production` and `app-two.production` as two unrelated tenants,
+//! Every call carries a capability naming one canonical tenant, which is
+//! what deis-runtime sends; nothing in the request names the tenant. The
+//! tests name tenants by label (`app-one.production`, `app-two.production`)
+//! and derive the canonical id from it (`CanonicalTenantId::derived_from_label`),
 //! and one test pairs `app-one.production` with `app-one.preview` to check
 //! that two environments of the *same* application are also two namespaces.
 
-use deis_backend_migration::proto::backend_migration_client::BackendMigrationClient;
-use deis_backend_migration::proto::{
-    AcquireWriteFenceRequest, GetBackendInfoRequest, InspectTenantRequest, ReleaseWriteFenceRequest,
-};
 use deis_capability::{CapabilityClaims, CapabilityResource, KeyRing, encode};
 use deis_identity::{Protocol, ServiceKind};
 use deis_identity_test_pki::TestFleet;
@@ -29,9 +26,10 @@ use deis_store::proto::storage::{
     PrepareRequest, QueryPreparedRequest, QueryRequest, SetRequest,
     database_client::DatabaseClient, kv_store_client::KvStoreClient,
 };
-use deis_store::tenant::{BINDING_HEADER, TENANT_HEADER};
+use deis_store::tenant::BINDING_HEADER;
 use deis_store::{MAX_GRPC_MESSAGE_BYTES, server};
-use deis_wire::conventions::{APP_ID_HEADER, tenant_id};
+use deis_wire::CanonicalTenantId;
+use deis_wire::conventions::tenant_id;
 use ed25519_dalek::SigningKey;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -48,7 +46,47 @@ fn test_signing_key() -> SigningKey {
     SigningKey::from_bytes(&seed)
 }
 
+/// The canonical tenant a test label stands for.
+fn canonical(label: &str) -> String {
+    CanonicalTenantId::derived_from_label(label).to_string()
+}
+
+/// The on-disk key of a test tenant's unnamed namespace.
+fn key_of(label: &str) -> String {
+    deis_wire::DeisletCanonicalTenantKey::new(CanonicalTenantId::derived_from_label(label))
+        .to_string()
+}
+
+/// A store capability naming exactly these raw (tenant, binding) pairs.
+fn make_raw_store_token(resources: &[(&str, &str)]) -> String {
+    let claims = CapabilityClaims::new(
+        "store",
+        "spiffe://deislet/control/main",
+        "spiffe://deislet/node/test-node",
+        1,
+        Duration::from_secs(TOKEN_LIFETIME_SECS),
+        resources
+            .iter()
+            .map(|(tenant, binding)| CapabilityResource {
+                tenant: (*tenant).to_string(),
+                binding: (*binding).to_string(),
+                generation: None,
+            })
+            .collect(),
+    );
+    encode(&claims, &test_signing_key())
+}
+
+/// The control plane these servers poll their revocation list from: a list
+/// signed with the key the tests sign capabilities with.
+fn fake_control() -> &'static deis_capability::testing::FakeControl {
+    static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+        std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| deis_capability::testing::FakeControl::start(test_signing_key()))
+}
+
 fn make_store_token(tenant: &str, binding: &str) -> String {
+    let tenant = canonical(tenant);
     let claims = CapabilityClaims::new(
         "store",
         "spiffe://deislet/control/main",
@@ -67,6 +105,7 @@ fn make_store_token(tenant: &str, binding: &str) -> String {
 /// Create a token that authorises all three storage bindings for one tenant.
 /// This lets any test call KvStore, Database or BlobStore with the same token.
 fn make_store_token_all_bindings(tenant: &str) -> String {
+    let tenant = canonical(tenant);
     let claims = CapabilityClaims::new(
         "store",
         "spiffe://deislet/control/main",
@@ -110,7 +149,7 @@ impl Harness {
     async fn start() -> Self {
         let data = TempDir::new().unwrap();
         let data_dir = data.path().to_path_buf();
-        Self::start_over(Some(data), data_dir, None).await
+        Self::start_over(Some(data), data_dir).await
     }
 
     /// A server that requires a capability token, as any deployment that is
@@ -122,27 +161,16 @@ impl Harness {
     /// A server over a data directory the caller keeps, so the same one can
     /// be served twice.
     async fn start_on(data_dir: &std::path::Path) -> Self {
-        Self::start_over(None, data_dir.to_path_buf(), None).await
+        Self::start_over(None, data_dir.to_path_buf()).await
     }
 
-    async fn start_migration_authenticated(token: &str) -> Self {
-        let data = TempDir::new().unwrap();
-        let data_dir = data.path().to_path_buf();
-        Self::start_over(Some(data), data_dir, Some(token.to_string())).await
-    }
-
-    async fn start_over(
-        owned: Option<TempDir>,
-        data_dir: std::path::PathBuf,
-        migration_admin_token: Option<String>,
-    ) -> Self {
+    async fn start_over(owned: Option<TempDir>, data_dir: std::path::PathBuf) -> Self {
         let config = Config {
             listen: "127.0.0.1:0".to_string(),
             data_dir,
             // Small enough that the size limit is reachable in a test, large
             // enough for the multi-chunk object below.
             max_object_bytes: 8 * 1024 * 1024,
-            migration_admin_token,
             ..Config::default()
         };
         // Bind first, so the port is known before anything is spawned and no
@@ -161,6 +189,7 @@ impl Harness {
                     let _ = rx.await;
                 },
                 keys,
+                fake_control().client(),
                 identity,
             )
             .await
@@ -205,12 +234,6 @@ impl Harness {
             .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
     }
-
-    async fn migration(&self) -> BackendMigrationClient<Channel> {
-        BackendMigrationClient::new(self.channel().await)
-            .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-    }
 }
 
 impl Drop for Harness {
@@ -221,12 +244,9 @@ impl Drop for Harness {
     }
 }
 
-/// Stamp the tenant and a capability token the way deis-runtime will.
+/// Carry a capability for the tenant, the way deis-runtime does.
 fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
     request.metadata_mut().insert(
         AUTHORIZATION,
         format!("Bearer {}", make_store_token_all_bindings(tenant))
@@ -236,27 +256,13 @@ fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
     request
 }
 
-fn as_migration_admin<T>(token: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert("authorization", format!("Bearer {token}").parse().unwrap());
-    request
+/// A call WITHOUT a capability token. Only use this in tests that
+/// deliberately check that calls without tokens are refused.
+fn as_tenant_no_token<T>(_tenant: &str, message: T) -> Request<T> {
+    Request::new(message)
 }
 
-/// Stamp the tenant header WITHOUT a capability token. Only use this
-/// in tests that deliberately check that calls without tokens are refused.
-fn as_tenant_no_token<T>(tenant: &str, message: T) -> Request<T> {
-    let mut request = Request::new(message);
-    request
-        .metadata_mut()
-        .insert(TENANT_HEADER, tenant.parse().unwrap());
-    request
-}
-
-/// Stamp the tenant *and* the binding, the way deis-runtime does for a
-
-/// Stamp the tenant, binding, and capability token.
+/// Carry a capability for the tenant and select a binding inside it.
 fn as_binding<T>(tenant: &str, binding: &str, message: T) -> Request<T> {
     let mut request = as_tenant(tenant, message);
     request
@@ -264,18 +270,22 @@ fn as_binding<T>(tenant: &str, binding: &str, message: T) -> Request<T> {
         .insert(BINDING_HEADER, binding.parse().unwrap());
     request
 }
-/// authorising `binding`, the way deis-runtime will have to.
-///
-/// The two tenants are separate arguments on purpose: presenting a token
-/// minted for one tenant on a call that claims another is exactly the attack
-/// the derivation is meant to defeat, and it has to be expressible here.
+
+/// Carry a capability for `token_tenant` authorising only `binding`. A
+/// `claimed` tenant other than `token_tenant` is stamped in the retired
+/// `x-deis-tenant` header, which the service must ignore.
 fn as_tenant_with_token<T>(
-    tenant: &str,
+    claimed: &str,
     token_tenant: &str,
     binding: &str,
     message: T,
 ) -> Request<T> {
-    let mut request = as_tenant(tenant, message);
+    let mut request = Request::new(message);
+    if claimed != token_tenant {
+        request
+            .metadata_mut()
+            .insert("x-deis-tenant", canonical(claimed).parse().unwrap());
+    }
     request.metadata_mut().insert(
         AUTHORIZATION,
         format!("Bearer {}", make_store_token(token_tenant, binding))
@@ -563,29 +573,37 @@ async fn a_request_without_a_usable_tenant_is_refused() {
         .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
-    for bad in [
-        // Would escape the data directory.
-        "../../etc",
-        // A bare application id: what every caller sent before the tenant
-        // contract. It names no environment, so it names no tenant.
-        "app-one",
-        // Neither too many parts nor an empty one is a tenant.
-        "a.b.c",
-        "app-one.",
+    // A capability whose tenant is not a canonical id, or that names no
+    // tenant or two for the binding, says nothing about whose data the call
+    // is about; the request has nothing that could say it instead.
+    let other = canonical("app-two.production");
+    let mine = canonical("app-one.production");
+    for (what, token) in [
+        ("../../etc", make_raw_store_token(&[("../../etc", "kv")])),
+        (
+            "a name label",
+            make_raw_store_token(&[("app-one.production", "kv")]),
+        ),
+        (
+            "no tenant for kv",
+            make_raw_store_token(&[(mine.as_str(), "sql")]),
+        ),
+        (
+            "two tenants",
+            make_raw_store_token(&[(mine.as_str(), "kv"), (other.as_str(), "kv")]),
+        ),
     ] {
-        let status = kv
-            .get(as_tenant(
-                bad,
-                GetRequest {
-                    key: "greeting".to_string(),
-                },
-            ))
-            .await
-            .unwrap_err();
+        let mut request = Request::new(GetRequest {
+            key: "greeting".to_string(),
+        });
+        request
+            .metadata_mut()
+            .insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        let status = kv.get(request).await.unwrap_err();
         assert_eq!(
             status.code(),
             tonic::Code::PermissionDenied,
-            "{bad} should be refused"
+            "{what} should be refused"
         );
     }
 }
@@ -1401,23 +1419,6 @@ async fn two_environments_of_one_application_share_nothing() {
     }
 }
 
-/// The application header is not the storage tenant. A caller that stamps
-/// only `x-deis-app-id` - which is what every caller did before this change -
-/// is refused rather than served production's data.
-#[tokio::test]
-async fn the_application_header_alone_does_not_identify_a_tenant() {
-    let harness = Harness::start().await;
-    let mut kv = harness.kv().await;
-    let mut request = Request::new(GetRequest {
-        key: "anything".to_string(),
-    });
-    request
-        .metadata_mut()
-        .insert(APP_ID_HEADER, "app-one".parse().unwrap());
-    let status = kv.get(request).await.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::Unauthenticated);
-}
-
 // ---- the capability token, over a real server -------------------------
 //
 // The checks below go through the same interceptor a deployed process runs,
@@ -1533,23 +1534,31 @@ async fn every_service_refuses_a_call_that_carries_no_token() {
 }
 
 #[tokio::test]
-async fn a_token_minted_for_another_tenant_opens_nothing() {
-    // The reason the token is derived from the tenant rather than issued as
-    // one fleet-wide bearer credential: a token that leaked out of one
-    // application must be useless against another, and against another
-    // environment of its own.
+async fn a_tenant_named_in_the_request_opens_nothing() {
+    // The tenant is the one the capability names. A caller holding a token
+    // for its own tenant that also names another one in a header - the
+    // retired `x-deis-tenant` - is served its own data, never the other's.
     let harness = Harness::start_authenticated().await;
     let mine = tenant_id("app-one", "production");
-
-    for claimed in [
+    let mut kv = harness.kv().await;
+    for owner in [
         tenant_id("app-two", "production"),
         tenant_id("app-one", "preview"),
     ] {
-        let status = harness
-            .kv()
-            .await
+        kv.set(as_tenant(
+            &owner,
+            SetRequest {
+                key: "greeting".to_string(),
+                value: owner.as_bytes().to_vec(),
+                ttl_seconds: None,
+                metadata: None,
+            },
+        ))
+        .await
+        .unwrap();
+        let got = kv
             .get(as_tenant_with_token(
-                &claimed,
+                &owner,
                 &mine,
                 "kv",
                 GetRequest {
@@ -1557,12 +1566,9 @@ async fn a_token_minted_for_another_tenant_opens_nothing() {
                 },
             ))
             .await
-            .unwrap_err();
-        assert_eq!(
-            status.code(),
-            tonic::Code::PermissionDenied,
-            "a token for {mine} must not open {claimed}"
-        );
+            .unwrap()
+            .into_inner();
+        assert_eq!(got.value, None, "a token for {mine} must not open {owner}");
     }
 }
 
@@ -1648,6 +1654,7 @@ async fn a_public_bind_still_works_when_authenticated() {
         public,
         async {},
         keys,
+        fake_control().client(),
         fleet.service_identity(ServiceKind::Store),
     )
     .await;
@@ -1733,7 +1740,7 @@ async fn a_named_binding_written_over_the_wire_survives_a_restart() {
     assert!(
         data.path()
             .join("db")
-            .join("shop.production@MEDIA.sqlite")
+            .join(format!("{}@MEDIA.sqlite", key_of("shop.production")))
             .is_file(),
         "a database binding is stored under the namespace, not the tenant: {:?}",
         std::fs::read_dir(data.path().join("db"))
@@ -1744,7 +1751,7 @@ async fn a_named_binding_written_over_the_wire_survives_a_restart() {
     assert!(
         data.path()
             .join("blob")
-            .join("shop.production@MEDIA")
+            .join(format!("{}@MEDIA", key_of("shop.production")))
             .is_dir()
     );
 
@@ -1854,120 +1861,6 @@ async fn a_single_chunk_above_the_message_ceiling_is_refused_not_an_internal_err
         .await
         .unwrap_err();
     assert_eq!(absent.code(), tonic::Code::NotFound);
-}
-
-#[tokio::test]
-async fn migration_management_is_absent_by_default_and_independently_authenticated() {
-    const ADMIN: &str = "migration-admin-token-000000000000000001";
-    const MIGRATION: &str = "01990f44-1000-7000-8000-000000000050";
-    const FENCE: &str = "migration-fence-token-00000000000000001";
-    const UNKNOWN_INCARNATION: &str = "01990f44-1000-7000-8000-000000000099";
-    let request = |backend_incarnation_id: &str| AcquireWriteFenceRequest {
-        tenant: "shop.production".to_string(),
-        migration_id: MIGRATION.to_string(),
-        expected_application_revision: 3,
-        fence_token: FENCE.to_string(),
-        expected_backend_incarnation_id: backend_incarnation_id.to_string(),
-    };
-
-    let without_management = Harness::start().await;
-    let error = without_management
-        .migration()
-        .await
-        .acquire_write_fence(Request::new(request(UNKNOWN_INCARNATION)))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::Unimplemented);
-    drop(without_management);
-
-    let harness = Harness::start_migration_authenticated(ADMIN).await;
-    let mut migration = harness.migration().await;
-    let backend_info = migration
-        .get_backend_info(as_migration_admin(ADMIN, GetBackendInfoRequest {}))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(backend_info.backend, "deis-store");
-    let backend_incarnation_id = backend_info.backend_incarnation_id;
-    let mut application_credential = Request::new(request(&backend_incarnation_id));
-    application_credential
-        .metadata_mut()
-        .insert(AUTHORIZATION, "Bearer not-an-admin-token".parse().unwrap());
-    assert_eq!(
-        migration
-            .acquire_write_fence(application_credential)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Unauthenticated
-    );
-    let receipt = migration
-        .acquire_write_fence(as_migration_admin(ADMIN, request(&backend_incarnation_id)))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(receipt.tenant, "shop.production");
-    assert_eq!(receipt.receipt_sha256.len(), 64);
-
-    let error = harness
-        .kv()
-        .await
-        .set(as_tenant_with_token(
-            "shop.production",
-            "shop.production",
-            "kv",
-            SetRequest {
-                key: "blocked".to_string(),
-                value: b"value".to_vec(),
-                ttl_seconds: None,
-                metadata: None,
-            },
-        ))
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-
-    let inventory = migration
-        .inspect_tenant(as_migration_admin(
-            ADMIN,
-            InspectTenantRequest {
-                tenant: "shop.production".to_string(),
-            },
-        ))
-        .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(inventory.backend, "deis-store");
-    assert_eq!(inventory.components.len(), 3);
-
-    let stale = ReleaseWriteFenceRequest {
-        tenant: "shop.production".to_string(),
-        migration_id: MIGRATION.to_string(),
-        expected_application_revision: 3,
-        fence_token: "different-fence-token-00000000000000002".to_string(),
-        expected_backend_incarnation_id: backend_incarnation_id.clone(),
-    };
-    assert_eq!(
-        migration
-            .release_write_fence(as_migration_admin(ADMIN, stale))
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::Aborted
-    );
-    migration
-        .release_write_fence(as_migration_admin(
-            ADMIN,
-            ReleaseWriteFenceRequest {
-                tenant: "shop.production".to_string(),
-                migration_id: MIGRATION.to_string(),
-                expected_application_revision: 3,
-                fence_token: FENCE.to_string(),
-                expected_backend_incarnation_id: backend_incarnation_id,
-            },
-        ))
-        .await
-        .unwrap();
 }
 
 /// The transport half of the store's contract: a caller that trusts this

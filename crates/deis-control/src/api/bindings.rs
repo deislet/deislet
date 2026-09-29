@@ -73,7 +73,7 @@
 //! the control plane that accepted it, and neither a deploy nor a rollback
 //! runs this gate again, so rolling a control plane back never makes an
 //! accepted version undeployable. Today no such kind exists; the gate is here
-//! so that the day one does, the older control plane fails closed.
+//! so that the day one does, a control plane that predates it fails closed.
 
 use deis_bundle::{BindingKind, Manifest, ServiceEnvironment};
 
@@ -261,9 +261,9 @@ mod tests {
     use crate::identity::{Authority, PrincipalKind, Role, Scope};
 
     fn manifest_with(bindings: &str) -> Manifest {
-        Manifest::parse(&format!(
-            r#"{{"schema":1,"app":"frontend","entry":"worker/index.js","bindings":{bindings}}}"#
-        ))
+        Manifest::parse(&deis_bundle::complete_manifest_json(&format!(
+            r#"{{"app":"frontend","entry":"worker/index.js","bindings":{bindings}}}"#
+        )))
         .expect("the manifest itself is valid")
     }
 

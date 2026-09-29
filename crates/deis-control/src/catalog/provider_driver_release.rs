@@ -14,11 +14,12 @@ use chrono::{DateTime, Utc};
 use deis_provider_driver::{
     DriverInstallationError, DriverReleaseInstaller, DriverWorkspaceRoot, ExecutableProviderDriver,
     ExecutableProviderDriverConfig, HostOperatingSystem, InstalledDriverRelease,
-    ProviderCredentialBroker, Sha256Digest, ValidatedDriverReleaseAuthorization,
-    ValidatedDriverReleaseTransparencyProof, ValidatedDriverReleaseTrustRoot,
-    ValidatedDriverTrustRootRotation, ValidatedProviderDriverManifest,
-    ValidatedProviderDriverRelease, VerifiedDriverReleaseAuthorization,
-    VerifiedDriverReleaseTransparencyProof, VerifiedDriverTrustRootRotation,
+    OperationInputSource, ProviderCredentialBroker, Sha256Digest,
+    ValidatedDriverReleaseAuthorization, ValidatedDriverReleaseTransparencyProof,
+    ValidatedDriverReleaseTrustRoot, ValidatedDriverTrustRootRotation,
+    ValidatedProviderDriverManifest, ValidatedProviderDriverRelease,
+    VerifiedDriverReleaseAuthorization, VerifiedDriverReleaseTransparencyProof,
+    VerifiedDriverTrustRootRotation,
 };
 use deis_wire::CanonicalId;
 use rusqlite::types::Value;
@@ -108,6 +109,8 @@ pub fn driver_process_config() -> ExecutableProviderDriverConfig {
 pub struct ProviderDriverDispatcher {
     registry: ProviderDriverReleaseRegistry,
     credential_broker: Arc<dyn ProviderCredentialBroker>,
+    /// Each operation's config values, secret values and purge consent.
+    inputs: Arc<dyn OperationInputSource>,
     /// Where every driver process gets its verified payload and state.
     workspaces: DriverWorkspaceRoot,
     process_config: ExecutableProviderDriverConfig,
@@ -230,13 +233,6 @@ impl ProviderDriverReleaseRegistry {
                                 "provider driver trust root bootstrap cannot use an unverifiable rotation envelope",
                             ));
                         }
-                        if trust_root.uses_legacy_implicit_root_role()
-                            || trust_root.uses_legacy_missing_transparency_policy()
-                        {
-                            return Err(CatalogError::conflict(
-                                "provider driver trust root bootstrap requires an explicit root role and transparency policy",
-                            ));
-                        }
                         insert_trust_root(
                             &transaction,
                             root_version,
@@ -278,7 +274,7 @@ impl ProviderDriverReleaseRegistry {
                                 "provider driver trust root versions must advance exactly once",
                             ));
                         }
-                        let previous_root = ValidatedDriverReleaseTrustRoot::parse_json_compatible(
+                        let previous_root = ValidatedDriverReleaseTrustRoot::parse_json(
                             highest_json.as_bytes(),
                         )
                         .map_err(|error| {
@@ -911,8 +907,8 @@ fn validate_trust_root_transition(
     let mut permanently_revoked_key_ids = BTreeSet::new();
 
     for root_json in historical_root_json {
-        let root = ValidatedDriverReleaseTrustRoot::parse_json_compatible(root_json.as_bytes())
-            .map_err(|error| {
+        let root =
+            ValidatedDriverReleaseTrustRoot::parse_json(root_json.as_bytes()).map_err(|error| {
                 CatalogError::invalid(format!(
                     "invalid durable provider driver trust root: {error}"
                 ))
@@ -1044,9 +1040,12 @@ fn validate_trust_root_transition(
 }
 
 impl ProviderDriverDispatcher {
+    /// `inputs` supplies each operation's config values, secret values and
+    /// purge consent; see [`crate::catalog::CatalogOperationInputs`].
     pub fn new(
         registry: ProviderDriverReleaseRegistry,
         credential_vault: Arc<CatalogProviderCredentialVault>,
+        inputs: Arc<dyn OperationInputSource>,
         workspaces: DriverWorkspaceRoot,
         process_config: ExecutableProviderDriverConfig,
     ) -> CatalogResult<Self> {
@@ -1062,6 +1061,7 @@ impl ProviderDriverDispatcher {
         Ok(Self {
             registry,
             credential_broker,
+            inputs,
             workspaces,
             process_config,
         })
@@ -1083,6 +1083,7 @@ impl ProviderDriverDispatcher {
     ) -> CatalogResult<ExecutableProviderDriver> {
         let resolved = self.registry.resolve_for_target(target_id).await?;
         let credential_broker = Arc::clone(&self.credential_broker);
+        let inputs = Arc::clone(&self.inputs);
         let workspaces = self.workspaces.clone();
         let process_config = self.process_config;
         tokio::task::spawn_blocking(move || {
@@ -1090,6 +1091,7 @@ impl ProviderDriverDispatcher {
                 resolved.manifest,
                 resolved.installed,
                 credential_broker,
+                inputs,
                 workspaces,
                 process_config,
             )
@@ -2678,196 +2680,6 @@ pub(crate) mod tests {
         assert_eq!(fs::read_dir(&fixture.install_root).unwrap().count(), 0);
     }
 
-    #[tokio::test]
-    async fn legacy_root_history_can_restart_and_rotate_but_cannot_bootstrap() {
-        let fixture = Fixture::new();
-        let mut legacy_value = serde_json::to_value(fixture.trust_root.get()).unwrap();
-        legacy_value.as_object_mut().unwrap().remove("root");
-        legacy_value
-            .as_object_mut()
-            .unwrap()
-            .remove("providerDriverTransparency");
-        let legacy_json = serde_jcs::to_vec(&legacy_value).unwrap();
-        let legacy_root =
-            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&legacy_json).unwrap();
-        assert!(legacy_root.uses_legacy_implicit_root_role());
-
-        let bootstrap_database = Arc::new(
-            Database::init(fixture.temporary.path().join("legacy-bootstrap.sqlite"))
-                .await
-                .unwrap(),
-        );
-        let bootstrap_error = ProviderDriverReleaseRegistry::new(
-            CatalogStore::new(bootstrap_database),
-            &fixture.install_root,
-            legacy_root.clone(),
-            None,
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(bootstrap_error.to_string().contains("explicit root role"));
-
-        let database = Arc::new(
-            Database::init(fixture.temporary.path().join("legacy-upgrade.sqlite"))
-                .await
-                .unwrap(),
-        );
-        let root_version = i64::try_from(legacy_root.get().root_version).unwrap();
-        let root_digest = legacy_root.canonical_sha256().to_string();
-        let root_json = String::from_utf8(legacy_root.canonical_json().unwrap()).unwrap();
-        let expires_at = legacy_root.get().expires_at.timestamp();
-        database
-            .with_connection(move |connection| {
-                connection.execute(
-                    "INSERT INTO provider_driver_trust_roots
-                       (root_version, root_sha256, root_json, expires_at,
-                        first_seen_at, last_seen_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![root_version, root_digest, root_json, expires_at, now_secs()],
-                )?;
-                Ok::<(), crate::database::DatabaseError>(())
-            })
-            .await
-            .unwrap();
-        let store = CatalogStore::new(Arc::clone(&database));
-        ProviderDriverReleaseRegistry::new(store.clone(), &fixture.install_root, legacy_root, None)
-            .await
-            .unwrap();
-
-        let mut next_root = fixture.trust_root.get().clone();
-        next_root.root_version = 2;
-        next_root.expires_at += TimeDelta::days(30);
-        let rotation = signed_root_rotation_with_seeds(next_root.clone(), &[29, 23]);
-        ProviderDriverReleaseRegistry::new(
-            store,
-            &fixture.install_root,
-            ValidatedDriverReleaseTrustRoot::new(next_root).unwrap(),
-            Some(rotation),
-        )
-        .await
-        .unwrap();
-        let versions: (i64, i64) = database
-            .with_connection(|connection| {
-                Ok::<(i64, i64), crate::database::DatabaseError>((
-                    connection.query_row(
-                        "SELECT count(*) FROM provider_driver_trust_roots",
-                        [],
-                        |row| row.get(0),
-                    )?,
-                    connection.query_row(
-                        "SELECT count(*) FROM provider_driver_trust_root_rotations",
-                        [],
-                        |row| row.get(0),
-                    )?,
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!(versions, (2, 1));
-    }
-
-    #[tokio::test]
-    async fn pre_transparency_explicit_root_can_only_restart_and_rotate() {
-        let fixture = Fixture::new();
-        let mut legacy_value = serde_json::to_value(fixture.trust_root.get()).unwrap();
-        legacy_value
-            .as_object_mut()
-            .unwrap()
-            .remove("providerDriverTransparency");
-        let legacy_json = serde_jcs::to_vec(&legacy_value).unwrap();
-        assert!(ValidatedDriverReleaseTrustRoot::parse_json(&legacy_json).is_err());
-        let legacy_root =
-            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&legacy_json).unwrap();
-        assert!(!legacy_root.uses_legacy_implicit_root_role());
-        assert!(legacy_root.uses_legacy_missing_transparency_policy());
-        assert_eq!(legacy_root.canonical_json().unwrap(), legacy_json);
-
-        let bootstrap_database = Arc::new(
-            Database::init(
-                fixture
-                    .temporary
-                    .path()
-                    .join("pre-transparency-bootstrap.sqlite"),
-            )
-            .await
-            .unwrap(),
-        );
-        let bootstrap_error = ProviderDriverReleaseRegistry::new(
-            CatalogStore::new(bootstrap_database),
-            &fixture.install_root,
-            legacy_root.clone(),
-            None,
-        )
-        .await
-        .err()
-        .unwrap();
-        assert!(bootstrap_error.to_string().contains("transparency policy"));
-
-        let database = Arc::new(
-            Database::init(
-                fixture
-                    .temporary
-                    .path()
-                    .join("pre-transparency-upgrade.sqlite"),
-            )
-            .await
-            .unwrap(),
-        );
-        let root_version = i64::try_from(legacy_root.get().root_version).unwrap();
-        let root_digest = legacy_root.canonical_sha256().to_string();
-        let root_json = String::from_utf8(legacy_root.canonical_json().unwrap()).unwrap();
-        let expires_at = legacy_root.get().expires_at.timestamp();
-        database
-            .with_connection(move |connection| {
-                connection.execute(
-                    "INSERT INTO provider_driver_trust_roots
-                       (root_version, root_sha256, root_json, expires_at,
-                        first_seen_at, last_seen_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                    params![root_version, root_digest, root_json, expires_at, now_secs()],
-                )?;
-                Ok::<(), crate::database::DatabaseError>(())
-            })
-            .await
-            .unwrap();
-        let store = CatalogStore::new(Arc::clone(&database));
-        ProviderDriverReleaseRegistry::new(store.clone(), &fixture.install_root, legacy_root, None)
-            .await
-            .unwrap();
-
-        let mut next_root = fixture.trust_root.get().clone();
-        next_root.root_version = 2;
-        next_root.expires_at += TimeDelta::days(30);
-        let rotation = signed_root_rotation(next_root.clone());
-        ProviderDriverReleaseRegistry::new(
-            store,
-            &fixture.install_root,
-            ValidatedDriverReleaseTrustRoot::new(next_root).unwrap(),
-            Some(rotation),
-        )
-        .await
-        .unwrap();
-        let counts: (i64, i64) = database
-            .with_connection(|connection| {
-                Ok::<(i64, i64), crate::database::DatabaseError>((
-                    connection.query_row(
-                        "SELECT count(*) FROM provider_driver_trust_roots",
-                        [],
-                        |row| row.get(0),
-                    )?,
-                    connection.query_row(
-                        "SELECT count(*) FROM provider_driver_trust_root_rotations",
-                        [],
-                        |row| row.get(0),
-                    )?,
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!(counts, (2, 1));
-    }
-
     #[test]
     fn retained_transparency_keys_cannot_change_operator_identity() {
         let fixture = Fixture::new();
@@ -3237,6 +3049,7 @@ pub(crate) mod tests {
         let dispatcher = ProviderDriverDispatcher::new(
             registry.clone(),
             Arc::clone(&vault),
+            Arc::new(deis_provider_driver::NoOperationInputs),
             crate::catalog::provider_payload::test_workspaces(),
             ExecutableProviderDriverConfig::default(),
         )
@@ -3368,40 +3181,16 @@ pub(crate) mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    #[cfg(windows)]
-    fn make_install_root_private(path: &Path) {
-        deis_provider_driver::test_support::set_windows_private_acl(path, true, false, true)
-            .unwrap();
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn make_install_root_private(_path: &Path) {}
-
     #[cfg(unix)]
     fn make_file_writable(path: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    #[cfg(windows)]
-    fn make_file_writable(path: &Path) {
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        permissions.set_readonly(false);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
     #[cfg(unix)]
     fn make_installed_file_read_only(path: &Path) {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
-    }
-
-    #[cfg(windows)]
-    fn make_installed_file_read_only(path: &Path) {
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(path, permissions).unwrap();
     }
 
     fn make_writable_for_cleanup(root: &Path) {
@@ -3426,15 +3215,5 @@ pub(crate) mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = if directory { 0o700 } else { 0o600 };
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
-    }
-
-    #[cfg(windows)]
-    fn make_cleanup_entry_writable(path: &Path, _directory: bool) {
-        if let Ok(metadata) = fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = fs::set_permissions(path, permissions);
-        }
     }
 }

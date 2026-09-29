@@ -1,10 +1,9 @@
 //! Deislet message queue.
 //!
-//! This service is deliberately "dumb": one tenant dimension, carried in the
-//! `x-deis-tenant` header, and no idea what a version, an environment, a
+//! This service is deliberately "dumb": one tenant dimension, named by the
+//! capability a call carries, and no idea what a version, an environment, a
 //! deployment or a node is. Those concepts live in deis-control and
-//! deis-runtime, which is also where the tenant id is built - here it is one
-//! opaque key. Consumers come to it and lease work; it never pushes to
+//! deis-runtime - here the tenant is one opaque key. Consumers come to it and lease work; it never pushes to
 //! anyone.
 //!
 //! Who a caller is allowed to be, it does check: a call carries a capability
@@ -67,8 +66,16 @@ async fn main() -> Result<()> {
         None | Some(Command::Serve) => {
             let (identity, control) = server::machine_identity(&config)?;
             let listener = server::bind(&config).await?;
-            let keys = capability_keys(control);
-            server::serve(config, listener, server::shutdown_signal(), keys, identity).await
+            let keys = capability_keys(control.clone());
+            server::serve(
+                config,
+                listener,
+                server::shutdown_signal(),
+                keys,
+                control,
+                identity,
+            )
+            .await
         }
         Some(Command::Snapshot { out }) => {
             let manifest = snapshot::take(&config.data_dir, &out).with_context(|| {

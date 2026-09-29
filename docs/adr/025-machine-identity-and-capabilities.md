@@ -197,7 +197,7 @@ Capability 默认 5 分钟、最长 15 分钟，不使用长期 refresh token。
 
 ### 实现现状：签发记录、吊销与 T8（2026-09）
 
-- **签发记录**：control 签出的每个 capability（节点经 `IssueCapability`、人类经 `/storage-token`、control 自己调 queue）在交出之前写入 `capability_issuances` 与 `capability_issuance_resources`（迁移 `0005_capability_issuances.sql`：`jti`、subject、node id、audience、`kid`、auth epoch、`iat`/`exp`、每个 tenant/binding/generation）；写不进去就不签发。这是本 ADR `machine_capability_issuances` 的第一步，尚无 `cnf` 与状态列。
+- **签发记录**：control 签出的每个 capability（节点经 `IssueCapability`、人类经 `/storage-token`、control 自己调 queue）在交出之前写入 `capability_issuances` 与 `capability_issuance_resources`（基线迁移 `0001_baseline.sql`：`jti`、subject、node id、audience、`kid`、auth epoch、`iat`/`exp`、每个 tenant/binding/generation）；写不进去就不签发。这是本 ADR `machine_capability_issuances` 的第一步，尚无 `cnf` 与状态列。
 - **节点签发范围**：`IssueCapability` 只签节点实际运行的 tenant：audience 必须是按 tenant 校验 binding 的（store、queue、telemetry），每个 resource 的 tenant 必须来自 `deployments_visible_to(node)`，binding 必须属于该 audience，generation（若给出）必须是该 deployment 的 routing generation；telemetry 只签 `ingest`（节点运行的 tenant，外加总可申请的 `@platform`），任何 `read` 都拒绝；任何一条不满足就整体拒绝并写审计 `capability.issue`。`deployments_visible_to` 只把当前 assignment 给在 fleet 中的节点（已注册或静态配置），进行中的 plan 按 `target_ids`。
 - **吊销**：owner API 按 `jti`、按节点、按 tenant 吊销（从签发表找出仍可能被接受的 `jti`，写入 `capability_revocations`，带其 `exp`），或递增 `auth_epoch` 做批量吊销；另有解除节点吊销的入口；五个入口都是 `Verb::Admin`、全部写审计。
 - **按 principal 吊销节点**：只收回节点当时持有的 `jti` 撑不过它的下一次续签，所以按节点吊销同时把节点本身写进 `revoked_nodes`，直到管理员解除（`DELETE /api/v1/capabilities/revocations/nodes/{node_id}`）。期间 control 把它移出 fleet，machine channel 对它只接受注销，注册、assignment、路由表、secret、`IssueCapability` 一律 `PermissionDenied`（后两者写审计）；签名的吊销名单带上 `revoked_nodes`，校验方拒绝 `sub` 为该节点 SPIFFE 名的**任何** capability——吊销前刚签的、离线缓存里的、T8 宽限期内的过期 token 都在内。平台无法区分同一名字的不同证书，因此只应在被泄露的私钥再也证明不了这个名字（它持有的证书全部过期）之后解除，或换一个 node id 重建机器。
@@ -205,7 +205,7 @@ Capability 默认 5 分钟、最长 15 分钟，不使用长期 refresh token。
 - **吊销名单**：只在 machine listener 上提供（`/capability/revocation-list`），内容是未过期（含 120 秒余量，覆盖 T8 的 `exp ≥ last_sync − skew` 边界）的吊销 `jti`、全部被吊销的节点与当前 `auth_epoch`，**用签发密钥签名**（与 capability 同一 `v1.<payload>.<sig>` 格式，payload 带 `typ = "deis-revocation-list"`，二者互不可冒充）。store、queue、telemetry 用各自的 `[machine_identity]` 经 mTLS 从 machine channel 拉取（与拉 JWKS 同一个 `ControlClient`、同一个 `control_endpoint`，http 只允许 loopback），每 30 秒一次；校验方用同一 JWKS 验签，拒绝早于两分钟、来自未来或早于上一份的名单（防重放），epoch 只升不降。store 的 kv/sql/blob 共用一个校验器，同一份名单三者一起生效。
 - **T8 节点判定**：宽限只给 subject 为节点 SPIFFE 名（`spiffe://<trust domain>/deislet/node/<id>`，由 `deis-identity` 解析）的 capability，且 trust domain 必须与校验方自身 machine identity 的一致（store、queue、telemetry 启动时设置）。
 - **重启语义**：校验方在 control 不可达时重启，没有 last sync，也没有公钥（JWKS 不落盘），因此拒绝一切 capability，指标报告 degraded。不持久化 last sync：单独持久化它会让宽限期接受在那次同步里已被吊销的 capability。
-- **指标**：`deis_auth_degraded`、`deis_auth_degraded_since_seconds`、`deis_auth_grace_accepted_total`、`deis_auth_revocation_last_sync_seconds`，label `service`。
+- **指标**：`deis_auth_degraded`、`deis_auth_degraded_since_seconds`、`deis_auth_grace_accepted_total`、`deis_auth_revocation_last_sync_seconds`，label `service`；`deis_auth_grace_accepted_total` 另带 `tenant`（被宽限接受的 capability 所指的租户）。
 
 ## Dual 到 Strict 的滚动顺序
 

@@ -251,9 +251,9 @@ mod tests {
         // Ignored is not unsaid. `crate::forward` is what names it, and a
         // misspelling reaches an author through the same line.
         assert_eq!(
-            crate::forward::unknown_fields(
-                r#"{"schema":1,"app":"d","entry":"e.js","limits":{"timeout_millis":1500}}"#
-            ),
+            crate::forward::unknown_fields(&crate::complete_manifest_json(
+                r#"{"app":"d","entry":"e.js","limits":{"timeout_millis":1500}}"#
+            )),
             vec!["limits.timeout_millis".to_string()]
         );
     }

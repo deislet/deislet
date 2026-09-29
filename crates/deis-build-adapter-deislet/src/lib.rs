@@ -22,10 +22,10 @@
 //!   so the same input has to produce the same bytes. See [`archive`].
 //!
 
-/// The `--vendor` value this adapter answers for.
+/// The `--target` value this adapter answers for.
 ///
-/// One adapter per vendor, and the crate is named after the value it serves:
-/// `deis build --vendor deislet` is served by `deis-build-adapter-deislet`.
+/// One adapter per target, and the crate is named after the value it serves:
+/// `deis build --target deislet` is served by `deis-build-adapter-deislet`.
 /// `deis-build` dispatches on this string, so it and the crate name are the
 /// same fact written twice; `the_crate_is_named_after_the_vendor` below fails
 /// if they stop agreeing.
@@ -42,9 +42,7 @@ pub use archive::{bundle_sha256, write_bundle, BUNDLE_FILE_NAME};
 pub use assets::{collect_assets, StagedAsset};
 pub use deis_build_core::routes::{QUEUE_HANDLER_STEM, SCHEDULED_HANDLER_STEM};
 pub use entry::generate_entry_module;
-pub use manifest::{
-    build_manifest, build_manifest_with_environment, RUNTIME_PROFILE, WORKER_ENTRY,
-};
+pub use manifest::{build_manifest, RUNTIME_PROFILE, WORKER_ENTRY};
 pub use routing::{plan_routes, RouteEntry, RoutePlan};
 pub use site::{build_site_config, is_site_file};
 
@@ -82,7 +80,6 @@ pub fn generate(
     Ok(AdapterArtifacts {
         router_code: generate_entry_module(&plan),
         context_builder_code: String::new(),
-        kv_adapter_code: None,
         config_files: Vec::new(),
         support_files: vec![(
             "edge-canon-runtime.js".to_string(),

@@ -450,7 +450,8 @@ check_a_fleet_certificate_only_speaks_for_the_machine_it_names() {
 
 # What a node may be issued. A node asks IssueCapability in its own name, and
 # is given a capability only for tenants of deployments assigned to it: the
-# node running this demo gets one for ${APP_ID}.${ENV_NAME}, and the same
+# node running this demo gets one for the canonical tenant of
+# ${APP_ID}/${ENV_NAME}, and the same
 # certificate asking for a tenant it does not run is refused - so a
 # compromised node cannot mint its way into another tenant's data. For
 # deis-telemetry it may push, never read. Each refusal is in the audit log.
@@ -476,20 +477,23 @@ check_a_node_cannot_mint_for_a_tenant_it_does_not_run() {
       deis.machine.MachineChannel/IssueCapability 2>&1 || true
   }
 
-  local own foreign read audited
-  own=$(issue_as_node store "${APP_ID}.${ENV_NAME}" kv)
-  foreign=$(issue_as_node store "not-deployed-here.${ENV_NAME}" kv)
+  # A well-formed canonical tenant no application in this catalog has.
+  local foreign_tenant="v1/01a0e9bb-0000-7000-8000-00000000f0f0/01a0e9bb-0000-7000-8000-00000000f0f1"
+  local own_tenant own foreign read audited
+  own_tenant=$(canonical_tenant)
+  own=$(issue_as_node store "$own_tenant" kv)
+  foreign=$(issue_as_node store "$foreign_tenant" kv)
   read=$(issue_as_node telemetry "${APP_ID}.${ENV_NAME}" read)
   audited=$(deis_cli audit --action capability.issue --limit 50 --json 2>/dev/null \
-    | jq -r '[.entries[]? | select(.detail // "" | contains("not-deployed-here"))] | length' 2>/dev/null || echo 0)
+    | jq -r --arg t "$foreign_tenant" '[.entries[]? | select(.detail // "" | contains($t))] | length' 2>/dev/null || echo 0)
 
   if echo "$own" | grep -q 'capabilityToken' \
     && echo "$foreign" | grep -q 'Code: PermissionDenied' \
-    && echo "$foreign" | grep -q 'not-deployed-here' \
+    && echo "$foreign" | grep -qF "$foreign_tenant" \
     && echo "$read" | grep -q 'Code: PermissionDenied' \
     && [ "${audited:-0}" -ge 1 ]; then
     pass_check "$title" \
-      "${NODE_ID}'s own certificate was issued a store capability for ${APP_ID}.${ENV_NAME}, which it runs; asking for not-deployed-here.${ENV_NAME} was refused ($(echo "$foreign" | grep -m1 'Message:' | sed 's/^ *Message: *//' | head -c 140)) and written to the audit log as capability.issue; asking for a telemetry read of its own tenant was refused too - a node pushes telemetry and reads none"
+      "${NODE_ID}'s own certificate was issued a store capability for ${own_tenant} (${APP_ID}/${ENV_NAME}), which it runs; asking for ${foreign_tenant}, which no deployment on it has, was refused ($(echo "$foreign" | grep -m1 'Message:' | sed 's/^ *Message: *//' | head -c 140)) and written to the audit log as capability.issue; asking for a telemetry read of its own tenant was refused too - a node pushes telemetry and reads none"
   else
     fail_check "$title" \
       "own tenant: $(echo "$own" | tr '\n' ' ' | head -c 120); foreign tenant: $(echo "$foreign" | tr '\n' ' ' | head -c 160); telemetry read: $(echo "$read" | tr '\n' ' ' | head -c 120); audited refusals: ${audited:-0}"

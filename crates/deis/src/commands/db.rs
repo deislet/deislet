@@ -25,9 +25,9 @@ use crate::settings::Overrides;
 pub struct QueryArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub sql: String,
     /// One per `?` placeholder, in order. Each is parsed as JSON when it
@@ -99,9 +99,9 @@ pub async fn query(args: QueryArgs, output: Output) -> Result<()> {
 pub struct ExecuteArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub sql: String,
     pub params: Vec<String>,

@@ -43,30 +43,36 @@ impl CanonicalTenantId {
         self.environment_id
     }
 
-    /// Decode the additive two-field form used by protobuf and legacy-tolerant
-    /// JSON contracts.
-    ///
-    /// Both empty means an older producer and is accepted as `None`.  One
-    /// field without the other is refused: guessing would bind an application
-    /// to an authority the producer never named.
+    /// A tenant derived deterministically from `label`, for fixtures and
+    /// tests; see [`CanonicalId::derived_from_label`].
+    #[must_use]
+    pub fn derived_from_label(label: &str) -> Self {
+        Self::new(
+            CanonicalId::derived_from_label(&format!("{label}/application")),
+            CanonicalId::derived_from_label(&format!("{label}/environment")),
+        )
+    }
+
+    /// Decode the two-field form protobuf messages carry. Both fields are
+    /// required: guessing either half would bind an application to an
+    /// authority the producer never named.
     pub fn from_wire_fields(
         application_id: &str,
         environment_id: &str,
-    ) -> Result<Option<Self>, CanonicalTenantIdError> {
-        match (application_id.is_empty(), environment_id.is_empty()) {
-            (true, true) => Ok(None),
-            (true, false) => Err(CanonicalTenantIdError::MissingApplicationId),
-            (false, true) => Err(CanonicalTenantIdError::MissingEnvironmentId),
-            (false, false) => {
-                let application_id = application_id
-                    .parse()
-                    .map_err(CanonicalTenantIdError::InvalidApplicationId)?;
-                let environment_id = environment_id
-                    .parse()
-                    .map_err(CanonicalTenantIdError::InvalidEnvironmentId)?;
-                Ok(Some(Self::new(application_id, environment_id)))
-            }
+    ) -> Result<Self, CanonicalTenantIdError> {
+        if application_id.is_empty() {
+            return Err(CanonicalTenantIdError::MissingApplicationId);
         }
+        if environment_id.is_empty() {
+            return Err(CanonicalTenantIdError::MissingEnvironmentId);
+        }
+        let application_id = application_id
+            .parse()
+            .map_err(CanonicalTenantIdError::InvalidApplicationId)?;
+        let environment_id = environment_id
+            .parse()
+            .map_err(CanonicalTenantIdError::InvalidEnvironmentId)?;
+        Ok(Self::new(application_id, environment_id))
     }
 }
 
@@ -93,8 +99,10 @@ impl FromStr for CanonicalTenantId {
         if environment_id.contains('/') {
             return Err(CanonicalTenantIdError::InvalidGrammar);
         }
-        Self::from_wire_fields(application_id, environment_id)?
-            .ok_or(CanonicalTenantIdError::InvalidGrammar)
+        if application_id.is_empty() || environment_id.is_empty() {
+            return Err(CanonicalTenantIdError::InvalidGrammar);
+        }
+        Self::from_wire_fields(application_id, environment_id)
     }
 }
 
@@ -187,11 +195,13 @@ mod tests {
     }
 
     #[test]
-    fn additive_wire_fields_accept_only_both_or_neither() {
-        assert_eq!(CanonicalTenantId::from_wire_fields("", "").unwrap(), None);
+    fn wire_fields_require_both_halves() {
+        assert_eq!(
+            CanonicalTenantId::from_wire_fields("", "").unwrap_err(),
+            CanonicalTenantIdError::MissingApplicationId
+        );
         assert_eq!(
             CanonicalTenantId::from_wire_fields(APP, ENV)
-                .unwrap()
                 .unwrap()
                 .to_string(),
             format!("v1/{APP}/{ENV}")

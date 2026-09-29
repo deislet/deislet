@@ -1900,7 +1900,7 @@ mod what_the_cache_refuses_to_store {
     /// An application that opens a cache under a name it took from a request
     /// -- a tenant, a locale, a path segment -- would otherwise hand a caller
     /// who sent the name "default" the namespace every other part of the
-    /// application writes to through `context.services.cache`.
+    /// application writes to through `caches.default`.
     #[tokio::test]
     async fn the_default_cache_cannot_be_opened_by_name() {
         let code = r#"

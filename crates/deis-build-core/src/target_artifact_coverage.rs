@@ -17,7 +17,7 @@ pub enum Platform {
     Deno,
     Tencent,
     /// The platform this toolchain is part of: deis-runtime executing a bundle
-    /// produced by `deis build --vendor deislet`.
+    /// produced by `deis build --target deislet`.
     Deislet,
 }
 

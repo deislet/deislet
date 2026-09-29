@@ -14,7 +14,7 @@
     "$schema": {"type": "string"},
     "schemaVersion": {"const": 1},
     "operationId": {"$ref": "#/$defs/canonicalId"},
-    "kind": {"enum": ["build", "provision", "deploy", "promote", "rollback", "migrate", "export", "delete", "restore", "purge", "provider"]},
+    "kind": {"enum": ["build", "provision", "deploy", "promote", "rollback", "export", "delete", "restore", "purge", "provider"]},
     "scope": {
       "type": "object", "additionalProperties": false,
       "required": ["organizationId", "applicationId", "environmentId"],

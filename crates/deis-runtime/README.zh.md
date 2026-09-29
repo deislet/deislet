@@ -19,11 +19,10 @@ English: [README.md](README.md)。
   占位符进 `context.params`。
 - **消费队列、执行 cron**。按 manifest 声明的每个队列轮询 deis-queue，把消息交给应用
   的 `queue` 导出；cron 每次到点由控制面挑一个节点触发，跑 `scheduled` 导出。
-- **主动连控制面**。启动时先登记自己，再要一份自己的清单，逐个用 HTTP 把包下下来、
-  校验 sha256、装好，全部装好之后才报 healthy。之后新的部署以 gRPC 推送到达。那两条
-  HTTP 路径是 `deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`，
-  两条都要带节点凭据（`[control] secret`）——清单里带着解密后的密钥。这把凭据是整支
-  机队共用的一把，而本节点的数据端口本身就是一道信任边界，两件事都写在
+- **主动连控制面**。启动时用本节点自己的证书经双向 TLS 拨机队通道
+  （`deis.machine.MachineChannel`，gRPC），登记自己，再要一份自己的清单，逐个把包下下来、
+  校验 sha256、装好，全部装好之后才报 healthy。之后新的部署也经同一通道到达。密钥值按部署
+  单独拉取，且只给证书证明的那个节点。本节点的数据端口本身就是一道信任边界，写在
   [docs/trust-boundaries.md](../../docs/trust-boundaries.md)（英文）。
 - **投递日志、指标与调用轨迹**给 deis-telemetry，攒批发送；缓冲满了丢最旧的，而不是
   一直涨。轨迹是一次调用一条——请求、队列批次、cron 触发、WebSocket 消息各算一次——
@@ -148,9 +147,10 @@ chunk 就是一次 op 派发，所以照默认值，一个生产者一秒最多�
 | `context.waitUntil(promise)` | 不让响应等的那部分工作 |
 
 context 只有这四个字段。请求元数据从 `context.request` 读取；应用日志使用
-`console`；Cache API 使用 `caches.default` / `caches.open(name)`。原生层的
-`context.services`、`context.bindings` 与 `context.log` 仍用于 schema 1 迁移和非 HTTP
-事件内部，但不会穿过生成桥进入标准 HTTP ABI。未声明的逻辑绑定直接缺席，不会模拟成功；
+`console`；Cache API 使用 `caches.default` / `caches.open(name)`。声明的绑定只在
+`env` 上：没有 `context.services` 与 `context.bindings`，声明的绑定之外也没有无名
+命名空间。queue 与 scheduled handler 的 context 另外带 `context.log`，它不属于标准
+HTTP ABI。未声明的逻辑绑定直接缺席，不会模拟成功；
 具体资源接口在 Edge Canon `logical-resource-bindings` 能力族冻结前仍是 Draft。
 
 ### 全局作用域——应用可以假设有什么

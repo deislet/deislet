@@ -84,12 +84,12 @@
 //! application and environment it is about - and therefore which scope may
 //! read or cancel it - is written in the operation record: the application
 //! and environment of a provider `deploy` or `rollback` (`read:<app>/<env>`
-//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for an
-//! identity migration, a backend restore, and every other kind. This gate
+//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for a
+//! backend restore and every other kind. This gate
 //! holds no catalog handle and reads no record, so the table marks both
 //! routes [`RecordClaim::OperationScope`], demands only that the caller hold
-//! *some* scope, and the handlers (`api::migrations::get_operation` and
-//! `api::migrations::cancel_operation`, through one shared check) load the
+//! *some* scope, and the handlers (`api::operations::get_operation` and
+//! `api::operations::cancel_operation`, through one shared check) load the
 //! record and check the caller against the exact demand before anything
 //! else, refusing with the same `insufficient-scope` 403 this gate would
 //! give and with one fixed body whether or not the id exists. The 403 is
@@ -191,12 +191,12 @@
 //! application and environment it is about - and therefore which scope may
 //! read or cancel it - is written in the operation record: the application
 //! and environment of a provider `deploy` or `rollback` (`read:<app>/<env>`
-//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for an
-//! identity migration, a backend restore, and every other kind. This gate
+//! to read it, `deploy:<app>/<env>` to cancel it), `admin:*/*` for a
+//! backend restore and every other kind. This gate
 //! holds no catalog handle and reads no record, so the table marks both
 //! routes [`RecordClaim::OperationScope`], demands only that the caller hold
-//! *some* scope, and the handlers (`api::migrations::get_operation` and
-//! `api::migrations::cancel_operation`, through one shared check) load the
+//! *some* scope, and the handlers (`api::operations::get_operation` and
+//! `api::operations::cancel_operation`, through one shared check) load the
 //! record and check the caller against the exact demand before anything
 //! else, refusing with the same `insufficient-scope` 403 this gate would
 //! give and with one fixed body whether or not the id exists. The 403 is
@@ -543,7 +543,7 @@ fn unclassified() -> Requirement {
     .operator()
 }
 
-/// The route table proper, over segments already in the legacy spelling.
+/// The route table proper, over segments already in the unprefixed spelling.
 fn classify_canonical(
     method: &Method,
     segments: &[&str],
@@ -576,24 +576,6 @@ fn classify_canonical(
         ["api", "apps", app] => {
             Requirement::new("app.delete", Verb::Admin, named(app), Resource::Every).changes_state()
         }
-
-        // Identity migration freezes every environment and reaches backend
-        // management services with credentials no application operator may
-        // hold. Both starting it and reading its cross-backend inventory are
-        // therefore platform-administrator operations over the whole app.
-        ["api", "apps", app, "identity-migration"] if !writing => Requirement::new(
-            "identity_migration.get",
-            Verb::Admin,
-            named(app),
-            Resource::Every,
-        ),
-        ["api", "apps", app, "identity-migration"] => Requirement::new(
-            "identity_migration.start",
-            Verb::Admin,
-            named(app),
-            Resource::Every,
-        )
-        .changes_state(),
 
         // A backend restore replaces the physical data incarnation for every
         // application on this installation. Its scope can therefore never be
@@ -869,10 +851,10 @@ fn classify_canonical(
         // `read:<app>/<env>` to read it, exactly as its scoped
         // `provider_deployment.get` route does, and `deploy:<app>/<env>` to
         // cancel it, exactly as `provider_deployment.cancel` does - and only
-        // a migration, a restore or a kind with no scope of its own answers
+        // a restore or a kind with no scope of its own answers
         // to `admin:*/*`. Which it is can only be read from the record, so
         // the gate asks for some scope - `Read` is what every scope grants -
-        // and the handlers in `api::migrations` load the record and refuse
+        // and the handlers in `api::operations` load the record and refuse
         // with `insufficient-scope` before they answer or act. See the
         // module header. The read changes nothing, so it is recorded only
         // when refused, like every other read.
@@ -1084,6 +1066,24 @@ fn classify_canonical(
             // The catalog transaction independently requires an exact active
             // target grant for this canonical application/environment. Route
             // scope alone never confers access to a provider account.
+            Verb::Deploy,
+            named(app),
+            named(env),
+        )
+        .changes_state(),
+        [
+            "api",
+            "apps",
+            app,
+            "environments",
+            env,
+            "provider-undeployments",
+        ] if writing => Requirement::new(
+            "provider_deployment.undeploy",
+            // Takes the deployment down and, with the request's explicit
+            // consent naming this environment, destroys its provider data.
+            // The catalog independently requires a provider deployment of
+            // this canonical application/environment on the target.
             Verb::Deploy,
             named(app),
             named(env),
@@ -2024,7 +2024,7 @@ mod tests {
         classify(&Method::from_bytes(method.as_bytes()).unwrap(), path, query)
     }
 
-    /// The route table, spelled out in the legacy form: every route the
+    /// The route table, spelled out unprefixed: every route the
     /// human router mounts, with the action and verb the table gives it.
     /// Shared by the tests below, which read it three ways - as the routes
     /// that must classify, as the routes whose `/api/v1` or `/api/platform`
@@ -2037,22 +2037,10 @@ mod tests {
             ("GET", "/api/apps/demo", "app.get", Verb::Read),
             ("DELETE", "/api/apps/demo", "app.delete", Verb::Admin),
             (
-                "GET",
-                "/api/apps/demo/identity-migration",
-                "identity_migration.get",
-                Verb::Admin,
-            ),
-            (
                 "POST",
                 "/api/operations/01990f44-1000-7000-8000-000000000040/cancel",
                 "operation.cancel",
                 Verb::Read,
-            ),
-            (
-                "POST",
-                "/api/apps/demo/identity-migration",
-                "identity_migration.start",
-                Verb::Admin,
             ),
             (
                 "GET",
@@ -2174,6 +2162,12 @@ mod tests {
                 "POST",
                 "/api/apps/demo/environments/production/provider-deployments/01990f44-1000-7000-8000-000000000040/rollback",
                 "provider_deployment.rollback",
+                Verb::Deploy,
+            ),
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-undeployments",
+                "provider_deployment.undeploy",
                 Verb::Deploy,
             ),
             (
@@ -2623,7 +2617,7 @@ mod tests {
     /// classify to something other than the closing arm - a route that fell
     /// through would answer to `admin:*/*` under one prefix and to its own
     /// narrower demand under another - and must classify identically under
-    /// its versioned and its legacy spelling.
+    /// its versioned and its unprefixed spelling.
     #[test]
     fn every_documented_operation_is_classified_the_same_under_both_prefixes() {
         let document: serde_json::Value =
@@ -2643,14 +2637,14 @@ mod tests {
                     "{method} {filled} is described in the OpenAPI document and the route table \
                      does not know it, so it answers to the closing arm"
                 );
-                let legacy =
+                let unprefixed =
                     filled
                         .replacen("/api/v1/", "/api/", 1)
                         .replacen("/api/platform/", "/api/", 1);
                 assert_eq!(
-                    requirement(&method, &legacy),
+                    requirement(&method, &unprefixed),
                     versioned,
-                    "{method} {filled} and its legacy spelling {legacy} are classified differently"
+                    "{method} {filled} and its unprefixed spelling {unprefixed} are classified differently"
                 );
                 seen += 1;
             }
@@ -2658,7 +2652,7 @@ mod tests {
         assert!(seen > 100, "only {seen} documented operations were checked");
     }
 
-    /// `/api/v1/apps/{app_name}/versions/{version_id}` with every `{...}`
+    /// `/api/v1/apps/{app_id}/versions/{version_id}` with every `{...}`
     /// replaced by a canonical id, which every route that parses a segment
     /// accepts and no route in the table reads.
     fn fill_path_parameters(path: &str) -> String {
@@ -2712,7 +2706,7 @@ mod tests {
         assert!(checked >= 6, "the platform reads are not being reached");
     }
 
-    /// The prefix a legacy route is served under once it has moved.
+    /// The prefix an unprefixed route of the table is served under.
     fn successor_prefix(requirement: &Requirement) -> &'static str {
         match requirement.scope {
             RequirementScope::Product => ApiSurface::V1.prefix(),
@@ -2725,11 +2719,11 @@ mod tests {
     /// claim and scope. The table is written once; this is what says a
     /// versioned path is not a second table that can drift.
     #[test]
-    fn a_versioned_path_is_classified_exactly_like_its_legacy_spelling() {
+    fn a_versioned_path_is_classified_exactly_like_its_unprefixed_spelling() {
         for (method, path, _, _) in mounted_routes() {
-            let legacy = requirement(method, path);
-            let moved = path.replacen("/api", successor_prefix(&legacy), 1);
-            assert_eq!(requirement(method, &moved), legacy, "{method} {moved}");
+            let unprefixed = requirement(method, path);
+            let moved = path.replacen("/api", successor_prefix(&unprefixed), 1);
+            assert_eq!(requirement(method, &moved), unprefixed, "{method} {moved}");
         }
 
         // The one arm that reads the query string narrows the same way on
@@ -2740,14 +2734,14 @@ mod tests {
             "?environment=production&environment=preview",
             "?environment=%70roduction",
         ] {
-            let legacy = requirement("DELETE", &format!("/api/runtime/n1/apps/demo{query}"));
-            assert_eq!(legacy.action, "node.app.unload");
+            let unprefixed = requirement("DELETE", &format!("/api/runtime/n1/apps/demo{query}"));
+            assert_eq!(unprefixed.action, "node.app.unload");
             assert_eq!(
                 requirement(
                     "DELETE",
                     &format!("/api/platform/runtime/n1/apps/demo{query}")
                 ),
-                legacy,
+                unprefixed,
                 "{query:?}"
             );
         }
@@ -2917,6 +2911,15 @@ mod tests {
                     by: "catalog::provider_target_grant::active_provider_target_grant_tx",
                 },
             ),
+            // The target named in the body has to be one this environment
+            // has a provider deployment on; nothing else is taken down.
+            (
+                "POST",
+                "/api/apps/demo/environments/production/provider-undeployments",
+                AuthorisedByCatalog {
+                    by: "catalog::provider_driver_operation::latest_undeployable_workflow_tx",
+                },
+            ),
             (
                 "POST",
                 "/api/apps/demo/environments/production/rollback",
@@ -3035,13 +3038,6 @@ mod tests {
                 "POST",
                 "/api/providers/targets/01990f44-1000-7000-8000-000000000040/enable",
                 AdministratorsAlready,
-            ),
-            // No body: the application is in the path and the demand is
-            // `admin` over it and every environment of it.
-            (
-                "POST",
-                "/api/apps/demo/identity-migration",
-                NothingTheUrlDoesNotAlreadyName,
             ),
             // The three that settle work already recorded. None of them
             // takes a body at all: `api::operations::cancel_provider_workflow`
@@ -4818,7 +4814,7 @@ mod gate_tests {
     /// differently means judging one application and creating another - and
     /// since no scope can contain a space, the credential that owns the
     /// application is the one that gets refused.
-    /// A versioned path is the legacy route with its surface named: the
+    /// A versioned path is the unprefixed route with its surface named: the
     /// credential that may call one may call the other, the one that may
     /// not still may not, and the audit line records the path as it was
     /// spelled, so an operator can see which surface a client is on.

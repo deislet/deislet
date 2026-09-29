@@ -88,16 +88,17 @@ struct Target {
 ///
 /// Only `deis kv`, `deis db` and `deis blob` take it, because a binding is a
 /// namespace inside one tenant's storage and nothing else in this CLI is about
-/// storage. Leaving it out means the tenant's *unnamed* namespace, which is
-/// what `context.services.kv`, `.database` and `.blob` reach and where an
-/// application that declares no binding keeps everything it has.
+/// storage. An application reaches its data only through the bindings it
+/// declared, so this names one of those; leaving it out means the
+/// tenant-level namespace, which no application reaches.
 #[derive(Args, Clone, Debug, Default)]
 struct DataTarget {
     #[command(flatten)]
     target: Target,
 
-    /// Named binding to act in. Omitted means the namespace
-    /// `context.services.*` uses.
+    /// Binding to act in, as the application declared it (`env.<NAME>`).
+    /// Omitted means the tenant-level namespace, which no application
+    /// reaches.
     #[arg(long, value_name = "NAME")]
     binding: Option<String>,
 }
@@ -162,8 +163,8 @@ enum Commands {
         #[arg(long)]
         minify: bool,
 
-        /// deis-store address, if one is running. Without it every
-        /// ctx.services.{kv,database,blob} call fails.
+        /// deis-store address, if one is running. Without it the app's kv,
+        /// database and blob bindings are not available.
         #[arg(long, value_name = "URL")]
         store: Option<String>,
 
@@ -226,10 +227,6 @@ enum Commands {
         #[arg(long)]
         note: Option<String>,
 
-        /// Deploy this bundle instead of building one.
-        #[arg(long, value_name = "PATH", conflicts_with = "no_build")]
-        bundle: Option<std::path::PathBuf>,
-
         /// Use the bundle the last build left behind.
         #[arg(long)]
         no_build: bool,
@@ -246,6 +243,29 @@ enum Commands {
         /// environment holds grants on more than one of the chosen kind.
         #[arg(long, value_name = "NAME_OR_ID")]
         provider_target: Option<String>,
+    },
+
+    /// Take an environment's deployment on a provider down.
+    Undeploy {
+        #[command(flatten)]
+        target: Target,
+
+        #[command(flatten)]
+        format: Format,
+
+        /// Where the deployment runs. Only a provider can be undeployed.
+        #[arg(long = "target", value_enum)]
+        deploy_target: commands::deploy::DeployTarget,
+
+        /// The provider target (name or id) to take the deployment down
+        /// from, when the environment has more than one of the chosen kind.
+        #[arg(long, value_name = "NAME_OR_ID")]
+        provider_target: Option<String>,
+
+        /// Also destroy the environment's provider data (KV, databases,
+        /// buckets, queues). Takes the environment's name again, as consent.
+        #[arg(long, value_name = "ENVIRONMENT")]
+        purge_data: Option<String>,
     },
 
     /// List an application's versions and which environments run them.
@@ -1193,7 +1213,8 @@ enum TargetsAction {
 
     /// Inspect one target's implementation evidence and certification blockers.
     Inspect {
-        /// Registry target id, as printed by `deis targets list`.
+        /// The target: its `--target` id (`cloudflare`), as `deis targets
+        /// list` prints it, or its registry id (`cloudflare-workers-pages`).
         id: String,
 
         #[command(flatten)]
@@ -1300,7 +1321,6 @@ async fn run(cli: Cli) -> Result<()> {
             target,
             format,
             note,
-            bundle,
             no_build,
             no_minify,
             deploy_target,
@@ -1311,7 +1331,6 @@ async fn run(cli: Cli) -> Result<()> {
                     app: target.app,
                     environment: target.environment,
                     note,
-                    bundle,
                     no_build,
                     no_minify,
                     target: deploy_target,
@@ -1327,6 +1346,26 @@ async fn run(cli: Cli) -> Result<()> {
             format,
             limit,
         } => commands::versions::execute(target.app, limit, format.into()).await,
+
+        Commands::Undeploy {
+            target,
+            format,
+            deploy_target,
+            provider_target,
+            purge_data,
+        } => {
+            commands::undeploy::execute(
+                commands::undeploy::Args {
+                    app: target.app,
+                    environment: target.environment,
+                    target: deploy_target,
+                    provider_target,
+                    purge_data,
+                },
+                format.into(),
+            )
+            .await
+        }
 
         Commands::Deployments {
             target,

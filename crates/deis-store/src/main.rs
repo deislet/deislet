@@ -1,12 +1,12 @@
 //! Deislet storage services: KV, database and blob.
 //!
-//! This service is deliberately "dumb": one tenant dimension, carried in the
-//! `x-deis-tenant` header, and no idea what a version, an environment or a
-//! deployment is. Those concepts live in deis-control and deis-runtime, which
-//! is also where the tenant id is built - here it is one opaque key.
+//! This service is deliberately "dumb": one tenant dimension, named by the
+//! capability a call carries, and no idea what a version, an environment or a
+//! deployment is. Those concepts live in deis-control and deis-runtime - here
+//! the tenant is one opaque key.
 //!
-//! Who a caller is allowed to be, it does check: a call carries a capability
-//! token for the tenant it names, an Ed25519-signed JCS-JWT verified against
+//! Who a caller is, it does check: a call carries a capability token naming
+//! its tenant, an Ed25519-signed JCS-JWT verified against
 //! the control plane's published keys, read from its JWKS over the machine
 //! channel under mutual TLS. Every call must present a valid token; there is
 //! no anonymous or loopback bypass. See [`deis_store::auth`]. The listener
@@ -112,9 +112,17 @@ async fn serve(config: Config) -> Result<()> {
     let (identity, control) = server::machine_identity(&config)?;
 
     let listener = server::bind(&config).await?;
-    let keys = capability_keys(control);
+    let keys = capability_keys(control.clone());
 
-    server::serve(config, listener, server::shutdown_signal(), keys, identity).await
+    server::serve(
+        config,
+        listener,
+        server::shutdown_signal(),
+        keys,
+        control,
+        identity,
+    )
+    .await
 }
 
 /// The verifier's key ring, kept current from the control plane's JWKS.
@@ -149,9 +157,7 @@ fn take_snapshot(config: &Config, out: &std::path::Path) -> Result<()> {
     println!(
         "snapshot written to {}\n  backend:   {}\n  databases: {}\n  objects:   {} ({} bytes)\n  restore:   {}",
         out.display(),
-        manifest
-            .source_backend_incarnation_id
-            .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
+        manifest.source_backend_incarnation_id,
         manifest.databases.len(),
         manifest.objects,
         manifest.object_bytes,
@@ -188,10 +194,7 @@ fn restore_snapshot(config: &Config, from: &std::path::Path, into: Option<PathBu
         "restored {} into {}\n  source backend:   {}\n  restored backend: {}\n  databases: {}\n  objects:   {} ({} bytes)",
         from.display(),
         target.display(),
-        report.source_backend_incarnation_id.map_or_else(
-            || "unknown (legacy snapshot)".to_string(),
-            |id| id.to_string()
-        ),
+        report.source_backend_incarnation_id,
         report.restored_backend_incarnation_id,
         report.databases,
         report.objects,

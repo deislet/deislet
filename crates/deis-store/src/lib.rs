@@ -1,29 +1,23 @@
 //! Deislet storage services: KV, SQL database and blob objects.
 //!
 //! The service is deliberately "dumb". It knows exactly one thing about the
-//! world outside itself: a tenant id, carried in the `x-deis-tenant` gRPC
-//! metadata header. It has no idea what a version, an environment or a
-//! deployment is, and it never calls anything back. It holds no opinion about
-//! which application owns which tenant either - only about whether the caller
-//! in front of it can prove it holds the capability for the tenant it names.
-//! Those decisions live in deis-control and deis-runtime; keeping them out of
-//! here is what lets storage be restarted, backed up and reasoned about on
-//! its own.
+//! world outside itself: a tenant, which the capability on each call names.
+//! It has no idea what a version, an environment or a deployment is, and it
+//! never calls anything back. It holds no opinion about which application
+//! owns which tenant either - only about whether the caller in front of it
+//! holds a capability for one. Those decisions live in deis-control and
+//! deis-runtime; keeping them out of here is what lets storage be restarted,
+//! backed up and reasoned about on its own.
 //!
 //! # What a tenant is here, and what it is not
 //!
-//! The platform above builds the tenant id out of an application and an
-//! environment (`deis_wire::conventions::tenant_id`), so `demo.production`
-//! and `demo.preview-7` are two tenants of one application. To this service
-//! that is invisible: it sees one opaque key, one tenant dimension, and it
-//! never takes the value apart for any purpose other than validating it.
-//! That is the point - a preview deployment must not be able to read or
-//! overwrite what production stored, and the cheapest way to guarantee it is
-//! that the two never name the same namespace here.
-//!
-//! Note which header carries it. `x-deis-app-id` names the *application* on
-//! the data path and is not the storage tenant; a call that stamps only that
-//! one is refused rather than served from a default namespace.
+//! A tenant is one application environment, keyed by canonical ids:
+//! `v1/<application id>/<environment id>`. A preview and production of the
+//! same application are two tenants, and an application deleted and created
+//! again under the same name is a new one, so neither can read or overwrite
+//! what the other stored. This service validates the key and never takes it
+//! apart for any other purpose. No request header names a tenant; a call
+//! whose capability names none for this binding is refused.
 //!
 //! Data layout under the configured data directory:
 //!
@@ -34,11 +28,11 @@
 //! blob/<namespace>/<aa>/<bb>/<sha256>   object content, addressed by digest
 //! ```
 //!
-//! `<namespace>` is the tenant - `demo.production` - for a call that names no
-//! binding, and `demo.production@MEDIA` for one that names `MEDIA`. Both are
-//! ordinary names on disk here; see [`tenant`] for why a binding cannot widen
-//! which tenant is addressed, and [`legacy`] for the startup check that has
-//! to know both forms.
+//! `<namespace>` is the canonical tenant key -
+//! `ct1_<application id>_<environment id>` - for a call that names no
+//! binding, and `ct1_<application id>_<environment id>@MEDIA` for one that
+//! names `MEDIA`. See [`tenant`] for why a binding cannot widen which tenant
+//! is addressed.
 //!
 //! This directory is the only copy of every tenant's data, and it cannot be
 //! backed up by copying it: SQLite runs in WAL mode here, so a plain `cp -r`
@@ -48,35 +42,18 @@
 //! --from DIR` - and that module documents what a snapshot does and does not
 //! promise.
 //!
-//! The tenant id is a directory name and a database file name, which is why
-//! it is validated hard rather than sanitised: the character set has no `.`,
-//! `/` or `\` in either half, so no accepted value can name a parent
-//! directory. See [`tenant`].
+//! The namespace key is a directory name and a database file name. It holds
+//! no `.`, `/` or `\`, so no accepted value can name a parent directory. See
+//! [`tenant`].
 //!
-//! # A data directory from before this change is not readable
+//! # Trust model: the capability names the tenant
 //!
-//! Storage used to be keyed by a bare application id: an `app_id` column,
-//! `db/<app>.sqlite`, `blob/<app>/...`. Those names do not exist under the
-//! tenant scheme and nothing looks for them, so an old data directory holds
-//! data no application can reach. There is no migration - this is a
-//! development platform with no deployed data, and inventing an environment
-//! for old rows would be inventing where production data belongs.
-//!
-//! What there is instead is a refusal: the service checks at startup and
-//! will not serve over a data directory in the old shape, because the
-//! alternative is a store that looks healthy while every read answers "not
-//! found". See [`legacy`].
-//!
-//! # Trust model: a tenant is claimed in a header and proved with a token
-//!
-//! Every request names its tenant in `x-deis-tenant`. On its own that is a
-//! claim: the header says which namespace the caller wants, and nothing in
-//! it says the caller is entitled to it. What goes with the claim is a
-//! capability token in `Authorization: Bearer <token>`, an Ed25519-signed
-//! JCS-JWT minted by deis-control and verified against the control plane's
-//! public key. The token's resources must include a (tenant, binding) pair
-//! that matches the request, so a token minted for one application opens
-//! nothing for another. See [`auth`].
+//! Every call carries a capability token in `Authorization: Bearer <token>`,
+//! an Ed25519-signed JCS-JWT minted by deis-control and verified against the
+//! control plane's published keys. The tenant a call acts for is the one
+//! tenant that token names for the service's binding; nothing in the request
+//! names it, so a token minted for one application environment opens nothing
+//! for another. See [`auth`].
 //!
 //! Every call must carry a valid capability token. There is no anonymous or
 //! loopback bypass. The verifying key is obtained from the control plane's
@@ -107,8 +84,6 @@ pub mod config;
 pub mod database;
 pub mod error;
 pub mod kv;
-pub mod legacy;
-pub mod migration;
 pub mod proto;
 pub mod server;
 pub mod snapshot;

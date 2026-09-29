@@ -17,7 +17,6 @@ use reqwest::{
     header::{ACCEPT, HeaderMap},
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How long one control-plane call may take.
 ///
@@ -73,27 +72,10 @@ pub const API_MAJOR: &str = "/api/v1";
 /// Path prefix of the platform diagnostics API: the runtime fleet and what
 /// each node reports it is running.
 pub const API_PLATFORM: &str = "/api/platform";
-/// The flat prefix every route lived under before the two above existed.
-///
-/// A control plane from before that split still answers here and nowhere
-/// else, and a newer one keeps it for a deprecation window. This CLI speaks
-/// the versioned prefixes and drops back to this one only after a control
-/// plane has shown it does not know them - see [`Control::dispatch`].
-const API_LEGACY: &str = "/api";
 /// The response header every versioned answer carries: the id the control
 /// plane logged the request under, which is what to quote when asking an
 /// operator what happened.
 const REQUEST_ID_HEADER: &str = "x-request-id";
-
-/// Spell a versioned path the way the legacy tree spells it, or `None` when
-/// the path is not under a versioned prefix and there is nothing to fall
-/// back to.
-fn legacy_spelling(path: &str) -> Option<String> {
-    [API_MAJOR, API_PLATFORM].into_iter().find_map(|prefix| {
-        let rest = path.strip_prefix(prefix)?;
-        (rest.is_empty() || rest.starts_with('/')).then(|| format!("{API_LEGACY}{rest}"))
-    })
-}
 
 /// One page of the control plane's unified list envelope.
 ///
@@ -206,10 +188,8 @@ fn bounded_page_limit(requested: usize, what: &str) -> usize {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct App {
     pub id: String,
-    /// Permanent product identity. `None` only when talking to a control
-    /// plane from before the canonical-identity migration.
-    #[serde(default)]
-    pub canonical_id: Option<CanonicalId>,
+    /// Permanent product identity.
+    pub canonical_id: CanonicalId,
     pub created_at: i64,
 }
 
@@ -217,9 +197,8 @@ pub struct App {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Version {
     pub id: String,
-    /// Permanent product identity; absent only on an older control plane.
-    #[serde(default)]
-    pub canonical_id: Option<CanonicalId>,
+    /// Permanent product identity.
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     /// The per-application counter a person says out loud: "v3".
     pub number: i64,
@@ -316,9 +295,8 @@ pub struct ProviderArtifactRef {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Environment {
     pub id: String,
-    /// Permanent product identity; absent only on an older control plane.
-    #[serde(default)]
-    pub canonical_id: Option<CanonicalId>,
+    /// Permanent product identity.
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     pub name: String,
     pub created_at: i64,
@@ -328,9 +306,8 @@ pub struct Environment {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Deployment {
     pub id: String,
-    /// Permanent product identity; absent only on an older control plane.
-    #[serde(default)]
-    pub canonical_id: Option<CanonicalId>,
+    /// Permanent product identity.
+    pub canonical_id: CanonicalId,
     pub app_id: String,
     pub env_id: String,
     pub version_id: String,
@@ -338,9 +315,7 @@ pub struct Deployment {
     #[serde(default)]
     pub note: Option<String>,
     /// Immutable Edge Canon environment snapshot selected by this pointer.
-    /// Absent for legacy schema-1 deployments and older control planes.
-    #[serde(default)]
-    pub snapshot_id: Option<String>,
+    pub snapshot_id: String,
 }
 
 /// The top of one environment's deployment history, and how deep the history
@@ -493,11 +468,16 @@ pub struct ProviderDeploymentStep {
 pub struct ProviderDeployment {
     pub operation: ProviderOperationSummary,
     /// `deploy` runs the driver's standard steps; `rollback` restores the
-    /// deployment named by `rolled_back_from_operation_id`.
+    /// deployment named by `rolled_back_from_operation_id`; `undeploy` takes
+    /// the environment's deployment down.
     pub kind: String,
     /// For a rollback workflow, the succeeded deployment it restores.
     #[serde(default)]
     pub rolled_back_from_operation_id: Option<CanonicalId>,
+    /// For an undeploy workflow, whether the environment's provider data is
+    /// destroyed along with the deployment.
+    #[serde(default)]
+    pub purge_data: bool,
     /// Every rollback that names this workflow as its source, oldest first,
     /// whatever state each reached.
     #[serde(default)]
@@ -608,9 +588,8 @@ mod canonical_identity_tests {
     use super::App;
 
     #[test]
-    fn old_control_without_canonical_identity_remains_readable() {
-        let app: App = serde_json::from_str(r#"{"id":"demo","created_at":1}"#).unwrap();
-        assert!(app.canonical_id.is_none());
+    fn an_app_without_its_canonical_identity_is_refused() {
+        assert!(serde_json::from_str::<App>(r#"{"id":"demo","created_at":1}"#).is_err());
     }
 
     #[test]
@@ -620,7 +599,7 @@ mod canonical_identity_tests {
         )
         .unwrap();
         assert_eq!(
-            valid.canonical_id.unwrap().to_string(),
+            valid.canonical_id.to_string(),
             "018f2518-7e38-7f80-8000-000000000001"
         );
 
@@ -635,9 +614,7 @@ mod canonical_identity_tests {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DeliveryReport {
     pub reason: String,
-    /// Exact wire phase observed by this report. Older controls omitted it
-    /// and therefore read as the legacy single-step apply path.
-    #[serde(default = "legacy_delivery_phase")]
+    /// Exact wire phase observed by this report.
     pub phase: String,
     pub app_id: String,
     pub environment: String,
@@ -651,10 +628,6 @@ pub struct DeliveryReport {
     /// Set when nothing was pushed at all, with the reason.
     #[serde(default)]
     pub skipped: Option<String>,
-}
-
-fn legacy_delivery_phase() -> String {
-    "legacy_apply".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -710,9 +683,8 @@ pub const EVERY_ENVIRONMENT: &str = "*";
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecretMeta {
     pub name: String,
-    /// Opaque immutable revision; absent only on an older control plane.
-    #[serde(default)]
-    pub revision: Option<String>,
+    /// Opaque immutable revision.
+    pub revision: String,
     pub updated_at: i64,
 }
 
@@ -972,8 +944,8 @@ struct ErrorEnvelope {
 enum Refusal {
     /// The envelope of `/api/v1` and `/api/platform`.
     Structured(ControlError),
-    /// The flat `{"error": "<message>"}` of the legacy tree - and of the
-    /// authorization gate, which answers that way on every surface.
+    /// The flat `{"error": "<message>"}` of the authorization gate, which
+    /// answers that way on every surface.
     Plain(String),
 }
 
@@ -989,13 +961,6 @@ impl Refusal {
                 .map(|envelope| Self::Structured(envelope.error)),
             _ => None,
         }
-    }
-
-    /// Whether a body is the versioned envelope. A 404 that carries one is
-    /// an answer about a record from a control plane that knows the route;
-    /// a 404 without one is a control plane that does not know the route.
-    fn is_structured(body: &[u8]) -> bool {
-        matches!(Self::parse(body), Some(Self::Structured(_)))
     }
 }
 
@@ -1055,10 +1020,6 @@ pub struct Control {
     base: String,
     token: Option<String>,
     http: reqwest::Client,
-    /// Set once this control plane has answered a versioned path with a
-    /// 404 that carried no envelope: it predates [`API_MAJOR`], and every
-    /// later call goes straight to [`API_LEGACY`] rather than probing again.
-    legacy: AtomicBool,
 }
 
 impl Control {
@@ -1071,7 +1032,6 @@ impl Control {
             base: base.trim_end_matches('/').to_string(),
             token: token.map(|t| t.to_string()),
             http,
-            legacy: AtomicBool::new(false),
         })
     }
 
@@ -1079,44 +1039,19 @@ impl Control {
         &self.base
     }
 
-    /// Whether this control plane has shown it predates the versioned
-    /// prefixes and is being driven through the legacy tree.
-    fn speaks_legacy(&self) -> bool {
-        self.legacy.load(Ordering::Relaxed)
-    }
-
-    /// The prefix a product route is sent under right now.
-    fn product_prefix(&self) -> &'static str {
-        if self.speaks_legacy() {
-            API_LEGACY
-        } else {
-            API_MAJOR
-        }
-    }
-
-    /// The prefix a platform route is sent under right now.
-    fn platform_prefix(&self) -> &'static str {
-        if self.speaks_legacy() {
-            API_LEGACY
-        } else {
-            API_PLATFORM
-        }
-    }
-
     fn url(&self, prefix: &str, route: &str) -> String {
         format!("{}{prefix}{route}", self.base)
     }
 
     /// A request to a product route: `route` is spelled without any prefix
-    /// (`/apps/demo`), and the one the control plane answers on is put in
-    /// front of it here.
+    /// (`/apps/demo`), and [`API_MAJOR`] is put in front of it here.
     fn request(&self, method: Method, route: &str) -> reqwest::RequestBuilder {
-        self.build(method, self.product_prefix(), route)
+        self.build(method, API_MAJOR, route)
     }
 
     /// A request to a platform diagnostics route, prefixed the same way.
     fn platform_request(&self, method: Method, route: &str) -> reqwest::RequestBuilder {
-        self.build(method, self.platform_prefix(), route)
+        self.build(method, API_PLATFORM, route)
     }
 
     fn build(&self, method: Method, prefix: &str, route: &str) -> reqwest::RequestBuilder {
@@ -1130,56 +1065,15 @@ impl Control {
         }
     }
 
-    /// Send one request and read the whole answer.
-    ///
-    /// The seam every call goes through, and the one place the deprecation
-    /// window is handled. A control plane from before the versioned prefixes
-    /// answers `/api/v1/...` with its route fallback: a 404 whose body is the
-    /// flat legacy string, where every versioned route - including for its
-    /// own 404 about a missing record - answers the envelope. That answer is
-    /// taken once as "this control plane is older than this CLI", said at
-    /// warn, and the same request is re-sent under the legacy prefix; every
-    /// later request is built for the legacy tree directly. A 404 that does
-    /// carry the envelope is returned as the answer it is.
+    /// Send one request and read the whole answer: the seam every call goes
+    /// through.
     async fn dispatch(&self, builder: reqwest::RequestBuilder) -> Result<Reply> {
         let request = builder
             .build()
             .context("building a request to the control plane")?;
-        // `None` only for a streaming body, which this CLI never sends.
-        let retry = request.try_clone();
-        let path = request.url().path().to_string();
         let response = self
             .http
             .execute(request)
-            .await
-            .map_err(|e| self.transport_error(e))?;
-        let reply = Reply::read(response).await;
-        if reply.status != StatusCode::NOT_FOUND || Refusal::is_structured(&reply.body) {
-            return Ok(reply);
-        }
-        let (Some(mut retry), Some(legacy_path)) = (retry, legacy_spelling(&path)) else {
-            return Ok(reply);
-        };
-        if !self.legacy.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                control = %self.base,
-                path,
-                cli_version = env!("CARGO_PKG_VERSION"),
-                "the control plane does not serve {API_MAJOR}: it is most likely a deis-control \
-                 older than this CLI, from before the versioned API; driving it through \
-                 {API_LEGACY} instead, which newer control planes keep only for a deprecation \
-                 window - upgrade it before that window closes"
-            );
-        }
-        tracing::debug!(
-            from = path,
-            to = legacy_path,
-            "re-sending under the legacy prefix"
-        );
-        retry.url_mut().set_path(&legacy_path);
-        let response = self
-            .http
-            .execute(retry)
             .await
             .map_err(|e| self.transport_error(e))?;
         Ok(Reply::read(response).await)
@@ -1323,7 +1217,7 @@ impl Control {
     ///
     /// The versioned envelope is printed as `code: message`, then each field
     /// it names as wrong, then the request id - the one thing an operator can
-    /// search the control plane's log for. The legacy string is printed as
+    /// search the control plane's log for. The flat string is printed as
     /// it is, with the request id from the header when there was one.
     fn http_error(&self, reply: &Reply, what: &str) -> String {
         let status = reply.status;
@@ -1450,28 +1344,6 @@ impl Control {
     }
 
     // ---- versions -----------------------------------------------------
-
-    /// Upload a bundle as a new version.
-    ///
-    /// `sha256` is sent along so the control plane refuses a truncated upload
-    /// instead of recording it as a version that no node can load.
-    pub async fn upload_version(
-        &self,
-        app_id: &str,
-        bundle: Vec<u8>,
-        sha256: &str,
-    ) -> Result<UploadResponse> {
-        self.send(
-            self.request(
-                Method::POST,
-                &format!("/apps/{app_id}/versions?sha256={sha256}"),
-            )
-            .header(reqwest::header::CONTENT_TYPE, "application/zip")
-            .body(bundle),
-            &format!("uploading a bundle for app {app_id}"),
-        )
-        .await
-    }
 
     /// Upload and revalidate the provider-neutral Build Output before any
     /// provider payload derived from it can become a version.
@@ -1741,15 +1613,11 @@ impl Control {
             return Ok(Some(plan));
         }
 
-        // Spelled under whichever prefix the mutation itself went out on,
-        // which `dispatch` has settled by now: a control plane that knows
-        // the versioned prefix points at it, and one that was fallen back
-        // to points at the legacy tree.
         let route = format!(
             "/apps/{app_id}/environments/{environment}/deployment-plans/{}",
             plan.id
         );
-        let path = format!("{}{route}", self.product_prefix());
+        let path = format!("{API_MAJOR}{route}");
         let location = headers
             .get(reqwest::header::LOCATION)
             .ok_or_else(|| anyhow::anyhow!("{what}: accepted plan {} has no Location", plan.id))?
@@ -2075,7 +1943,7 @@ impl Control {
         // bearing client somewhere of its choosing.
         let expected = format!(
             "{}{}",
-            self.product_prefix(),
+            API_MAJOR,
             Self::provider_deployment_route(app_id, environment, operation.operation_id)
         );
         let location = headers
@@ -2124,10 +1992,18 @@ impl Control {
         environment: &str,
         provider_target_id: CanonicalId,
         artifact: &ProviderArtifactRef,
+        config_values: &std::collections::BTreeMap<String, serde_json::Value>,
     ) -> Result<ProviderOperationSummary> {
         let what = format!(
             "starting a provider deployment of {environment} of app {app_id} to target {provider_target_id}"
         );
+        let mut body = serde_json::json!({
+            "providerTargetId": provider_target_id,
+            "artifact": artifact,
+        });
+        if !config_values.is_empty() {
+            body["configValues"] = serde_json::to_value(config_values)?;
+        }
         let (_, headers, operation) = self
             .send_with_metadata::<ProviderOperationSummary>(
                 self.request(
@@ -2135,10 +2011,7 @@ impl Control {
                     &format!("/apps/{app_id}/environments/{environment}/provider-deployments"),
                 )
                 .header(IDEMPOTENCY_KEY, new_idempotency_key())
-                .json(&serde_json::json!({
-                    "providerTargetId": provider_target_id,
-                    "artifact": artifact,
-                })),
+                .json(&body),
                 &what,
             )
             .await?;
@@ -2146,7 +2019,7 @@ impl Control {
         // as an arbitrary URL; see `rollback_provider_deployment`.
         let expected = format!(
             "{}{}",
-            self.product_prefix(),
+            API_MAJOR,
             Self::provider_deployment_route(app_id, environment, operation.operation_id)
         );
         let location = headers
@@ -2159,6 +2032,62 @@ impl Control {
             })?
             .to_str()
             .context("reading the provider deployment Location")?;
+        if location != expected {
+            bail!(
+                "{what}: operation {} returned Location {location:?}, expected the scoped path \
+                 {expected:?}",
+                operation.operation_id
+            );
+        }
+        Ok(operation)
+    }
+
+    /// Ask the control plane to take an environment's provider deployment
+    /// down. `purge_environment`, when given, is the consent to destroy the
+    /// environment's provider data and must name `environment`.
+    pub async fn undeploy_provider_deployment(
+        &self,
+        app_id: &str,
+        environment: &str,
+        provider_target_id: Option<CanonicalId>,
+        purge_environment: Option<&str>,
+    ) -> Result<ProviderOperationSummary> {
+        let what = format!("taking down the provider deployment of {environment} of app {app_id}");
+        let mut body = serde_json::json!({});
+        if let Some(target) = provider_target_id {
+            body["providerTargetId"] = serde_json::to_value(target)?;
+        }
+        if let Some(purge) = purge_environment {
+            body["purgeData"] = serde_json::json!({ "environment": purge });
+        }
+        let (_, headers, operation) = self
+            .send_with_metadata::<ProviderOperationSummary>(
+                self.request(
+                    Method::POST,
+                    &format!("/apps/{app_id}/environments/{environment}/provider-undeployments"),
+                )
+                .header(IDEMPOTENCY_KEY, new_idempotency_key())
+                .json(&body),
+                &what,
+            )
+            .await?;
+        // As for a deployment: checked against the path this CLI would have
+        // built, never followed as an arbitrary URL.
+        let expected = format!(
+            "{}{}",
+            API_MAJOR,
+            Self::provider_deployment_route(app_id, environment, operation.operation_id)
+        );
+        let location = headers
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{what}: operation {} was accepted without a Location to poll",
+                    operation.operation_id
+                )
+            })?
+            .to_str()
+            .context("reading the provider undeploy Location")?;
         if location != expected {
             bail!(
                 "{what}: operation {} returned Location {location:?}, expected the scoped path \
@@ -2191,7 +2120,7 @@ impl Control {
         );
         let path = format!(
             "{}{}",
-            self.product_prefix(),
+            API_MAJOR,
             Self::provider_deployment_route(app_id, environment, operation_id)
         );
         let deadline = tokio::time::Instant::now() + PROVIDER_DEPLOYMENT_WAIT_TIMEOUT;
@@ -2649,6 +2578,7 @@ mod deployment_plan_tests {
     fn version() -> serde_json::Value {
         serde_json::json!({
             "id": "version-1",
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000009",
             "app_id": "demo",
             "number": 1,
             "bundle_sha": "sha256",
@@ -2683,7 +2613,8 @@ mod deployment_plan_tests {
             "app_id": "demo",
             "env_id": "environment-1",
             "version_id": "version-1",
-            "created_at": 2
+            "created_at": 2,
+            "snapshot_id": "snapshot-1"
         })
     }
 
@@ -2754,53 +2685,6 @@ mod deployment_plan_tests {
         let _ = shutdown.send(());
     }
 
-    /// A control plane from before the versioned prefixes points at its
-    /// plan under `/api/...`, and the CLI - having fallen back for the
-    /// mutation itself - expects exactly that spelling and polls it there.
-    async fn accepted_deploy_on_the_legacy_tree() -> impl IntoResponse {
-        (
-            StatusCode::ACCEPTED,
-            [(LOCATION, LEGACY_PLAN_PATH)],
-            Json(serde_json::json!({
-                "environment": "production",
-                "version": version(),
-                "delivery": delivery("prepare"),
-                "plan": plan("prepared")
-            })),
-        )
-    }
-
-    const LEGACY_PLAN_PATH: &str = "/api/apps/demo/environments/production/deployment-plans/018f2518-7e38-7f80-8000-000000000001";
-
-    #[tokio::test]
-    async fn an_accepted_plan_on_an_older_control_plane_is_polled_under_the_legacy_prefix() {
-        let router = Router::new()
-            .route(
-                "/api/apps/demo/environments/production/deployments",
-                axum::routing::post(accepted_deploy_on_the_legacy_tree),
-            )
-            .route(LEGACY_PLAN_PATH, get(active_plan))
-            .route(
-                "/api/apps/demo/environments/production/deployment",
-                get(current_deployment),
-            );
-        let (control, shutdown) = control_for(router).await;
-        let response = control
-            .deploy(
-                "demo",
-                "production",
-                "version-1",
-                None,
-                &std::collections::BTreeMap::new(),
-            )
-            .await
-            .unwrap();
-        assert!(control.speaks_legacy());
-        assert_eq!(response.deployment.id, PLAN_ID);
-        assert_eq!(response.plan.unwrap().state, "active");
-        let _ = shutdown.send(());
-    }
-
     #[tokio::test]
     async fn accepted_deploy_without_location_is_not_reported_as_success() {
         let router = Router::new().route(
@@ -2847,6 +2731,7 @@ mod list_page_tests {
     fn version(id: &str, number: i64) -> serde_json::Value {
         serde_json::json!({
             "id": id,
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000009",
             "app_id": "demo",
             "number": number,
             "bundle_sha": "sha256",
@@ -2923,7 +2808,7 @@ mod list_page_tests {
     fn a_last_page_reads_as_no_cursor() {
         let read: ListPage<Environment> = serde_json::from_value(serde_json::json!({
             "schemaVersion": 1,
-            "items": [{"id": "env-1", "app_id": "demo", "name": "production", "created_at": 1}],
+            "items": [{"id": "env-1", "canonical_id": "018f2518-7e38-7f80-8000-000000000009", "app_id": "demo", "name": "production", "created_at": 1}],
             "page": {"limit": 100, "count": 1, "total": 1, "nextCursor": null}
         }))
         .unwrap();
@@ -2988,7 +2873,7 @@ mod list_page_tests {
         let secrets = control.list_secrets("demo", "production").await.unwrap();
         let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["API_KEY", "DB_URL", "TOKEN"]);
-        assert_eq!(secrets[0].revision.as_deref(), Some("rev-1"));
+        assert_eq!(secrets[0].revision, "rev-1");
         let _ = shutdown.send(());
     }
 
@@ -3179,7 +3064,6 @@ mod list_page_tests {
         assert_eq!(history.deployments[0].version_id, "version-dep-9");
         assert_eq!(history.deployments[0].note.as_deref(), Some("hotfix"));
         assert!(history.deployments[1].note.is_none());
-        assert!(history.deployments[0].canonical_id.is_some());
         // The rest of the history is counted, not read.
         assert_eq!(history.total, 137);
         let _ = shutdown.send(());
@@ -3339,6 +3223,7 @@ mod list_page_tests {
                         "schemaVersion": 1,
                         "items": [{
                             "id": "env-1",
+                            "canonical_id": "018f2518-7e38-7f80-8000-000000000009",
                             "app_id": "demo",
                             "name": "production",
                             "created_at": 1
@@ -3385,7 +3270,7 @@ mod surface_tests {
     const REQUEST: &str = "018f2518-7e38-7f80-8000-0000000000aa";
     /// What `deis-control`'s route fallback answers, byte for byte, for a
     /// path it has no route for - on every control plane there has been.
-    const ROUTE_FALLBACK: &str = r#"{"error":"Not Found","details":"No such endpoint. The API surface is listed in the component's API_DOCUMENTATION.md."}"#;
+    const ROUTE_FALLBACK: &str = r#"{"error":"Not Found","details":"No such endpoint. The API surface is the OpenAPI contract, contracts/openapi/v1.json."}"#;
 
     fn page(items: Vec<serde_json::Value>) -> serde_json::Value {
         let count = items.len();
@@ -3399,6 +3284,7 @@ mod surface_tests {
     fn version(id: &str) -> serde_json::Value {
         serde_json::json!({
             "id": id,
+            "canonical_id": "018f2518-7e38-7f80-8000-000000000009",
             "app_id": "demo",
             "number": 1,
             "bundle_sha": "sha256",
@@ -3406,10 +3292,10 @@ mod surface_tests {
         })
     }
 
-    /// A control plane from before the versioned prefixes: every route it
-    /// has lives under `/api`, and anything else gets the route fallback.
+    /// A server whose only routes live under the flat `/api` prefix, which
+    /// deis-control does not serve; anything else gets the route fallback.
     /// `probes` counts how often the fallback was reached.
-    fn older_control_plane(probes: Arc<AtomicUsize>) -> Router {
+    fn flat_control_plane(probes: Arc<AtomicUsize>) -> Router {
         Router::new()
             .route(
                 "/api/apps/demo/versions",
@@ -3447,22 +3333,6 @@ mod surface_tests {
     }
 
     #[test]
-    fn a_versioned_path_has_exactly_one_legacy_spelling() {
-        assert_eq!(
-            legacy_spelling("/api/v1/apps/demo?limit=1").as_deref(),
-            Some("/api/apps/demo?limit=1")
-        );
-        assert_eq!(
-            legacy_spelling("/api/platform/runtime").as_deref(),
-            Some("/api/runtime")
-        );
-        // Already the legacy spelling, or a lookalike: nothing to fall back to.
-        assert_eq!(legacy_spelling("/api/apps"), None);
-        assert_eq!(legacy_spelling("/api/v10/apps"), None);
-        assert_eq!(legacy_spelling("/api/platformer"), None);
-    }
-
-    #[test]
     fn a_refusal_is_read_in_either_shape() {
         match Refusal::parse(br#"{"error":"plain"}"#) {
             Some(Refusal::Plain(message)) => assert_eq!(message, "plain"),
@@ -3483,7 +3353,10 @@ mod surface_tests {
         assert!(Refusal::parse(br#"{"error":{"message":"no code"}}"#).is_none());
         assert!(Refusal::parse(br#"{"error":7}"#).is_none());
         assert!(Refusal::parse(b"<html>gateway</html>").is_none());
-        assert!(!Refusal::is_structured(ROUTE_FALLBACK.as_bytes()));
+        assert!(matches!(
+            Refusal::parse(ROUTE_FALLBACK.as_bytes()),
+            Some(Refusal::Plain(_))
+        ));
     }
 
     #[test]
@@ -3505,33 +3378,17 @@ mod surface_tests {
     }
 
     #[tokio::test]
-    async fn an_older_control_plane_is_probed_once_and_then_driven_through_the_legacy_tree() {
+    async fn a_missing_route_is_an_error_and_never_retried_under_another_prefix() {
         let probes = Arc::new(AtomicUsize::new(0));
-        let (control, shutdown) = control_for(older_control_plane(probes.clone())).await;
-        assert!(!control.speaks_legacy());
-
-        let versions = control.list_versions("demo").await.unwrap();
-        assert_eq!(versions[0].id, "version-1");
-        assert!(control.speaks_legacy());
-        assert_eq!(probes.load(Ordering::SeqCst), 1);
-
-        // The second call is built for the legacy tree outright: no probe.
-        let accounts = control.list_accounts().await.unwrap();
-        assert_eq!(accounts[0].name, "alice");
-        assert_eq!(probes.load(Ordering::SeqCst), 1);
-
-        // And its flat refusal is still read as the string it is, with no
-        // request id invented for it.
-        let error = control.create_app("demo").await.unwrap_err().to_string();
-        assert!(error.contains("409"), "{error}");
-        assert!(error.contains("app demo already exists"), "{error}");
-        assert!(!error.contains("[request"), "{error}");
+        let (control, shutdown) = control_for(flat_control_plane(probes.clone())).await;
+        let error = control.list_versions("demo").await.unwrap_err().to_string();
+        assert!(error.contains("404"), "{error}");
         assert_eq!(probes.load(Ordering::SeqCst), 1);
         let _ = shutdown.send(());
     }
 
     /// A 404 that carries the envelope is the control plane saying "no such
-    /// record" on a surface it does know; the legacy tree is not consulted.
+    /// record" on a surface it does know.
     #[tokio::test]
     async fn a_versioned_404_about_a_record_is_an_answer_not_a_missing_surface() {
         let router = Router::new()
@@ -3559,7 +3416,6 @@ mod surface_tests {
             );
         let (control, shutdown) = control_for(router).await;
         assert!(control.get_app("demo").await.unwrap().is_none());
-        assert!(!control.speaks_legacy());
         let _ = shutdown.send(());
     }
 
@@ -3690,7 +3546,6 @@ mod surface_tests {
         assert_eq!(nodes[0].id, "n1");
         let apps = control.node_status("n1").await.unwrap().unwrap();
         assert_eq!(apps[0].app_id, "demo");
-        assert!(!control.speaks_legacy());
         let _ = shutdown.send(());
     }
 }
@@ -4519,7 +4374,6 @@ mod captured_example_tests {
         ("ApiToken", "unscoped"),
         ("ApiToken", "last_used_at"),
         ("ApiToken", "revoked_at"),
-        ("App", "canonical_id"),
         ("ControlListPage_Account", "items.0.disabled_at"),
         ("ControlListPage_ApiToken", "items.0.unscoped"),
         ("ControlListPage_ApiToken", "items.0.last_used_at"),
@@ -4532,17 +4386,13 @@ mod captured_example_tests {
         ("ControlListPage_AuditEntry", "items.0.peer"),
         ("ControlListPage_AuditEntry", "items.0.detail"),
         ("ControlListPage_AuditEntry", "items.0.requestId"),
-        ("ControlListPage_Deployment", "items.0.canonical_id"),
         ("ControlListPage_Deployment", "items.0.note"),
         ("ControlListPage_DomainGrant", "items.0.note"),
-        ("ControlListPage_Environment", "items.0.canonical_id"),
         ("ControlListPage_Route", "items.0.host"),
         ("ControlListPage_SecretMeta", "items.0.revision"),
-        ("ControlListPage_VersionView", "items.0.canonical_id"),
         ("ControlListPage_VersionView", "items.0.manifest"),
         ("ControlListPage_VersionView", "items.0.compatibility"),
         ("DeploymentPlanResponse", "plan.last_error"),
-        ("DeploymentResponse", "deployment.canonical_id"),
         ("DeploymentResponse", "deployment.note"),
         ("DeploymentResponse", "delivery"),
         ("DeploymentResponse", "delivery.phase"),
@@ -4551,7 +4401,6 @@ mod captured_example_tests {
         ("DeploymentResponse", "delivery.skipped"),
         ("DeploymentResponse", "plan"),
         ("DeploymentResponse", "plan.last_error"),
-        ("Environment", "canonical_id"),
         ("ErrorBody", "error.requestId"),
         ("ErrorBody", "error.violations"),
         ("ErrorBody", "error.retryable"),
@@ -4559,8 +4408,6 @@ mod captured_example_tests {
         ("SecretChangeResponse", "delivery.phase"),
         ("SecretChangeResponse", "delivery.skipped"),
         ("SecretDeletedResponse", "delivery.phase"),
-        ("UploadResponse", "version.canonical_id"),
-        ("VersionView", "canonical_id"),
         ("VersionView", "manifest"),
         ("VersionView", "compatibility"),
     ];

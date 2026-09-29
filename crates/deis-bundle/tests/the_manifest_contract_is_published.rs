@@ -54,21 +54,16 @@ fn a_manifest_holding_every_field() -> Manifest {
     bindings.insert("HOT", Binding::storage(BindingKind::Kv));
 
     Manifest {
-        schema: 1,
+        schema: deis_bundle::SUPPORTED_SCHEMA,
         app: "demo".to_string(),
         entry: "worker/index.js".to_string(),
         runtime: Some("standard-v1".to_string()),
-        services: [("kv".to_string(), true)].into_iter().collect(),
         bindings,
         callable_by: vec!["storefront".to_string()],
-        env: [("LOG_LEVEL".to_string(), "info".to_string())]
-            .into_iter()
-            .collect(),
-        secrets: vec!["API_KEY".to_string()],
-        environment: Some(deis_wire::EnvironmentDeclarations::new(
+        environment: deis_wire::EnvironmentDeclarations::new(
             "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
             Vec::new(),
-        )),
+        ),
         routes: vec![Route {
             pattern: "/api/users/:id".to_string(),
             methods: vec!["GET".to_string()],

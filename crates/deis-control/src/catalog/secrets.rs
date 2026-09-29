@@ -219,11 +219,6 @@ impl SecretCipher {
     }
 }
 
-/// Associated data binding a ciphertext to one environment and name.
-pub fn secret_aad(env_id: &str, name: &str) -> Vec<u8> {
-    format!("{env_id}\u{1f}{name}").into_bytes()
-}
-
 /// Associated data for an immutable revision. Including the revision stops a
 /// valid ciphertext from being substituted into another revision row of the
 /// same environment and name.
@@ -355,7 +350,7 @@ mod tests {
     #[test]
     fn round_trips_a_value() {
         let cipher = test_cipher();
-        let aad = secret_aad("env-1", "API_KEY");
+        let aad = secret_revision_aad("env-1", "API_KEY", "rev-1");
         let blob = cipher.encrypt(b"s3cr3t", &aad).unwrap();
 
         assert!(blob.len() > NONCE_LEN);
@@ -390,7 +385,7 @@ mod tests {
     #[test]
     fn every_encryption_uses_a_fresh_nonce() {
         let cipher = test_cipher();
-        let aad = secret_aad("env-1", "API_KEY");
+        let aad = secret_revision_aad("env-1", "API_KEY", "rev-1");
         let a = cipher.encrypt(b"same", &aad).unwrap();
         let b = cipher.encrypt(b"same", &aad).unwrap();
         assert_ne!(a[..NONCE_LEN], b[..NONCE_LEN]);
@@ -401,23 +396,23 @@ mod tests {
     fn a_blob_moved_to_another_environment_does_not_decrypt() {
         let cipher = test_cipher();
         let blob = cipher
-            .encrypt(b"value", &secret_aad("env-1", "API_KEY"))
+            .encrypt(b"value", &secret_revision_aad("env-1", "API_KEY", "rev-1"))
             .unwrap();
         assert!(
             cipher
-                .decrypt(&blob, &secret_aad("env-2", "API_KEY"))
+                .decrypt(&blob, &secret_revision_aad("env-2", "API_KEY", "rev-1"))
                 .is_err()
         );
         assert!(
             cipher
-                .decrypt(&blob, &secret_aad("env-1", "OTHER"))
+                .decrypt(&blob, &secret_revision_aad("env-1", "OTHER", "rev-1"))
                 .is_err()
         );
     }
 
     #[test]
     fn another_key_cannot_read_the_ciphertext() {
-        let aad = secret_aad("env-1", "API_KEY");
+        let aad = secret_revision_aad("env-1", "API_KEY", "rev-1");
         let blob = test_cipher().encrypt(b"value", &aad).unwrap();
         let other = SecretCipher::from_key_bytes(&[9u8; MASTER_KEY_LEN]).unwrap();
         assert!(other.decrypt(&blob, &aad).is_err());
@@ -426,7 +421,7 @@ mod tests {
     #[test]
     fn rejects_a_truncated_blob() {
         let cipher = test_cipher();
-        let aad = secret_aad("env-1", "API_KEY");
+        let aad = secret_revision_aad("env-1", "API_KEY", "rev-1");
         assert!(cipher.decrypt(&[0u8; NONCE_LEN], &aad).is_err());
         assert!(cipher.decrypt(&[], &aad).is_err());
     }
@@ -446,7 +441,7 @@ mod tests {
         let from_hex = SecretCipher::load_from_file(&hex_path).unwrap();
 
         // Both encodings must yield the same key.
-        let aad = secret_aad("env-1", "API_KEY");
+        let aad = secret_revision_aad("env-1", "API_KEY", "rev-1");
         let blob = from_hex.encrypt(b"value", &aad).unwrap();
         let from_raw = SecretCipher::load_from_file(&raw_path).unwrap();
         assert_eq!(from_raw.decrypt(&blob, &aad).unwrap(), b"value");

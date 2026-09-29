@@ -11,8 +11,7 @@
 
 | 领域 | 当前代码事实 | v1 迁移目标 |
 |---|---|---|
-| 应用身份 | `crates/deis-control/src/catalog/model.rs` 的 `App.id` 同时是应用名称；名称进入路由、目录和存储租户 | 所有持久对象使用不可复用、类型化的 lowercase UUIDv7；名称只作可改显示属性 |
-| 存储隔离 | `deis_wire::conventions::tenant_id` 生成 `app.environment`，binding 再形成 `app.environment@BINDING` | namespace 使用 canonical application/environment/binding ID；旧字符串只存在迁移映射与 tombstone |
+| 应用身份 | `crates/deis-control/src/catalog/model.rs` 的 `App.id` 同时是应用名称；名称进入路由和目录 | 所有持久对象使用不可复用、类型化的 lowercase UUIDv7；名称只作可改显示属性 |
 | Version/Deployment | `Version` 保存 bundle；`Deployment` 是 newest-row-wins 指针，CLI 已明确承认部分节点可能继续旧版本 | artifact、environment version、deployment revision 和 operation 分离；未完成 observe 不得进入 `active` |
 | 长操作 | `commands` 状态机只描述 Control 对单个节点下发命令 | build/deploy/migrate/delete 等使用可恢复、幂等、可取消、带 revision 的产品 operation；节点命令成为 child/provider operation |
 | 构建产物 | build core 的 `VendorBuild`/`AdapterArtifacts` 直接表达多个 vendor 输出；Deislet bundle manifest 仍包含应用名称和旧服务模型 | 先形成 provider-neutral、内容寻址、可验证和签名的 canonical artifact，再派生 provider artifact |
@@ -20,27 +19,19 @@
 | Provider driver | 当前 adapter 主要生成文件，外部部署还没有统一 driver lifecycle | driver 必须实现 12 个统一动作，可以在内部调用锁定的官方 CLI/API，但只返回统一 operation 与结构化诊断 |
 | Driver 发行 | 单个 `distributionDigest` 未说明它代表哪种主机 archive，来源 tarball 也不等于 npm/CLI 完整安装树 | digest 绑定一个 canonical release index，再由它逐主机固定 archive、file tree、components 与 executable |
 
-这些是迁移输入，不因 schema 文件出现而自动修复。路线中的 `P0-MODEL-001` 只有在代码采用共享类型、旧数据迁移 fixture 可实际运行、且无停机 cutover 测试通过后才能完成。
+这些是改造输入，不因 schema 文件出现而自动修复。没有任何存量安装，因此不存在旧数据迁移：改造直接替换旧形态，不保留双读或兼容窗口。
 
 ## 当前实现进度
 
-identity 迁移已完成八个可执行切片。第一段让 `application`、`environment`、`version`、`deployment` 在保留旧主键和名称查找的同时获得独立 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写；SQLite 启动迁移会回填存量行、建立唯一索引且重复启动不改写 ID，写入触发器拒绝显式无效、擦除或从一个有效 UUIDv7 改绑到另一个有效 UUIDv7，兼容触发器仍会为滚动升级期间按旧列集合写入的进程补齐 UUIDv7。数据库旧损坏行在读取时 fail closed，REST 只序列化有效类型；新 CLI 允许连接尚未提供该字段的旧 Control，但字段一旦存在就必须有效。
+身份与存储租户已切到 canonical ID：
 
-第二段新增共享 `deis-wire::CanonicalTenantId`，唯一逻辑拼写与本契约相同：`v1/<application UUIDv7>/<environment UUIDv7>`。Control 的 push 与 assignment list 现在同时发送两个 canonical ID；节点只允许“两者都缺失”的旧 Control 或“两者都有效”的新 Control，partial/UUIDv4/非规范拼写在 bundle 下载前失败关闭。节点把 identity 写入 installed record，已记录的 canonical tenant 不能被另一组合法 ID 重绑，旧 Control 的字段缺失也不能擦除它。Runtime placement/telemetry key 与 storage authority 已拆成两个输入，KV/SQL/blob 与 queue poller 共用后者，并有真实 store round-trip 测试证明两者不会混用。
+- `application`、`environment`、`version`、`deployment` 都有独立的 lowercase UUIDv7 `canonical_id`。`deis-wire::CanonicalId` 是 Control 与 CLI 共用的验证类型，拒绝 UUIDv4、大小写/无连字符等第二种拼写。
+- `deis-wire::CanonicalTenantId` 的唯一逻辑拼写是 `v1/<application UUIDv7>/<environment UUIDv7>`。Control 的 push 与 assignment list 都携带两个 canonical ID，节点把它写入 installed record，不能被另一组 ID 重绑。
+- deis-store 与 deis-queue 的租户就是 capability 为该 binding 命名的唯一 canonical tenant：服务从已验证的 capability 取租户，请求里没有、也不接受任何租户头。capability 为同一 binding 命名零个或多个租户时整次调用被拒。节点和 CLI 申领或领取的 store/queue capability 都只命名 canonical tenant；deis-telemetry 的记录仍按 `<app>.<environment>` 标签归属。
+- 后端物理 key 是可逆的 `ct1_<application UUIDv7>_<environment UUIDv7>`，named namespace 追加应用声明的 binding 名（`@HOT`）。binding 名只在 capability 证明的租户内选择命名空间，不是授权。该 key 是 Linux、macOS、Windows 均可用的单个路径组件，不含 `.`、`/`、`\`。
+- 每份 store/queue/telemetry 数据目录有一个不可变的 backend incarnation UUIDv7（数据目录中的 `backend-incarnation` 文件）。snapshot 不复制该文件，restore 后首次打开即生成新 ID，所以恢复出的目录不能冒充源目录。
 
-第三段在 Control 内部建立持久 `identity_migrations` 计划、operation/migration UUIDv7、catalog inventory、per-environment canonical binding ID、application revision 与 catalog fence。相同 revision 的重复规划逐字段幂等；计划态 inventory 变化保留 operation identity、递增 record revision、轮换 fence token；获取 fence 时在同一 `BEGIN IMMEDIATE` 事务内核对 app identity/revision/token，之后 SQLite trigger 会拒绝新旧 writer 改动 environment/version/deployment/route/secret。迁移唯一性、fence 与 binding 归属均绑定 canonical application/environment ID，不绑定可复用的显示名或旧 UUID；删除目录 app 不级联删除旧迁移/binding 身份，同名新 app 也不会继承它们。catalog snapshot 保存完整 environment/version/deployment/route/secret metadata 与 binding mapping，并计算确定性 SHA-256；新快照在提交前与持久读取采用同一语义校验，强制规范顺序和唯一键，不读取 secret ciphertext。错误 manifest app、跨应用引用、缺失 join、非规范 bundle digest、JSON 语义损坏、mapping 漂移及历史 binding 大小写/同名 kind 歧义都会使整个事务失败且不留下部分 mapping。永久 migration identity 与 binding row 禁止改绑，binding row 也禁止删除。inventory 明确把 catalog 标为 `captured`，KV/SQL/blob/queue/telemetry/stateful objects/provider resources 全部保留 `pending`，当前代码拒绝持久数据提前把这些外部证据标为完成。
-
-第四段定义 Deislet 后端自己的 canonical persistence boundary。标准逻辑身份仍且只能是 `CanonicalTenantId` 的 `v1/<application UUIDv7>/<environment UUIDv7>`；store、queue、migration、snapshot 与 restore 共享的物理 tenant key 则是可逆的 `ct1_<application UUIDv7>_<environment UUIDv7>`，named namespace 只追加永久 `@<binding UUIDv7>`，不使用可改显示名。该集合与必含 `.` 的 legacy `application.environment[@binding]` 集合不相交，且是 Linux、macOS、Windows 均可用的单个路径组件。测试已覆盖规范/非规范解析、live metadata 拒绝、KV/SQL/blob snapshot/restore、legacy detection、orphan scan 及 queue reopen 隔离。物理 key 是 Deislet 实现细节，禁止写入 `x-deis-tenant`、禁止成为 HMAC subject；请求入口仍故意只接受 legacy grammar。
-
-第五段建立后端真实写入栅栏与外部 inventory。共享 `deis.backend.migration.v1.BackendMigration` 只在配置独立 `migration_admin_token` 时注册，且只接受 `Authorization: Bearer`；应用 storage token 不属于该认证域。store 的 KV/SQL/blob 共用持久 fence journal，queue 使用自己的 journal；acquire 等待已有写许可和 SQL 交互事务完成，再提交单调 epoch，重启先恢复 active fence。KV expiry、blob orphan sweep、queue lease/ack/nack/replay/retention 也受同一边界。inventory 产生规范 SHA-256/count/bytes/orphan evidence，SQL 必须完成 WAL checkpoint，blob 校验真实 content digest；错误 token/revision/migration 不能替换或释放 fence。共享 proto、Rust 测试和真实 gRPC 测试验证了默认不暴露、独立认证、在途事务 drain、四类 component 拒绝写入、重启保持和精确 rollback。
-
-第六段由 Control 使用分别配置、禁止复用的 store/queue 管理凭证协调 catalog 与每个 legacy tenant 的 backend fence。`identity_migration_backend_attempts` 在每次网络调用前后记录 endpoint digest、revision、状态、attempt count、回执和契约 evidence；Control 若在远端取得 fence 后崩溃，下一次以相同 migration/revision/token 重放，而不是猜测。受管理员权限保护的 `POST /api/apps/:app/identity-migration` 在持久 plan 后返回 `202` 并后台执行，客户端断开不会取消；启动时恢复 `planned/running`，GET 在管理凭证移除后仍可读取脱敏状态。错误 backend/tenant、缺失或变化的 receipt、组件缺失/重复、非规范摘要或时间均失败关闭。当前只捕获 store 的 KV/SQL/blob 与 queue，操作进入 `waiting` 且明确列出 telemetry、Stateful Objects、provider resources 缺口，不会冒充 ready-for-copy。
-
-第七段把迁移接入共享 `deis-wire::ProductOperation` 与 `operation-transitions.json` 的唯一状态图。POST 必须提供 `Idempotency-Key`，Control 只持久化其 SHA-256，并把稳定 organization、actor、request/correlation UUIDv7、scope、target、revision、phase 和完整时间字段写入 operation；只有同 actor、同 key、同 canonical target 的重放会返回原 Operation，包括终态重放与同名 application 重建的隔离。响应返回 `Location`、`ETag`，可由统一 `GET /api/operations/:id` 读取。取消必须携带单个强 `If-Match`：缺失为 428、旧 revision 为 412；接受后先进入 `cancelling`。后台按已记录的 backend incarnation 与原 fence token 精确调用 `ReleaseWriteFence`，全部成功后才进入 `cancelled` 并解除 catalog fence，重启会继续未完成的 release。当前迁移没有真实 child/provider operation，数组保持诚实的空值。终态迁移保留历史且同一 application 最多只有一个非终态迁移；启动迁移会原子升级旧唯一约束并接管此前没有正式 Operation 记录的在途迁移。
-
-第八段为每份物理 store/queue/telemetry 数据建立持久、不可变的 backend incarnation UUIDv7。统一管理协议新增 `GetBackendInfo`，acquire/release 必须携带 expected incarnation，receipt v2 把它纳入 SHA-256；因此 endpoint 不变但数据目录被 restore 或替换时也不能重放旧 fence。Control 在任何远端变更前持久绑定首次发现的 ID，并在恢复、已捕获 evidence 复核和取消 release 时逐次失败关闭。旧 journal 可保留活动 v1 receipt 原位升级。deis-store、deis-queue 与 deis-telemetry snapshot manifest 都记录源 ID但不复制 fence journal，restore 会验证 digest/integrity/count、立即生成并打印新 ID；测试证明源/目标不同且目标重启保持不变。
-
-第九段把三份 snapshot 原语组合成一个 installation 级恢复点与正式 Restore ProductOperation。`deis-backend-topology snapshot-set` 在关闭 writer admission 前建立持久 capture journal，再于停止三个 backend 的同一 outage barrier 下取样；下一次 topology mutation 会先恢复遗留 capture，完整集合在服务/入口恢复和 envelope 复核后幂等发布，不完整集合保留现场并终止。restore 先完整 staging，再 journaled switch，失败时恢复全部 prior incarnation。Control 以持久租约协调多实例、从 driver status 对账未知退出，并在三个 live management endpoint 证明新 incarnation 后原子推进 installation revision、plan 与 Operation。restore set 使用 RFC 8785 JSON Canonicalization Scheme 生成跨语言一致字节，再计算 `restoreSetSha256`；数值字段限于 I-JSON 安全整数范围。execution report、幂等请求和 topology driver digest 都被持久绑定，不能依赖 Rust struct 或某个供应商 JSON encoder 的字段顺序。
+`deis-backend-topology` 把三份 snapshot 原语组合成一个 installation 级恢复点与正式 Restore ProductOperation：`snapshot-set` 在关闭 writer admission 前建立持久 capture journal，再在停止三个 backend 的同一 outage barrier 下取样；restore 先完整 staging，再 journaled switch，失败时恢复全部 prior incarnation。Control 只有一个实例，restore 由它直接驱动，driver 的 report 在绑定 restore set 后原子推进 installation revision、plan 与 Operation。restore set 使用 RFC 8785 JCS 生成跨语言一致字节，再计算 `restoreSetSha256`。
 
 第十段把 `provider-driver.schema.json` 接入真实执行边界。共享 crate 的 orchestrator 只执行持久 store 返回的 exact request，并以 owner UUIDv7、单调 claim epoch、lease 与 heartbeat 拒绝并发或陈旧 worker；实际 driver 的 ID、version、distribution SHA-256 与 JCS manifest SHA-256 必须全部匹配 target pin。Control 持久化 installation、不可变 target、driver operation 与逐 attempt journal；installation 只含 credential binding ID，不存在 token/secret value/ciphertext 列。claim、renew、receipt/error/contract failure 与 `ProductOperation` 状态及 provider summary 在同一事务完成；进程退出、租约过期或 unknown side effect 的接管只能执行 `reconcile`，无副作用且明确 retryable 的失败才可重放原动作。外部 provider 调用始终发生在 SQLite 事务之外。
 
@@ -76,7 +67,7 @@ request、argv、持久状态或未脱敏输出。timeout/输出上限/进程树
 密码学、Control registry、两项 target migration 与严格 Clippy；当前 v1 只定义 C2SP Ed25519 日志/见证签名，
 ML-DSA-44 等后续行业能力须以版本化契约演进。
 
-这些切片仍不代表八阶段 identity 迁移或统一部署完成。当前迁移、restore、单步 provider work 与 provider deployment parent 已满足 `operation.schema.json` 全字段与通用状态图，credential vault/broker、验证安装器、Control release registry、DSSE 阈值授权、透明 proof、旧根/新根双阈值轮换与进程 dispatcher 已存在；但真实官方工具 materialized release、真实公共日志/见证服务与发行 ceremony、Windows service DACL、Cloudflare/EdgeOne/Deislet 完整 driver、后台执行循环和 API/CLI/Web 仍未接线。Stateful Objects 与 provider resources 仍无 inventory/fence/restore；实际 live storage namespace 与 HMAC token subject 仍是 `app.environment`，运行 placement、路由、bundle path 与 telemetry 仍以旧名称定位，installed record 写失败也尚无可恢复 product operation 接管。因此在 canonical-first dual-read、copy/verify/cutover、旧 capability 撤销和 tombstone 完成前，代码刻意不把 live `storage_tenant` 切到 canonical target，也不双写。旧主键列在兼容期保持 nullable，最终 `NOT NULL` 约束必须等旧 writer 和旧查找路径退出后通过表重建落地。
+这些切片仍不代表统一部署完成。restore、单步 provider work 与 provider deployment parent 已满足 `operation.schema.json` 全字段与通用状态图，credential vault/broker、验证安装器、Control release registry、DSSE 阈值授权、透明 proof、旧根/新根双阈值轮换与进程 dispatcher 已存在；但真实官方工具 materialized release、真实公共日志/见证服务与发行 ceremony、Windows service DACL、Cloudflare/EdgeOne/Deislet 完整 driver、后台执行循环和 API/CLI/Web 仍未接线。Stateful Objects 与 provider resources 仍无 restore；运行 placement、路由、bundle path 与 telemetry 仍以名称定位。
 
 ## 十八份机器契约
 
@@ -92,16 +83,14 @@ ML-DSA-44 等后续行业能力须以版本化契约演进。
 10. [`provider-driver-release-envelope.schema.json`](provider-driver-release-envelope.schema.json)：标准 DSSE v1 envelope；签名覆盖 PAE(payload type, canonical payload)，而不是只签一个可重解释的裸摘要。
 11. [`provider-driver-transparency-proof.schema.json`](provider-driver-transparency-proof.schema.json)：canonical authorization 的离线透明证明；固定 RFC 6962 inclusion path、C2SP signed checkpoint 与 timestamped witness cosignature，不采信在线响应中的未认证时间。
 12. [`provider-driver-process.schema.json`](provider-driver-process.schema.json)：Control 与已安装 driver executable 之间唯一的 request/outcome envelope；固定协议版本、统一 lifecycle 对象与错误，不含 credential。`rollback` request 额外携带可选的 `rollbackTarget`：源 deploy 的 operation ID、其 `activate` 步骤的 operation ID 与该 receipt 的 RFC 8785 canonical SHA-256，以及 receipt 上报的 `providerDeploymentId`/`providerVersionId`/`providerResourceIds` 原样副本，让 driver 按 provider 原生身份定位要恢复的部署，而不只靠 `desiredStateDigest` 搜索。Control 发出的每个 `rollback` request 都必须带它（源部署没有 succeeded `activate` receipt 时以 `operation-not-rollbackable` 拒绝），schema 的 `rollback` 分支同样把它列为必填，不是仅仅容忍；`None` 时整个成员省略，旧 driver 对未知成员的拒绝仍然成立。`reconcile` request 另带必填的 `reconciles.operation`：被接管的那次操作。`reconcile` 不是工作流自己的步骤，而是 Control 在答案丢失（lease 过期、进程超时、driver 回 `unknown`）后替换掉原操作的重问，operation ID、desired state 与 plan 保持逐字不变。driver 进程只看得到 request，而“已清理”和“已部署”在同一份 provider 状态上结论相反，所以不说明接管的是哪次操作，driver 就会回答另一个问题，而 Control 会把这份 `succeeded` receipt 当作原操作已完成的证据。被接管的是 `rollback` 时，`rollbackTarget` 随之保留（schema 在该分支同样必填）；接管其它操作的 `reconcile` 不得携带 `rollbackTarget`，`reconciles.operation` 也不能是 `reconcile` 自身。非 `reconcile` operation 必须省略该成员，旧 driver 直接执行的每个 operation 因此与原始 v1 request 逐字节相同；只有接管才多出该成员，拒绝未知成员的旧 driver 会在接管时失败关闭，这好过让它对着另一个问题回答 `succeeded`。信封另有必填的 `workspace`（与 `request` 并列，而不是 `request` 的成员：同一份 durable request 每次尝试都可能落在不同目录）：`directory` 是 Control 为这一个进程新建的 0700 目录，也是进程的 cwd，进程退出后即删除，Control 启动时清扫遗留；`artifactDirectory` 固定为 `<directory>/<request.artifact.providerPayloadSha256>`，是 Control 从自己的 provider payload 存储（`POST /api/v1/apps/{app_id}/artifacts/{artifact_id}/provider-payloads` 上传的树）复制出来、并在启动进程前按该摘要重新计算 file-set digest 的产物树（Cloudflare 即 `wrangler.toml`、Worker bundle 与 `binding-plan.json`），`request.artifact` 为 null 时它也必须为 null；`stateDirectory` 是按 provider target 与 environment 划分、跨操作保留的 0700 目录，供 driver 记 journal，不能位于 `directory` 之内。摘要不符、payload 不存在或无法复制时，Control 不取凭据租约、不启动进程，分别以 `DRIVER_ARTIFACT_INTEGRITY`、`DRIVER_ARTIFACT_NOT_FOUND`、`DRIVER_WORKSPACE_UNAVAILABLE` 失败。进程环境被清空，除凭据外 Control 只设置 `PATH`（固定为 `/usr/local/bin:/usr/bin:/bin`）、`TMPDIR`（即 `directory`）与 `HOME`（本 Control 所有 driver 进程共用的 0700 目录，供缓存工具链）。driver 不得从自己的安装目录或 cwd 之外的任何隐含位置读取应用文件。
-13. [`identity-migration.schema.json`](identity-migration.schema.json)：旧 name-based tenant 到 canonical identity 的 inventory、双读、复制/rename、验证、cutover、旧 capability 撤销和 tombstone。
-14. [`backend-migration-evidence.schema.json`](backend-migration-evidence.schema.json)：后端在持久 writer fence 下取得的 component count/bytes/digest/orphan evidence；明确认证域、backend incarnation 和 receipt，但禁止保存 fence token。
-15. [`backend-restore-set.schema.json`](backend-restore-set.schema.json)：把 store、queue、telemetry 三份本地快照绑定到同一个全平台停写/停服屏障、固定 topology driver 和不可变 snapshot digest；明确禁止复制 migration fence journal。缺少任一组件、只具有各自一致点或无法证明 outage barrier 的集合不能进入平台级 Restore Operation。
-16. [`backend-restore-report.schema.json`](backend-restore-report.schema.json)：topology driver 对同一 operation/restore set 的可对账终态证据，只允许 `succeeded` 或 `rolled-back`，并按固定顺序记录三后端切换前后的 incarnation。`restoreSetSha256` 统一是 restore set 的 RFC 8785 JCS 字节摘要；进程退出、timeout 或中间阶段不属于 report 状态。
-17. [`control-list-page.schema.json`](control-list-page.schema.json)：Control 所有资源列表共用的 v1 envelope：`items` 与 `page.limit/count/total/nextCursor`。`total` 是同一读快照中符合 scope/filter 的精确总数；cursor 是 256-bit 随机、URL-safe、不透明且有期限的定位符，只能用于签发它的 collection/scope/filter/sort，不能替代正常授权。当前共 32 个 operation 消费该契约：`/api/v1` 下 26 条（provider 管理面的 list/audit、应用目录的 apps/retired-apps/artifacts/versions/environments、产品面的 deployments/routes/secrets/domain grants/accounts/tokens/audit），`/api/platform` 下 6 条（events、commands 两条、heartbeats、config history 两条）。剩下的读取是有意的例外，不是欠迁移：节点通道的 `GET /api/nodes/:id/assignments` 与 `GET /api/routing-table` 永不进入版本化命名空间，且必须保持整表原子语义——分页后的节点会按两页拼出一个从未在任何时刻成立过的集合；`/api/platform/sessions`、`/api/platform/configs`、`/api/platform/metrics/summary` 由进程内内存而非数据库读快照供数，没有可用于精确 `total` 的读事务，其最终形态仍属产品决策，本轮只收口了无上限 `limit`。
-18. [`control-error.schema.json`](control-error.schema.json)：Control API v1 与 platform 命名空间所有失败响应共用的结构化错误封装：`error.code/message/requestId/violations/retryable`，可选 `target`、`retryAfterSeconds`、`docs`、`provider`，每一层都禁止未声明成员。`code` 是封闭枚举，客户端只允许分支于它，不允许解析 `message`；`violations` 始终存在，没有逐字段结论时为空数组；`requestId` 是与响应头和服务端日志同一条请求的 UUIDv7 关联 ID；`retryable` 是错误类别自身的属性，不随单次请求变化，只有它为真时才会出现 `retryAfterSeconds`。控制面自身一侧的失败（`internal`、`database-unavailable`、由所拨后端产生的 `backend-unavailable`）的 `message` 是固定句子，后端原文只进服务端日志并以 `requestId` 关联。`provider` 逐字复用 [`provider-driver-process.schema.json`](provider-driver-process.schema.json) 的 driver 错误词汇，永远不携带 provider 管理凭证。豁免路由（node-auth、bundle 下载）与兼容期 `/api/*` 旧树仍保持逐字节不变的 `{"error": "message"}`，不套用本封装。
+13. [`backend-restore-set.schema.json`](backend-restore-set.schema.json)：把 store、queue、telemetry 三份本地快照绑定到同一个全平台停写/停服屏障、固定 topology driver 和不可变 snapshot digest。缺少任一组件、只具有各自一致点或无法证明 outage barrier 的集合不能进入平台级 Restore Operation。
+14. [`backend-restore-report.schema.json`](backend-restore-report.schema.json)：topology driver 对同一 operation/restore set 的可对账终态证据，只允许 `succeeded` 或 `rolled-back`，并按固定顺序记录三后端切换前后的 incarnation。`restoreSetSha256` 统一是 restore set 的 RFC 8785 JCS 字节摘要；进程退出、timeout 或中间阶段不属于 report 状态。
+15. [`control-list-page.schema.json`](control-list-page.schema.json)：Control 所有资源列表共用的 v1 envelope：`items` 与 `page.limit/count/total/nextCursor`。`total` 是同一读快照中符合 scope/filter 的精确总数；cursor 是 256-bit 随机、URL-safe、不透明且有期限的定位符，只能用于签发它的 collection/scope/filter/sort，不能替代正常授权。当前共 32 个 operation 消费该契约：`/api/v1` 下 26 条（provider 管理面的 list/audit、应用目录的 apps/retired-apps/artifacts/versions/environments、产品面的 deployments/routes/secrets/domain grants/accounts/tokens/audit），`/api/platform` 下 6 条（events、commands 两条、heartbeats、config history 两条）。剩下的读取是有意的例外，不是欠迁移：节点通道的 `GET /api/nodes/:id/assignments` 与 `GET /api/routing-table` 永不进入版本化命名空间，且必须保持整表原子语义——分页后的节点会按两页拼出一个从未在任何时刻成立过的集合；`/api/platform/sessions`、`/api/platform/configs`、`/api/platform/metrics/summary` 由进程内内存而非数据库读快照供数，没有可用于精确 `total` 的读事务，其最终形态仍属产品决策，本轮只收口了无上限 `limit`。
+16. [`control-error.schema.json`](control-error.schema.json)：Control API v1 与 platform 命名空间所有失败响应共用的结构化错误封装：`error.code/message/requestId/violations/retryable`，可选 `target`、`retryAfterSeconds`、`docs`、`provider`，每一层都禁止未声明成员。`code` 是封闭枚举，客户端只允许分支于它，不允许解析 `message`；`violations` 始终存在，没有逐字段结论时为空数组；`requestId` 是与响应头和服务端日志同一条请求的 UUIDv7 关联 ID；`retryable` 是错误类别自身的属性，不随单次请求变化，只有它为真时才会出现 `retryAfterSeconds`。控制面自身一侧的失败（`internal`、`database-unavailable`、由所拨后端产生的 `backend-unavailable`）的 `message` 是固定句子，后端原文只进服务端日志并以 `requestId` 关联。`provider` 逐字复用 [`provider-driver-process.schema.json`](provider-driver-process.schema.json) 的 driver 错误词汇，永远不携带 provider 管理凭证。豁免路由（node-auth、bundle 下载）与兼容期 `/api/*` 旧树仍保持逐字节不变的 `{"error": "message"}`，不套用本封装。
 
 UUIDv7 目前是 draft 实现选择：它标准化、可跨进程生成并按时间大致排序；其时间部分不是秘密，因此授权永远另行校验。若安全或存储评审否决该格式，必须在 v1 冻结前更新所有 schema/fixture；已发布后不得原地换格式。
 
-Control 已执行该 artifact record 的首个持久化路径。`POST /api/apps/:app/artifacts` 接收的 zip
+Control 已执行该 artifact record 的首个持久化路径。`POST /api/v1/apps/:app/artifacts` 接收的 zip
 仅是传输封装；解包后必须由锁定的 Edge Canon validator 完整验证，目录按 application canonical ID
 和 manifest SHA-256 内容寻址保存，record 中的 contract、requirements 与 artifact schema 摘要来自
 同一仓库锁。Deislet provider derivation 作为独立不可变记录绑定 parent、provider、standard 与
@@ -136,24 +125,9 @@ inspect / reconcile / delete / cleanup
 
 `implementationMappings` 只解释 driver 如何组合供应商能力。合规与支持状态仍只能来自 Edge Canon conformance registry；artifact generated、syntax verified 和 deployed 都不是 compliant。
 
-## Identity 无停机迁移
-
-每个已有应用生成一条持久 migration operation，按固定八阶段执行：
-
-1. `inventory`：冻结资源清单，发现 catalog、KV、SQL、blob、queue、telemetry、stateful objects 和 provider orphan；
-2. `allocate-canonical-ids`：为 application/environment/binding/resource 分配永不复用的 ID；
-3. `dual-read`：新 identity 优先，旧 identity 只读 fallback；所有写入受 fencing token 约束；
-4. `copy-or-rename`：按后端能力执行事务 rename 或可校验 copy，记录每项 operation；
-5. `verify`：比较 count、digest、schema、lease/in-flight 与 provider observed state；
-6. `cutover`：一次 revision/fence 提交 runtime、route、binding 和 capability subject；
-7. `revoke-legacy-capabilities`：撤销旧 tenant token、session、provider/runtime capability，停止旧路径双读；
-8. `tombstone`：永久保留 ID/name reuse 防护和最小审计，不保留应删除的内容。
-
-任何 mismatch、未知 orphan 或不可检查 provider state 都使操作等待或失败；不得以“主要数据已复制”为成功。回退只允许在 cutover 前，或使用有明确反向验证的新 operation；不允许让同一写入同时接受两个不受 fence 约束的 identity。
-
 ## 可执行校验
 
-[`fixtures.json`](fixtures.json) 同时登记每份 schema 的正、反例。反例从对应正例应用确定性 JSON Pointer mutation，证明以下情况会失败：名称冒充 ID、canonical artifact 携带 provider 字段、binding snapshot 含 secret value、终态 operation 没有完成时间、driver 缺生命周期动作、driver release 路径穿越、driver process 改用 vendor-specific protocol、迁移继续使用名称 tenant key、backend evidence 泄漏 fence token，restore set 缺少 component 或复制 fence journal，以及错误封装使用枚举外的 code、缺少 `requestId`、夹带未声明成员或给出负数 `retryAfterSeconds`。
+[`fixtures.json`](fixtures.json) 同时登记每份 schema 的正、反例。反例从对应正例应用确定性 JSON Pointer mutation，证明以下情况会失败：名称冒充 ID、canonical artifact 携带 provider 字段、binding snapshot 含 secret value、终态 operation 没有完成时间、driver 缺生命周期动作、driver release 路径穿越、driver process 改用 vendor-specific protocol、restore set 缺少 component，以及错误封装使用枚举外的 code、缺少 `requestId`、夹带未声明成员或给出负数 `retryAfterSeconds`。
 
 运行：
 
@@ -162,4 +136,4 @@ python3 -m pip install -r scripts/governance-requirements.txt
 python3 scripts/check-shared-contracts.py
 ```
 
-校验器还检查 UUIDv7 规则在 schema 间不漂移、operation 图可达且终态不可逆、binding declaration/resolution 一一对应、proposal artifact 不可部署、driver 没有宣称支持未发布标准、driver process 不能改用 vendor-specific protocol、迁移 tenant key 只由 canonical ID 构成，restore set 恰好包含三个内置后端并由同一个全平台 outage barrier 约束，以及错误封装的 `retryable` 与 code 一致：`service-unavailable`、`backend-unavailable`、`database-unavailable`、`idempotency-request-in-progress` 在每个正例中必须为 `true`，其余 code 必须为 `false` 且不得给出 `retryAfterSeconds`，正例还必须同时覆盖可重试与不可重试两类。
+校验器还检查 UUIDv7 规则在 schema 间不漂移、operation 图可达且终态不可逆、binding declaration/resolution 一一对应、proposal artifact 不可部署、driver 没有宣称支持未发布标准、driver process 不能改用 vendor-specific protocol，restore set 恰好包含三个内置后端并由同一个全平台 outage barrier 约束，以及错误封装的 `retryable` 与 code 一致：`service-unavailable`、`backend-unavailable`、`database-unavailable`、`idempotency-request-in-progress` 在每个正例中必须为 `true`，其余 code 必须为 `false` 且不得给出 `retryAfterSeconds`，正例还必须同时覆盖可重试与不可重试两类。

@@ -1,10 +1,9 @@
 //! Key/value client backing `ctx.kv`.
 //!
 //! Talks to deis-store, which partitions data by tenant -- one application in
-//! one environment. The tenant travels in the `x-deis-tenant` metadata header
-//! and the capability token that proves this node may act as it travels in
-//! `Authorization: Bearer` (both stamped by [`StorageIdentity`]), not in the
-//! proto messages, so one client speaks for exactly one environment of one
+//! one environment. The tenant is the one named by the capability token this
+//! node presents in `Authorization: Bearer` (stamped by [`StorageIdentity`]),
+//! not a field of the proto messages, so one client speaks for exactly one environment of one
 //! application and a preview cannot read or overwrite what production
 //! stored.
 
@@ -90,8 +89,7 @@ impl KvClient {
     /// Shares the channel: the tonic client is a reference-counted handle over
     /// one HTTP/2 connection, so a version declaring four namespaces holds
     /// four identities and one connection rather than four. `None` gives the
-    /// tenant's unnamed namespace, which is what an application that declares
-    /// no binding of this kind has always used.
+    /// tenant-level client this one was derived from.
     pub(crate) fn for_binding(&self, binding: Option<&str>) -> Result<Self> {
         let identity = self.identity.for_binding(binding)?;
         tracing::debug!(
@@ -151,7 +149,7 @@ impl KvClient {
 
     /// Get a value together with the metadata and expiry stored with it.
     ///
-    /// Backs `ctx.services.kv.getWithMetadata`. It is a separate method rather
+    /// Backs `ctx.env.KV.getWithMetadata`. It is a separate method rather
     /// than a wider return type on [`Self::get`] because the two answer
     /// different questions and the plain read is the hot one; both are the
     /// same single `Get` call, so asking for metadata costs no extra round
@@ -252,7 +250,7 @@ impl KvClient {
     /// cursor rather than an error. `cursor` resumes a previous page and is
     /// `None` for the first one.
     ///
-    /// Every listing asks for metadata, because `ctx.services.kv.list`
+    /// Every listing asks for metadata, because `ctx.env.KV.list`
     /// promises it and the columns are on rows the scan already visits -- what
     /// the flag buys is response *size*, and a page of names alone is not a
     /// shape anything in this runtime wants.
@@ -280,39 +278,17 @@ impl KvClient {
         let response = client.list(request).await?;
         let list_response = response.into_inner();
 
-        // `entries` is where a store that honoured `include_metadata` puts
-        // the page; `keys` is where one that did not put it. The second can
-        // only happen against a deis-store older than the flag, which is a
-        // version skew an operator has to fix -- the listing still answers,
-        // without the metadata it was asked for, rather than looking empty.
-        let keys = if list_response.entries.is_empty() && !list_response.keys.is_empty() {
-            tracing::warn!(
-                prefix = %prefix,
-                keys = list_response.keys.len(),
-                "deis-store answered a listing without the metadata it was asked for; it predates \
-                 ListRequest.include_metadata, so every listed key reports null metadata and null \
-                 expiration until the store is upgraded"
-            );
-            list_response
-                .keys
-                .into_iter()
-                .map(|name| KvListEntry {
-                    name,
-                    metadata: None,
-                    expiration: None,
-                })
-                .collect()
-        } else {
-            list_response
-                .entries
-                .into_iter()
-                .map(|entry| KvListEntry {
-                    name: entry.key,
-                    metadata: entry.metadata,
-                    expiration: entry.expires_at,
-                })
-                .collect()
-        };
+        // Asked with `include_metadata`, deis-store answers the page in
+        // `entries`, each key with its metadata and expiry.
+        let keys = list_response
+            .entries
+            .into_iter()
+            .map(|entry| KvListEntry {
+                name: entry.key,
+                metadata: entry.metadata,
+                expiration: entry.expires_at,
+            })
+            .collect();
 
         Ok(KvListPage {
             keys,
@@ -380,6 +356,11 @@ mod tests {
             let (shutdown, rx) = oneshot::channel();
             let identity = crate::runtime::test_store::fleet()
                 .service_identity(deis_identity::ServiceKind::Store);
+            // The store polls its revocation list from a stand-in control
+            // plane signing with the same key, and accepts nothing until it
+            // has one.
+            let control =
+                deis_capability::testing::FakeControl::start(signing_key.clone()).client();
             tokio::spawn(async move {
                 server::serve(
                     config,
@@ -388,6 +369,7 @@ mod tests {
                         let _ = rx.await;
                     },
                     deis_capability::KeyRing::from_keys([verifying_key]),
+                    control,
                     identity,
                 )
                 .await
@@ -411,7 +393,7 @@ mod tests {
                 1,
                 Duration::from_secs(900),
                 vec![CapabilityResource {
-                    tenant: tenant.to_string(),
+                    tenant: crate::runtime::tenant::test_tenant(tenant),
                     binding: "kv".to_string(),
                     generation: None,
                 }],
@@ -423,7 +405,8 @@ mod tests {
         /// lazily dialled, carrying whatever proof the node was handed.
         /// `tenant` is the `<app>.<environment>` pair the store keys on.
         fn binding(&self, tenant: &str, token: Option<&str>) -> KvClient {
-            let identity = StorageIdentity::new(tenant, token).expect("a legal tenant");
+            let identity = StorageIdentity::new(crate::runtime::tenant::test_tenant(tenant), token)
+                .expect("a legal tenant");
             KvClient::connect_lazy(&self.endpoint, &identity).expect("client is built")
         }
 
@@ -804,19 +787,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_token_minted_for_another_tenant_is_refused() {
-        // What makes a leaked token harmless elsewhere: the store checks the
-        // capability names the tenant the call itself claims, so presenting
-        // production's token while naming the preview proves nothing.
+    async fn the_capability_not_the_client_decides_the_tenant() {
+        // deis-store acts for the tenant the capability names. A client
+        // labelled for the preview but carrying production's token writes
+        // production's data - and the preview, with its own token, sees none
+        // of it.
         let store = Store::start().await;
         let production_token = store.capability_token_for("demo.production");
 
-        let error = store
+        store
             .binding("demo.preview-7", Some(&production_token))
             .set("k".to_string(), b"v".to_vec())
             .await
-            .expect_err("one environment's token must not authorise another's namespace");
-        assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
+            .expect("production's token is served");
+        assert_eq!(
+            store
+                .client("demo.production")
+                .get("k".to_string())
+                .await
+                .unwrap(),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(
+            store
+                .client("demo.preview-7")
+                .get("k".to_string())
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     /// A token the store refuses is reported to the renewer from under the
@@ -825,9 +824,28 @@ mod tests {
     async fn a_refused_token_is_reported_to_the_renewer() {
         use crate::deployment::capability_renewer;
         let store = Store::start().await;
-        let tenant = "kv-refused.production";
-        let wrong = store.capability_token_for("kv-refused.preview");
-        let identity = StorageIdentity::new(tenant, Some(&wrong)).expect("a legal tenant");
+        let tenant = &crate::runtime::tenant::test_tenant("kv-refused.production");
+        // A genuine signature for this tenant, but for the sql binding: the
+        // kv service finds no tenant it may act for and refuses it.
+        let wrong = {
+            use deis_capability::{encode, CapabilityClaims, CapabilityResource};
+            encode(
+                &CapabilityClaims::new(
+                    "store",
+                    "spiffe://deislet/control/main",
+                    "spiffe://deislet/node/test",
+                    1,
+                    std::time::Duration::from_secs(900),
+                    vec![CapabilityResource {
+                        tenant: tenant.clone(),
+                        binding: "sql".to_string(),
+                        generation: None,
+                    }],
+                ),
+                &store.signing_key,
+            )
+        };
+        let identity = StorageIdentity::new(tenant.as_str(), Some(&wrong)).expect("a legal tenant");
         capability_renewer::register(tenant, "store", identity.token_lock());
         let client = KvClient::connect_lazy(&store.endpoint, &identity).expect("client is built");
         assert!(!capability_renewer::is_refused(tenant, "store"));
@@ -835,7 +853,7 @@ mod tests {
         let error = client
             .get("k".to_string())
             .await
-            .expect_err("a token naming another tenant is refused");
+            .expect_err("a token naming no tenant for kv is refused");
         assert_eq!(refusal(&error), tonic::Code::PermissionDenied, "{error:#}");
         assert!(
             capability_renewer::is_refused(tenant, "store"),
@@ -848,7 +866,9 @@ mod tests {
         // Nothing listens on port 1. Building the client must succeed -- an
         // app may not be blocked from loading by a store outage -- and the
         // call must fail with something an operator can act on.
-        let identity = StorageIdentity::new("demo.production", None).expect("a legal tenant");
+        let identity =
+            StorageIdentity::new(crate::runtime::tenant::test_tenant("demo.production"), None)
+                .expect("a legal tenant");
         let client =
             KvClient::connect_lazy("http://127.0.0.1:1", &identity).expect("client is built");
         let error = client

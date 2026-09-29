@@ -1,87 +1,82 @@
-//! The legacy telemetry record shape carries application and environment in
-//! different places for each signal. This module is the one translation into
-//! the platform tenant identity used by migration fencing and inventory.
+//! Whose a telemetry record is.
+//!
+//! Every record an application produces carries its canonical tenant,
+//! `v1/<application id>/<environment id>`, beside the `app_id` and
+//! environment names an operator reads. The tenant is what a capability
+//! names and what decides who may push or read the record. Names are not:
+//! an application deleted and created again under the same name gets new
+//! ids, so it is another tenant and none of the old one's records reach its
+//! readers.
 
-use std::collections::BTreeMap;
-
-use deis_wire::conventions::{DEFAULT_ENVIRONMENT, is_valid_tenant_part, tenant_id};
+use deis_wire::CanonicalTenantId;
 
 use crate::auth::Owner;
 use crate::store::{LogRecord, MetricRecord, TraceRecord};
 
-/// Missing and empty environments from older producers mean production, the
-/// same compatibility rule used on the request path throughout the platform.
-fn environment(value: Option<&str>) -> &str {
-    match value {
-        Some(value) if !value.is_empty() => value,
-        _ => DEFAULT_ENVIRONMENT,
-    }
-}
-
-fn map_environment(values: &BTreeMap<String, String>) -> &str {
-    environment(values.get("environment").map(String::as_str))
-}
-
-pub(crate) fn from_parts(app_id: &str, environment: Option<&str>) -> Result<String, String> {
-    let environment = self::environment(environment);
-    if !is_valid_tenant_part(app_id) {
-        return Err(format!(
-            "app_id {app_id:?} is not a valid canonical tenant part"
-        ));
-    }
-    if !is_valid_tenant_part(environment) {
-        return Err(format!(
-            "environment {environment:?} is not a valid canonical tenant part"
-        ));
-    }
-    Ok(tenant_id(app_id, environment))
-}
-
 /// Whose a record is. No application at all means a node's own record, which
-/// belongs to the platform rather than to any tenant; anything else has to
-/// name a valid application environment.
-fn owner(app_id: &str, environment: Option<&str>) -> Result<Owner, String> {
-    if app_id.is_empty() {
-        return Ok(Owner::Platform);
+/// belongs to the platform rather than to any tenant and carries no tenant;
+/// a record of an application must name its canonical tenant.
+fn owner(app_id: &str, tenant: &str) -> Result<Owner, String> {
+    match (app_id.is_empty(), tenant.is_empty()) {
+        (true, true) => Ok(Owner::Platform),
+        (true, false) => Err(format!(
+            "tenant {tenant:?} is set on a record that names no application"
+        )),
+        (false, true) => Err(format!(
+            "a record of application {app_id:?} names no canonical tenant"
+        )),
+        (false, false) => tenant
+            .parse::<CanonicalTenantId>()
+            .map(|_| Owner::Tenant(tenant.to_string()))
+            .map_err(|error| format!("tenant {tenant:?} is not canonical: {error}")),
     }
-    from_parts(app_id, environment).map(Owner::Tenant)
 }
 
 pub(crate) fn log(record: &LogRecord) -> Result<Owner, String> {
-    owner(&record.app_id, Some(map_environment(&record.fields)))
+    owner(&record.app_id, &record.tenant)
 }
 
 pub(crate) fn metric(record: &MetricRecord) -> Result<Owner, String> {
-    owner(&record.app_id, Some(map_environment(&record.labels)))
+    owner(&record.app_id, &record.tenant)
 }
 
 pub(crate) fn trace(record: &TraceRecord) -> Result<Owner, String> {
-    owner(&record.app_id, Some(&record.environment))
+    owner(&record.app_id, &record.tenant)
+}
+
+/// The canonical tenant a fixture record of `app_id` in `environment`
+/// carries; empty for a record of no application.
+#[cfg(test)]
+pub(crate) fn fixture_tenant(app_id: &str, environment: &str) -> String {
+    if app_id.is_empty() {
+        return String::new();
+    }
+    CanonicalTenantId::derived_from_label(&format!("{app_id}.{environment}")).to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn legacy_missing_or_empty_environment_maps_to_production() {
-        assert_eq!(from_parts("shop", None).unwrap(), "shop.production");
-        assert_eq!(from_parts("shop", Some("")).unwrap(), "shop.production");
+    fn canonical(label: &str) -> String {
+        CanonicalTenantId::derived_from_label(label).to_string()
     }
 
     #[test]
-    fn unsafe_or_ambiguous_parts_are_rejected() {
-        assert!(from_parts("shop.preview", Some("production")).is_err());
-        assert!(from_parts("shop", Some("../../preview")).is_err());
-        assert!(from_parts("", None).is_err());
+    fn an_application_record_is_owned_by_its_canonical_tenant() {
+        let tenant = canonical("shop.production");
+        assert_eq!(owner("shop", &tenant).unwrap(), Owner::Tenant(tenant));
+    }
+
+    #[test]
+    fn a_name_is_never_an_owner() {
+        assert!(owner("shop", "").is_err());
+        assert!(owner("shop", "shop.production").is_err());
+        assert!(owner("", &canonical("shop.production")).is_err());
     }
 
     #[test]
     fn no_application_means_the_platform() {
-        assert_eq!(owner("", Some("production")).unwrap(), Owner::Platform);
-        assert_eq!(
-            owner("shop", None).unwrap(),
-            Owner::Tenant("shop.production".to_string())
-        );
+        assert_eq!(owner("", "").unwrap(), Owner::Platform);
     }
 }

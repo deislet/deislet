@@ -8,9 +8,7 @@
 # is the only health surface this process offers. That one answers NOT_SERVING
 # whenever the database underneath has stopped taking writes or reads, so a
 # probe on it is worth having: a collector that reports healthy while
-# refusing every log line is worse than one that reports broken. An optional
-# fifth BackendMigration service appears only when migration_admin_token is
-# configured and uses that independent credential.
+# refusing every log line is worse than one that reports broken.
 #
 # Every call on either port - push, query, follow, scrape - must carry a
 # capability deis-control signed; there is no mode without that check. This
@@ -29,20 +27,11 @@ listen = "127.0.0.1:8092"
 # host, or through a tunnel.
 metrics_listen = "127.0.0.1:8093"
 
-# Independent bearer credential for the optional BackendMigration management
-# service. Telemetry producers and readers must not be able to freeze,
-# inventory or release a tenant, so this is its own credential. When
-# absent, management RPCs are not registered. The durable fence journal is
-# still enforced, so removing this setting cannot bypass an active fence.
-#
-#   openssl rand -hex 32
-# migration_admin_token = "put an independent migration token here"
-
 # Directory holding telemetry.sqlite: the logs, traces and metric series.
 # It runs in WAL mode, so never back it up with `cp`: a plain copy can omit
 # committed WAL pages. Use `deis-telemetry snapshot --out DIR`; restore with
 # `deis-telemetry restore --from DIR` while the destination service is
-# stopped. The verified snapshot excludes migration-fences.sqlite, and a
+# stopped. The verified snapshot excludes the backend-incarnation record, so a
 # restore creates a fresh backend incarnation. Losing this directory loses
 # history, not the ability to serve; see crates/deis-control/DEPLOYMENT.md for
 # what the rest of the platform needs backed up.

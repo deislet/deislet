@@ -39,7 +39,9 @@ pub struct VersionView {
     pub number: i64,
     pub bundle_sha: String,
     /// Exact provider-neutral parent and provider derivation. Both are absent
-    /// only for legacy raw-bundle uploads.
+    /// for a native bundle uploaded directly, without a canonical artifact:
+    /// such a version runs on Deislet nodes and cannot be derived for another
+    /// provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = Uuid, nullable = false)]
     pub canonical_artifact_id: Option<CanonicalId>,
@@ -733,11 +735,8 @@ pub async fn get_version(
 /// inside a gRPC message.
 /// Where a machine downloads one version's bundle from.
 ///
-/// Spelled once because two listeners mount it: the machine channel, which is
-/// where it belongs, and - until the fleet has moved - the node router on the
-/// human listener. Two spellings of one route is the mistake
-/// `scripts/check-doc-path-literals.sh` exists to catch in documents, and it
-/// is no better in code.
+/// Spelled once so the machine channel's router and the tests that exercise
+/// it cannot disagree about the path.
 pub const BUNDLE_ROUTE: &str = "/api/apps/:app_id/versions/:version_id/bundle";
 
 pub async fn download_bundle(

@@ -30,38 +30,44 @@ impl Validator {
         _strict: bool,
         result: &mut ValidationResult,
     ) -> anyhow::Result<()> {
-        if handler_kind == deis_build_core::routes::HandlerKind::Http {
-            for reference in &handler_info.non_standard_context_references {
-                let suggestion = match reference.field.as_str() {
-                    "path" | "query" => "Parse context.request.url with new URL(...)".to_string(),
-                    "method" | "headers" => {
-                        format!("Use context.request.{}", reference.field)
-                    }
-                    "log" => "Use console.debug/info/warn/error".to_string(),
-                    "services" | "bindings" => {
-                        "Declare a logical binding and use context.env.<NAME>".to_string()
-                    }
-                    "cookies" => {
-                        "Read and parse context.request.headers.get('cookie')".to_string()
-                    }
-                    _ => {
-                        "Use only context.request, context.env, context.params, and context.waitUntil"
-                            .to_string()
-                    }
-                };
-                result.add_error(ValidationError {
-                    file: handler_info.path.clone(),
-                    line: reference.line,
-                    column: reference.column,
-                    message: format!(
+        let http = handler_kind == deis_build_core::routes::HandlerKind::Http;
+        for reference in handler_info
+            .non_standard_context_references
+            .iter()
+            .filter(|reference| handler_kind.refuses_context_field(&reference.field))
+        {
+            let suggestion = match reference.field.as_str() {
+                "path" | "query" => "Parse context.request.url with new URL(...)".to_string(),
+                "method" | "headers" => {
+                    format!("Use context.request.{}", reference.field)
+                }
+                "log" => "Use console.debug/info/warn/error".to_string(),
+                "services" | "bindings" => {
+                    "Declare a logical binding and use context.env.<NAME>".to_string()
+                }
+                "cookies" => "Read and parse context.request.headers.get('cookie')".to_string(),
+                _ => "Use only context.request, context.env, context.params, and context.waitUntil"
+                    .to_string(),
+            };
+            result.add_error(ValidationError {
+                file: handler_info.path.clone(),
+                line: reference.line,
+                column: reference.column,
+                message: if http {
+                    format!(
                         "context.{} is outside the selected Edge Canon HTTP context",
                         reference.field
-                    ),
-                    code: "EC_WEB_CONTEXT_FIELD_NONSTANDARD".to_string(),
-                    severity: Severity::Error,
-                    suggestion: Some(suggestion),
-                });
-            }
+                    )
+                } else {
+                    format!(
+                        "context.{} is not part of any handler's context",
+                        reference.field
+                    )
+                },
+                code: "EC_WEB_CONTEXT_FIELD_NONSTANDARD".to_string(),
+                severity: Severity::Error,
+                suggestion: Some(suggestion),
+            });
         }
 
         // The default export, and only the default export.
@@ -219,7 +225,6 @@ mod tests {
             route: "/test".to_string(),
             has_default_export: has_default,
             named_exports: vec![],
-            used_services: vec![],
             imports: vec![],
             specifier_literals: vec![],
             module_references: vec![],
@@ -427,5 +432,43 @@ function notExported() {
             .unwrap();
 
         assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn event_contexts_refuse_the_platform_fields_an_http_context_refuses() {
+        let validator = Validator::new();
+        for kind in [
+            deis_build_core::routes::HandlerKind::Queue,
+            deis_build_core::routes::HandlerKind::Scheduled,
+        ] {
+            for field in ["bindings", "services"] {
+                let code = format!(
+                    "export default function handler(batch, env, context) {{ return context.{field}; }}"
+                );
+                let mut handler_info = create_mock_handler_info("_queue.ts", true);
+                handler_info
+                    .non_standard_context_references
+                    .push(NonStandardContextReference {
+                        field: field.to_string(),
+                        line: 1,
+                        column: 70,
+                    });
+                let mut result = ValidationResult::new();
+
+                validator
+                    .validate(
+                        &code,
+                        &handler_info,
+                        kind,
+                        &create_mock_config(),
+                        false,
+                        &mut result,
+                    )
+                    .unwrap();
+
+                assert_eq!(result.errors.len(), 1, "{kind:?} {field}");
+                assert_eq!(result.errors[0].code, "EC_WEB_CONTEXT_FIELD_NONSTANDARD");
+            }
+        }
     }
 }

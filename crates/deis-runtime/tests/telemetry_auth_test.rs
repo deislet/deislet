@@ -34,8 +34,26 @@ fn control_key() -> SigningKey {
     SigningKey::from_bytes(&[0x24; 32])
 }
 
-/// What the control plane would issue this node for `tenants`.
-fn issued_for(tenants: &[&str]) -> String {
+/// The control plane the collector polls its revocation list from.
+fn fake_control() -> &'static deis_capability::testing::FakeControl {
+    static CONTROL: std::sync::OnceLock<deis_capability::testing::FakeControl> =
+        std::sync::OnceLock::new();
+    CONTROL.get_or_init(|| deis_capability::testing::FakeControl::start(control_key()))
+}
+
+/// The canonical tenant an environment named by `label` runs as. Recorded
+/// the way the runtime pool records it when it builds the isolate, so the
+/// shipper stamps it on the environment's lines.
+fn running(label: &str) -> String {
+    let canonical = deis_wire::CanonicalTenantId::derived_from_label(label).to_string();
+    deis_runtime::telemetry::record_tenant(label, &canonical);
+    canonical
+}
+
+/// What the control plane would issue this node for the environments named
+/// by `labels`: their canonical tenants, never the labels.
+fn issued_for(labels: &[&str]) -> String {
+    let tenants: Vec<String> = labels.iter().map(|label| running(label)).collect();
     let claims = CapabilityClaims::new(
         AUD_TELEMETRY,
         "spiffe://deis.test/deislet/control/main",
@@ -43,7 +61,7 @@ fn issued_for(tenants: &[&str]) -> String {
         1,
         Duration::from_secs(900),
         std::iter::once(TELEMETRY_PLATFORM_TENANT)
-            .chain(tenants.iter().copied())
+            .chain(tenants.iter().map(String::as_str))
             .map(|tenant| CapabilityResource {
                 tenant: tenant.to_string(),
                 binding: TELEMETRY_INGEST.to_string(),
@@ -78,7 +96,7 @@ fn collector_identity() -> Option<deis_capability::ServiceIdentityConfig> {
         certificate: files.certificate,
         private_key: files.private_key,
         trust_root: files.trust_root,
-        control_endpoint: "http://127.0.0.1:1".to_string(),
+        control_endpoint: fake_control().url().to_string(),
         identity_reload_seconds: 60,
     })
 }
@@ -166,6 +184,9 @@ async fn a_line_for_an_application_the_node_does_not_run_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let server = collector(dir.path()).await;
     let credential = TelemetryCredential::with_token(&issued_for(&["demo.production"])).unwrap();
+    // The node ran bank once, so its lines carry bank's tenant; the
+    // capability does not name it.
+    running("bank.production");
 
     let count = ship_one_line(&server, credential, "bank.production", "not-this-node").await;
     assert_eq!(count, 0, "a capability for demo must not write bank's logs");

@@ -2,11 +2,10 @@
 //!
 //! The schema is owned by an ordered list of numbered migrations, each with a
 //! fixed name, executed once and recorded through SQLite's `user_version`
-//! pragma. `0001_baseline.sql` is the converged schema the former
-//! `create_tables` + `ensure_*` ladder used to converge to; it was curated
-//! once from the `sqlite_master` export of an empty database and is frozen
-//! from there on. Every later schema change is a new migration appended at
-//! the end of [`MIGRATIONS`] - existing entries are never edited.
+//! pragma. `0001_baseline.sql` is the whole schema. There is no installed
+//! base, so until the first release it is edited in place; from then on it
+//! is frozen and every schema change is a new migration appended at the end
+//! of [`MIGRATIONS`] - existing entries are never edited.
 //!
 //! Opening a database decides between exactly four states:
 //!
@@ -40,7 +39,7 @@ use rusqlite::{Connection, OptionalExtension};
 pub const APPLICATION_ID: i64 = 0x0DE1_5001;
 
 /// The metadata database currently understands schemas up to this version.
-pub const LATEST_VERSION: i64 = 5;
+pub const LATEST_VERSION: i64 = 1;
 
 /// One numbered migration.
 struct Migration {
@@ -59,38 +58,12 @@ struct Migration {
     sql: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "baseline",
-        fk_off: false,
-        sql: include_str!("migrations/0001_baseline.sql"),
-    },
-    Migration {
-        version: 2,
-        name: "operation_audit_counters",
-        fk_off: false,
-        sql: include_str!("migrations/0002_operation_audit_counters.sql"),
-    },
-    Migration {
-        version: 3,
-        name: "capability_signing",
-        fk_off: false,
-        sql: include_str!("migrations/0003_capability_signing.sql"),
-    },
-    Migration {
-        version: 4,
-        name: "capability_key_rotation",
-        fk_off: false,
-        sql: include_str!("migrations/0004_capability_key_rotation.sql"),
-    },
-    Migration {
-        version: 5,
-        name: "capability_issuances",
-        fk_off: false,
-        sql: include_str!("migrations/0005_capability_issuances.sql"),
-    },
-];
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "baseline",
+    fk_off: false,
+    sql: include_str!("migrations/0001_baseline.sql"),
+}];
 
 /// Migrate the database to [`LATEST_VERSION`], creating it if empty.
 ///
@@ -273,24 +246,22 @@ fn migration_error(migration: &Migration, error: rusqlite::Error) -> rusqlite::E
     ))
 }
 
-/// Seed the three singleton rows the former `ensure_*` ladder inserted on
-/// every open: the default organization, the singleton installation and the
-/// legacy operation-adoption actor. Seed rows carry freshly minted UUIDv7
-/// identities and cannot be expressed as static SQL in `0001_baseline.sql`,
-/// which is why they live here instead.
+/// Seed the two singleton rows every control database has: the default
+/// organization and the singleton installation. Seed rows carry freshly
+/// minted UUIDv7 identities and cannot be expressed as static SQL in
+/// `0001_baseline.sql`, which is why they live here instead.
 ///
-/// Idempotent: existing rows win, only missing rows are inserted - exactly
-/// what the old `INSERT OR IGNORE` ladder did on every open.
+/// Idempotent: existing rows win, only missing rows are inserted.
 fn seed_baseline_rows(conn: &Connection) -> rusqlite::Result<()> {
     // Skip when the schema is not ours (tests drive `run_migrations_with`
     // with synthetic migration lists that lack these tables).
     let present: i64 = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name IN \
-         ('product_organizations', 'product_installations', 'operation_actors')",
+         ('product_organizations', 'product_installations')",
         [],
         |row| row.get(0),
     )?;
-    if present != 3 {
+    if present != 2 {
         return Ok(());
     }
 
@@ -334,20 +305,6 @@ fn seed_baseline_rows(conn: &Connection) -> rusqlite::Result<()> {
              (singleton, installation_id, organization_id, revision, created_at, updated_at) \
          VALUES (1, ?1, ?2, 1, ?3, ?3)",
         rusqlite::params![installation_id, organization_id, now],
-    )?;
-
-    const LEGACY_ACTOR_SUBJECT: &str = "system:legacy-operation-adoption";
-    let actor_id: String = conn
-        .query_row(
-            "SELECT actor_id FROM operation_actors WHERE subject = ?1",
-            [LEGACY_ACTOR_SUBJECT],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or_else(|| CanonicalId::new_v7().to_string());
-    conn.execute(
-        "INSERT OR IGNORE INTO operation_actors (actor_id, subject, created_at) VALUES (?1, ?2, ?3)",
-        rusqlite::params![actor_id, LEGACY_ACTOR_SUBJECT, now],
     )?;
 
     Ok(())
@@ -594,15 +551,8 @@ mod tests {
             .unwrap();
         assert_eq!(installation_organization, organization_id);
         assert_eq!(revision, 1);
-        let actor: String = conn
-            .query_row(
-                "SELECT actor_id FROM operation_actors \
-                 WHERE subject = 'system:legacy-operation-adoption'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        for id in [&organization_id, &actor] {
+        {
+            let id = &organization_id;
             assert!(
                 CanonicalId::from_str(id).is_ok(),
                 "seed id {id} is not a canonical UUIDv7"
@@ -621,12 +571,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        let actors: i64 = conn
-            .query_row("SELECT count(*) FROM operation_actors", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!((organizations, installations, actors), (1, 1, 1));
+        assert_eq!((organizations, installations), (1, 1));
     }
 
     #[test]

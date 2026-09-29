@@ -1,6 +1,6 @@
 //! Bundle storage on the control plane.
 //!
-//! A bundle is the zip produced by `deis build --vendor deislet` and is
+//! A bundle is the zip produced by `deis build --target deislet` and is
 //! the only carrier of a version (see docs/implementation-plan.zh.md
 //! section 2). Accepting one means: hash it, read `manifest.json` out of
 //! it, check the manifest actually describes the app it was uploaded for,
@@ -339,9 +339,9 @@ pub(crate) mod tests {
     /// Build a minimal but valid bundle in memory.
     pub(crate) fn sample_bundle(app: &str) -> Vec<u8> {
         bundle_with_manifest(
-            &format!(
-                r#"{{"schema":1,"app":"{app}","entry":"worker/index.js","services":{{"kv":true}},"secrets":["API_KEY"]}}"#
-            ),
+            &deis_bundle::complete_manifest_json(&format!(
+                r#"{{"app":"{app}","entry":"worker/index.js","bindings":{{"KV":{{"kind":"kv"}}}}}}"#
+            )),
             true,
         )
     }
@@ -373,7 +373,6 @@ pub(crate) mod tests {
         assert!(stored.path.exists());
         assert_eq!(stored.manifest.app, "demo");
         assert_eq!(stored.manifest.entry, "worker/index.js");
-        assert_eq!(stored.manifest.secrets, vec!["API_KEY".to_string()]);
         assert!(!stored.already_present);
         assert_eq!(std::fs::read(&stored.path).unwrap(), bytes);
 
@@ -458,7 +457,7 @@ pub(crate) mod tests {
         assert!(read_manifest(&future).is_err());
 
         let no_entry = bundle_with_manifest(
-            r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#,
+            &deis_bundle::complete_manifest_json(r#"{"app":"demo","entry":"worker/index.js"}"#),
             false,
         );
         let err = read_manifest(&no_entry).unwrap_err();
@@ -474,8 +473,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BundleStore::new(dir.path());
         let bytes = bundle_with_manifest(
-            r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js",
                 "compatibility":{"date":"2099-01-01"}}"#,
+            ),
             true,
         );
 
@@ -506,8 +507,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BundleStore::new(dir.path());
         let bytes = bundle_with_manifest(
-            r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js",
                 "compatibility":{"date":"2026-09-01","flags":["cookies_but_faster"]}}"#,
+            ),
             true,
         );
 
@@ -530,8 +533,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BundleStore::new(dir.path());
         let bytes = bundle_with_manifest(
-            r#"{"schema":1,"app":"demo","entry":"worker/index.js",
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js",
                 "compatibility":{"date":"2026-09-01"}}"#,
+            ),
             true,
         );
 

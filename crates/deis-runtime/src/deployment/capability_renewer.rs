@@ -337,7 +337,7 @@ fn snapshot() -> Vec<TokenEntry> {
     map.iter()
         .map(|((tenant, audience), slot)| TokenEntry {
             tenant: tenant.clone(),
-            audience: *audience,
+            audience,
             locks: slot.locks.iter().filter_map(Weak::upgrade).collect(),
             held_exp: slot.held.as_ref().map(|held| held.exp),
             retry_at: slot.refused.then(|| {

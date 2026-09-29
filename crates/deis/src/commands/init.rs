@@ -17,8 +17,20 @@ pub async fn execute(name: String, template: String) -> Result<()> {
 
     println!("{}", "Creating project...".green().bold());
 
-    let project_dir = Path::new(&name);
+    scaffold(Path::new(&name), &name)?;
 
+    println!("\n{}", "✓ Project created successfully!".green().bold());
+    println!("\n{}", "Next steps:".bold());
+    println!("  {} {}", "cd".cyan(), name.cyan());
+    println!("  {}", "npm install".cyan());
+    println!("  {}", "npm run dev".cyan());
+    println!();
+
+    Ok(())
+}
+
+/// Write a new project named `name` into `project_dir`.
+fn scaffold(project_dir: &Path, name: &str) -> Result<()> {
     // Create project structure
     fs::create_dir_all(project_dir.join("functions/api"))?;
 
@@ -30,11 +42,22 @@ pub async fn execute(name: String, template: String) -> Result<()> {
         "language": "typescript",
         "functionRoot": "./functions",
         "compatibilityDate": "2026-09-01",
+        // What the code may read from `context.env`: each name is declared
+        // here, and a config value is given under `values`. A secret is
+        // declared the same way with `"kind": "secret"`, and its value is set
+        // with `deis secret set`, never written into this file.
         "environment": {
-            "variables": {
+            "declarations": [
+                {
+                    "name": "LOG_LEVEL",
+                    "kind": "config",
+                    "valueType": "string",
+                    "required": true
+                }
+            ],
+            "values": {
                 "LOG_LEVEL": "info"
-            },
-            "secrets": []
+            }
         },
         // Static files carried inside the version bundle. A request whose
         // path names one of them is answered from it without starting an
@@ -251,12 +274,35 @@ without a handler builds, but warns, because the symptom is otherwise silent.
         "node_modules/\ndist/\n.cache/\n.env.local\n.edge-function/\n",
     )?;
 
-    println!("\n{}", "✓ Project created successfully!".green().bold());
-    println!("\n{}", "Next steps:".bold());
-    println!("  {} {}", "cd".cyan(), name.cyan());
-    println!("  {}", "npm install".cyan());
-    println!("  {}", "npm run dev".cyan());
-    println!();
-
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What `deis init` writes has to be something `deis build` accepts: a
+    /// template the compiler refuses is the first thing a new user runs into.
+    #[tokio::test]
+    async fn a_new_project_builds_for_every_default_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("myapp");
+        scaffold(&project, "myapp").unwrap();
+
+        let compiler = deis_build::Compiler::new();
+        let validation = compiler.validate(&project, false).unwrap();
+        assert!(validation.is_valid(), "{:?}", validation.errors);
+
+        let result = compiler
+            .compile(
+                &project,
+                vec!["deislet".to_string(), "cloudflare".to_string()],
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.errors);
+        assert!(result.builds.contains_key("deislet"));
+        assert!(result.builds.contains_key("cloudflare"));
+    }
 }

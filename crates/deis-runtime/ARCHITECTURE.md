@@ -44,7 +44,7 @@ version of this document said and is no longer true.
                          ▼                    ▼ polled under a lease
                   deis-telemetry          deis-queue
                                               ▲
-                                      ctx.services.* → deis-store
+                                      env.<NAME> → deis-store
 ```
 
 Three of those arrows are the node dialling out and were added after the
@@ -125,7 +125,7 @@ process. See the `[control]` and `[machine_identity]` keys below.
 ### 4. Runtime Isolation (`src/runtime/`)
 - **Engine**: V8 Isolate (via `deno_core`), one per `(app, environment)`, each
   on its own OS thread.
-- **Handler shape**: `export default function handler(context)`. The legacy
+- **Handler shape**: `export default function handler(context)`. The
   Cloudflare `fetch(request, env, ctx)` signature is not accepted.
 - **Web globals**: `context`, routing, assets, KV, SQL, blob, queue, cron and
   the Cache API are all there, and so is every global SPECIFICATION_BASIC.md

@@ -104,10 +104,10 @@ bundle_sha + 环境表），节点自己用 HTTP 把包拉下来、校验 sha256
 
 ```
 scripts/demo-assets/example-app/
-  .config.json                     声明服务（kv + queue）、具名绑定（`HOT` / `COLD` 两个
-                                   kv 命名空间，`AUTH` 一个指向 demo-auth 的服务绑定）、
+  .config.json                     具名绑定（`KV` / `HOT` / `COLD` 三个 kv 命名空间、`jobs`
+                                   队列，`AUTH` 一个指向 demo-auth 的服务绑定）、
                                    队列 jobs（batchSize 10、maxConcurrency 2）、cron「每分钟」、
-                                   密钥名 DEMO_SECRET、变量 BUILD_LABEL 与 ASSETS、
+                                   密钥名 DEMO_SECRET、配置项 BUILD_LABEL 与 LOG_LEVEL、
                                    资产目录与 notFound、limits（timeoutMs / memoryMb /
                                    maxSubrequests）与 compatibilityDate（见下文）
   public/index.html                静态资产，`/` 直接命中它，不起 Isolate
@@ -138,8 +138,8 @@ scripts/demo-assets/example-app/
 
 最后四个（`stream` / `cookies` / `timers` / `objects`）不在仓库里，`start` 只在
 示例应用自己没带同名文件时才写进已构建好的副本，写法见下文；写 `objects.ts` 的同时还会
-把 `.config.json` 里的 `services.blob` 打开——一个不声明 `blob` 的应用调
-`context.services.blob` 拿到的是「这个服务对本应用不可用」，不是一个对象存储。
+在 `.config.json` 里声明 `BLOB` 绑定——一个不声明它的应用，`context.env.BLOB` 是
+`undefined`，不是一个对象存储。
 
 演示还部署了**第二个应用** `demo-auth`（源码由 `scripts/demo.sh::prepare_callee_source`
 现写到 `.demo/app-callee/`）。它是「应用间调用」那一组的被调方：同意谁能调它，写在它
@@ -173,11 +173,11 @@ manifest，版本加载时编译一次，之后每个请求在**起 Isolate 之�
 `_redirects` 与 `_headers` 本身不会进包，否则任何人问一句 `/_redirects` 就能把作者的
 路由表读走。函数路由仍然优先：`/hello/world` 走的是处理函数，不会被 404 页面吃掉。
 
-`.config.json` 里的 `environment.variables.ASSETS` 是**故意声明的**：`ASSETS` 是平台
-保留名，节点在把这张表交给 `context.env` 之前会把它摘掉，再把 `env.ASSETS` 这个绑定
-装上去。所以应用声明同名变量拿不到自己那串字符串，拿到的仍是绑定——
-`functions/api/asset.ts` 把 `env.ASSETS` 到底是什么一并回报出来，`verify` 就是照这个
-判的。
+`ASSETS` 是平台保留名：应用在 `environment.declarations` 里声明同名项，构建就以
+`EC_ENV_NAMESPACE_COLLISION` 拒绝，所以示例应用没有、也不可能有这个声明。`verify` 另起
+一个声明了 `ASSETS` 的小项目去部署，确认它被构建拒绝、什么都没留下；再由
+`functions/api/asset.ts` 回报示例应用里 `env.ASSETS` 到底是什么——带 `fetch()` 的平台
+绑定。
 
 `.config.json` 里的 `limits` 是应用给自己提的**上限申请**：这里写 `timeoutMs: 1000`
 （节点自己允许 30000）与 `memoryMb: 32`（节点自己允许 256）。方向是单向的——应用只能
@@ -215,9 +215,9 @@ Isolate 里到底有没有 `fetch`，后者说这一发有没有打出去。分�
 里逐个开口子；而平台自己那几个服务地址（deis-store / deis-queue / deis-control /
 deis-telemetry）是在查过 allow 之后再拒一道的，**任何 allow 条目都开不到它们**。
 
-理由很直接：deis-store 信任别人递给它的 `x-deis-tenant` 头——在应用没法自己往外发包
-之前，「只有节点进程能连到它」就是它的全部保护。一旦 Isolate 里有了 `fetch`，一个处理
-函数只要能连上 deis-store，换个租户头就能读、能删别的应用的 KV、数据行和 blob。
+理由很直接：deis-store、deis-queue 与节点的管理端口都是内部服务，应用不该能直接够到。
+租户虽然由 capability 决定、请求里改不了，但一个节点替它运行的所有租户持有 capability，
+不能让 Isolate 里的 `fetch` 成为一个应用摸到这些内部服务的通道。
 
 演示据此摆了一个最小的对照组：脚本自己起一个上游（默认 8094），节点配置里
 `[fetch] allow` 只写这一个地址；deis-store 在同一块回环网卡的另一个端口上，不写。
@@ -251,7 +251,7 @@ API key 能不能从控制面领到那张令牌。
 | | `GET /css/app.css` 与 `GET /` 各一发 | `_headers` 里 `/css/*` 那一块的强缓存只落在它点名的文件上，`/` 保持节点自己的默认；`/*` 那一块的头两边都有。只问一个文件分不出「按路径匹配」和「全都加上」 |
 | | `GET /no-such-page` | 无人认领的路径按应用自己选的 `notFound` 回：404 状态 + 包里那份 `404.html`（页面上有个别处没有的标记）。函数路由不受影响，`/hello/world` 仍走处理函数 |
 | | `GET /api/asset?path=/css/app.css` | 处理函数里 `env.ASSETS.fetch()` 取回的就是本版包里那个文件：字节数与磁盘上那份一致、内容摘要一致。这条不走网络，字节自版本加载起就在节点内存里 |
-| | 同一处理函数回报的 `env.ASSETS` 是什么 | 应用在自己的 `environment.variables` 里声明了 `ASSETS`，节点在交出 `context.env` 之前把它摘掉并记了一行日志；Isolate 里 `env.ASSETS` 仍是那个带 `fetch()` 的绑定，不是应用发的字符串 |
+| | 同一处理函数回报的 `env.ASSETS` 是什么 | 另一个在 `environment.declarations` 里声明了 `ASSETS` 的项目被构建以 `EC_ENV_NAMESPACE_COLLISION` 拒绝，控制面里也查不到它；示例应用 Isolate 里的 `env.ASSETS` 是那个带 `fetch()` 的平台绑定 |
 | 路由 | `GET /hello/world` | 路由占位符进了 `context.params` |
 | | 同一个域名下不同路径前缀各打一发，经 deis-proxy | 前门是按**域名加路径前缀**选应用的，不是只看域名——目录里的路由表真的影响了去向 |
 | 流式响应 | 经 `deis-proxy` 取一条 5 帧的 SSE，逐帧记到达时间 | 头 13 毫秒就到了，5 帧分别在 13/165/316/470/621 毫秒到——处理函数每帧之间停 150 毫秒，所以这个间隔不可能出自一个先攒齐再发的响应体。最后收到了结束块，客户端看到的是一次完整的响应 |
@@ -271,13 +271,13 @@ API key 能不能从控制面领到那张令牌。
 | 密钥 | `deis secret list` | 只列出名字与最后修改时间；JSON 与人读两种输出都不含值，也没有任何命令能打印值 |
 | | 同一响应的 `secretPresent` | 加密存库的密钥被解开、随下发进了 Isolate |
 | | 递归 grep 数据目录与全部日志 | 解开后的明文哪儿都没落下 |
-| 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
+| 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.env.KV` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
 | | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
 | | 明文连 deis-store 的 gRPC 端口 | 连不上：deis-store 只在 TLS 上应答，出示的是机队签给它的 `spiffe://…/deislet/store/…` 证书，调用方拿控制面的根去验它。同一个问题经 `-cacert` 走 TLS 才答得出来 |
 | | 领两张存储 capability，先用其一问 `KvStore.Get`，再 `DELETE /api/v1/capabilities/<jti>` 吊销它 | 吊销前答得出来；吊销后一次轮询（30 秒）之内 deis-store 就拒它（`PermissionDenied`），旁边那张没吊销的照常被服务。deis-store 从机器通道拉的是控制面签过名的吊销名单，所以吊销不必等 15 分钟过期 |
 | | 吊销 `demo/production` 这个租户的全部 capability，之后每秒经节点各写一次 production 与 preview 的 KV | preview 在整个窗口里一次也没被拒：节点按租户逐个申领 capability，每张只点名一个租户，吊销一个环境收不走同一节点上另一个环境的存储。production 被拒一两次后又写得进去——deis-store 拒了节点出示的那张，节点从客户端底下听到拒绝，当场向控制面要一张新的，而不是等到它快过期（十来分钟）才换 |
 | | 吊销节点本身（`POST /api/v1/capabilities/revocations/nodes/<node_id>`），之后每秒经节点写一次 production 的 KV，75 秒后再解除（`DELETE` 同一路径） | 一次轮询之内被拒，而且一直被拒：节点照样每 30 秒重新申领，可控制面对被吊销的节点什么都不答（注册、assignment、secret、新 capability），签名名单也按名字点了它，deis-store 拒绝一切签给它的 capability。只收回它手里那几张 `jti` 做不到这一点——下一次续签就回来了。解除后节点自己重新注册、领到新 capability，production、preview 与队列都恢复 |
-| | 不带 API key 打 `GET /api/apps/:app/environments/:env/storage-token` | 401，什么也拿不到；同一发带上 key 才拿到租户名、deis-store 地址与令牌本身（令牌不打印）。这张令牌绕过控制面直接对 deis-store 生效、而且不过期，所以它和部署走同一道门——这是「成功了算失败」的第三项 |
+| | 不带 API key 打 `GET /api/v1/apps/:app/environments/:env/storage-token` | 401，什么也拿不到；同一发带上 key 才拿到租户名、deis-store 地址与令牌本身（令牌不打印）。这张令牌绕过控制面直接对 deis-store 生效、而且不过期，所以它和部署走同一道门——这是「成功了算失败」的第三项 |
 | | 应用写一个 KV 键，再用 `deis kv get` 读 | `deis kv` / `deis db` / `deis blob` 靠的就是上面那条路由：先向控制面要一张这个租户的令牌，再拿它直接问 deis-store。CLI 从头到尾碰不到控制面的能力签名密钥，它只拿到这一个租户的令牌 |
 | | `deis db query` 发一条数到二十亿的递归查询 | deis-store 在几秒内把它停下来，而不是跑到底；拒绝的话写在响应里（跟一个 SQL 拼写错一样），并且同时点出上限是多少、要改哪里。管的是这个租户的 SQL 能花多少，跟它能碰哪些数据是两件事 |
 | | 一个租户的 SQL 去读另一个租户的表、去点它的文件名 | 两样都够不到：库是一租户一个文件，schema 和路径在查询里都不可达 |
@@ -287,9 +287,9 @@ API key 能不能从控制面领到那张令牌。
 | | 处理函数把 `Range` 头原样交给 `blob.get`，再自己答 206 | `bytes=4-9` 与 `bytes=-4` 都取对了段、`content-range` 对得上真实大小；16 字节的对象上 `bytes=99-` 答 416，同一个 range 打不存在的 key 答 404——这两种失败应用必须能分开 |
 | | 同一个 key 连着两次 `onlyIf: { ifNoneMatch: "*" }` | 第一次落地、第二次被告知输了，对象里还是第一个写的值；拿当前 etag 去写能成，同一个 etag 在被顶替之后再用就不成，`delete` 也一样。每一次被拒的写都没动过对象——这是本平台唯一的原子协调原语 |
 | | `deis blob list` / `head` / `get --offset` | 命令行读到的就是应用写下的那些对象；`deis blob put --if-none-match '*'` 输了的时候退 3（它自己的退出码，不是「连不上存储」那个 1），`delete --if-match` 拿过期 etag 同样退 3，对象原封不动 |
-| 具名绑定 | 同一个 key 经 `ctx.bindings.HOT`、`ctx.bindings.COLD` 和 `ctx.services.kv` 各写一次，再直接问 `KvStore.Get` | 读回来是三个不同的值；直接问 deis-store 时带 `x-deis-binding: HOT` 拿到 HOT 那个、不带这个头拿到无名那个。所以具名的命名空间是开在无名那个**旁边**，不是盖在它上面——早先部署的应用数据一个字节没挪 |
+| 具名绑定 | 同一个 key 经 `ctx.env.HOT`、`ctx.env.COLD` 和 `ctx.env.KV` 各写一次，再直接问 `KvStore.Get` | 读回来是三个不同的值；直接问 deis-store 时带 `x-deis-binding: HOT` 拿到 HOT 那个、带 `x-deis-binding: KV` 拿到 KV 那个。同一应用的每个绑定各占一个命名空间，互不覆盖 |
 | | 把 `..`、`a.b`、`a@b`、`../../etc`、超长名字当作 binding 头发给 deis-store；再拿 `demo` 的令牌去点名 `demo-auth` | 五个恶意名字全部在碰到磁盘之前被拒（`is not a namespace id`）；换租户那一发即使带着合法 binding 也被拒。令牌管的是租户，binding 只在租户内部选命名空间——一个伪造的名字最坏够到调用方自己那个租户的另一个空命名空间 |
-| | `deis kv put --binding HOT` 写，再用三种方式读 | 带 `--binding HOT` 读得到，并把命名空间印成 `demo.production@HOT` 而不是光租户；同一条命令不带 `--binding` 读回 `found=false`；应用侧 `ctx.bindings.HOT` 读到的就是 CLI 写的那个值 |
+| | `deis kv put --binding HOT` 写，再用三种方式读 | 带 `--binding HOT` 读得到，并把命名空间印成 `demo.production@HOT` 而不是光租户；同一条命令不带 `--binding`（租户级命名空间，没有应用够得到）读回 `found=false`；应用侧 `ctx.env.HOT` 读到的就是 CLI 写的那个值 |
 | 队列 | `POST /api/enqueue` 后轮询 `/api/kv/job:<key>` | 消息进了 deis-queue，节点的轮询任务领到并交给 `_queue.ts` |
 | | 一次 `send()` 交一整个数组 | 走的是一次 `SendBatch` 而不是 n 次 `Send`，回话里 `queued` 就是这一批的条数，消费端把这一批的每一条都写了出来 |
 | | 项目里写 `maxConcurrency` | 节点报出它同时**持有**这么多批，并且明说这不是并行：一个应用在一个环境里就一只 Isolate。这一项还会自己现发一条消息、等它被消费出来：那行日志是消费任务**起来的时候**写的，之后一直躺在文件里——先前把 deis-queue 杀掉、端口都空了，这一项照过不误（实测） |
@@ -318,7 +318,7 @@ API key 能不能从控制面领到那张令牌。
 | | 拿控制面为 `demo/production` 铸的遥测读 capability 去查 `demo-auth` 的日志，以及一条不点名应用的查询 | 两发都被拒（`PermissionDenied`），而不是答一页空的：所有租户的记录在同一个库里，挡在中间的只有 capability。同一个问题换成 `read:*/*` 操作员才领得到的平台读 capability 就答得出来，说明拒的是 capability 而不是查询本身 |
 | | `deis trace --follow` 开流 → 之后才发一个请求 | 跟到的那一行说的就是**这一次调用**（一次性探针路径确认）：方法、URL、状态码、耗时、判决、哪个节点。日志说应用讲了什么，trace 说平台决定了什么 |
 | | `deis tail` 开流 → 之后才发一个请求 | 跟到的是**开流之后**产生的那一行（用一次性探针名字确认），不是历史里捞的 |
-| 机队 | 控制面的 `/api/runtime` | 节点自己经机队通道（`deis.machine.MachineChannel/Register`，证明一张只属于这台机器的证书）登记上了；写在配置文件里的地址没有被节点自报的主机名覆盖掉 |
+| 机队 | 控制面的 `/api/platform/runtime` | 节点自己经机队通道（`deis.machine.MachineChannel/Register`，证明一张只属于这台机器的证书）登记上了；写在配置文件里的地址没有被节点自报的主机名覆盖掉 |
 | | 拿一张**没写在** `deis_runtime_nodes` 里、但由这支机队自己的根签给这个 id 的证书，经机队通道也发一次 `Register` | 机队里真的多出这个 id，且 `source` 是 `registered` 而非 `configured`——证明一台配置文件从未提过的机器，光靠证明一张这支机队签的证书就能加入机队，而不是全靠这行演示脚本里唯一的节点本来就在配置文件里、这条登记路径从没被真正走过；随后用同一张证书发一次 `Deregister`，机队里这个 id 也真的没了 |
 | | 登记、清单、路由表这三条路由改在**人用的那个监听口**上各发一次，带的是从前那把**部署用**的 API key | 三发都是 404，不是 401——不是「这把凭据不够格」，是这几条路由在这个口子上根本不存在：这个演示以前处处配置、现在哪儿都不配的那把机队共用密钥，也开不了一个不存在的路由。机队里没有多出任何 id，真正的节点仍然健康，而且是凭它证明的那个名字被认出来的 |
 | | 不带证书、以及带一张这支机队从没签过的证书，各去碰一次机队监听口 | 都连不上——一个只到握手就断了的连接，不是一个被业务逻辑拒绝的请求。同一条路径换成节点自己的证书能连上（答 404，因为探的是一个不存在的版本号），说明口子本身在应答，不通的是没有凭据或凭据不是这支机队签的那两种情况 |
@@ -328,13 +328,13 @@ API key 能不能从控制面领到那张令牌。
 | 账号与作用域 | `deis token list` | 配置文件里那把 key 也在列，注明来源是配置文件、作用域是空的，并单独报出「当前还有几把无作用域的凭据」——那个数是运维要推到零的东西。key 本身不进库，进库的只有这条记录 |
 | | 一把只有 `deploy:demo/preview` 的 token 去部署两个环境 | 它自己那个环境部署得动，另一个 403；这把 token 去读别的环境的密钥、读审计日志、列凭据也一律 403 |
 | | 拿一把只有 `deploy:demo/*` 的 token 传一个声明了 `AUTH` 服务绑定的 bundle | 403，而且回话点名少的是 `read:demo-auth/*`；给同一个账号加上这一条，同一个 bundle 就传上去了。一个应用在 manifest 里点另一个应用的名，是在**主张**一项调用权，而这次上传走的路由只说得出调用方是谁——所以这一道单查。`read` 是这套语法里最弱的动词，任何别的动词都蕴含它：这是团队之间的一道边界，不是第二个发版权限。那次拒绝在审计日志里 |
-| | 同一把 token 去 `DELETE /api/runtime/<节点>/apps/demo` | 被拒：部署和「把应用从节点上卸下来」是两种权限。一条不点名环境的卸载会停掉全部环境，所以它要的是整个应用的权限；应用还在服务，拒绝也进了审计日志 |
+| | 同一把 token 去 `DELETE /api/platform/runtime/<节点>/apps/demo` | 被拒：部署和「把应用从节点上卸下来」是两种权限。一条不点名环境的卸载会停掉全部环境，所以它要的是整个应用的权限；应用还在服务，拒绝也进了审计日志 |
 | | 不带凭据、带一个随手编的字符串、以及带演示以前处处配置现在哪儿都不配的那把机队共用密钥，各去打一次节点自己的管理端口 | `GetStatus` 与 `Trigger/OnScheduled` 三发都答 UNAUTHENTICATED——不是「带错的也一样」，是没有一个字符串还能通：这个口子已经不认凭据了。真正驱动这台节点的是另一个 socket，`[machine_identity] management_listen`，只认一张证明了这个节点的控制面之名的证书；节点仍然健康、仍在被控制面的直连探活探到，说明管理面是挪了地方，不是彻底停摆 |
 | | 拿一把 `deploy:*/*` + `secrets:*/*` 去领存储令牌 | 403：领令牌要的是**写死那个租户**的 `storage:demo/production`。`deis token create --scope storage:*/*` 本身就建不出来，所以没有一个「一把管全部」的形态能被误发出去 |
 | | `deis token revoke` 之后紧接着再打一发 | 下一发就被拒，而且回话和一把从没存在过的 token 一模一样——偷到凭据的人分不出是被吊销了还是本来就没有。控制面自己的日志分得出。没有缓存要等：每一发都回表查 |
 | | `deis audit --action secret.write` | 那一行点名应用 / 环境、密钥名、写它的凭据、来源地址和结果，唯独没有值 |
 | | 审计日志里的拒绝 | 被拒的调用记得和成功的一样全，包括「什么都没带」的那种，以及那把被收窄的 token 想部署 production 的那一次和原因——运维就是靠这个找出还攥着旧凭据的流水线 |
-| | `DELETE /api/audit` 与 `POST /api/audit`，用那把无作用域的 key | 405 / 404：这条路由只读，后面根本没有写和删的端点，两次尝试前后行数一动不动。要抹掉一行得拿到数据库文件本身，而那份访问权同时也是密钥主密钥的访问权 |
+| | `DELETE /api/v1/audit` 与 `POST /api/v1/audit`，用那把无作用域的 key | 405 / 404：这条路由只读，后面根本没有写和删的端点，两次尝试前后行数一动不动。要抹掉一行得拿到数据库文件本身，而那份访问权同时也是密钥主密钥的访问权 |
 | 自动证书 | 环回口上起一个真的 ACME 颁发机构，看它签了哪些名字 | 两个名字都不在 proxy 的配置文件里，是 `routing.preview_zone` 套在控制面发布的应用与环境上合成出来的；颁发机构自己的记录显示它确实回来抓过 `/.well-known/acme-challenge/<token>` 校验过这两个名字——一张没人被挑战过的证书什么也不能说明 |
 | | `curl --cacert <颁发机构根证书>` 打 proxy 的 TLS 端口 | 握手用这张根验得过，取回来的证书正是签给那个 SNI 名字的那张 |
 | | 打一个没人发布过的挑战令牌，以及 `../../../etc/passwd` 的原样与百分号编码两种写法 | 只有真发布过的令牌答得出内容，其余一律 404，穿越路径一个文件都不给 |

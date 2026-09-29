@@ -185,6 +185,7 @@ pub struct ExecutableProviderDriver {
     installed: InstalledDriverRelease,
     executable: InstalledReleaseExecutable,
     credential_broker: Arc<dyn ProviderCredentialBroker>,
+    inputs: Arc<dyn crate::OperationInputSource>,
     workspaces: DriverWorkspaceRoot,
     config: ExecutableProviderDriverConfig,
     runner: PinnedCommandRunner,
@@ -195,6 +196,7 @@ impl ExecutableProviderDriver {
         manifest: ValidatedProviderDriverManifest,
         installed: InstalledDriverRelease,
         credential_broker: Arc<dyn ProviderCredentialBroker>,
+        inputs: Arc<dyn crate::OperationInputSource>,
         workspaces: DriverWorkspaceRoot,
         config: ExecutableProviderDriverConfig,
     ) -> Result<Self, DriverContractError> {
@@ -235,6 +237,7 @@ impl ExecutableProviderDriver {
             installed,
             executable,
             credential_broker,
+            inputs,
             workspaces,
             config,
             runner: PinnedCommandRunner,
@@ -330,6 +333,35 @@ impl ProviderDriver for ExecutableProviderDriver {
                 invocation.output_limits(self.config.max_stdout_bytes, self.config.max_stderr_bytes)
             })
             .map_err(|error| command_error(request, &error))?;
+
+        // The deployment's config, secrets and purge consent, fetched before
+        // the credential is leased: an operation that cannot be given what
+        // it needs is not started at all, and costs no lease.
+        let inputs = self
+            .inputs
+            .inputs(context)
+            .await
+            .map_err(|error| input_error(request, &error))?;
+        if let Some(config) = inputs.config_json() {
+            invocation
+                .environment(crate::DRIVER_PROCESS_CONFIG_ENV, config)
+                .map_err(|error| command_error(request, &error))?;
+        }
+        if let Some(environment_id) = inputs.purge_environment() {
+            invocation
+                .environment(crate::DRIVER_PROCESS_PURGE_ENV, environment_id.to_string())
+                .map_err(|error| command_error(request, &error))?;
+        }
+        if let Some(secrets) = inputs
+            .secrets_json()
+            .map_err(|error| input_error(request, &error))?
+        {
+            invocation.credential(
+                SecretInjection::environment(crate::DRIVER_PROCESS_SECRETS_ENV, secrets)
+                    .map_err(|error| command_error(request, &error))?,
+            );
+        }
+        drop(inputs);
 
         let lease = self
             .credential_broker
@@ -507,6 +539,26 @@ fn workspace_error(request: &crate::DriverRequest, error: &DriverArtifactError) 
         retryable,
         SideEffect::None,
         if retryable {
+            DriverNextAction::Retry
+        } else {
+            DriverNextAction::None
+        },
+    )
+}
+
+fn input_error(request: &crate::DriverRequest, error: &crate::OperationInputError) -> DriverError {
+    driver_error(
+        request,
+        if error.retryable() {
+            DriverErrorCategory::Internal
+        } else {
+            DriverErrorCategory::Configuration
+        },
+        "DRIVER_INPUTS_UNAVAILABLE",
+        &error.to_string(),
+        error.retryable(),
+        SideEffect::None,
+        if error.retryable() {
             DriverNextAction::Retry
         } else {
             DriverNextAction::None
@@ -1044,7 +1096,15 @@ mod tests {
              test \"$HOME\" = {home} || exit 18\n\
              test \"$TMPDIR\" = \"$here\" || exit 19\n\
              test \"$PATH\" = {path} || exit 20\n\
+             test \"${config_env}\" = '{{\"GREETING\":\"hello\"}}' || exit 21\n\
+             test \"${secrets_env}\" = '{{\"API_KEY\":\"s3cret-value\"}}' || exit 22\n\
+             test \"${purge_env}\" = {environment} || exit 23\n\
+             case \"$*\" in *s3cret-value*) exit 24 ;; esac\n\
              printf '%s' '{output}'\n",
+            config_env = crate::DRIVER_PROCESS_CONFIG_ENV,
+            secrets_env = crate::DRIVER_PROCESS_SECRETS_ENV,
+            purge_env = crate::DRIVER_PROCESS_PURGE_ENV,
+            environment = request.environment_id,
             operations = operations.display(),
             operation = request.operation_id,
             sha = payload.sha256.as_str(),
@@ -1071,6 +1131,7 @@ mod tests {
             fixture.manifest.clone(),
             installed,
             broker_trait,
+            Arc::new(FixedInputs),
             workspaces,
             quick_config(),
         )
@@ -1117,6 +1178,7 @@ mod tests {
             fixture.manifest.clone(),
             installed,
             broker_trait,
+            Arc::new(crate::NoOperationInputs),
             workspaces,
             quick_config(),
         )
@@ -1165,6 +1227,31 @@ mod tests {
                 "{}",
                 directory.display()
             );
+        }
+    }
+
+    /// Config, a secret and purge consent, as a teardown with consent and
+    /// a deployment's inputs would carry them.
+    #[cfg(unix)]
+    struct FixedInputs;
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl crate::OperationInputSource for FixedInputs {
+        async fn inputs(
+            &self,
+            context: &DriverExecutionContext<'_>,
+        ) -> Result<crate::OperationInputs, crate::OperationInputError> {
+            Ok(crate::OperationInputs::none()
+                .with_config(std::collections::BTreeMap::from([(
+                    "GREETING".to_owned(),
+                    "hello".to_owned(),
+                )]))
+                .with_secrets(std::collections::BTreeMap::from([(
+                    "API_KEY".to_owned(),
+                    zeroize::Zeroizing::new("s3cret-value".to_owned()),
+                )]))
+                .with_purge(context.request().environment_id))
         }
     }
 

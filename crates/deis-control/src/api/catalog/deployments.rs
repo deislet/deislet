@@ -362,25 +362,16 @@ pub async fn rollback(
         .store
         .deployment_snapshot_for_version(&env.id, &version.id)
         .await?;
-    if historical_snapshot.is_none()
-        && deis_bundle::Manifest::parse(&version.manifest)
-            .map(|manifest| manifest.environment.is_some())
-            .unwrap_or(false)
-    {
+    let Some((_, snapshot)) = historical_snapshot else {
         return Err(ApiError::Conflict(format!(
             "EC_ENV_ROLLBACK_SNAPSHOT_UNAVAILABLE: version {} has no historical environment snapshot to reactivate",
             version.id
         )));
-    }
-    let payload_result = if let Some((_, snapshot)) = historical_snapshot {
-        state
-            .deliverer
-            .payload_for_snapshot(&env, &version, &base, snapshot)
-            .await
-    } else {
-        state.deliverer.payload(&env, &version, &base).await
     };
-    let mut payload = payload_result
+    let mut payload = state
+        .deliverer
+        .payload_for_snapshot(&env, &version, &base, snapshot)
+        .await
         .inspect_err(|e| {
             warn!(
                 app_id = %app_id,
@@ -659,7 +650,7 @@ async fn coordinate_plan(
     reason: DeliveryReason,
     secret_change: Option<serde_json::Value>,
 ) -> ApiResult<(Option<Deployment>, DeploymentPlan, DeliveryReport)> {
-    let expected_secret_heads = payload.expected_secret_heads().unwrap_or_default();
+    let expected_secret_heads = payload.expected_secret_heads();
     let target_ids = state.deliverer.serving_target_ids();
     let mut proxy_ids: Vec<String> = state
         .sessions
@@ -684,7 +675,7 @@ async fn coordinate_plan(
             env,
             version,
             DeploymentPlanSpec {
-                snapshot: payload.environment_snapshot().cloned(),
+                snapshot: payload.environment_snapshot().clone(),
                 expected_secret_heads,
                 compare_secret_heads: reason != DeliveryReason::Rollback && secret_change.is_none(),
                 target_ids,
@@ -1425,15 +1416,14 @@ async fn reconcile_claimed_generation_drain(
         .get_version(&plan.app_id, &plan.version_id)
         .await?;
     let base_url = state.deliverer.machine_reconciliation_base_url();
-    let mut payload = if let Some(snapshot_id) = &plan.snapshot_id {
-        let snapshot = state.store.get_environment_snapshot(snapshot_id).await?;
-        state
-            .deliverer
-            .payload_for_snapshot(&env, &version, &base_url, snapshot)
-            .await?
-    } else {
-        state.deliverer.payload(&env, &version, &base_url).await?
-    };
+    let snapshot = state
+        .store
+        .get_environment_snapshot(&plan.snapshot_id)
+        .await?;
+    let mut payload = state
+        .deliverer
+        .payload_for_snapshot(&env, &version, &base_url, snapshot)
+        .await?;
     payload.set_instruction(
         &plan.id,
         &drain.generation,
@@ -1585,15 +1575,14 @@ async fn reconcile_claimed_plan(
         .get_version(&plan.app_id, &plan.version_id)
         .await?;
     let base_url = state.deliverer.machine_reconciliation_base_url();
-    let mut payload = if let Some(snapshot_id) = &plan.snapshot_id {
-        let snapshot = state.store.get_environment_snapshot(snapshot_id).await?;
-        state
-            .deliverer
-            .payload_for_snapshot(&env, &version, &base_url, snapshot)
-            .await?
-    } else {
-        state.deliverer.payload(&env, &version, &base_url).await?
-    };
+    let snapshot = state
+        .store
+        .get_environment_snapshot(&plan.snapshot_id)
+        .await?;
+    let mut payload = state
+        .deliverer
+        .payload_for_snapshot(&env, &version, &base_url, snapshot)
+        .await?;
     let reason = plan_delivery_reason(&plan)?;
 
     match plan.state.as_str() {
@@ -2268,7 +2257,9 @@ mod tests {
                 "lease-app",
                 "sha-lease",
                 "/unused/lease.zip",
-                r#"{"schema":1,"app":"lease-app","entry":"worker/index.js"}"#,
+                &deis_bundle::complete_manifest_json(
+                    r#"{"app":"lease-app","entry":"worker/index.js"}"#,
+                ),
             )
             .await
             .unwrap();
@@ -2280,7 +2271,7 @@ mod tests {
                 &env,
                 &version,
                 DeploymentPlanSpec {
-                    snapshot: None,
+                    snapshot: crate::catalog::store::empty_snapshot(&env, &version),
                     expected_secret_heads: Default::default(),
                     compare_secret_heads: true,
                     target_ids: Vec::new(),
@@ -2318,30 +2309,7 @@ mod tests {
         use deis_queue::proto::queue::{AckRequest, MessageHandle, PullRequest, SendRequest};
 
         let h = harness_with_queue(true).await;
-        let tenant = "demo.production";
         let mut queue = h.queue_client().await;
-        for body in ["old lease", "next generation"] {
-            let mut request = tonic::Request::new(SendRequest {
-                queue_name: "jobs".to_string(),
-                message_body: body.as_bytes().to_vec(),
-            });
-            request.metadata_mut().insert(
-                deis_wire::conventions::TENANT_HEADER,
-                tenant.parse().unwrap(),
-            );
-            queue.send(request).await.unwrap();
-        }
-        let mut request = tonic::Request::new(PullRequest {
-            queue_name: "jobs".to_string(),
-            max_messages: 1,
-            lease_seconds: 60,
-        });
-        request.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            tenant.parse().unwrap(),
-        );
-        let old = queue.pull(request).await.unwrap().into_inner().messages;
-        assert_eq!(old.len(), 1);
 
         json(
             &h.router,
@@ -2351,7 +2319,9 @@ mod tests {
         )
         .await;
         let bundle = bundle_with_manifest(
-            r#"{"schema":1,"app":"demo","entry":"worker/index.js","queues":[{"name":"jobs"}]}"#,
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js","queues":[{"name":"jobs"}]}"#,
+            ),
             true,
         );
         let (_, uploaded) = call(
@@ -2370,6 +2340,32 @@ mod tests {
             serde_json::json!({"name": "production"}),
         )
         .await;
+        for body in ["old lease", "next generation"] {
+            let request = h
+                .queue_request(
+                    "demo",
+                    "production",
+                    SendRequest {
+                        queue_name: "jobs".to_string(),
+                        message_body: body.as_bytes().to_vec(),
+                    },
+                )
+                .await;
+            queue.send(request).await.unwrap();
+        }
+        let request = h
+            .queue_request(
+                "demo",
+                "production",
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 1,
+                    lease_seconds: 60,
+                },
+            )
+            .await;
+        let old = queue.pull(request).await.unwrap().into_inner().messages;
+        assert_eq!(old.len(), 1);
         let (status, accepted) = json(
             &h.router,
             "POST",
@@ -2409,17 +2405,19 @@ mod tests {
         );
 
         let leased = &old[0];
-        let mut ack = tonic::Request::new(AckRequest {
-            queue_name: "jobs".to_string(),
-            messages: vec![MessageHandle {
-                id: leased.id.clone(),
-                lease_token: leased.lease_token.clone(),
-            }],
-        });
-        ack.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            tenant.parse().unwrap(),
-        );
+        let ack = h
+            .queue_request(
+                "demo",
+                "production",
+                AckRequest {
+                    queue_name: "jobs".to_string(),
+                    messages: vec![MessageHandle {
+                        id: leased.id.clone(),
+                        lease_token: leased.lease_token.clone(),
+                    }],
+                },
+            )
+            .await;
         queue.ack(ack).await.unwrap();
 
         let plan = h.state.store.deployment_plan(plan_id).await.unwrap();
@@ -2532,7 +2530,7 @@ mod tests {
                 &env,
                 &version,
                 crate::catalog::store::DeploymentPlanSpec {
-                    snapshot: None,
+                    snapshot: crate::catalog::store::empty_snapshot(&env, &version),
                     expected_secret_heads: Default::default(),
                     compare_secret_heads: false,
                     target_ids: vec!["runtime-gone".to_string()],
@@ -2555,7 +2553,12 @@ mod tests {
             .unwrap();
         h.state
             .store
-            .commit_deployment_plan(&prepared, &env, None, owner)
+            .commit_deployment_plan(
+                &prepared,
+                &env,
+                &crate::catalog::store::empty_snapshot(&env, &version),
+                owner,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2705,7 +2708,7 @@ mod tests {
                 &env,
                 &version,
                 crate::catalog::store::DeploymentPlanSpec {
-                    snapshot: None,
+                    snapshot: crate::catalog::store::empty_snapshot(&env, &version),
                     expected_secret_heads: Default::default(),
                     compare_secret_heads: false,
                     target_ids: vec!["runtime-gone".to_string()],
@@ -3046,7 +3049,9 @@ mod tests {
             "POST",
             "/api/apps/demo/versions",
             Body::from(bundle_with_manifest(
-                r#"{"schema":1,"app":"demo","entry":"worker/index.js","env":{"LOG_LEVEL":"debug"}}"#,
+                &deis_bundle::complete_manifest_json(
+                    r#"{"app":"demo","entry":"worker/index.js","env":{"LOG_LEVEL":"debug"}}"#,
+                ),
                 true,
             )),
             "application/zip",
@@ -3281,24 +3286,28 @@ mod tests {
             .unwrap()
             .to_string();
         let mut queue = h.queue_client().await;
-        let mut send = tonic::Request::new(SendRequest {
-            queue_name: "jobs".to_string(),
-            message_body: b"finish under the old secret".to_vec(),
-        });
-        send.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            "demo.production".parse().unwrap(),
-        );
+        let send = h
+            .queue_request(
+                "demo",
+                "production",
+                SendRequest {
+                    queue_name: "jobs".to_string(),
+                    message_body: b"finish under the old secret".to_vec(),
+                },
+            )
+            .await;
         queue.send(send).await.unwrap();
-        let mut pull = tonic::Request::new(PullRequest {
-            queue_name: "jobs".to_string(),
-            max_messages: 1,
-            lease_seconds: 60,
-        });
-        pull.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            "demo.production".parse().unwrap(),
-        );
+        let mut pull = h
+            .queue_request(
+                "demo",
+                "production",
+                PullRequest {
+                    queue_name: "jobs".to_string(),
+                    max_messages: 1,
+                    lease_seconds: 60,
+                },
+            )
+            .await;
         pull.metadata_mut().insert(
             deis_wire::conventions::DEPLOYMENT_GENERATION_HEADER,
             first_generation.parse().unwrap(),
@@ -3340,17 +3349,19 @@ mod tests {
             "202 exposes candidate metadata but the current secret head stays unchanged"
         );
         let leased = &old_lease[0];
-        let mut ack = tonic::Request::new(AckRequest {
-            queue_name: "jobs".to_string(),
-            messages: vec![MessageHandle {
-                id: leased.id.clone(),
-                lease_token: leased.lease_token.clone(),
-            }],
-        });
-        ack.metadata_mut().insert(
-            deis_wire::conventions::TENANT_HEADER,
-            "demo.production".parse().unwrap(),
-        );
+        let ack = h
+            .queue_request(
+                "demo",
+                "production",
+                AckRequest {
+                    queue_name: "jobs".to_string(),
+                    messages: vec![MessageHandle {
+                        id: leased.id.clone(),
+                        lease_token: leased.lease_token.clone(),
+                    }],
+                },
+            )
+            .await;
         queue.ack(ack).await.unwrap();
         let plan = h.state.store.deployment_plan(rotation_plan).await.unwrap();
         reconcile_plan(&h.state, plan).await.unwrap();

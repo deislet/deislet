@@ -8,17 +8,18 @@
 //!
 //! The Deislet store and queue nevertheless need one bounded, path-safe value
 //! for a SQLite key, database file or blob directory. The types below are that
-//! backend-specific persistence boundary. They are shared here so migration,
-//! store, queue, snapshot and restore cannot each invent a different encoding.
+//! backend-specific persistence boundary. They are shared here so store,
+//! queue, snapshot and restore cannot each invent a different encoding.
 //!
-//! This encoding is not an application-facing standard and must never be put
-//! into `x-deis-tenant` or used as an HMAC subject. It is injective, reversible
-//! and disjoint from the legacy `application.environment` family: every
-//! legacy tenant contains `.`, while a canonical Deislet key contains none.
+//! This encoding is not an application-facing standard: nothing on the wire
+//! carries it, a capability names the logical tenant. It is injective and
+//! reversible, and it contains no `.`, `/` or `\`, so it is always exactly
+//! one path component.
 
 use std::{fmt, str::FromStr};
 
-use crate::{CanonicalId, CanonicalIdError, CanonicalTenantId};
+use crate::conventions::is_valid_binding_name;
+use crate::{CanonicalIdError, CanonicalTenantId};
 
 /// Versioned prefix for Deislet's canonical physical tenant encoding.
 ///
@@ -33,10 +34,8 @@ pub const DEISLET_CANONICAL_TENANT_KEY_PREFIX: &str = "ct1_";
 /// also safe in one filename component on Linux, macOS and Windows.
 const ID_SEPARATOR: char = '_';
 
-/// Separator between a tenant key and an optional permanent binding ID.
-///
-/// This matches the existing local namespace separator, but the value after
-/// it is a UUIDv7 rather than a mutable logical binding name.
+/// Separator between a tenant key and an optional binding name. Neither a
+/// canonical id nor a binding name may contain it.
 const BINDING_SEPARATOR: char = '@';
 
 /// Deislet's one-component persistence key for a canonical tenant.
@@ -95,20 +94,34 @@ impl FromStr for DeisletCanonicalTenantKey {
 
 /// Deislet's one-component persistence key for a canonical storage namespace.
 ///
-/// The unnamed namespace is the tenant key itself. A named logical binding is
-/// represented by its permanent binding UUIDv7, never by its mutable display
-/// name. The mapping from logical name to this ID belongs to an immutable
-/// environment binding snapshot.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// The unnamed namespace is the tenant key itself. A named binding adds the
+/// binding name the application declared (`HOT`, `MEDIA`), validated with
+/// [`is_valid_binding_name`]. The name only selects a namespace *inside* the
+/// tenant the capability proved; it is never an authority of its own, so a
+/// rename is a new, empty namespace of the same tenant and nothing else.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeisletCanonicalNamespaceKey {
     tenant: CanonicalTenantId,
-    binding_id: Option<CanonicalId>,
+    binding: Option<String>,
 }
 
 impl DeisletCanonicalNamespaceKey {
-    #[must_use]
-    pub const fn new(tenant: CanonicalTenantId, binding_id: Option<CanonicalId>) -> Self {
-        Self { tenant, binding_id }
+    /// The namespace of `tenant` that `binding` names, or the tenant's
+    /// unnamed one for `None`. Refuses a binding name that
+    /// [`is_valid_binding_name`] refuses.
+    pub fn new(
+        tenant: CanonicalTenantId,
+        binding: Option<&str>,
+    ) -> Result<Self, DeisletStorageKeyError> {
+        if let Some(name) = binding
+            && !is_valid_binding_name(name)
+        {
+            return Err(DeisletStorageKeyError::InvalidBindingName);
+        }
+        Ok(Self {
+            tenant,
+            binding: binding.map(str::to_string),
+        })
     }
 
     #[must_use]
@@ -117,16 +130,16 @@ impl DeisletCanonicalNamespaceKey {
     }
 
     #[must_use]
-    pub const fn binding_id(&self) -> Option<CanonicalId> {
-        self.binding_id
+    pub fn binding(&self) -> Option<&str> {
+        self.binding.as_deref()
     }
 }
 
 impl fmt::Display for DeisletCanonicalNamespaceKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         DeisletCanonicalTenantKey::new(self.tenant).fmt(formatter)?;
-        if let Some(binding_id) = self.binding_id {
-            write!(formatter, "{BINDING_SEPARATOR}{binding_id}")?;
+        if let Some(binding) = &self.binding {
+            write!(formatter, "{BINDING_SEPARATOR}{binding}")?;
         }
         Ok(())
     }
@@ -136,20 +149,12 @@ impl FromStr for DeisletCanonicalNamespaceKey {
     type Err = DeisletStorageKeyError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let (tenant, binding_id) = match value.split_once(BINDING_SEPARATOR) {
-            Some((tenant, binding)) => {
-                if binding.contains(BINDING_SEPARATOR) || binding.is_empty() {
-                    return Err(DeisletStorageKeyError::InvalidNamespaceGrammar);
-                }
-                let binding_id = binding
-                    .parse()
-                    .map_err(DeisletStorageKeyError::InvalidBindingId)?;
-                (tenant, Some(binding_id))
-            }
+        let (tenant, binding) = match value.split_once(BINDING_SEPARATOR) {
+            Some((tenant, binding)) => (tenant, Some(binding)),
             None => (value, None),
         };
         let tenant = tenant.parse::<DeisletCanonicalTenantKey>()?.tenant();
-        Ok(Self::new(tenant, binding_id))
+        Self::new(tenant, binding)
     }
 }
 
@@ -157,10 +162,9 @@ impl FromStr for DeisletCanonicalNamespaceKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeisletStorageKeyError {
     InvalidTenantGrammar,
-    InvalidNamespaceGrammar,
     InvalidApplicationId(CanonicalIdError),
     InvalidEnvironmentId(CanonicalIdError),
-    InvalidBindingId(CanonicalIdError),
+    InvalidBindingName,
 }
 
 impl fmt::Display for DeisletStorageKeyError {
@@ -169,18 +173,15 @@ impl fmt::Display for DeisletStorageKeyError {
             Self::InvalidTenantGrammar => formatter.write_str(
                 "canonical Deislet tenant key must be ct1_<application UUIDv7>_<environment UUIDv7>",
             ),
-            Self::InvalidNamespaceGrammar => formatter.write_str(
-                "canonical Deislet namespace key may contain at most one non-empty @<binding UUIDv7> suffix",
-            ),
             Self::InvalidApplicationId(error) => {
                 write!(formatter, "invalid application ID in Deislet tenant key: {error}")
             }
             Self::InvalidEnvironmentId(error) => {
                 write!(formatter, "invalid environment ID in Deislet tenant key: {error}")
             }
-            Self::InvalidBindingId(error) => {
-                write!(formatter, "invalid binding ID in Deislet namespace key: {error}")
-            }
+            Self::InvalidBindingName => formatter.write_str(
+                "a binding name must be 1 to 64 ASCII letters, digits, '_' or '-'",
+            ),
         }
     }
 }
@@ -190,11 +191,9 @@ impl std::error::Error for DeisletStorageKeyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conventions::{namespace_id, tenant_id};
 
     const APP: &str = "018f2518-7e38-7f80-8000-000000000001";
     const ENV: &str = "018f2518-7e38-7f80-8000-000000000002";
-    const BINDING: &str = "018f2518-7e38-7f80-8000-000000000003";
 
     fn canonical_tenant() -> CanonicalTenantId {
         CanonicalTenantId::new(APP.parse().unwrap(), ENV.parse().unwrap())
@@ -212,33 +211,35 @@ mod tests {
     }
 
     #[test]
-    fn a_namespace_uses_permanent_binding_identity_not_a_display_name() {
-        let binding_id = BINDING.parse().unwrap();
-        let key = DeisletCanonicalNamespaceKey::new(canonical_tenant(), Some(binding_id));
-        let expected = format!("ct1_{APP}_{ENV}@{BINDING}");
+    fn a_named_binding_is_a_namespace_inside_the_tenant() {
+        let key = DeisletCanonicalNamespaceKey::new(canonical_tenant(), Some("HOT")).unwrap();
+        let expected = format!("ct1_{APP}_{ENV}@HOT");
         assert_eq!(key.to_string(), expected);
         assert_eq!(
             expected.parse::<DeisletCanonicalNamespaceKey>().unwrap(),
             key
         );
-        assert_eq!(key.binding_id(), Some(binding_id));
-        assert!(!key.to_string().contains("HOT"));
+        assert_eq!(key.binding(), Some("HOT"));
+        assert_eq!(key.tenant(), canonical_tenant());
+        let unnamed = DeisletCanonicalNamespaceKey::new(canonical_tenant(), None).unwrap();
+        assert_ne!(unnamed, key);
+        assert_eq!(unnamed.to_string(), format!("ct1_{APP}_{ENV}"));
     }
 
     #[test]
     fn physical_keys_are_one_cross_platform_path_component() {
         for key in [
-            DeisletCanonicalNamespaceKey::new(canonical_tenant(), None).to_string(),
-            DeisletCanonicalNamespaceKey::new(canonical_tenant(), Some(BINDING.parse().unwrap()))
-                .to_string(),
+            DeisletCanonicalNamespaceKey::new(canonical_tenant(), None).unwrap(),
+            DeisletCanonicalNamespaceKey::new(canonical_tenant(), Some(&"x".repeat(64))).unwrap(),
         ] {
+            let key = key.to_string();
             assert!(key.is_ascii());
             assert!(key.len() < 194);
             assert!(!key.ends_with(['.', ' ']));
             assert!(
                 !key.chars().any(|character| matches!(
                     character,
-                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0'
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0' | '.'
                 )),
                 "{key} is not one portable path component"
             );
@@ -246,24 +247,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_and_every_legacy_namespace_family_are_disjoint() {
-        let canonical =
-            DeisletCanonicalNamespaceKey::new(canonical_tenant(), Some(BINDING.parse().unwrap()))
-                .to_string();
-        for legacy in [
-            namespace_id(&tenant_id("ct1", "production"), None),
-            namespace_id(&tenant_id("ct1_018f2518", "production"), Some("HOT")),
-            namespace_id(&tenant_id("shop", "production"), Some(BINDING)),
-        ] {
-            assert!(legacy.contains('.'));
-            assert!(!canonical.contains('.'));
-            assert_ne!(canonical, legacy);
-            assert!(legacy.parse::<DeisletCanonicalNamespaceKey>().is_err());
-        }
-    }
-
-    #[test]
-    fn malformed_or_noncanonical_id_spellings_fail_closed() {
+    fn malformed_keys_and_binding_names_fail_closed() {
         for bad in [
             format!("{APP}_{ENV}"),
             format!("ct1_{APP}"),
@@ -271,13 +255,19 @@ mod tests {
             format!("ct1_{}_{ENV}", APP.to_ascii_uppercase()),
             format!("ct1_550e8400-e29b-41d4-a716-446655440000_{ENV}"),
             format!("ct1_{APP}_{ENV}@"),
-            format!("ct1_{APP}_{ENV}@HOT"),
-            format!("ct1_{APP}_{ENV}@{BINDING}@{BINDING}"),
+            format!("ct1_{APP}_{ENV}@a.b"),
+            format!("ct1_{APP}_{ENV}@.."),
+            format!("ct1_{APP}_{ENV}@HOT@COLD"),
+            "shop.production".to_string(),
+            "shop.production@HOT".to_string(),
         ] {
             assert!(
                 bad.parse::<DeisletCanonicalNamespaceKey>().is_err(),
                 "accepted {bad}"
             );
+        }
+        for hostile in ["", "a/b", "a.b", "a@b", ".."] {
+            assert!(DeisletCanonicalNamespaceKey::new(canonical_tenant(), Some(hostile)).is_err());
         }
     }
 }

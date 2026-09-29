@@ -325,27 +325,23 @@ check_queue_capability_token() {
 
   none=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
-    -H "x-deis-tenant: ${tenant}" \
     -d "$request" \
     "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && none_rc=0 || none_rc=$?
 
   wrong=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
-    -H "x-deis-tenant: ${tenant}" \
     -H "authorization: Bearer not-a-capability" \
     -d "$request" \
     "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && wrong_rc=0 || wrong_rc=$?
 
   other=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
-    -H "x-deis-tenant: ${tenant}" \
     -H "authorization: Bearer $(storage_token store)" \
     -d "$request" \
     "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && other_rc=0 || other_rc=$?
 
   served=$(grpcurl -cacert "${PKI_DIR}/ca.crt" -max-time 5 \
     -import-path "${ROOT_DIR}/crates/deis-queue/proto" -proto queue.proto \
-    -H "x-deis-tenant: ${tenant}" \
     -H "authorization: Bearer $(storage_token queue)" \
     -d "$request" \
     "127.0.0.1:${DEIS_QUEUE_PORT}" deis.queue.Queue/ListDeadLetters 2>&1) && served_rc=0 || served_rc=$?

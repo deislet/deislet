@@ -420,14 +420,14 @@ use deis_build::{
 
 ### 适配器
 
-每个适配器 crate 名就是 `--vendor` 的取值本身，re-export 的别名也跟着它走：
+每个适配器 crate 名就是 `--target` 的取值本身，re-export 的别名也跟着它走：
 
 ```rust
 use deis_build::{
-    adapter_cloudflare, // --vendor cloudflare  (deis-build-adapter-cloudflare)
-    adapter_deno,       // --vendor deno        (deis-build-adapter-deno)
-    adapter_tencent,    // --vendor tencent     (deis-build-adapter-tencent，腾讯 EdgeOne)
-    adapter_deislet,    // --vendor deislet     (deis-build-adapter-deislet，应用包)
+    adapter_cloudflare, // --target cloudflare  (deis-build-adapter-cloudflare)
+    adapter_deno,       // --target deno        (deis-build-adapter-deno)
+    adapter_tencent,    // --target tencent     (deis-build-adapter-tencent，腾讯 EdgeOne)
+    adapter_deislet,    // --target deislet     (deis-build-adapter-deislet，应用包)
 };
 ```
 
@@ -462,12 +462,8 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. 检测使用的扩展特性
     let mut used_features = Vec::new();
-    if let Some(ref services) = config.services {
-        if let Some(ref db) = services.database {
-            if db.enabled {
-                used_features.push(Feature::SQLDatabase);
-            }
-        }
+    if !config.queues.is_empty() {
+        used_features.push(Feature::Queues);
     }
 
     // 3. 检查当前目标打包器覆盖

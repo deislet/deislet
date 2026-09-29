@@ -170,7 +170,12 @@ fn record_on(conn: &Connection, claims: &CapabilityClaims) -> Result<(), Databas
         tx.execute(
             "INSERT INTO capability_issuance_resources (jti, tenant, binding, generation)
              VALUES (?1, ?2, ?3, ?4)",
-            params![claims.jti, resource.tenant, resource.binding, resource.generation],
+            params![
+                claims.jti,
+                resource.tenant,
+                resource.binding,
+                resource.generation
+            ],
         )?;
     }
     tx.commit()?;
@@ -230,9 +235,8 @@ fn revoke_on(
 }
 
 fn revoked_jtis_on(conn: &Connection, now: i64) -> Result<Vec<String>, DatabaseError> {
-    let mut statement = conn.prepare(
-        "SELECT jti FROM capability_revocations WHERE expires_at > ?1 ORDER BY jti",
-    )?;
+    let mut statement =
+        conn.prepare("SELECT jti FROM capability_revocations WHERE expires_at > ?1 ORDER BY jti")?;
     let rows = statement.query_map(params![now - LIST_MARGIN_SECS], |row| row.get(0))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }

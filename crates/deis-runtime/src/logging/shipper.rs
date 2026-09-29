@@ -557,6 +557,21 @@ fn to_proto(entry: &LogEntry) -> ProtoLogEntry {
             },
         );
 
+    // The record's owner as deis-telemetry judges it, looked up by the
+    // environment's `<app>.<environment>` label. The logging layer has
+    // usually split that label already - the application in `app_id`, the
+    // environment in `fields` - so it is put back together here. A line of
+    // an application this node never built an isolate for has no tenant and
+    // is refused there, which is what it would be under any name.
+    let tenant = app_id
+        .as_deref()
+        .map(|application| match fields.get(ENVIRONMENT_FIELD) {
+            Some(environment) => deis_wire::conventions::tenant_id(application, environment),
+            None => application.to_string(),
+        })
+        .and_then(|label| crate::telemetry::canonical_tenant(&label))
+        .unwrap_or_default();
+
     ProtoLogEntry {
         timestamp_us: micros_since_epoch(entry.timestamp),
         level: proto_level(entry.level) as i32,
@@ -566,6 +581,7 @@ fn to_proto(entry: &LogEntry) -> ProtoLogEntry {
         fields,
         trace_id: entry.trace_id.clone().unwrap_or_default(),
         span_id: entry.span_id.clone().unwrap_or_default(),
+        tenant,
     }
 }
 

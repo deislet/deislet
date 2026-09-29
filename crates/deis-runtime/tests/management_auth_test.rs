@@ -236,10 +236,8 @@ async fn until_served(
             caller,
             node_id,
             address,
-            &format!(
-                "GET /health HTTP/1.1\r\nHost: node\r\n\
-                 x-deis-app-id: _system\r\nConnection: close\r\n\r\n"
-            ),
+            "GET /health HTTP/1.1\r\nHost: node\r\n\
+                 x-deis-app-id: _system\r\nConnection: close\r\n\r\n",
         )
         .await
         {

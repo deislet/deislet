@@ -117,16 +117,16 @@ mod tests {
 
     fn manifest() -> Manifest {
         Manifest {
-            schema: deis_bundle::MIN_SUPPORTED_SCHEMA,
+            schema: deis_bundle::SUPPORTED_SCHEMA,
             app: "demo".to_string(),
             entry: WORKER_ENTRY.to_string(),
             runtime: Some("standard-v1".to_string()),
-            services: Default::default(),
             bindings: Default::default(),
             callable_by: Vec::new(),
-            env: Default::default(),
-            secrets: Vec::new(),
-            environment: None,
+            environment: deis_wire::EnvironmentDeclarations::new(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                Vec::new(),
+            ),
             routes: Vec::new(),
             cron: Vec::new(),
             queues: Vec::new(),

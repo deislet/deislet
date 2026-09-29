@@ -1,9 +1,9 @@
 # ADR-023：后端迁移清单与写入栅栏必须位于真实提交边界
 
-- 状态：Accepted
+- 状态：Deprecated（2026-09-28：没有任何安装持有按名字键控的数据，身份迁移子系统连同本 ADR 的 `BackendMigration` 服务、写入栅栏、inventory 与 `migration_admin_token` 一并删除；恢复所需的 backend incarnation 改为数据目录中的 `backend-incarnation` 文件，见 ADR-024）
 - 日期：2026-09-04
 - 决策者：产品负责人已确认的统一标准方向；本记录落实 ADR-019 的后端约束
-- 关联：[ADR-019](019-coordinated-data-lifecycle.md)、`../archive/phase-analysis-2026-09-03.zh.md` 第 13 节、`../../contracts/v1/backend-migration-evidence.schema.json`
+- 关联：[ADR-019](019-coordinated-data-lifecycle.md)、`../archive/phase-analysis-2026-09-03.zh.md` 第 13 节（原机器契约 `contracts/v1/backend-migration-evidence.schema.json` 已随本 ADR 的实现一并删除）
 - 标准提案：[Edge Canon Proposal 0001](https://github.com/deislet/edge-canon/blob/a41a4caadeaf8e5751ebe57ef5be673d18384654/proposals/0001-unified-platform-contract/README.zh.md)
 
 ## 决策
@@ -58,7 +58,7 @@ Embedded 模式仍是一份 data directory 对应一个 service process，多个
 - `InspectTenant`
 - `ReleaseWriteFence`
 
-机器可读证据格式由 `contracts/v1/backend-migration-evidence.schema.json` 定义。proto 响应不返回 fence token，只返回绑定 incarnation 后的 receipt digest。Control 在网络变更前把首次发现的 incarnation 持久绑定到 attempt，重试、已捕获 evidence 的复核和取消 release 都要求相同 ID；RPC 发现与 acquire 之间的替换由 request 内的 expected ID 再次阻断。identity migration 也已采用正式 `ProductOperation`，持久记录 actor、organization、幂等摘要、request/correlation 和统一状态转换。当前没有真实 provider 下游操作，因此 child/provider operation 数组保持为空；所有 component evidence 仍须在后续 verification 阶段合并。
+机器可读证据格式曾由 `contracts/v1/backend-migration-evidence.schema.json` 定义（已删除）。proto 响应不返回 fence token，只返回绑定 incarnation 后的 receipt digest。Control 在网络变更前把首次发现的 incarnation 持久绑定到 attempt，重试、已捕获 evidence 的复核和取消 release 都要求相同 ID；RPC 发现与 acquire 之间的替换由 request 内的 expected ID 再次阻断。identity migration 也已采用正式 `ProductOperation`，持久记录 actor、organization、幂等摘要、request/correlation 和统一状态转换。当前没有真实 provider 下游操作，因此 child/provider operation 数组保持为空；所有 component evidence 仍须在后续 verification 阶段合并。
 
 ## 尚未完成
 

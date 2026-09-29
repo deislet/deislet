@@ -1,12 +1,12 @@
 //! The Deno Deploy adapter.
 //!
-//! One adapter per vendor, and the crate is named after the `--vendor` value
-//! it answers for: `deis build --vendor deno` is served by
+//! One adapter per target, and the crate is named after the `--target` value
+//! it answers for: `deis build --target deno` is served by
 //! `deis-build-adapter-deno`. That correspondence is the whole naming
 //! rule, and [`VENDOR`] plus the test at the bottom of this file is what
 //! keeps a rename from quietly breaking it.
 
-/// The `--vendor` value this adapter answers for.
+/// The `--target` value this adapter answers for.
 ///
 /// `deis-build` dispatches on it, so the string here and the crate name are
 /// the same fact written twice; `the_crate_is_named_after_the_vendor` fails
@@ -47,32 +47,12 @@ pub fn generate_with_node_runtime(
     let environment_declarations =
         deis_build_core::resolve_environment_declaration_entries(config)?;
     let environment_declarations_json = serde_json::to_string(&environment_declarations)?;
-    let has_kv = config
-        .services
-        .as_ref()
-        .and_then(|s| s.kv.as_ref())
-        .map(|kv| kv.enabled)
-        .unwrap_or(false);
-
     // 1. Generate Context Builder Code
-    let context_builder_code =
-        generate_context_builder_code(has_kv, &environment_declarations_json);
-
-    // 2. Generate KV Adapter Code
-    let kv_adapter_code = if has_kv {
-        Some(generate_kv_adapter_code())
-    } else {
-        None
-    };
+    let context_builder_code = generate_context_builder_code(&environment_declarations_json);
 
     // 3. Generate Router Code
-    let router_code = generate_router_code(
-        routes,
-        has_kv,
-        assets,
-        node_runtime,
-        &environment_declarations_json,
-    );
+    let router_code =
+        generate_router_code(routes, assets, node_runtime, &environment_declarations_json);
 
     // 4. Generate Config Files
     let mut config_files = Vec::new();
@@ -111,7 +91,6 @@ pub fn generate_with_node_runtime(
     Ok(AdapterArtifacts {
         router_code,
         context_builder_code,
-        kv_adapter_code,
         config_files,
         support_files: vec![(
             "edge-canon-runtime.js".to_string(),
@@ -121,18 +100,7 @@ pub fn generate_with_node_runtime(
 }
 
 fn refuse_unplanned_resources(config: &ProjectConfig) -> anyhow::Result<()> {
-    let enabled_service = config.services.as_ref().is_some_and(|services| {
-        [
-            services.kv.as_ref(),
-            services.database.as_ref(),
-            services.blob.as_ref(),
-            services.queue.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|service| service.enabled)
-    });
-    if !config.bindings.is_empty() || enabled_service || !config.callable_by.is_empty() {
+    if !config.bindings.is_empty() || !config.callable_by.is_empty() {
         anyhow::bail!(
             "EC_BINDING_TARGET_UNIMPLEMENTED: the deno adapter requires a resolved standard binding plan"
         );
@@ -142,7 +110,6 @@ fn refuse_unplanned_resources(config: &ProjectConfig) -> anyhow::Result<()> {
 
 fn generate_router_code(
     routes: &[(String, String)],
-    has_kv: bool,
     assets: &[StaticAsset],
     bundled_at_root: bool,
     environment_declarations_json: &str,
@@ -177,12 +144,6 @@ fn generate_router_code(
         ));
     }
 
-    let kv_import = if has_kv {
-        "import { createKVAdapter } from './adapters/kv-adapter.ts';\n"
-    } else {
-        ""
-    };
-
     let context_builder_import =
         "import { createContextBuilder } from './adapters/context-builder.ts';\n";
     let node_runtime_import = if bundled_at_root {
@@ -190,7 +151,6 @@ fn generate_router_code(
     } else {
         ""
     };
-    let kv_comment = if has_kv { "" } else { "undefined; // " };
 
     // The static files, as a table rather than as a directory listing at
     // request time.
@@ -223,19 +183,16 @@ fn generate_router_code(
  * Artifact assumptions: deis-build-adapter-deno/spec.mdc (research snapshot)
  * - Entry format: Deno.serve() per Deno Deploy spec
  * - Handler receives Request, returns Promise<Response>
- * - Uses Deno.openKv() for key-value storage
  * - Uses Deno.env for environment variables
  *
  * See: https://docs.deno.com/deploy/
  */
 
 import {{ invokeEdgeCanonHandler, edgeCanonFailureResponse, matchRoute }} from './edge-canon-runtime.js';
-{node_runtime_import}{imports}{kv_import}{context_builder_import}
+{node_runtime_import}{imports}{context_builder_import}
 const EDGE_CANON_ENVIRONMENT_DECLARATIONS = {environment_declarations_json};
 
-// Initialize Deno KV database
-const kv = {kv_comment}await Deno.openKv();
-const buildContext = createContextBuilder(kv);
+const buildContext = createContextBuilder();
 
 Deno.serve(async (request: Request): Promise<Response> => {{
   try {{
@@ -285,18 +242,7 @@ console.log('🚀 Deno Deploy server running...');
     )
 }
 
-fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &str) -> String {
-    let kv_import = if has_kv {
-        "import { createKVAdapter } from './kv-adapter.ts';\n"
-    } else {
-        ""
-    };
-
-    let kv_binding = if has_kv {
-        "if (kv) standardEnv.KV = createKVAdapter(kv);"
-    } else {
-        ""
-    };
+fn generate_context_builder_code(environment_declarations_json: &str) -> String {
     format!(
         r#"/**
  * Edge Canon context bridge for Deno Deploy.
@@ -306,18 +252,17 @@ fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &s
  * isolates rejection and closes registration with the response body.
  */
 
-{kv_import}import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
+import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
 
 const EDGE_CANON_ENVIRONMENT_DECLARATIONS = {environment_declarations_json};
 
-export function createContextBuilder(kv?: Deno.Kv) {{
+export function createContextBuilder() {{
   return function buildContext(request: Request, route: string = '/', wildcardName: string | null = null) {{
     const url = new URL(request.url);
     const standardEnv: Record<string, unknown> = materializeEdgeCanonEnvironment(
       Deno.env.toObject(),
       EDGE_CANON_ENVIRONMENT_DECLARATIONS
     );
-    {kv_binding}
     return createEdgeCanonContext(
       request,
       standardEnv,
@@ -328,71 +273,6 @@ export function createContextBuilder(kv?: Deno.Kv) {{
 }}
 "#
     )
-}
-
-fn generate_kv_adapter_code() -> String {
-    r#"/**
- * Deno KV Adapter
- */
-
-export function createKVAdapter(kv: Deno.Kv) {
-  return {
-    async get(key: string): Promise<string | null> {
-      const result = await kv.get([key]);
-      return result.value ? String(result.value) : null;
-    },
-
-    async getJSON<T = any>(key: string): Promise<T | null> {
-      const result = await kv.get([key]);
-      return result.value as T | null;
-    },
-
-    async put(key: string, value: string, options?: any): Promise<void> {
-      const kvOptions: any = {};
-      if (options?.expirationTtl) {
-        kvOptions.expireIn = options.expirationTtl * 1000;
-      }
-      await kv.set([key], value, kvOptions);
-    },
-
-    async putJSON<T = any>(key: string, value: T, options?: any): Promise<void> {
-      const kvOptions: any = {};
-      if (options?.expirationTtl) {
-        kvOptions.expireIn = options.expirationTtl * 1000;
-      }
-      await kv.set([key], value, kvOptions);
-    },
-
-    async delete(key: string): Promise<void> {
-      await kv.delete([key]);
-    },
-
-    async list(options?: any) {
-      const entries = kv.list(options?.prefix ? { prefix: [options.prefix] } : { prefix: [] });
-      const keys: any[] = [];
-
-      for await (const entry of entries) {
-        keys.push({
-          name: entry.key[0],
-          metadata: entry.versionstamp
-        });
-      }
-
-      return {
-        keys,
-        list_complete: true,
-        cursor: undefined
-      };
-    },
-
-    async exists(key: string): Promise<boolean> {
-      const result = await kv.get([key]);
-      return result.value !== null;
-    }
-  };
-}
-"#
-    .to_string()
 }
 
 #[cfg(test)]

@@ -29,9 +29,9 @@ use crate::settings::Overrides;
 pub struct GetArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub key: String,
     /// Write the value's bytes here instead of showing them.
@@ -144,9 +144,9 @@ pub async fn get(args: GetArgs, output: Output) -> Result<()> {
 pub struct PutArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub key: String,
     /// The value, as text. `clap` refuses this together with `file`.
@@ -194,9 +194,9 @@ pub async fn put(args: PutArgs, output: Output) -> Result<()> {
 pub struct DeleteArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub key: String,
     pub yes: bool,
@@ -241,9 +241,9 @@ pub async fn delete(args: DeleteArgs, output: Output) -> Result<()> {
 pub struct ListArgs {
     pub app: Option<String>,
     pub environment: Option<String>,
-    /// Which namespace inside the tenant to act in. `None` is the unnamed one:
-    /// what `context.services.*` reaches, and where an application that
-    /// declares no binding keeps everything it has.
+    /// Which binding to act in: a name the application declared, reached
+    /// there as `env.<NAME>`. `None` is the tenant-level namespace, which no
+    /// application reaches.
     pub binding: Option<String>,
     pub prefix: String,
     pub limit: i32,

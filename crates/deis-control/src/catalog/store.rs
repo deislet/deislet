@@ -41,7 +41,7 @@ use super::pagination::{
 use super::{CatalogError, CatalogResult};
 use crate::database::Database;
 
-const APP_COLUMNS: &str = "id, canonical_id, revision, created_at";
+const APP_COLUMNS: &str = "id, canonical_id, created_at";
 const VERSION_COLUMNS: &str = "id, canonical_id, app_id, number, bundle_sha, bundle_path, manifest, canonical_artifact_id, provider_derivation_sha256, created_at";
 const CANONICAL_ARTIFACT_COLUMNS: &str = "id, app_id, artifact_sha256, content_root_sha256, standard_version, file_count, storage_path, record, created_at";
 const PROVIDER_DERIVATION_COLUMNS: &str = "manifest_sha256, artifact_id, provider, standard_version, payload_root_sha256, manifest, created_at";
@@ -76,13 +76,38 @@ pub struct ProviderDerivationSpec {
     pub manifest: String,
 }
 
+/// A snapshot of `version` for `env` that binds no value: complete for any
+/// version that requires none. For tests that are about something else; a
+/// test version whose stored manifest is not a real one is taken to declare
+/// nothing.
+#[cfg(test)]
+pub(crate) fn empty_snapshot(env: &Environment, version: &Version) -> EnvironmentBindingSnapshot {
+    let declarations = deis_bundle::Manifest::parse(&version.manifest)
+        .map(|manifest| manifest.environment)
+        .unwrap_or_else(|_| {
+            deis_wire::EnvironmentDeclarations::new(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                Vec::new(),
+            )
+        });
+    EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        version.id.clone(),
+        env.canonical_id.to_string(),
+        declarations
+            .identity()
+            .expect("a test version declares a valid environment"),
+        Vec::new(),
+    )
+}
+
 /// Immutable inputs for one durable deployment plan.
 ///
 /// Keeping the policy inputs together prevents call sites from swapping a
 /// run of booleans and vectors while the plan contract evolves.
 #[derive(Debug, Clone)]
 pub struct DeploymentPlanSpec {
-    pub snapshot: Option<EnvironmentBindingSnapshot>,
+    pub snapshot: EnvironmentBindingSnapshot,
     pub expected_secret_heads: std::collections::BTreeMap<String, Option<String>>,
     pub compare_secret_heads: bool,
     pub target_ids: Vec<String>,
@@ -240,14 +265,11 @@ impl CatalogStore {
                     return Err(CatalogError::conflict(format!("app {id} already exists")));
                 }
                 // A name that belonged to a deleted application is not free.
-                // Its data is still in deis-store and deis-queue, keyed by
-                // (application, environment), so an application created here
-                // would be that tenant: it would read and overwrite the
-                // deleted application's kv, database, objects and queued
-                // messages, and it can belong to a different account
-                // entirely. Refused until somebody releases the name and
-                // says, on the record, that the next application of that name
-                // may have what the last one left.
+                // Its stored data is keyed by canonical ids and stays out of
+                // reach of a new application, but tokens and hostname grants
+                // are scoped by name, and a new application under the name
+                // can belong to a different account entirely. Refused until
+                // somebody releases the name on the record.
                 if let Some(retired) = retired_name(conn, &id)?.filter(RetiredAppName::is_held) {
                     warn!(
                         app_id = %id,
@@ -271,7 +293,6 @@ impl CatalogStore {
                 Ok(App {
                     id,
                     canonical_id,
-                    revision: 1,
                     created_at,
                 })
             })
@@ -400,7 +421,6 @@ impl CatalogStore {
                     "DELETE FROM secret_heads WHERE env_id IN (SELECT id FROM environments WHERE app_id = ?1)",
                     params![app_id],
                 )?;
-                tx.execute("DELETE FROM secrets WHERE app_id = ?1", params![app_id])?;
                 let routes = tx.execute("DELETE FROM routes WHERE app_id = ?1", params![app_id])?;
                 let deployments =
                     tx.execute("DELETE FROM deployments WHERE app_id = ?1", params![app_id])?;
@@ -615,7 +635,7 @@ impl CatalogStore {
             app_id = %released.app_id,
             retired_at = released.retired_at,
             tenants = ?released.tenants(),
-            "Released a retired application name; it can be created again, and the next application called {} will be the same storage tenant as the deleted one - {}. Every token scoped to this application, and every storage capability token minted for those tenants, also still authorises it: a capability token is derived from the tenant name and never expires, so revoke what the deleted application's owner still holds",
+            "Released a retired application name; it can be created again. The next application called {} gets new canonical ids and does not see the deleted one's data - {}. Every token scoped to this application's name still authorises it, so revoke what the deleted application's owner still holds",
             released.app_id,
             released.describe_data()
         );
@@ -1339,6 +1359,29 @@ impl CatalogStore {
             .await
     }
 
+    /// The version of `app_id` whose permanent identity is `canonical_id`.
+    pub async fn get_version_by_canonical_id(
+        &self,
+        app_id: &str,
+        canonical_id: CanonicalId,
+    ) -> CatalogResult<Version> {
+        let app_id = app_id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                &format!(
+                    "SELECT {VERSION_COLUMNS} FROM versions WHERE app_id = ?1 AND canonical_id = ?2"
+                ),
+                params![app_id, canonical_id.to_string()],
+                map_version,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CatalogError::not_found(format!("version {canonical_id} of app {app_id}"))
+            })
+        })
+        .await
+    }
+
     /// Resolve the human-facing "v3" to a version row.
     pub async fn get_version_by_number(&self, app_id: &str, number: i64) -> CatalogResult<Version> {
         let app_id = app_id.to_string();
@@ -1495,7 +1538,7 @@ impl CatalogStore {
         &self,
         env: &Environment,
         version: &Version,
-        mut spec: DeploymentPlanSpec,
+        spec: DeploymentPlanSpec,
         coordinator_id: CanonicalId,
         lease_seconds: u64,
     ) -> CatalogResult<DeploymentPlan> {
@@ -1508,51 +1551,51 @@ impl CatalogStore {
                 "unknown deployment plan operation kind",
             ));
         }
-        spec.target_ids.sort();
-        spec.target_ids.dedup();
-        spec.proxy_ids.sort();
-        spec.proxy_ids.dedup();
-        let snapshot_record = spec
-            .snapshot
-            .take()
-            .map(|snapshot| {
-                if snapshot.deployment_version_id != version.id
-                    || snapshot.environment_id != env.canonical_id.to_string()
-                {
-                    return Err(CatalogError::invalid(
-                        "EC_ENV_SNAPSHOT_INVALID: snapshot is not bound to this version and environment",
-                    ));
-                }
-                let snapshot_id = snapshot
-                    .identity()
-                    .map_err(|error| CatalogError::invalid(error.to_string()))?;
-                let document = String::from_utf8(
-                    snapshot
-                        .canonical_json()
-                        .map_err(|error| CatalogError::invalid(error.to_string()))?,
-                )
-                .map_err(|_| {
-                    CatalogError::invalid("EC_ENV_SNAPSHOT_INVALID: snapshot is not UTF-8")
-                })?;
-                Ok((snapshot_id, snapshot.declarations_sha256, document))
-            })
-            .transpose()?;
-        let snapshot_id = snapshot_record
-            .as_ref()
-            .map(|(snapshot_id, _, _)| snapshot_id.clone());
+        let DeploymentPlanSpec {
+            snapshot,
+            expected_secret_heads,
+            compare_secret_heads,
+            mut target_ids,
+            mut proxy_ids,
+            queue_fence,
+            operation_kind,
+            secret_change,
+            note,
+        } = spec;
+        target_ids.sort();
+        target_ids.dedup();
+        proxy_ids.sort();
+        proxy_ids.dedup();
+        if snapshot.deployment_version_id != version.id
+            || snapshot.environment_id != env.canonical_id.to_string()
+        {
+            return Err(CatalogError::invalid(
+                "EC_ENV_SNAPSHOT_INVALID: snapshot is not bound to this version and environment",
+            ));
+        }
+        let snapshot_id = snapshot
+            .identity()
+            .map_err(|error| CatalogError::invalid(error.to_string()))?;
+        let document = String::from_utf8(
+            snapshot
+                .canonical_json()
+                .map_err(|error| CatalogError::invalid(error.to_string()))?,
+        )
+        .map_err(|_| CatalogError::invalid("EC_ENV_SNAPSHOT_INVALID: snapshot is not UTF-8"))?;
+        let snapshot_record = (snapshot_id.clone(), snapshot.declarations_sha256, document);
         let id = CanonicalId::new_v7().to_string();
         let routing_generation = CanonicalId::new_v7();
         let policy = serde_json::json!({
             "activation": "strict_all",
             "traffic": [{"generation": routing_generation.to_string(), "basisPoints": 10000}],
             "affinity": "stable",
-            "queueFence": spec.queue_fence,
+            "queueFence": queue_fence,
             "drain": {
                 "retentionSeconds": DEFAULT_GENERATION_RETENTION_SECONDS,
                 "timeoutSeconds": 30
             },
-            "operation": spec.operation_kind,
-            "secretChange": spec.secret_change,
+            "operation": operation_kind,
+            "secretChange": secret_change,
         });
         let app_id = env.app_id.clone();
         let env_id = env.id.clone();
@@ -1596,12 +1639,12 @@ impl CatalogStore {
                 "snapshotId": snapshot_id,
                 "previousDeploymentId": previous_deployment_id,
                 "previousGeneration": previous_generation,
-                "expectedSecretHeads": spec.expected_secret_heads,
-                "compareSecretHeads": spec.compare_secret_heads,
-                "targetIds": spec.target_ids,
-                "proxyIds": spec.proxy_ids,
+                "expectedSecretHeads": expected_secret_heads,
+                "compareSecretHeads": compare_secret_heads,
+                "targetIds": target_ids,
+                "proxyIds": proxy_ids,
                 "policy": policy,
-                "note": spec.note,
+                "note": note,
             });
             let canonical = serde_jcs::to_vec(&immutable_document).map_err(|error| {
                 CatalogError::invalid(format!(
@@ -1617,21 +1660,22 @@ impl CatalogStore {
                 snapshot_id,
                 previous_deployment_id,
                 previous_generation,
-                expected_secret_heads: spec.expected_secret_heads,
-                compare_secret_heads: spec.compare_secret_heads,
-                target_ids: spec.target_ids,
-                proxy_ids: spec.proxy_ids,
+                expected_secret_heads,
+                compare_secret_heads,
+                target_ids,
+                proxy_ids,
                 policy,
                 plan_sha256: hex::encode(Sha256::digest(canonical)),
                 state: "preparing".to_string(),
-                note: spec.note,
+                note,
                 last_error: None,
                 coordinator_id: Some(coordinator_id),
                 lease_expires_at: Some(lease_expires_at),
                 created_at: now,
                 updated_at: now,
             };
-            if let Some((snapshot_id, declarations_sha256, document)) = &snapshot_record {
+            {
+                let (snapshot_id, declarations_sha256, document) = &snapshot_record;
                 tx.execute(
                     "INSERT OR IGNORE INTO environment_binding_snapshots
                          (snapshot_id, app_id, env_id, version_id, declarations_sha256, document, created_at)
@@ -1701,9 +1745,10 @@ impl CatalogStore {
                 // The old generation lives on the previous plan's frozen
                 // runtime set, not necessarily on this plan's set. A scale
                 // change between the two deployments must not strand an old
-                // isolate on a node removed from the new serving set. Legacy
-                // deployment rows have no plan to consult, so the current
-                // serving set is the only truthful fallback available.
+                // isolate on a node removed from the new serving set. A
+                // deployment activated directly (`activate_deployment` and its
+                // siblings) has no plan to consult, so the current serving set
+                // is the only truthful fallback available.
                 let previous_targets_json: Option<String> =
                     if let Some(previous_id) = plan.previous_deployment_id.as_deref() {
                         tx.query_row(
@@ -2519,18 +2564,16 @@ impl CatalogStore {
         &self,
         plan: &DeploymentPlan,
         env: &Environment,
-        snapshot: Option<&EnvironmentBindingSnapshot>,
+        snapshot: &EnvironmentBindingSnapshot,
         coordinator_id: CanonicalId,
     ) -> CatalogResult<Deployment> {
         if plan.state != "prepared"
             || plan.app_id != env.app_id
             || plan.env_id != env.id
-            || plan.snapshot_id.as_deref()
+            || plan.snapshot_id
                 != snapshot
-                    .map(|document| document.identity())
-                    .transpose()
+                    .identity()
                     .map_err(|error| CatalogError::invalid(error.to_string()))?
-                    .as_deref()
         {
             return Err(CatalogError::conflict(
                 "deployment plan is not a prepared plan for this exact environment snapshot",
@@ -2551,7 +2594,7 @@ impl CatalogStore {
                 "deployment plan identity is already bound to another pointer",
             ));
         }
-        if let Some(snapshot) = snapshot {
+        {
             let operation = plan
                 .policy
                 .get("operation")
@@ -2604,115 +2647,30 @@ impl CatalogStore {
                 }
                 None
             };
-            return self
-                .activate_deployment_inner(DeploymentActivation {
-                    env,
-                    version_id: &plan.version_id,
-                    snapshot,
-                    expected_current_deployment: plan.previous_deployment_id.as_deref(),
-                    expected_secret_heads: plan
-                        .compare_secret_heads
-                        .then(|| plan.expected_secret_heads.clone()),
-                    note: plan.note.clone(),
-                    secret_change,
-                    deployment_identity: Some((plan.id.clone(), plan.routing_generation)),
-                    coordinator_id: Some(coordinator_id),
-                    advance_plan: true,
-                })
-                .await;
+            self.activate_deployment_inner(DeploymentActivation {
+                env,
+                version_id: &plan.version_id,
+                snapshot,
+                expected_current_deployment: plan.previous_deployment_id.as_deref(),
+                expected_secret_heads: plan
+                    .compare_secret_heads
+                    .then(|| plan.expected_secret_heads.clone()),
+                note: plan.note.clone(),
+                secret_change,
+                deployment_identity: Some((plan.id.clone(), plan.routing_generation)),
+                coordinator_id: Some(coordinator_id),
+                advance_plan: true,
+            })
+            .await
         }
-
-        let app_id = plan.app_id.clone();
-        let env_id = plan.env_id.clone();
-        let version_id = plan.version_id.clone();
-        let expected = plan.previous_deployment_id.clone();
-        let deployment = Deployment {
-            id: plan.id.clone(),
-            canonical_id: plan.routing_generation,
-            app_id,
-            env_id,
-            version_id,
-            created_at: now_secs(),
-            note: plan.note.clone(),
-            snapshot_id: None,
-        };
-        let inserted = deployment.clone();
-        self.with_conn(move |conn| {
-            let tx = conn.unchecked_transaction()?;
-            let now = now_secs();
-            require_deployment_plan_lease(&tx, &inserted.id, coordinator_id, now)?;
-            load_version(&tx, &inserted.app_id, &inserted.version_id)?;
-            if let Some(existing) = tx
-                .query_row(
-                    &format!("SELECT {DEPLOYMENT_COLUMNS} FROM deployments WHERE id = ?1"),
-                    [&inserted.id],
-                    map_deployment,
-                )
-                .optional()?
-            {
-                if existing.canonical_id == inserted.canonical_id
-                    && existing.app_id == inserted.app_id
-                    && existing.env_id == inserted.env_id
-                    && existing.version_id == inserted.version_id
-                    && existing.snapshot_id == inserted.snapshot_id
-                {
-                    return Ok(());
-                }
-                return Err(CatalogError::conflict(
-                    "deployment plan identity is already bound to another pointer",
-                ));
-            }
-            let current = current_deployment(&tx, &inserted.env_id)?;
-            if current.as_ref().map(|row| row.id.as_str()) != expected.as_deref() {
-                return Err(CatalogError::conflict(
-                    "deployment changed while the plan was prepared; reconcile before retrying",
-                ));
-            }
-            tx.execute(
-                &format!(
-                    "INSERT INTO deployments ({DEPLOYMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)"
-                ),
-                params![
-                    inserted.id,
-                    inserted.canonical_id.to_string(),
-                    inserted.app_id,
-                    inserted.env_id,
-                    inserted.version_id,
-                    inserted.created_at,
-                    inserted.note,
-                ],
-            )?;
-            let advanced = tx.execute(
-                "UPDATE deployment_plans
-                    SET state = 'activating', last_error = NULL, updated_at = ?1
-                  WHERE id = ?2 AND state = 'prepared' AND coordinator_id = ?3
-                    AND lease_expires_at > ?1",
-                params![now, inserted.id, coordinator_id.to_string()],
-            )?;
-            if advanced != 1 {
-                return Err(CatalogError::conflict(
-                    "deployment plan left prepared state before its pointer commit",
-                ));
-            }
-            tx.execute(
-                "INSERT INTO deployment_events
-                   (plan_id, from_state, to_state, detail, created_at)
-                 VALUES (?1, 'prepared', 'activating', 'production pointer committed', ?2)",
-                params![inserted.id, now_secs()],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
-        .await?;
-        Ok(deployment)
     }
 
     /// Point an environment at a version by inserting a new pointer row.
     /// Test-only: production traffic goes through
     /// [`CatalogStore::activate_deployment_inner`], which moves the pointer
     /// under the plan's CAS. This helper exists so tests can stand up an
-    /// active deployment in one step; only the note differs between the
-    /// deploy and rollback cases.
+    /// active deployment in one step: it binds a snapshot with no values,
+    /// which is complete for any version that requires none.
     #[cfg(test)]
     pub(crate) async fn deploy(
         &self,
@@ -2720,53 +2678,22 @@ impl CatalogStore {
         version_id: &str,
         note: Option<String>,
     ) -> CatalogResult<Deployment> {
-        let app_id = env.app_id.clone();
-        let env_id = env.id.clone();
-        let env_name = env.name.clone();
-        let version_id = version_id.to_string();
-
-        let deployment = self
-            .with_conn(move |conn| {
-                let version = load_version(conn, &app_id, &version_id)?;
-                let deployment = Deployment {
-                    id: Uuid::new_v4().to_string(),
-                    canonical_id: CanonicalId::new_v7(),
-                    app_id,
-                    env_id,
-                    version_id: version.id,
-                    created_at: now_secs(),
-                    note,
-                    snapshot_id: None,
-                };
-                conn.execute(
-                    &format!(
-                        "INSERT INTO deployments ({DEPLOYMENT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-                    ),
-                    params![
-                        deployment.id,
-                        deployment.canonical_id.to_string(),
-                        deployment.app_id,
-                        deployment.env_id,
-                        deployment.version_id,
-                        deployment.created_at,
-                        deployment.note,
-                        deployment.snapshot_id,
-                    ],
-                )?;
-                Ok(deployment)
-            })
-            .await?;
-
-        info!(
-            app_id = %deployment.app_id,
-            environment = %env_name,
-            env_id = %deployment.env_id,
-            version_id = %deployment.version_id,
-            deployment_id = %deployment.id,
-            note = deployment.note.as_deref().unwrap_or(""),
-            "Deployment pointer moved; nodes pick this up on their next assignment fetch"
-        );
-        Ok(deployment)
+        let version = self.get_version(&env.app_id, version_id).await?;
+        let snapshot = empty_snapshot(env, &version);
+        let current = self.current_deployment(&env.id).await?;
+        self.activate_deployment_inner(DeploymentActivation {
+            env,
+            version_id: &version.id,
+            snapshot: &snapshot,
+            expected_current_deployment: current.as_ref().map(|row| row.id.as_str()),
+            expected_secret_heads: None,
+            note,
+            secret_change: None,
+            deployment_identity: None,
+            coordinator_id: None,
+            advance_plan: false,
+        })
+        .await
     }
 
     /// Atomically persist an immutable environment snapshot and move the
@@ -2924,7 +2851,7 @@ impl CatalogStore {
                         && existing.app_id == app_id
                         && existing.env_id == env_id
                         && existing.version_id == version.id
-                        && existing.snapshot_id.as_deref() == Some(snapshot_id.as_str())
+                        && existing.snapshot_id == snapshot_id
                     {
                         return Ok(existing);
                     }
@@ -2995,10 +2922,6 @@ impl CatalogStore {
                             params![env_id, name],
                         )?;
                     }
-                    tx.execute(
-                        "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
-                        params![env_id, name],
-                    )?;
                 }
 
                 tx.execute(
@@ -3036,7 +2959,7 @@ impl CatalogStore {
                     version_id: version.id,
                     created_at: now_secs(),
                     note,
-                    snapshot_id: Some(snapshot_id),
+                    snapshot_id,
                 };
                 tx.execute(
                     &format!(
@@ -3088,7 +3011,7 @@ impl CatalogStore {
             environment = %env_name,
             version_id = %deployment.version_id,
             deployment_id = %deployment.id,
-            snapshot_id = %deployment.snapshot_id.as_deref().unwrap_or(""),
+            snapshot_id = %deployment.snapshot_id,
             "Environment snapshot and deployment pointer activated atomically"
         );
         Ok(deployment)
@@ -3752,8 +3675,8 @@ impl CatalogStore {
     }
 
     /// Move or remove a secret head without changing a deployment pointer.
-    /// Used when no version is active, the active version is legacy, or the
-    /// standard version does not declare this name.
+    /// Used when no version is active or the active version does not declare
+    /// this name.
     pub async fn promote_secret_change(
         &self,
         env: &Environment,
@@ -3811,10 +3734,6 @@ impl CatalogStore {
                     params![env_id, name],
                 )?;
             }
-            tx.execute(
-                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
-                params![env_id, name],
-            )?;
             tx.commit()?;
             Ok(())
         })
@@ -3916,66 +3835,17 @@ impl CatalogStore {
         .await
     }
 
-    /// Store or replace one secret. The caller passes ciphertext produced
-    /// by [`super::SecretCipher`]; this layer never sees a plaintext value
-    /// and never logs one.
+    /// Store or replace one secret under a fresh revision; a test shorthand
+    /// for [`Self::put_secret_revision`].
+    #[cfg(test)]
     pub async fn put_secret(
         &self,
         env: &Environment,
         name: &str,
         ciphertext: Vec<u8>,
     ) -> CatalogResult<SecretMeta> {
-        validate_secret_name(name)?;
-        let app_id = env.app_id.clone();
-        let env_id = env.id.clone();
-        let name_owned = name.to_string();
-        let updated_at = now_secs();
-        let bytes = ciphertext.len();
-
-        let meta = self
-            .with_conn(move |conn| {
-                let tx = conn.unchecked_transaction()?;
-                let id = Uuid::new_v4().to_string();
-                tx.execute(
-                    "INSERT INTO secrets (id, app_id, env_id, name, ciphertext, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(env_id, name) DO UPDATE SET
-                         id = excluded.id,
-                         ciphertext = excluded.ciphertext,
-                         updated_at = excluded.updated_at",
-                    params![id, app_id, env_id, name_owned, ciphertext, updated_at],
-                )?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO secret_revisions
-                         (revision_id, app_id, env_id, name, ciphertext, encryption_scheme, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 'legacy-name-v1', ?6)",
-                    params![id, app_id, env_id, name_owned, ciphertext, updated_at],
-                )?;
-                tx.execute(
-                    "INSERT INTO secret_heads (env_id, name, revision_id, updated_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(env_id, name) DO UPDATE SET
-                         revision_id = excluded.revision_id,
-                         updated_at = excluded.updated_at",
-                    params![env_id, name_owned, id, updated_at],
-                )?;
-                tx.commit()?;
-                Ok(SecretMeta {
-                    name: name_owned,
-                    revision: id,
-                    updated_at,
-                })
-            })
-            .await?;
-
-        info!(
-            app_id = %env.app_id,
-            environment = %env.name,
-            secret = %meta.name,
-            ciphertext_bytes = bytes,
-            "Legacy secret stored encrypted and mirrored into an immutable revision; it takes effect on the next deployment push without creating an application version"
-        );
-        Ok(meta)
+        self.put_secret_revision(env, name, &CanonicalId::new_v7().to_string(), ciphertext)
+            .await
     }
 
     /// Append an already-encrypted secret revision and move only the current
@@ -4012,13 +3882,6 @@ impl CatalogStore {
                      revision_id = excluded.revision_id,
                      updated_at = excluded.updated_at",
                 params![env_id, name, revision, updated_at],
-            )?;
-            // Once a name uses revision-bound AAD, remove its legacy current
-            // row so an older process fails closed instead of reading stale
-            // plaintext under the same name.
-            tx.execute(
-                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
-                params![env_id, name],
             )?;
             tx.commit()?;
             Ok(SecretMeta {
@@ -4084,10 +3947,6 @@ impl CatalogStore {
                     "secret {name_owned} in environment {env_id}"
                 )));
             }
-            tx.execute(
-                "DELETE FROM secrets WHERE env_id = ?1 AND name = ?2",
-                params![env_id, name_owned],
-            )?;
             tx.commit()?;
             Ok(())
         })
@@ -4220,7 +4079,7 @@ impl CatalogStore {
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, Option<String>>(8)?,
@@ -4516,8 +4375,7 @@ fn map_app(row: &Row<'_>) -> rusqlite::Result<App> {
     Ok(App {
         id: row.get(0)?,
         canonical_id: map_canonical_id(row, 1)?,
-        revision: row.get(2)?,
-        created_at: row.get(3)?,
+        created_at: row.get(2)?,
     })
 }
 
@@ -5082,10 +4940,7 @@ mod tests {
                 // altered outside this process. Current direct writes are
                 // rejected by the schema test; the reader must still refuse
                 // pre-existing corruption instead of trusting the label.
-                conn.execute_batch(
-                    "DROP TRIGGER trg_apps_canonical_id_validate_update_v1;
-                     DROP TRIGGER trg_apps_canonical_id_immutable_v1;",
-                )?;
+                conn.execute_batch("DROP TRIGGER trg_apps_canonical_id_immutable_v1;")?;
                 conn.execute(
                     "UPDATE apps SET canonical_id = '550e8400-e29b-41d4-a716-446655440000' \
                      WHERE id = 'demo'",
@@ -5315,7 +5170,7 @@ mod tests {
                 &env,
                 &first_version,
                 DeploymentPlanSpec {
-                    snapshot: Some(candidate_snapshot.clone()),
+                    snapshot: candidate_snapshot.clone(),
                     expected_secret_heads: std::collections::BTreeMap::new(),
                     compare_secret_heads: true,
                     target_ids: vec!["node-a".to_string()],
@@ -5335,7 +5190,7 @@ mod tests {
         assert!(store.current_deployment(&env.id).await.unwrap().is_none());
         assert_eq!(
             store
-                .get_environment_snapshot(plan.snapshot_id.as_deref().unwrap())
+                .get_environment_snapshot(plan.snapshot_id.as_str())
                 .await
                 .unwrap()
                 .identity()
@@ -5372,7 +5227,7 @@ mod tests {
                 &env,
                 &first_version,
                 DeploymentPlanSpec {
-                    snapshot: None,
+                    snapshot: empty_snapshot(&env, &first_version),
                     expected_secret_heads: std::collections::BTreeMap::new(),
                     compare_secret_heads: true,
                     target_ids: vec!["node-b".to_string()],
@@ -5419,12 +5274,12 @@ mod tests {
             .await
             .unwrap();
         let deployment = store
-            .commit_deployment_plan(&prepared, &env, Some(&candidate_snapshot), owner)
+            .commit_deployment_plan(&prepared, &env, &candidate_snapshot, owner)
             .await
             .unwrap();
         assert_eq!(
             store
-                .commit_deployment_plan(&prepared, &env, Some(&candidate_snapshot), owner)
+                .commit_deployment_plan(&prepared, &env, &candidate_snapshot, owner)
                 .await
                 .expect("a lost pointer-commit response is resolved by immutable identity")
                 .id,
@@ -5464,7 +5319,7 @@ mod tests {
                 &env,
                 &next_version,
                 DeploymentPlanSpec {
-                    snapshot: None,
+                    snapshot: empty_snapshot(&env, &next_version),
                     expected_secret_heads: std::collections::BTreeMap::new(),
                     compare_secret_heads: true,
                     target_ids: vec!["node-b".to_string()],
@@ -5504,7 +5359,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .commit_deployment_plan(&next, &env, None, next_owner)
+            .commit_deployment_plan(
+                &next,
+                &env,
+                &empty_snapshot(&env, &next_version),
+                next_owner,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -5607,7 +5467,7 @@ mod tests {
                 &env,
                 &version,
                 DeploymentPlanSpec {
-                    snapshot: None,
+                    snapshot: empty_snapshot(&env, &version),
                     expected_secret_heads: Default::default(),
                     compare_secret_heads: true,
                     target_ids: vec!["node-a".to_string()],
@@ -5725,14 +5585,24 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .commit_deployment_plan(&prepared, &env, None, second_owner)
+                .commit_deployment_plan(
+                    &prepared,
+                    &env,
+                    &empty_snapshot(&env, &version),
+                    second_owner
+                )
                 .await
                 .is_err(),
             "a released owner cannot commit the production pointer"
         );
         assert!(store.current_deployment(&env.id).await.unwrap().is_none());
         store
-            .commit_deployment_plan(&prepared, &env, None, third_owner)
+            .commit_deployment_plan(
+                &prepared,
+                &env,
+                &empty_snapshot(&env, &version),
+                third_owner,
+            )
             .await
             .unwrap();
         let terminal = store
@@ -5758,7 +5628,7 @@ mod tests {
                 &env,
                 &version,
                 DeploymentPlanSpec {
-                    snapshot: None,
+                    snapshot: empty_snapshot(&env, &version),
                     expected_secret_heads: Default::default(),
                     compare_secret_heads: true,
                     target_ids: vec!["node-a".to_string()],
@@ -6652,7 +6522,7 @@ mod tests {
                 &env,
                 &version,
                 DeploymentPlanSpec {
-                    snapshot: Some(candidate),
+                    snapshot: candidate,
                     expected_secret_heads: Default::default(),
                     compare_secret_heads: false,
                     target_ids: vec!["node-a".to_string()],

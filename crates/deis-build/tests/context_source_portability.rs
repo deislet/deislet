@@ -74,3 +74,57 @@ async fn every_target_rejects_non_standard_context_fields_before_packaging() {
         );
     }
 }
+
+/// The two platform-only fields are refused on an event handler too. Its
+/// context is the third parameter, and it is not an EC-WEB request context, so
+/// only `bindings` and `services` are judged there - but those two are refused
+/// on every kind of handler, because a logical resource is reached as
+/// `env.<NAME>` and nowhere else.
+#[tokio::test]
+async fn event_handlers_reject_the_platform_only_context_fields_before_packaging() {
+    for (vendor, stem) in [
+        ("deislet", "_queue"),
+        ("deislet", "_scheduled"),
+        ("cloudflare", "_queue"),
+        ("cloudflare", "_scheduled"),
+    ] {
+        let project = tempfile::tempdir().expect("temporary project");
+        stage(project.path(), vendor);
+        fs::write(
+            project.path().join("functions/index.ts"),
+            "export default (ctx: any) => new Response(ctx.request.url);\n",
+        )
+        .expect("http handler");
+        fs::write(
+            project.path().join(format!("functions/{stem}.ts")),
+            r#"
+            export default async function handler(event: any, env: any, context: any) {
+              const { services } = context;
+              await context.bindings.KV.get(String(event) + services + env);
+            }
+            "#,
+        )
+        .expect("event handler");
+        let error = Compiler::with_options(CompilerOptions {
+            project_dir: project.path().to_string_lossy().to_string(),
+            ..Default::default()
+        })
+        .compile(project.path(), vec![vendor.to_string()], false)
+        .await
+        .expect_err("a platform-only context field must fail before packaging")
+        .to_string();
+
+        assert!(
+            error.contains("EC_WEB_CONTEXT_FIELD_NONSTANDARD"),
+            "{vendor} {stem}: {error}"
+        );
+        assert!(
+            error.contains("context.services"),
+            "{vendor} {stem}: {error}"
+        );
+        assert!(
+            error.contains("context.bindings"),
+            "{vendor} {stem}: {error}"
+        );
+    }
+}

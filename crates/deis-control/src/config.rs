@@ -140,40 +140,18 @@ pub struct ControlConfig {
     /// deployment (docs/architecture.zh.md section 6); it is deliberately not
     /// a node-side setting, so moving deis-store does not mean editing every
     /// node's file. Leave it unset and applications that declare `kv`,
-    /// `database` or `blob` load fine but every `ctx.services` call they make
-    /// answers "service not available".
+    /// `database` or `blob` bindings load fine but those bindings are not
+    /// available to them.
     ///
     /// It is an address, not a credential: it is logged like any other
     /// variable.
     #[serde(default)]
     pub store_endpoint: Option<String>,
     /// gRPC address of deis-queue, same contract as [`Self::store_endpoint`].
-    /// Without it an app's `ctx.services.queue` fails and its declared queue
-    /// consumers never start, so messages pile up in deis-queue unread.
+    /// Without it an app's queue bindings fail every send and its declared
+    /// queue consumers never start, so messages pile up in deis-queue unread.
     #[serde(default)]
     pub queue_endpoint: Option<String>,
-    /// gRPC address of deis-telemetry's ingest/query and optional backend
-    /// migration service. It is not handed to application code by Control;
-    /// the migration coordinator uses it to inventory the same environment
-    /// identity across logs, metrics and traces.
-    #[serde(default)]
-    pub telemetry_endpoint: Option<String>,
-    /// Independent administrator credential used only when Control calls the
-    /// deis-store backend-migration service. It is never derived from, equal
-    /// to, or sent in place of an application storage capability.
-    #[serde(default)]
-    pub store_migration_admin_token: Option<String>,
-    /// Independent administrator credential used only when Control calls the
-    /// deis-queue backend-migration service. Keeping this separate from the
-    /// store credential limits a compromise to one backend and permits their
-    /// rotation and deployment lifecycles to differ.
-    #[serde(default)]
-    pub queue_migration_admin_token: Option<String>,
-    /// Independent administrator credential for deis-telemetry migration
-    /// management. It must differ from every storage, queue, node and human
-    /// credential configured here.
-    #[serde(default)]
-    pub telemetry_migration_admin_token: Option<String>,
     /// Absolute path of the reviewed embedded-backend topology driver. When
     /// paired with `backend_restore_driver_config`, Control may execute or
     /// resume a durable Restore Operation. Arguments are fixed by Control;
@@ -433,10 +411,6 @@ impl Default for ControlConfig {
             secret_key_file: None,
             store_endpoint: None,
             queue_endpoint: None,
-            telemetry_endpoint: None,
-            store_migration_admin_token: None,
-            queue_migration_admin_token: None,
-            telemetry_migration_admin_token: None,
             backend_restore_driver_executable: None,
             backend_restore_driver_config: None,
             backend_restore_driver_timeout_secs: default_backend_restore_driver_timeout_secs(),
@@ -475,28 +449,6 @@ impl std::fmt::Debug for ControlConfig {
             .field("secret_key_file", &self.secret_key_file)
             .field("store_endpoint", &self.store_endpoint)
             .field("queue_endpoint", &self.queue_endpoint)
-            .field("telemetry_endpoint", &self.telemetry_endpoint)
-            .field(
-                "store_migration_admin_token",
-                &self
-                    .store_migration_admin_token
-                    .as_ref()
-                    .map(|_| "<redacted>"),
-            )
-            .field(
-                "queue_migration_admin_token",
-                &self
-                    .queue_migration_admin_token
-                    .as_ref()
-                    .map(|_| "<redacted>"),
-            )
-            .field(
-                "telemetry_migration_admin_token",
-                &self
-                    .telemetry_migration_admin_token
-                    .as_ref()
-                    .map(|_| "<redacted>"),
-            )
             .field(
                 "backend_restore_driver_executable",
                 &self.backend_restore_driver_executable,

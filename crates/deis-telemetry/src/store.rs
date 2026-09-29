@@ -24,7 +24,7 @@
 //! [`MAX_PAGE_BYTES`], well under the frame, and reports `has_more` with a
 //! cursor for the rest. Whatever limit a client asks for pages through.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -34,11 +34,7 @@ use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, params_from_iter};
 use tracing::{debug, info, warn};
 
-use deis_backend_migration::{ComponentInventory, InventoryHasher};
-
 use crate::MAX_GRPC_MESSAGE_BYTES;
-use crate::auth::Owner;
-use crate::identity;
 
 /// Microseconds in one day, the width of a log partition.
 pub const DAY_US: i64 = 86_400_000_000;
@@ -148,6 +144,10 @@ pub struct LogRecord {
     pub fields: BTreeMap<String, String>,
     pub trace_id: String,
     pub span_id: String,
+    /// The canonical tenant `v1/<application id>/<environment id>` the record
+    /// belongs to; empty for a node's own records. What decides who may read
+    /// it back (see `crate::identity`).
+    pub tenant: String,
 }
 
 /// One numeric sample of one series at one point in time.
@@ -158,6 +158,10 @@ pub struct MetricRecord {
     pub labels: BTreeMap<String, String>,
     pub value: f64,
     pub timestamp_us: i64,
+    /// The canonical tenant `v1/<application id>/<environment id>` the record
+    /// belongs to; empty for a node's own records. What decides who may read
+    /// it back (see `crate::identity`).
+    pub tenant: String,
 }
 
 /// One stored trace record: a single invocation of one application.
@@ -188,6 +192,10 @@ pub struct TraceRecord {
     pub error: String,
     /// Extra dimensions, kept ordered so the stored JSON is canonical.
     pub attributes: BTreeMap<String, String>,
+    /// The canonical tenant `v1/<application id>/<environment id>` the record
+    /// belongs to; empty for a node's own records. What decides who may read
+    /// it back (see `crate::identity`).
+    pub tenant: String,
 }
 
 impl WireSize for LogRecord {
@@ -195,6 +203,7 @@ impl WireSize for LogRecord {
         RECORD_FIXED_COST
             + string_cost(&self.component)
             + string_cost(&self.app_id)
+            + string_cost(&self.tenant)
             + string_cost(&self.message)
             + string_cost(&self.trace_id)
             + string_cost(&self.span_id)
@@ -211,6 +220,7 @@ impl WireSize for MetricRecord {
         RECORD_FIXED_COST
             + string_cost(&self.name)
             + string_cost(&self.app_id)
+            + string_cost(&self.tenant)
             + self
                 .labels
                 .iter()
@@ -224,6 +234,7 @@ impl WireSize for TraceRecord {
         RECORD_FIXED_COST
             + string_cost(&self.trace_id)
             + string_cost(&self.app_id)
+            + string_cost(&self.tenant)
             + string_cost(&self.environment)
             + string_cost(&self.node)
             + string_cost(&self.target)
@@ -551,7 +562,8 @@ impl TelemetryStore {
                  app_id       TEXT NOT NULL,
                  labels       TEXT NOT NULL,
                  value        REAL NOT NULL,
-                 timestamp_us INTEGER NOT NULL
+                 timestamp_us INTEGER NOT NULL,
+                 tenant       TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS ix_metrics_series_time
                  ON metrics (name, app_id, timestamp_us DESC, id DESC);
@@ -648,8 +660,9 @@ impl TelemetryStore {
             create_partition(&tx, &table)?;
             let sql = format!(
                 "INSERT INTO {table}
-                     (timestamp_us, level, component, app_id, message, fields, trace_id, span_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                     (timestamp_us, level, component, app_id, message, fields, trace_id, span_id,
+                      tenant)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
             );
             let mut stmt = tx
                 .prepare_cached(&sql)
@@ -666,6 +679,7 @@ impl TelemetryStore {
                     fields,
                     record.trace_id,
                     record.span_id,
+                    record.tenant,
                 ])
                 .with_context(|| format!("cannot insert log into {table}"))?;
                 written += 1;
@@ -772,8 +786,8 @@ impl TelemetryStore {
             let sql = format!(
                 "INSERT INTO {table}
                      (trace_id, started_us, duration_us, app_id, environment, node,
-                      kind, outcome, target, method, status, error, attributes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                      kind, outcome, target, method, status, error, attributes, tenant)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             );
             let mut stmt = tx
                 .prepare_cached(&sql)
@@ -795,6 +809,7 @@ impl TelemetryStore {
                     record.status,
                     record.error,
                     attributes,
+                    record.tenant,
                 ])
                 .with_context(|| format!("cannot insert trace into {table}"))?;
                 written += 1;
@@ -875,8 +890,8 @@ impl TelemetryStore {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO metrics (name, app_id, labels, value, timestamp_us)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO metrics (name, app_id, labels, value, timestamp_us, tenant)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )
                 .context("cannot prepare metric insert")?;
             for record in records {
@@ -888,6 +903,7 @@ impl TelemetryStore {
                     labels,
                     record.value,
                     record.timestamp_us,
+                    record.tenant,
                 ])
                 .context("cannot insert metric sample")?;
             }
@@ -946,6 +962,7 @@ impl TelemetryStore {
                     labels,
                     value: row.get(4)?,
                     timestamp_us,
+                    tenant: row.get(6)?,
                 };
                 if !budget.admit(&record) {
                     break;
@@ -985,7 +1002,7 @@ impl TelemetryStore {
         self.with_reader(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT name, app_id, labels, value, MAX(timestamp_us)
+                    "SELECT name, app_id, labels, value, MAX(timestamp_us), tenant
                  FROM metrics
                  WHERE timestamp_us >= ?1
                  GROUP BY name, app_id, labels
@@ -1001,6 +1018,7 @@ impl TelemetryStore {
                         labels: serde_json::from_str(&labels_json).unwrap_or_default(),
                         value: row.get(3)?,
                         timestamp_us: row.get(4)?,
+                        tenant: row.get(5)?,
                     })
                 })
                 .context("cannot run metric export")?;
@@ -1068,79 +1086,6 @@ impl TelemetryStore {
         Ok(outcome)
     }
 
-    /// Every legacy tenant currently represented by a stored signal.
-    ///
-    /// Retention uses this before a global delete so it can hold every
-    /// tenant's migration permit. A corrupt or unassignable row fails closed:
-    /// silently omitting it would let retention delete data no fence owns.
-    pub fn tenant_ids(&self) -> Result<Vec<String>> {
-        self.with_reader(|conn| {
-            let mut tenants = BTreeSet::new();
-            visit_stored_signals(conn, |signal| {
-                let signal = signal.map_err(anyhow::Error::msg)?;
-                // A node's own records belong to no tenant and are never
-                // fenced or migrated with one.
-                if let Owner::Tenant(tenant) = signal.owner().map_err(anyhow::Error::msg)? {
-                    tenants.insert(tenant);
-                }
-                Ok(())
-            })?;
-            Ok(tenants.into_iter().collect())
-        })
-    }
-
-    /// Deterministic inventory for one fenced legacy tenant.
-    ///
-    /// SQLite row ids are deliberately excluded: a verified snapshot may
-    /// rewrite them without changing telemetry semantics. Records are sorted
-    /// by their complete canonical content before hashing, so insertion order
-    /// and partition traversal order cannot change the digest.
-    pub fn tenant_inventory(&self, tenant: &str) -> Result<ComponentInventory> {
-        self.with_reader(|conn| {
-            let mut rows = Vec::new();
-            let mut unchecked_orphan_count = 0u64;
-            visit_stored_signals(conn, |signal| {
-                let signal = match signal {
-                    Ok(signal) => signal,
-                    Err(_) => {
-                        unchecked_orphan_count += 1;
-                        return Ok(());
-                    }
-                };
-                let record_tenant = match signal.owner() {
-                    Ok(Owner::Tenant(tenant)) => tenant,
-                    Ok(Owner::Platform) => return Ok(()),
-                    Err(_) => {
-                        unchecked_orphan_count += 1;
-                        return Ok(());
-                    }
-                };
-                if record_tenant == tenant {
-                    rows.push(signal.canonical()?);
-                }
-                Ok(())
-            })?;
-            rows.sort_unstable();
-
-            let mut hasher = InventoryHasher::new("telemetry");
-            let mut logical_bytes = 0u64;
-            for row in &rows {
-                hasher.field(b"record");
-                for field in row {
-                    hasher.field(field);
-                    logical_bytes = logical_bytes.saturating_add(field.len() as u64);
-                }
-            }
-            Ok(hasher.finish(
-                "telemetry",
-                rows.len() as u64,
-                logical_bytes,
-                0,
-                unchecked_orphan_count,
-            ))
-        })
-    }
-
     /// Number of log partitions currently on disk. Used by the self-metrics
     /// export and by tests.
     pub fn partition_count(&self) -> Result<usize> {
@@ -1159,188 +1104,6 @@ impl TelemetryStore {
                 .context("cannot count metric samples")
         })
     }
-}
-
-#[derive(Debug)]
-enum StoredSignal {
-    Log(LogRecord),
-    Metric(MetricRecord),
-    Trace(TraceRecord),
-}
-
-impl StoredSignal {
-    fn owner(&self) -> std::result::Result<Owner, String> {
-        match self {
-            Self::Log(record) => identity::log(record),
-            Self::Metric(record) => identity::metric(record),
-            Self::Trace(record) => identity::trace(record),
-        }
-    }
-
-    fn canonical(&self) -> Result<Vec<Vec<u8>>> {
-        fn json(values: &BTreeMap<String, String>) -> Result<Vec<u8>> {
-            serde_json::to_vec(values).context("cannot canonically encode telemetry attributes")
-        }
-        fn text(value: &str) -> Vec<u8> {
-            value.as_bytes().to_vec()
-        }
-
-        Ok(match self {
-            Self::Log(record) => vec![
-                b"log".to_vec(),
-                record.timestamp_us.to_be_bytes().to_vec(),
-                record.level.to_be_bytes().to_vec(),
-                text(&record.component),
-                text(&record.app_id),
-                text(&record.message),
-                json(&record.fields)?,
-                text(&record.trace_id),
-                text(&record.span_id),
-            ],
-            Self::Metric(record) => vec![
-                b"metric".to_vec(),
-                text(&record.name),
-                text(&record.app_id),
-                json(&record.labels)?,
-                record.value.to_bits().to_be_bytes().to_vec(),
-                record.timestamp_us.to_be_bytes().to_vec(),
-            ],
-            Self::Trace(record) => vec![
-                b"trace".to_vec(),
-                text(&record.trace_id),
-                record.started_us.to_be_bytes().to_vec(),
-                record.duration_us.to_be_bytes().to_vec(),
-                text(&record.app_id),
-                text(&record.environment),
-                text(&record.node),
-                record.kind.to_be_bytes().to_vec(),
-                record.outcome.to_be_bytes().to_vec(),
-                text(&record.target),
-                text(&record.method),
-                record.status.to_be_bytes().to_vec(),
-                text(&record.error),
-                json(&record.attributes)?,
-            ],
-        })
-    }
-}
-
-/// Visit all persisted records in one read snapshot. JSON damage is a record
-/// classification failure, not a database failure, so inventory can expose it
-/// through `unchecked_orphan_count`; callers such as retention may instead
-/// turn it into a fail-closed error.
-fn visit_stored_signals(
-    conn: &Connection,
-    mut visit: impl FnMut(std::result::Result<StoredSignal, String>) -> Result<()>,
-) -> Result<()> {
-    for day in list_partitions(conn, LOG_PARTITIONS)? {
-        let table = partition_table(LOG_PARTITIONS, day)?;
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT id, timestamp_us, level, component, app_id, message, fields, trace_id, span_id FROM {table}"
-            ))
-            .with_context(|| format!("cannot prepare migration scan of {table}"))?;
-        let mut rows = statement
-            .query([])
-            .with_context(|| format!("cannot scan {table}"))?;
-        while let Some(row) = rows
-            .next()
-            .with_context(|| format!("cannot read migration row from {table}"))?
-        {
-            let id: i64 = row.get(0)?;
-            let fields_json: String = row.get(6)?;
-            let fields = match serde_json::from_str(&fields_json) {
-                Ok(fields) => fields,
-                Err(error) => {
-                    visit(Err(format!(
-                        "{table} row {id} has invalid fields JSON: {error}"
-                    )))?;
-                    continue;
-                }
-            };
-            visit(Ok(StoredSignal::Log(LogRecord {
-                timestamp_us: row.get(1)?,
-                level: row.get(2)?,
-                component: row.get(3)?,
-                app_id: row.get(4)?,
-                message: row.get(5)?,
-                fields,
-                trace_id: row.get(7)?,
-                span_id: row.get(8)?,
-            })))?;
-        }
-    }
-
-    {
-        let mut statement = conn
-            .prepare("SELECT id, name, app_id, labels, value, timestamp_us FROM metrics")
-            .context("cannot prepare migration scan of metrics")?;
-        let mut rows = statement.query([]).context("cannot scan metrics")?;
-        while let Some(row) = rows.next().context("cannot read migration metric row")? {
-            let id: i64 = row.get(0)?;
-            let labels_json: String = row.get(3)?;
-            let labels = match serde_json::from_str(&labels_json) {
-                Ok(labels) => labels,
-                Err(error) => {
-                    visit(Err(format!(
-                        "metrics row {id} has invalid labels JSON: {error}"
-                    )))?;
-                    continue;
-                }
-            };
-            visit(Ok(StoredSignal::Metric(MetricRecord {
-                name: row.get(1)?,
-                app_id: row.get(2)?,
-                labels,
-                value: row.get(4)?,
-                timestamp_us: row.get(5)?,
-            })))?;
-        }
-    }
-
-    for day in list_partitions(conn, TRACE_PARTITIONS)? {
-        let table = partition_table(TRACE_PARTITIONS, day)?;
-        let mut statement = conn
-            .prepare(&format!(
-                "SELECT id, trace_id, started_us, duration_us, app_id, environment, node, kind, outcome, target, method, status, error, attributes FROM {table}"
-            ))
-            .with_context(|| format!("cannot prepare migration scan of {table}"))?;
-        let mut rows = statement
-            .query([])
-            .with_context(|| format!("cannot scan {table}"))?;
-        while let Some(row) = rows
-            .next()
-            .with_context(|| format!("cannot read migration row from {table}"))?
-        {
-            let id: i64 = row.get(0)?;
-            let attributes_json: String = row.get(13)?;
-            let attributes = match serde_json::from_str(&attributes_json) {
-                Ok(attributes) => attributes,
-                Err(error) => {
-                    visit(Err(format!(
-                        "{table} row {id} has invalid attributes JSON: {error}"
-                    )))?;
-                    continue;
-                }
-            };
-            visit(Ok(StoredSignal::Trace(TraceRecord {
-                trace_id: row.get(1)?,
-                started_us: row.get(2)?,
-                duration_us: row.get(3)?,
-                app_id: row.get(4)?,
-                environment: row.get(5)?,
-                node: row.get(6)?,
-                kind: row.get(7)?,
-                outcome: row.get(8)?,
-                target: row.get(9)?,
-                method: row.get(10)?,
-                status: row.get(11)?,
-                error: row.get(12)?,
-                attributes,
-            })))?;
-        }
-    }
-    Ok(())
 }
 
 /// What a connection is opened for. Only the writer sets the file-wide
@@ -1554,7 +1317,8 @@ fn create_partition(conn: &Connection, table: &str) -> Result<()> {
              message      TEXT NOT NULL,
              fields       TEXT NOT NULL,
              trace_id     TEXT NOT NULL,
-             span_id      TEXT NOT NULL
+             span_id      TEXT NOT NULL,
+             tenant       TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS ix_{table}_app_time
              ON {table} (app_id, timestamp_us DESC, id DESC);
@@ -1587,7 +1351,8 @@ fn create_trace_partition(conn: &Connection, table: &str) -> Result<()> {
              method      TEXT NOT NULL,
              status      INTEGER NOT NULL,
              error       TEXT NOT NULL,
-             attributes  TEXT NOT NULL
+             attributes  TEXT NOT NULL,
+             tenant      TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS ix_{table}_app_time
              ON {table} (app_id, started_us DESC, id DESC);
@@ -1705,7 +1470,8 @@ fn build_partition_query(
     let limit_slot = args.len() + 1;
     args.push(SqlValue::Integer(limit as i64));
     let sql = format!(
-        "SELECT id, timestamp_us, level, component, app_id, message, fields, trace_id, span_id
+        "SELECT id, timestamp_us, level, component, app_id, message, fields, trace_id, span_id,
+                tenant
          FROM {table}{where_sql}
          ORDER BY timestamp_us DESC, id DESC
          LIMIT ?{limit_slot}"
@@ -1755,7 +1521,7 @@ fn build_metric_query(
         format!(" WHERE {}", clauses.join(" AND "))
     };
     let sql = format!(
-        "SELECT id, name, app_id, labels, value, timestamp_us
+        "SELECT id, name, app_id, labels, value, timestamp_us, tenant
          FROM metrics{where_sql}
          ORDER BY timestamp_us DESC, id DESC"
     );
@@ -1803,6 +1569,7 @@ fn query_partition(
                     }),
                     trace_id: row.get(7)?,
                     span_id: row.get(8)?,
+                    tenant: row.get(9)?,
                 },
             ))
         })
@@ -1891,7 +1658,7 @@ fn build_trace_partition_query(
     args.push(SqlValue::Integer(limit as i64));
     let sql = format!(
         "SELECT id, trace_id, started_us, duration_us, app_id, environment, node,
-                kind, outcome, target, method, status, error, attributes
+                kind, outcome, target, method, status, error, attributes, tenant
          FROM {table}{where_sql}
          ORDER BY started_us DESC, id DESC
          LIMIT ?{limit_slot}"
@@ -1943,6 +1710,7 @@ fn query_trace_partition(
                         );
                         BTreeMap::new()
                     }),
+                    tenant: row.get(14)?,
                 },
             ))
         })
@@ -1980,6 +1748,7 @@ mod tests {
             fields: BTreeMap::new(),
             trace_id: String::new(),
             span_id: String::new(),
+            tenant: crate::identity::fixture_tenant(app, "production"),
         }
     }
 
@@ -2459,6 +2228,7 @@ mod tests {
             status: if outcome == OUTCOME_OK { 200 } else { 500 },
             error: String::new(),
             attributes: BTreeMap::new(),
+            tenant: crate::identity::fixture_tenant(app, "production"),
         }
     }
 
@@ -2739,6 +2509,7 @@ mod tests {
                 .collect(),
             value,
             timestamp_us: ts,
+            tenant: crate::identity::fixture_tenant(app, "production"),
         }
     }
 
@@ -3162,44 +2933,5 @@ mod tests {
         // Exactly the cap is fine.
         store.insert_logs(&logs[1..]).unwrap();
         assert_eq!(store.partition_count().unwrap(), MAX_PARTITIONS_PER_BATCH);
-    }
-
-    #[test]
-    fn tenant_inventory_is_independent_of_insert_order_and_row_ids() {
-        let first = TelemetryStore::open_in_memory().unwrap();
-        let second = TelemetryStore::open_in_memory().unwrap();
-        let records = [
-            record(BASE_US + 1, "shop", 3, "first"),
-            record(BASE_US + 2, "shop", 4, "second"),
-        ];
-        first.insert_logs(&records).unwrap();
-        second
-            .insert_logs(&[records[1].clone(), records[0].clone()])
-            .unwrap();
-
-        let first = first.tenant_inventory("shop.production").unwrap();
-        let second = second.tenant_inventory("shop.production").unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.item_count, 2);
-        assert_eq!(first.unchecked_orphan_count, 0);
-    }
-
-    #[test]
-    fn corrupt_identity_metadata_blocks_retention_and_is_visible_in_inventory() {
-        let store = TelemetryStore::open_in_memory().unwrap();
-        store
-            .insert_logs(&[record(BASE_US, "shop", 3, "corrupt me")])
-            .unwrap();
-        let table = partition_table(LOG_PARTITIONS, day_of(BASE_US)).unwrap();
-        store
-            .writer()
-            .execute(&format!("UPDATE {table} SET fields = '{{'"), [])
-            .unwrap();
-
-        let inventory = store.tenant_inventory("shop.production").unwrap();
-        assert_eq!(inventory.item_count, 0);
-        assert_eq!(inventory.unchecked_orphan_count, 1);
-        let error = store.tenant_ids().unwrap_err().to_string();
-        assert!(error.contains("invalid fields JSON"), "{error}");
     }
 }

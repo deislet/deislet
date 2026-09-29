@@ -131,7 +131,7 @@ mod tests {
 
     // The tests below go the whole way instead: a real isolate running
     // `js/runtime.js` against a real deis-store. Nothing less would prove
-    // anything about `ctx.services.database.batch` or `.transaction`, because
+    // anything about `ctx.env.DB.batch` or `.transaction`, because
     // what each promises is a property of three things at once -- the
     // JavaScript wrapper, the ops, and what deis-store does on the far side.
 
@@ -140,7 +140,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     /// A table to write into, created outside any transaction.
-    const CREATE_TABLE: &str = r#"await ctx.services.database.execute(
+    const CREATE_TABLE: &str = r#"await ctx.env.DB.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
     );"#;
 
@@ -183,7 +183,7 @@ mod tests {
         body
     }
 
-    // `ctx.services.database.batch` had the same problem the whole brief is
+    // `ctx.env.DB.batch` had the same problem the whole brief is
     // about: `op_db_batch` was written, registered in the extension, and
     // called by no line of JavaScript anywhere. These are the first calls it
     // has ever had from an application, so they go the whole way through.
@@ -197,7 +197,7 @@ mod tests {
         let body = database_probe(
             "db_batch_commit_app.production",
             &store,
-            r#"const db = ctx.services.database;
+            r#"const db = ctx.env.DB;
                 await db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, stock INTEGER)");
                 await db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, item INTEGER, buyer TEXT)");
                 await db.execute("INSERT INTO items (id, stock) VALUES (?, ?)", [1, 5]);
@@ -246,7 +246,7 @@ mod tests {
         let body = database_probe(
             "db_batch_rollback_app.production",
             &store,
-            r#"const db = ctx.services.database;
+            r#"const db = ctx.env.DB;
                 await db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, stock INTEGER)");
                 await db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, buyer TEXT NOT NULL)");
                 await db.execute("INSERT INTO items (id, stock) VALUES (?, ?)", [1, 5]);
@@ -299,7 +299,7 @@ mod tests {
         let body = database_probe(
             "db_batch_select_app.production",
             &store,
-            r#"const db = ctx.services.database;
+            r#"const db = ctx.env.DB;
                 await db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)");
                 let caught = null;
                 try {
@@ -401,7 +401,7 @@ mod tests {
         let body = database_probe(
             "db_batch_refusal_app.production",
             &store,
-            r#"const db = ctx.services.database;
+            r#"const db = ctx.env.DB;
                 const caught = {};
                 for (const [name, call] of [
                     ["notAnArray", () => db.batch({ sql: "SELECT 1" })],
@@ -452,7 +452,7 @@ mod tests {
             &store,
             &format!(
                 r#"{CREATE_TABLE}
-                const db = ctx.services.database;
+                const db = ctx.env.DB;
                 const returned = await db.transaction(async (tx) => {{
                     await tx.execute("INSERT INTO t (v) VALUES (?)", ["one"]);
                     await tx.execute("INSERT INTO t (v) VALUES (?)", ["two"]);
@@ -489,7 +489,7 @@ mod tests {
             &store,
             &format!(
                 r#"{CREATE_TABLE}
-                const db = ctx.services.database;
+                const db = ctx.env.DB;
                 await db.execute("INSERT INTO t (v) VALUES (?)", ["before"]);
                 let caught = null;
                 try {{
@@ -533,7 +533,7 @@ mod tests {
             &store,
             &format!(
                 r#"{CREATE_TABLE}
-                const db = ctx.services.database;
+                const db = ctx.env.DB;
                 let caught = null;
                 try {{
                     await db.transaction(async (tx) => {{
@@ -576,7 +576,7 @@ mod tests {
             &store,
             &format!(
                 r#"{CREATE_TABLE}
-                const db = ctx.services.database;
+                const db = ctx.env.DB;
                 let escaped = null;
                 await db.transaction(async (tx) => {{
                     escaped = tx;
@@ -613,7 +613,7 @@ mod tests {
     #[tokio::test]
     async fn the_outer_database_handle_inside_a_callback_is_not_part_of_the_transaction() {
         // The mistake everyone makes, and the reason the doc comment on
-        // `transaction` says so in as many words: `ctx.services.database` is
+        // `transaction` says so in as many words: `ctx.env.DB` is
         // not redirected while the callback runs. A read through it goes to
         // another connection and sees the database as it was before the
         // transaction opened.
@@ -623,7 +623,7 @@ mod tests {
             &store,
             &format!(
                 r#"{CREATE_TABLE}
-                const db = ctx.services.database;
+                const db = ctx.env.DB;
                 const seen = await db.transaction(async (tx) => {{
                     await tx.execute("INSERT INTO t (v) VALUES (?)", ["inside"]);
                     const throughTx = await tx.query("SELECT v FROM t");
@@ -665,7 +665,7 @@ mod tests {
             &store,
             &format!(
                 r#"{CREATE_TABLE}
-                const db = ctx.services.database;
+                const db = ctx.env.DB;
                 let caught = null;
                 try {{
                     await db.transaction(async (tx) => {{
@@ -711,7 +711,7 @@ mod tests {
         let body = database_probe(
             "db_tx_no_callback_app.production",
             &store,
-            r#"const db = ctx.services.database;
+            r#"const db = ctx.env.DB;
                 let caught = null;
                 try {
                     await db.transaction("SELECT 1");

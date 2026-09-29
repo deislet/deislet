@@ -1,14 +1,27 @@
 //! Provider-neutral deployment driver contracts.
 //!
 //! Build adapters translate one canonical artifact into a provider payload.
-//! This crate starts at the next trust boundary: it gives every backend the
+//! This crate starts at the next trust boundary: it gives every provider the
 //! same durable lifecycle and provides the only supported way to execute a
 //! pinned official CLI. Provider credentials are deliberately absent from all
 //! serializable request and receipt types.
+//!
+//! # Frozen: release governance
+//!
+//! The signed-release half of this crate - release authorization
+//! (`release_authorization`), the transparency log proofs
+//! (`release_transparency`) and the installer that verifies both - is frozen:
+//! it is kept working, and gets no new features. Deislet runs its control
+//! plane, and so this crate, on Unix hosts only; there is no Windows build.
+//! See `docs/operations/provider-driver-governance.md`.
+
+#[cfg(not(unix))]
+compile_error!("deis-provider-driver runs inside deis-control, which is built for Unix hosts only");
 
 mod credential;
 mod digest;
 mod executor;
+mod inputs;
 mod installer;
 mod lifecycle;
 mod manifest;
@@ -18,40 +31,7 @@ mod process;
 mod release;
 mod release_authorization;
 mod release_transparency;
-#[cfg(windows)]
-mod windows_security;
 mod workspace;
-
-#[cfg(all(windows, feature = "test-support"))]
-#[doc(hidden)]
-pub mod test_support {
-    use std::{io, path::Path};
-
-    /// Builds explicit Windows ACL fixtures for cross-crate security tests.
-    ///
-    /// This API exists only behind the `test-support` feature. Production code
-    /// must provision the service-owned directory and trust files outside the
-    /// running Control process, then let the normal constructors validate them.
-    pub fn set_windows_private_acl(
-        path: &Path,
-        directory: bool,
-        add_untrusted_writer: bool,
-        protected: bool,
-    ) -> io::Result<()> {
-        crate::windows_security::set_private_acl_for_test(
-            path,
-            directory,
-            add_untrusted_writer,
-            protected,
-        )
-        .map_err(|error| match error {
-            crate::windows_security::WindowsSecurityError::Io(error) => error,
-            crate::windows_security::WindowsSecurityError::Insecure(message) => {
-                io::Error::other(message)
-            }
-        })
-    }
-}
 
 pub use credential::{
     CredentialBrokerError, CredentialBrokerErrorKind, CredentialLeaseDisposition,
@@ -61,6 +41,10 @@ pub use digest::{Sha256Digest, Sha256DigestError};
 pub use executor::{
     CommandExecutionError, CommandExecutionErrorKind, CommandInvocation, CommandOutput,
     PinnedCommandRunner, PinnedExecutable, SecretInjection, SecretString, SideEffectPolicy,
+};
+pub use inputs::{
+    DRIVER_PROCESS_CONFIG_ENV, DRIVER_PROCESS_PURGE_ENV, DRIVER_PROCESS_SECRETS_ENV,
+    NoOperationInputs, OperationInputError, OperationInputSource, OperationInputs,
 };
 pub use installer::{
     DriverInstallationError, DriverReleaseInstaller, InstalledDriverRelease,

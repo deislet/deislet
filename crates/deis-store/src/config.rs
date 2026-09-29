@@ -77,11 +77,6 @@ pub struct Config {
     /// loopback IP address is accepted; anything else refuses to start.
     #[serde(default)]
     pub metrics_listen: Option<String>,
-    /// Independent credential for backend migration inventory and writer
-    /// fencing. When absent, the management service is not registered at
-    /// all, including on loopback.
-    #[serde(default)]
-    pub migration_admin_token: Option<String>,
     /// Directory holding the SQLite database and any on-disk payloads.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -244,7 +239,6 @@ impl Default for Config {
             download_idle_timeout_secs: default_download_idle_timeout_secs(),
             machine_identity: None,
             metrics_listen: None,
-            migration_admin_token: None,
             snapshot_dir: None,
             snapshot_interval_secs: default_snapshot_interval_secs(),
             snapshot_retention: default_snapshot_retention(),
@@ -307,7 +301,6 @@ mod tests {
     fn assert_matches_defaults(parsed: &Config) {
         let defaults = Config::default();
         assert_eq!(parsed.machine_identity, defaults.machine_identity);
-        assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.durability, defaults.durability);
         assert_eq!(parsed.snapshot_dir, defaults.snapshot_dir);
         assert_eq!(
@@ -486,20 +479,15 @@ mod tests {
     }
 
     #[test]
-    fn the_secret_and_the_snapshot_keys_are_read_from_a_file() {
+    fn the_snapshot_keys_are_read_from_a_file() {
         let parsed: Config = toml::from_str(
             r#"
-            migration_admin_token = "an-independent-migration-secret"
             snapshot_dir = "/var/backups/deis-store"
             snapshot_interval_secs = 3600
             snapshot_retention = 24
             "#,
         )
         .unwrap();
-        assert_eq!(
-            parsed.migration_admin_token.as_deref(),
-            Some("an-independent-migration-secret")
-        );
         let schedule = parsed.snapshot_schedule().unwrap();
         assert_eq!(schedule.interval, Duration::from_secs(3600));
         assert_eq!(schedule.retention, 24);

@@ -86,9 +86,13 @@ require_bins() {
       missing+=("${name}")
     fi
   done
+  if [[ ! -x "${INSTALL_ROOT}/bin/litestream" ]]; then
+    missing+=(litestream)
+  fi
   if ((${#missing[@]})); then
     die "missing binaries in ${INSTALL_ROOT}/bin: ${missing[*]}"
   fi
+  [[ -f "${INSTALL_ROOT}/litestream.yml" ]] || die "missing ${INSTALL_ROOT}/litestream.yml"
 }
 
 ensure_user() {
@@ -496,6 +500,44 @@ install_bins() {
   log "installed binaries to /usr/local/bin"
 }
 
+# The control plane's continuous backup (docs/control-backup-and-restore.md).
+#
+# The binary and /etc/litestream.yml come from the payload on every release;
+# /etc/deis/litestream.env, which names the replica and holds any bucket
+# credentials, is written once and then left alone, like secrets.env. Set
+# LITESTREAM_REPLICA_URL on the first install to replicate somewhere real
+# (s3://bucket/prefix, and put the credentials in that file afterwards). The
+# default is a directory on this machine: it proves the pipeline end to end,
+# and it is no backup against losing the disk, which the log says out loud.
+install_litestream() {
+  install -o root -g root -m 755 "${INSTALL_ROOT}/bin/litestream" /usr/local/bin/litestream
+  install -o root -g root -m 644 "${INSTALL_ROOT}/litestream.yml" /etc/litestream.yml
+  local env_file=/etc/deis/litestream.env
+  if [[ ! -f ${env_file} ]]; then
+    local url=${LITESTREAM_REPLICA_URL:-file:///var/backups/deis-control}
+    (
+      umask 077
+      {
+        echo "# Generated $(date -Is). Read by litestream.service. Releases reuse this file."
+        echo "LITESTREAM_REPLICA_URL=${url}"
+        echo "# LITESTREAM_ACCESS_KEY_ID="
+        echo "# LITESTREAM_SECRET_ACCESS_KEY="
+      } >"${env_file}"
+    )
+    chmod 600 "${env_file}"
+    log "wrote ${env_file} (replica: ${url})"
+  fi
+  local replica
+  replica=$(sed -n 's/^LITESTREAM_REPLICA_URL=//p' "${env_file}")
+  [[ -n ${replica} ]] || die "${env_file} names no LITESTREAM_REPLICA_URL"
+  if [[ ${replica} == file://* ]]; then
+    install -o deis -g deis -m 700 -d "${replica#file://}"
+    log "warning: the control database replicates to ${replica}, on this machine; set an off-host replica in ${env_file}"
+  fi
+  systemctl enable litestream
+  log "installed $(/usr/local/bin/litestream version 2>/dev/null | head -1 || echo litestream)"
+}
+
 install_units() {
   install -o root -g root -m 644 "${INSTALL_ROOT}/systemd/"*.service /etc/systemd/system/
   install -o root -g root -m 644 "${INSTALL_ROOT}/systemd/deislet.slice" /etc/systemd/system/
@@ -687,6 +729,7 @@ check_configs() {
 start_stack() {
   systemctl restart deis-telemetry deis-store deis-queue
   systemctl restart deis-control
+  systemctl restart litestream
   systemctl restart deis-runtime
   systemctl restart deis-proxy
 }
@@ -784,6 +827,7 @@ fi
 
 install_bins
 install_units
+install_litestream
 install_runtime_fs
 write_release_stamp
 ensure_hosts

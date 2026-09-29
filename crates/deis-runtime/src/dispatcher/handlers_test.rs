@@ -85,9 +85,10 @@ mod the_static_site_answers_a_real_request {
     /// redirect, a `_headers` block over the stylesheet, an SPA fallback, and
     /// one function route that the fallback must not swallow.
     fn bundle() -> AssetBundle {
-        let mut manifest =
-            Manifest::parse(r#"{"schema":1,"app":"static-site","entry":"worker/index.js"}"#)
-                .expect("the minimal manifest parses");
+        let mut manifest = Manifest::parse(&deis_bundle::complete_manifest_json(
+            r#"{"app":"static-site","entry":"worker/index.js"}"#,
+        ))
+        .expect("the minimal manifest parses");
         for path in ["index.html", "css/app.css"] {
             manifest.assets.push(Asset {
                 path: path.to_string(),
@@ -162,7 +163,6 @@ mod the_static_site_answers_a_real_request {
                 entry_point: "worker/index.js".to_string(),
                 code: CODE.to_string(),
                 config,
-                env_confirmed: true,
                 assets: Arc::new(bundle()),
             })
             .await
@@ -1822,7 +1822,7 @@ mod a_refused_request_is_answered_503_rather_than_500 {
 
 /// The exact-generation dispatch is the other door into a thread's queue: the
 /// edge selected a particular generation, that generation's thread is at
-/// capacity, and the answer must be the same 503 the legacy path gets rather
+/// capacity, and the answer must be the same 503 the direct path gets rather
 /// than a 500 that reads as the application failing.
 mod a_refused_generation_request_is_answered_503 {
     use std::sync::Arc;
@@ -1871,7 +1871,6 @@ mod a_refused_generation_request_is_answered_503 {
                 entry_point: "index.js".to_string(),
                 code: CODE.to_string(),
                 config: AppConfig::default(),
-                env_confirmed: true,
                 assets: Arc::new(AssetBundle::empty(Arc::from("max-age=300"))),
             })
             .await

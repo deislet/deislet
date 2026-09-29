@@ -25,18 +25,12 @@ fleet that never learns about its own nodes.
 | `APP_ID_HEADER` (`x-deis-app-id`) | which application an inbound request is for |
 | `ENVIRONMENT_HEADER` (`x-deis-environment`) | which environment of it; absent means `DEFAULT_ENVIRONMENT` |
 | `DEFAULT_ENVIRONMENT` (`production`) | so a caller that predates environments still lands somewhere sensible |
-| `TENANT_HEADER` (`x-deis-tenant`) | the storage tenant — a *different* header, because it carries a different thing |
-| `tenant_id(app, env)` / `split_tenant` / `is_valid_tenant_part` | `demo.production`; the character set has no `.`, `/` or `\`, so no legal pair can express a parent directory |
+| `BINDING_HEADER` (`x-deis-binding`) | which namespace inside the tenant a storage call wants; the tenant itself is the one the call's capability names |
+| `tenant_id(app, env)` / `split_tenant` / `is_valid_tenant_part` | the human-readable `demo.production` label a record is shown under; storage and telemetry own data by `CanonicalTenantId` |
 | `MAX_GRPC_MESSAGE_BYTES` (16 MB) | one ceiling, both directions, every service |
 | `STREAM_CHUNK_BYTES` (1 MB) | blob upload and download chunking |
 | `STORE_ENDPOINT_ENV` / `QUEUE_ENDPOINT_ENV` | reserved env keys carrying the storage addresses, lifted out before an application sees them |
-| `NODE_REGISTRATION_ROUTE` / `NODE_ASSIGNMENTS_ROUTE` | the axum `:id` route templates |
-| `node_registration_path(id)` / `node_assignments_path(id)` | the client-side halves |
 | `ASSIGNMENTS_COMPLETE_HEADER` / `ASSIGNMENTS_WITHHELD_HEADER` | whether an assignment list is the whole truth for that node |
-
-The route constants exist because they once did not: a node asked for
-`/register` while the control plane served `/registration`, both sides
-compiled, and the only symptom was a fleet with no nodes in it.
 
 ## The node link
 

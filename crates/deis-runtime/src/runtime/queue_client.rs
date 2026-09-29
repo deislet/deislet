@@ -1,14 +1,12 @@
-//! Queue client backing `ctx.services.queue` and the consumer poller.
+//! Queue client backing `ctx.env.QUEUE` and the consumer poller.
 //!
 //! Talks to deis-queue, which partitions messages by tenant -- one
-//! application in one environment: the tenant travels in the `x-deis-tenant`
-//! metadata header, and the capability token that proves this node may act as
-//! it in `Authorization: Bearer` (both stamped by [`StorageIdentity`]), not in
-//! the proto messages, so one client
+//! application in one environment: the tenant is the one named by the
+//! capability token this node presents in `Authorization: Bearer` (stamped by
+//! [`StorageIdentity`]), not a field of the proto messages, so one client
 //! speaks for exactly one environment of one application and a preview never
-//! consumes production's messages. A call without the header is refused with
-//! `PermissionDenied` rather than served from some default namespace, which is
-//! why this client cannot be built without a tenant.
+//! consumes production's messages. A call without a capability is refused
+//! rather than served from some default namespace.
 //!
 //! Delivery is at-least-once: a message stays in the queue until it is
 //! acknowledged, so a consumer that crashes mid-batch sees the same messages

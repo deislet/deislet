@@ -23,9 +23,10 @@ pub struct AppConfig {
     #[serde(default, skip_serializing)]
     pub env: std::collections::HashMap<String, String>,
 
-    /// Materialized EC-ENV config/secret values for schema-2 deployments.
-    /// `None` selects the legacy string map above; `Some` (including empty)
-    /// selects the typed, declaration-filtered standard environment.
+    /// Materialized EC-ENV config/secret values of the deployment's
+    /// environment snapshot. Every deployment carries one (`Some`, possibly
+    /// empty); `None` is an application loaded without a deployment behind
+    /// it - a test or `deis dev` - which reads the string map above.
     #[serde(default, skip_serializing)]
     pub standard_env: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 
@@ -61,6 +62,14 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub permissions: AppPermissions,
+
+    /// The canonical tenant (`v1/<application id>/<environment id>`) this
+    /// application's storage and queue calls are charged to, as the control
+    /// plane sent it with the deployment. `None` only for an application
+    /// that reaches no storage service; building a storage client without
+    /// it fails the load.
+    #[serde(default)]
+    pub storage_tenant: Option<deis_wire::CanonicalTenantId>,
 }
 
 /// Prints the shape of the configuration and the *names* of the environment
@@ -89,6 +98,7 @@ impl std::fmt::Debug for AppConfig {
             .field("resources", &self.resources)
             .field("routes", &self.routes)
             .field("permissions", &self.permissions)
+            .field("storage_tenant", &self.storage_tenant)
             .finish()
     }
 }

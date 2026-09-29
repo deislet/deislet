@@ -126,6 +126,14 @@ def load_baseline() -> dict | None:
 # ---------------------------------------------------------------------------
 
 
+PATH_PARAMETER = re.compile(r"\{([^}]+)\}")
+
+
+def path_shape(path: str) -> str:
+    """The path with every parameter name blanked: what a client actually sends."""
+    return PATH_PARAMETER.sub("{}", path)
+
+
 def operations(document: dict):
     for path, item in sorted(document.get("paths", {}).items()):
         for method in METHODS:
@@ -428,9 +436,20 @@ class Comparison:
                 continue
             self.schema(old_media.get("schema", {}), new[media].get("schema", {}), f"{where} {media}", direction)
 
-    def parameters(self, old: list, new: list, where: str) -> None:
-        old_by_key = {(p.get("in"), p.get("name")): p for p in old}
-        new_by_key = {(p.get("in"), p.get("name")): p for p in new}
+    @staticmethod
+    def _parameter_key(parameter: dict, path_names: list) -> tuple:
+        # A path parameter is identified by its position in the template, not
+        # its name: the name never reaches the wire, so renaming `{app_name}`
+        # to `{app_id}` changes nothing a client sends.
+        if parameter.get("in") == "path" and parameter.get("name") in path_names:
+            return ("path", f"#{path_names.index(parameter.get('name'))}")
+        return (parameter.get("in"), parameter.get("name"))
+
+    def parameters(self, old: list, new: list, where: str, old_path: str = "", new_path: str = "") -> None:
+        old_names = PATH_PARAMETER.findall(old_path)
+        new_names = PATH_PARAMETER.findall(new_path)
+        old_by_key = {self._parameter_key(p, old_names): p for p in old}
+        new_by_key = {self._parameter_key(p, new_names): p for p in new}
         for key, parameter in old_by_key.items():
             current = new_by_key.get(key)
             if current is None:
@@ -446,8 +465,8 @@ class Comparison:
             if key not in old_by_key and parameter.get("required", False):
                 self.note(f"{where}: new parameter {key[1]} ({key[0]}) is required")
 
-    def operation(self, old: dict, new: dict, where: str) -> None:
-        self.parameters(old.get("parameters", []), new.get("parameters", []), where)
+    def operation(self, old: dict, new: dict, where: str, old_path: str = "", new_path: str = "") -> None:
+        self.parameters(old.get("parameters", []), new.get("parameters", []), where, old_path, new_path)
         old_body = old.get("requestBody", {})
         new_body = new.get("requestBody", {})
         if old_body:
@@ -480,17 +499,20 @@ class Comparison:
             self.note(f"{where}: a security requirement was added")
 
     def run(self) -> None:
-        old_ops = {(path, method): op for path, method, op in operations(self.old)}
-        new_ops = {(path, method): op for path, method, op in operations(self.new)}
-        for (path, method), old_op in sorted(old_ops.items()):
+        # Operations are matched by the shape of their path, so a path
+        # parameter that is only renamed is the same operation.
+        old_ops = {(path_shape(path), method): (path, op) for path, method, op in operations(self.old)}
+        new_ops = {(path_shape(path), method): (path, op) for path, method, op in operations(self.new)}
+        for (shape, method), (path, old_op) in sorted(old_ops.items()):
             where = f"{method.upper()} {path}"
-            new_op = new_ops.get((path, method))
-            if new_op is None:
+            found = new_ops.get((shape, method))
+            if found is None:
                 self.note(f"{where}: operation removed")
                 continue
+            new_path, new_op = found
             if old_op.get("operationId") != new_op.get("operationId"):
                 self.note(f"{where}: operationId changed from {old_op.get('operationId')} to {new_op.get('operationId')}")
-            self.operation(old_op, new_op, where)
+            self.operation(old_op, new_op, where, path, new_path)
         if not self.old.get("security") and self.new.get("security"):
             self.note("a global security requirement was added")
 
@@ -727,6 +749,37 @@ BOUNDS_CASES = [
 ]
 
 
+def _with_app_path(name: str):
+    def mutate(document: dict) -> None:
+        document["paths"][f"/api/v1/apps/{{{name}}}"] = {
+            "get": {
+                "operationId": "getApp",
+                "parameters": [{"name": name, "in": "path", "required": True, "schema": {"type": "string"}}],
+                "responses": {"200": {}},
+            }
+        }
+
+    return mutate
+
+
+def _rename_app_path(document: dict) -> None:
+    document["paths"]["/api/v1/apps/{app_id}"] = document["paths"].pop("/api/v1/apps/{app_name}")
+    document["paths"]["/api/v1/apps/{app_id}"]["get"]["parameters"][0]["name"] = "app_id"
+
+
+def _drop_app_path_parameter(document: dict) -> None:
+    item = document["paths"].pop("/api/v1/apps/{app_name}")
+    item["get"]["parameters"] = []
+    document["paths"]["/api/v1/apps/current"] = item
+
+
+PATH_CASES = [
+    # The name of a path parameter never reaches the wire.
+    ("a renamed path parameter", _with_app_path("app_name"), _rename_app_path, None),
+    ("a path parameter replaced by a literal segment", _with_app_path("app_name"), _drop_app_path_parameter, "operation removed"),
+]
+
+
 def _optional_then_required(document: dict) -> None:
     """The baseline for this case takes an optional body; see `self_check`."""
     document["paths"]["/api/v1/apps"]["post"]["requestBody"]["required"] = True
@@ -736,6 +789,7 @@ def self_check() -> None:
     cases = [(label, None, mutate, expected) for label, mutate, expected in SELF_CHECK_CASES]
     cases.extend(NULLABILITY_CASES)
     cases.extend(BOUNDS_CASES)
+    cases.extend(PATH_CASES)
     for label, mutate_baseline, mutate, expected in cases:
         baseline = _minimal_document()
         if label == "a request body that became required":
@@ -764,33 +818,33 @@ def self_check() -> None:
 # notice - has no subject yet. That is the only thing this list stands on,
 # and it goes away when v1 ships.
 #
-# Two kinds of entry have been here.
-#
-# The first was a response member that really is `null` on the wire and was
-# documented as though it never could be. Those eight are on `origin/main`
-# now, so the baseline carries them and the comparison no longer reports
-# them; they have been deleted, which is what this list is for.
-#
-# The second is what is here now: a response member that described a
-# credential this platform no longer has. The fleet-wide node key is gone -
-# it is not a field of any configuration struct, and a control plane whose
-# file still sets `node_preshared_keys` refuses to start - so "which of the
-# fleet's keys did this node prove" has no answer to report. Restoring the
-# members is not available; they would have to be filled with something
-# untrue. The same holds for the flat configuration-file API key: its
-# origin, `config`, is no longer a value the platform can answer with, so
-# the enum loses it. Removing a response property, or a value a response
-# enum may take, is refused on principle, so each removal is named here in
-# full: an entry that does not match a reported change exactly does
-# nothing, and a removal that is not listed is still refused.
+# What is here now is compatibility with a release that never existed: the
+# identity migration's two routes (they moved data from name-keyed tenants to
+# canonical ids, and no installation ever held name-keyed data), members
+# nothing wrote and a code nothing emitted. Each removal is named in full: an
+# entry that does not match a reported change exactly does nothing, and a
+# removal that is not listed is still refused.
 #
 # The list is meant to be emptied rather than grown. Once these are on
 # `origin/main` the baseline carries them and the comparison stops reporting
 # them, which the run says so that the entries can be deleted.
 PRERELEASE_CORRECTIONS = frozenset(
     {
-        "POST /api/v1/accounts/{account}/tokens 200 application/json.token.origin: "
-        "enum values removed: ['config']",
+        # A reserved error code nothing ever emitted, and three members of the
+        # canonical artifact record nothing ever wrote; they were kept only
+        # for compatibility with clients of a release that does not exist.
+        "GET /api/platform/commands 400 application/json.error.code: enum values removed: ['offset-out-of-range']",
+        "GET /api/v1/apps/{app_id}/artifacts 200 application/json.items[]: response property artifactSha256 removed",
+        "GET /api/v1/apps/{app_id}/artifacts 200 application/json.items[]: response property contentRootSha256 removed",
+        "GET /api/v1/apps/{app_id}/artifacts 200 application/json.items[]: response property standardVersion removed",
+        "POST /api/v1/apps/{app_id}/artifacts 200 application/json.artifact: response property artifactSha256 removed",
+        "POST /api/v1/apps/{app_id}/artifacts 200 application/json.artifact: response property contentRootSha256 removed",
+        "POST /api/v1/apps/{app_id}/artifacts 200 application/json.artifact: response property standardVersion removed",
+        "GET /api/v1/apps/{application_name}/identity-migration: operation removed",
+        "POST /api/v1/apps/{application_name}/identity-migration: operation removed",
+        "GET /api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments 200 application/json.items[].operation.kind: enum values removed: ['migrate']",
+        "GET /api/v1/apps 200 application/json.items[]: response property revision removed",
+        "POST /api/v1/apps 201 application/json: response property revision removed",
     }
 )
 

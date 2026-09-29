@@ -523,7 +523,7 @@ impl Settings {
 /// Reject a name the storage services would refuse.
 ///
 /// A tenant is `<app>.<environment>`, so a dot in either half splits into
-/// three parts and every `ctx.services` call of that application fails with a
+/// three parts and every storage call of that application fails with a
 /// permission error - while the application itself loads and serves traffic,
 /// which makes it a slow thing to diagnose. Catching it here costs one string
 /// check and turns it into a sentence.

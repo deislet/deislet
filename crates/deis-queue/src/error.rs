@@ -25,8 +25,6 @@ pub enum QueueError {
     TooLarge(String),
     /// A stored message cannot be handed back as it was stored.
     Corrupt(String),
-    /// A migration coordinator has durably fenced this tenant's mutations.
-    WriteFenced(String),
     /// A queue consumer belongs to a deployment generation that is not
     /// currently admitted for this tenant.
     ConsumerGenerationFenced(String),
@@ -37,9 +35,6 @@ pub enum QueueError {
     /// A tokio blocking task panicked or was cancelled. Nothing to do with a
     /// Cloudflare Worker: this service never runs application code.
     BlockingTask(String),
-    /// The data directory was written before the queue was keyed by tenant,
-    /// so nothing in it can be delivered. Startup only; see [`crate::legacy`].
-    LegacyData(String),
 }
 
 impl fmt::Display for QueueError {
@@ -50,14 +45,12 @@ impl fmt::Display for QueueError {
             Self::InvalidArgument(m) => write!(f, "invalid argument: {m}"),
             Self::TooLarge(m) => write!(f, "too large: {m}"),
             Self::Corrupt(m) => write!(f, "corrupt: {m}"),
-            Self::WriteFenced(m) => write!(f, "write fenced: {m}"),
             Self::ConsumerGenerationFenced(m) => {
                 write!(f, "consumer generation fenced: {m}")
             }
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::BlockingTask(m) => write!(f, "blocking task: {m}"),
-            Self::LegacyData(m) => write!(f, "data predates the tenant contract: {m}"),
         }
     }
 }
@@ -90,18 +83,6 @@ impl From<tokio::task::JoinError> for QueueError {
     }
 }
 
-impl From<deis_backend_migration::FenceError> for QueueError {
-    fn from(error: deis_backend_migration::FenceError) -> Self {
-        match error {
-            deis_backend_migration::FenceError::Fenced(receipt) => Self::WriteFenced(format!(
-                "tenant {:?} is frozen by migration {} at fence epoch {}; retry only after the migration coordinator releases or cuts over the namespace",
-                receipt.tenant, receipt.migration_id, receipt.fence_epoch
-            )),
-            other => Self::BlockingTask(other.to_string()),
-        }
-    }
-}
-
 impl From<QueueError> for Status {
     fn from(e: QueueError) -> Self {
         let code = match &e {
@@ -115,13 +96,10 @@ impl From<QueueError> for Status {
             // The row is there but cannot be handed back: no retry by the
             // caller will fix it, an operator has to.
             QueueError::Corrupt(_) => Code::DataLoss,
-            QueueError::WriteFenced(_) | QueueError::ConsumerGenerationFenced(_) => {
-                Code::FailedPrecondition
-            }
+            QueueError::ConsumerGenerationFenced(_) => Code::FailedPrecondition,
             // Nothing the caller sent is wrong and no retry helps: the
             // service is standing on data it cannot use, and an operator has
             // to move it aside first.
-            QueueError::LegacyData(_) => Code::FailedPrecondition,
             QueueError::Sqlite(_) | QueueError::Io(_) | QueueError::BlockingTask(_) => {
                 Code::Internal
             }
@@ -152,10 +130,6 @@ mod tests {
             (QueueError::TooLarge("x".into()), Code::ResourceExhausted),
             (QueueError::Corrupt("x".into()), Code::DataLoss),
             (
-                QueueError::WriteFenced("x".into()),
-                Code::FailedPrecondition,
-            ),
-            (
                 QueueError::ConsumerGenerationFenced("x".into()),
                 Code::FailedPrecondition,
             ),
@@ -164,7 +138,6 @@ mod tests {
                 Code::Internal,
             ),
             (QueueError::BlockingTask("x".into()), Code::Internal),
-            (QueueError::LegacyData("x".into()), Code::FailedPrecondition),
         ];
         for (err, want) in cases {
             let status: Status = err.into();

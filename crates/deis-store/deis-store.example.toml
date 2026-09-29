@@ -22,12 +22,6 @@ listen = "127.0.0.1:8090"
 # The machine identity this is read with is the [machine_identity] table at
 # the end of this file.
 
-# Enables the separate BackendMigration gRPC service used by Control to
-# acquire durable writer fences and collect deterministic KV/SQL/blob
-# inventory. It is never optional once configured: even loopback calls must
-# send `Authorization: Bearer <token>`.
-# migration_admin_token = "put a different long random string here"
-
 # Directory holding kv.sqlite, blob.sqlite, db/<tenant>.sqlite and the blob
 # content tree. Back this up: it is the only copy of every tenant's data.
 #
@@ -38,11 +32,9 @@ listen = "127.0.0.1:8090"
 # layout is not a secret, but the process still must not be able to write
 # outside this tree for any other reason - run it as a user that cannot.
 #
-# A tenant is one application in one environment, spelled "<app>.<environment>"
-# (for example "demo.production"). A directory written before that was true is
-# keyed by bare application ids and cannot be read now; there is no migration,
-# and the service refuses to start on one rather than serving empty stores
-# over the top of it.
+# A tenant is one application in one environment, keyed by canonical ids
+# ("v1/<application id>/<environment id>") and named by the capability on each
+# call, never by the caller.
 data_dir = "./data"
 
 # How much a commit is allowed to cost in durability: "normal" or "full".

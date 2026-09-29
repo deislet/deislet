@@ -131,17 +131,12 @@ impl SecretSource {
     /// resolved, because the control plane authorises a fetch per deployment.
     pub async fn resolve(
         &self,
-        deployment_id: Option<&str>,
+        deployment_id: &str,
         order: StandardEnvironmentOrder,
     ) -> Result<StandardEnvironmentOrder, String> {
         if secret_revisions(&order).is_empty() {
             return Ok(order);
         }
-        let deployment_id = deployment_id.ok_or_else(|| {
-            "EC_ENV_SECRET_REVISION_UNAVAILABLE: this deployment binds secrets but carries no \
-             deployment id to fetch them under"
-                .to_string()
-        })?;
 
         let missing = self.cache().missing(deployment_id, &order);
         if !missing.is_empty() {

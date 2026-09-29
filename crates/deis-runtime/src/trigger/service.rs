@@ -54,42 +54,20 @@ impl TriggerServiceImpl {
 
     /// Which running application a scheduled trigger is about.
     ///
-    /// `ScheduledEvent` now carries the environment, because the control plane
-    /// keys its schedules by (app, environment) and a node runs production and
-    /// every preview of an app side by side. An empty field is a caller that
-    /// predates it and means the default environment - the same rule the HTTP
-    /// data path applies to a request with no environment header - and that is
-    /// the case worth warning about: if this node also runs other environments
-    /// of the app, the tick may belong to one of them and is about to run
-    /// production's code with production's secrets.
-    fn scheduled_target(&self, app_id: &str, environment: &str, cron: &str) -> AppKey {
+    /// The control plane keys its schedules by (app, environment), and a node
+    /// runs production and every preview of an app side by side, each with
+    /// its own version and values. A tick that names no environment names no
+    /// application, and is refused rather than run against a guessed one.
+    #[allow(clippy::result_large_err)]
+    fn scheduled_target(&self, app_id: &str, environment: &str) -> Result<AppKey, Status> {
         let environment = environment.trim();
-        if !environment.is_empty() {
-            return AppKey::new(app_id, environment);
+        if environment.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "a scheduled event for {app_id} names no environment; every schedule belongs to \
+                 one environment of an application"
+            )));
         }
-
-        let key = self.target(app_id);
-        let others: Vec<String> = self
-            .app_manager
-            .environments_of(app_id)
-            .into_iter()
-            .filter(|candidate| *candidate != key)
-            .map(|candidate| candidate.environment().to_string())
-            .collect();
-        if !others.is_empty() {
-            warn!(
-                app_id = %app_id,
-                cron = %cron,
-                other_environments = ?others,
-                "A scheduled trigger arrived with no environment, so it is being run against \
-                 {}. This node also runs {} other environment(s) of this app, and a schedule \
-                 that belongs to one of them is running the wrong code with the wrong secrets. \
-                 The caller is older than ScheduledEvent.environment and should be upgraded",
-                key,
-                others.len()
-            );
-        }
-        key
+        Ok(AppKey::new(app_id, environment))
     }
 }
 
@@ -193,7 +171,7 @@ impl Trigger for TriggerServiceImpl {
         request: Request<ScheduledEvent>,
     ) -> Result<Response<TriggerResponse>, Status> {
         let req = request.into_inner();
-        let key = self.scheduled_target(&req.app_id, &req.environment, &req.cron);
+        let key = self.scheduled_target(&req.app_id, &req.environment)?;
         info!(
             app_id = %key.app_id(),
             environment = %key.environment(),

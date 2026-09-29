@@ -38,8 +38,7 @@ message ScheduledEvent {
   // preview's cron ran the production copy's handler, with production's
   // secrets, and neither side could tell.
   //
-  // Empty means the default environment ("production"), which is what a
-  // caller that predates this field means.
+  // Required: a tick naming no environment is refused.
   string environment = 4;
 }
 

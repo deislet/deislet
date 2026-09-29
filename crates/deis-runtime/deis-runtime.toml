@@ -215,23 +215,21 @@ max_pending_entries = 10000
 # How this node reaches the control plane: it announces itself, asks what it
 # should be running, and keeps matching the answer.
 #
-# On startup it sends PUT <endpoint>/api/nodes/<node_id>/registration so the
+# On startup it calls Register on the control plane's machine channel so the
 # control plane knows this node exists without an operator editing anything on
-# that side, then calls GET <endpoint>/api/nodes/<node_id>/assignments, downloads
-# and loads every version named there, and only then reports healthy. Neither
-# path is spelled out in the code: both come from
-# deis_wire::conventions::{node_registration_path, node_assignments_path}, so
-# the two sides cannot drift apart. After that it
-# re-asks on a timer (reconcile_interval_secs). With no endpoint set the node
-# never asks anyone: it runs what is already in its bundle directory plus
-# whatever is pushed to it, and reports healthy immediately.
+# that side, then FetchAssignments, downloads and loads every version named
+# there, and only then reports healthy. Both are RPCs of
+# deis.machine.MachineChannel (crates/deis-wire/proto/machine.proto), so the
+# two sides share one generated definition. After that it re-asks on a timer
+# (reconcile_interval_secs). With no endpoint set the node never asks anyone:
+# it runs whatever is pushed to it and reports healthy immediately.
 #
-# A node that cannot reach the control plane keeps serving what it recovered
-# from its own disk, says so at error level, reports UNHEALTHY, and retries with
-# a growing delay. Bundles on disk carry no secrets, so an app that declares any
-# runs without them until the control plane redelivers. Once contact comes back
-# it registers again, because a control plane that restarted may have forgotten
-# it.
+# A node that cannot reach the control plane at startup restarts from its
+# sealed offline cache (<data_dir>/offline-cache/, at most 24 hours old): the
+# last assignment list, the secret values it binds and the capabilities it
+# held. It says so in its log, reports unhealthy, and retries with a
+# growing delay. Once contact comes back it registers again, because a control
+# plane that restarted may have forgotten it.
 #
 # Everything this node asks of a control plane - registering itself, the
 # assignment list, the bundle download - is served on the control plane's

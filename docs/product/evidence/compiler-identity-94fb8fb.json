@@ -14,7 +14,7 @@
     }
   },
   "fixture": {
-    "path": "scripts/demo-assets/portable-app",
+    "path": "docs/product/evidence/fixtures/portable-app",
     "files": {
       ".config.json": "4e57dc50f08496349ae3b9819ccc873e27159305d6167763b837a3a9db432cdf",
       "functions/api/where.ts": "34af2ed3e5c34b014f7a41a78f8ef283741483f02f3425196979ee090b2ef3fe"

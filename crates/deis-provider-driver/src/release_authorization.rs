@@ -9,8 +9,6 @@ use std::{collections::BTreeMap, fmt, fs::OpenOptions, io::Read as _, path::Path
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-#[cfg(windows)]
-use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
@@ -87,27 +85,12 @@ pub struct DriverReleaseTrustRoot {
     pub keys: Vec<DriverReleaseSigningKey>,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-struct LegacyDriverReleaseTrustRoot {
-    #[serde(rename = "$schema")]
-    schema: Option<String>,
-    schema_version: u32,
-    root_version: u64,
-    expires_at: DateTime<Utc>,
-    provider_driver_release: DriverReleaseSigningRole,
-    keys: Vec<DriverReleaseSigningKey>,
-}
-
 #[derive(Clone, Debug)]
 pub struct ValidatedDriverReleaseTrustRoot {
     root: DriverReleaseTrustRoot,
     verifying_keys: BTreeMap<String, VerifyingKey>,
     canonical_json: Vec<u8>,
     canonical_sha256: Sha256Digest,
-    legacy_implicit_root_role: bool,
-    legacy_missing_transparency_policy: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -229,62 +212,17 @@ impl ValidatedDriverReleaseTrustRoot {
         Self::new(root)
     }
 
-    /// Reads the pre-root-role v1 shape only for an already deployed trust
-    /// history. New bootstrap and every rotation payload remain strict.
-    pub fn load_file_compatible(
-        path: impl AsRef<Path>,
-    ) -> Result<Self, DriverReleaseAuthorizationError> {
-        let bytes = read_secure_trust_metadata_file(path.as_ref())?;
-        Self::parse_json_compatible(&bytes)
-    }
-
-    pub fn parse_json_compatible(bytes: &[u8]) -> Result<Self, DriverReleaseAuthorizationError> {
-        if let Ok(root) = serde_json::from_slice::<DriverReleaseTrustRoot>(bytes) {
-            let canonical_json =
-                serde_jcs::to_vec(&root).map_err(DriverReleaseAuthorizationError::Json)?;
-            if root.provider_driver_transparency.is_some() {
-                return Self::from_root_and_canonical(root, canonical_json, false, false);
-            }
-            return Self::from_root_and_canonical(root, canonical_json, false, true);
-        }
-        let legacy: LegacyDriverReleaseTrustRoot =
-            serde_json::from_slice(bytes).map_err(DriverReleaseAuthorizationError::Json)?;
-        let canonical_json =
-            serde_jcs::to_vec(&legacy).map_err(DriverReleaseAuthorizationError::Json)?;
-        let root_role = DriverReleaseRootRole {
-            key_ids: legacy.provider_driver_release.key_ids.clone(),
-            threshold: legacy.provider_driver_release.threshold,
-        };
-        Self::from_root_and_canonical(
-            DriverReleaseTrustRoot {
-                schema: legacy.schema,
-                schema_version: legacy.schema_version,
-                root_version: legacy.root_version,
-                expires_at: legacy.expires_at,
-                root: root_role,
-                provider_driver_release: legacy.provider_driver_release,
-                provider_driver_transparency: None,
-                keys: legacy.keys,
-            },
-            canonical_json,
-            true,
-            true,
-        )
-    }
-
     pub fn new(root: DriverReleaseTrustRoot) -> Result<Self, DriverReleaseAuthorizationError> {
         let canonical_json =
             serde_jcs::to_vec(&root).map_err(DriverReleaseAuthorizationError::Json)?;
-        Self::from_root_and_canonical(root, canonical_json, false, false)
+        Self::from_root_and_canonical(root, canonical_json)
     }
 
     fn from_root_and_canonical(
         root: DriverReleaseTrustRoot,
         canonical_json: Vec<u8>,
-        legacy_implicit_root_role: bool,
-        legacy_missing_transparency_policy: bool,
     ) -> Result<Self, DriverReleaseAuthorizationError> {
-        validate_trust_root(&root, !legacy_missing_transparency_policy)?;
+        validate_trust_root(&root)?;
         let mut verifying_keys = BTreeMap::new();
         for key in &root.keys {
             let bytes = decode_canonical_base64(&key.public_key)?;
@@ -305,8 +243,6 @@ impl ValidatedDriverReleaseTrustRoot {
             verifying_keys,
             canonical_sha256: sha256(&canonical_json),
             canonical_json,
-            legacy_implicit_root_role,
-            legacy_missing_transparency_policy,
         })
     }
 
@@ -322,16 +258,6 @@ impl ValidatedDriverReleaseTrustRoot {
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, DriverReleaseAuthorizationError> {
         Ok(self.canonical_json.clone())
-    }
-
-    #[must_use]
-    pub const fn uses_legacy_implicit_root_role(&self) -> bool {
-        self.legacy_implicit_root_role
-    }
-
-    #[must_use]
-    pub const fn uses_legacy_missing_transparency_policy(&self) -> bool {
-        self.legacy_missing_transparency_policy
     }
 
     #[must_use]
@@ -631,7 +557,6 @@ impl ValidatedDriverReleaseAuthorization {
 
 fn validate_trust_root(
     root: &DriverReleaseTrustRoot,
-    require_transparency_policy: bool,
 ) -> Result<(), DriverReleaseAuthorizationError> {
     require(
         root.schema
@@ -753,7 +678,6 @@ fn validate_trust_root(
             )?;
             crate::release_transparency::validate_transparency_policy(policy, &root.keys)
         }
-        None if !require_transparency_policy => Ok(()),
         None => Err(DriverReleaseAuthorizationError::Invalid(
             "provider driver release trust root requires a transparency policy",
         )),
@@ -872,10 +796,6 @@ fn read_secure_trust_metadata_file(
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-    #[cfg(windows)]
-    options
-        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
-        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
     let mut file = options
         .open(path)
         .map_err(DriverReleaseAuthorizationError::Io)?;
@@ -885,15 +805,6 @@ fn read_secure_trust_metadata_file(
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(DriverReleaseAuthorizationError::Invalid(
             "provider driver release trust metadata must be a regular non-symlink file",
-        ));
-    }
-    #[cfg(windows)]
-    if metadata.file_attributes()
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-        != 0
-    {
-        return Err(DriverReleaseAuthorizationError::Invalid(
-            "provider driver release trust metadata cannot be a Windows reparse point",
         ));
     }
     if metadata.len() > MAX_TRUST_ROOT_BYTES {
@@ -907,15 +818,6 @@ fn read_secure_trust_metadata_file(
             "provider driver release trust metadata must be owned by the service identity and not group/other writable",
         ));
     }
-    #[cfg(windows)]
-    crate::windows_security::validate_private_file(&file).map_err(|error| match error {
-        crate::windows_security::WindowsSecurityError::Io(error) => {
-            DriverReleaseAuthorizationError::Io(error)
-        }
-        crate::windows_security::WindowsSecurityError::Insecure(message) => {
-            DriverReleaseAuthorizationError::Invalid(message)
-        }
-    })?;
     let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
     file.read_to_end(&mut bytes)
         .map_err(DriverReleaseAuthorizationError::Io)?;
@@ -928,8 +830,6 @@ fn read_secure_trust_metadata_file(
         || metadata.len() != final_metadata.len()
         || metadata.mtime() != final_metadata.mtime()
         || metadata.mtime_nsec() != final_metadata.mtime_nsec();
-    #[cfg(not(unix))]
-    let metadata_changed = metadata.len() != final_metadata.len();
     if metadata_changed || u64::try_from(bytes.len()).ok() != Some(final_metadata.len()) {
         return Err(DriverReleaseAuthorizationError::Invalid(
             "provider driver release trust metadata changed while it was read",
@@ -1377,33 +1277,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_root_shape_preserves_its_identity_only_in_compatible_mode() {
-        let now = Utc::now();
-        let (root, _authorization, _release, _manifest) = signed_fixture(now);
-        let mut legacy: serde_json::Value = serde_json::to_value(root.get()).unwrap();
-        legacy.as_object_mut().unwrap().remove("root");
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("providerDriverTransparency");
-        let canonical_legacy = serde_jcs::to_vec(&legacy).unwrap();
-
-        assert!(ValidatedDriverReleaseTrustRoot::parse_json(&canonical_legacy).is_err());
-        let compatible =
-            ValidatedDriverReleaseTrustRoot::parse_json_compatible(&canonical_legacy).unwrap();
-        assert!(compatible.uses_legacy_implicit_root_role());
-        assert_eq!(compatible.canonical_json().unwrap(), canonical_legacy);
-        assert_eq!(
-            compatible.get().root.key_ids,
-            compatible.get().provider_driver_release.key_ids
-        );
-        assert_eq!(
-            compatible.get().root.threshold,
-            compatible.get().provider_driver_release.threshold
-        );
-    }
-
-    #[test]
     fn payload_and_signature_malleability_are_rejected() {
         let now = Utc::now();
         let (_root, envelope, _release, _manifest) = signed_fixture(now);
@@ -1484,8 +1357,6 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("trust-root.json");
         std::fs::write(&path, serde_jcs::to_vec(root.get()).unwrap()).unwrap();
-        #[cfg(windows)]
-        crate::windows_security::set_private_acl_for_test(&path, false, false, true).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -1496,25 +1367,6 @@ mod tests {
         }
         let loaded = ValidatedDriverReleaseTrustRoot::load_file(&path).unwrap();
         assert_eq!(loaded.canonical_sha256(), root.canonical_sha256());
-
-        #[cfg(windows)]
-        {
-            crate::windows_security::set_private_acl_for_test(&path, false, false, false).unwrap();
-            assert!(
-                ValidatedDriverReleaseTrustRoot::load_file(&path)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("protected")
-            );
-            crate::windows_security::set_private_acl_for_test(&path, false, true, true).unwrap();
-            assert!(
-                ValidatedDriverReleaseTrustRoot::load_file(&path)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("untrusted")
-            );
-            crate::windows_security::set_private_acl_for_test(&path, false, false, true).unwrap();
-        }
 
         #[cfg(unix)]
         {

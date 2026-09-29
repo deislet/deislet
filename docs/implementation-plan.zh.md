@@ -85,8 +85,8 @@ date、账号与作用域 token 与审计日志、ACME 签发与续期、回滚�
 
 这个维度是什么，deis-store / deis-queue 与 deis-telemetry 的答案不同，原因也不同：
 
-- **deis-store 与 deis-queue** 认的是**租户** `<应用>.<环境>`（例如 `demo.production`），走 `x-deis-tenant` 头，服务端用 `deis_wire::conventions::split_tenant` 校验。它们看不见「环境」这个概念，租户 id 对它们只是一把更长的、不透明的钥匙。之所以要把环境揉进这把钥匙：预览环境一旦能读写生产的 KV / 库 / 对象 / 队列，覆盖掉的数据是回滚不回来的——回滚只换代码，不还数据。
-- **deis-telemetry** 的查询维度是**应用**，环境作为普通字段（日志）、普通标签（指标）或显式属性（trace）随行。它不按环境分物理区，应用数据凭证也不提供租户隔离：能持有共享 telemetry token 的调用方仍能读写任意 app。迁移管理例外地把三种表达统一映射回 `<应用>.<环境>`，用独立管理员凭证和提交边界 writer fence 冻结指定环境；这不改变日常查询仍可覆盖一个应用全部环境的产品语义。
+- **deis-store 与 deis-queue** 认的是**租户**，即 canonical id `v1/<应用 id>/<环境 id>`（`CanonicalTenantId`）。租户不由请求决定：服务从调用携带的 capability 中取出它为本 binding 命名的唯一租户，落盘键为 `ct1_<应用 id>_<环境 id>`。它们看不见「环境」这个概念，租户 id 对它们只是一把不透明的钥匙。之所以要把环境揉进这把钥匙：预览环境一旦能读写生产的 KV / 库 / 对象 / 队列，覆盖掉的数据是回滚不回来的——回滚只换代码，不还数据。
+- **deis-telemetry** 的查询维度是**应用**，环境作为普通字段（日志）、普通标签（指标）或显式属性（trace）随行。它不按环境分物理区，应用数据凭证也不提供租户隔离：能持有共享 telemetry token 的调用方仍能读写任意 app。记录按 `<应用>.<环境>` 标签归属。
 
 ---
 
@@ -110,7 +110,6 @@ assets/                  # 静态资产，原样保留目录结构
   "app": "my-app",
   "entry": "worker/index.js",
   "runtime": "standard-v1",
-  "services": { "kv": true, "database": true, "blob": false, "queue": true },
   "bindings": {
     "HOT": { "kind": "kv" },
     "DOCS": { "kind": "blob" },
@@ -193,14 +192,13 @@ assets/                  # 静态资产，原样保留目录结构
   `Manifest::parse`/`validate` 里，而在 `Manifest::compatibility_profile()`，所以
   manifest 照样解析、别的字段照样能读，拒绝理由里写着两个日期，同一个包在新一版的节点
   上照样 `Ok`。
-- schema 2 的 `environment` 是 canonical artifact 中同一份 Edge Canon declaration：只含名称、
-  `kind`、`valueType` 与 `required`，不含 config 值或 secret 明文。部署时另建不可变的
-  `environment-binding-snapshot/v1`，把它绑定到版本、环境、config revision 与 secret revision；
-  `context.env` 只从该 snapshot 物化。旧 schema 1 的 `env`/`secrets` 仍可读取以支持历史版本
-  回滚，但新构建不再写入这两个字段；schema 2 若携带它们会被拒绝，避免同时存在两套真源。
+- `schema` 只有 2 一个取值，`environment` 必填：它是 canonical artifact 中同一份 Edge Canon
+  declaration，只含名称、`kind`、`valueType` 与 `required`，不含 config 值或 secret 明文。部署时另建
+  不可变的 `environment-binding-snapshot/v1`，把它绑定到版本、环境、config revision 与 secret
+  revision；`context.env` 只从该 snapshot 物化。manifest 没有携带运行时值的字段。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
-- `services` 的四个键是 schema 1 的旧式无名资源声明，只为迁移既有 bundle 与数据保留；
-  新标准应用只声明 `bindings`，生成的 HTTP context 不暴露 `context.services`。
+- 存储资源只有 `bindings` 一种声明方式，没有无名命名空间；应用从 `context.env.<名字>`
+  取得它们。
 - `bindings` 是一张**平表**：名字 → `{ "kind": ... }`，`kind` 五选一
   （`kv` / `database` / `blob` / `queue` / `service`）。前四种是本租户内部又一个命名
   空间（租户边界一点没动：绑定名是验过能力令牌之后用
@@ -303,7 +301,7 @@ CREATE TABLE routes (
   priority    INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE secrets (                    -- schema-1/滚动升级兼容源
+CREATE TABLE secrets (                    -- secret revision 的密文
   id          TEXT PRIMARY KEY,
   app_id      TEXT NOT NULL,
   env_id      TEXT NOT NULL REFERENCES environments(id),
@@ -428,11 +426,11 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
      string environment = 3;
      string bundle_url  = 4;   // 控制面上的 HTTP 下载地址
      string bundle_sha  = 5;
-     map<string, string> env = 6;   // schema-1 环境 + 平台内部存储 wiring
+     map<string, string> env = 6;   // 平台内部存储 wiring，不含应用的值
      string environment_declarations_json = 11;
      string environment_snapshot_json = 12;
      string environment_snapshot_id = 13;
-     map<string, string> secret_values_by_revision = 14;
+     // 14 已删除：secret 明文只经 FetchSecretValues 按 revision 取得
      string deployment_id = 15;       // lowercase UUIDv7 plan identity
      string routing_generation = 16;  // immutable route/consumer generation
      DeploymentAction action = 17;    // PREPARE / ACTIVATE / ABORT / DRAIN
@@ -448,8 +446,8 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
 FetchAssignments(node_id)
 → assignments_json: [ { app_id, version_id, environment, bundle_url, bundle_sha, env,
       environment_declarations, environment_snapshot,
-      environment_snapshot_id, secret_values_by_revision,
-      deployment_id, routing_generation, deployment_action } ]
+      environment_snapshot_id, deployment_id, routing_generation,
+      deployment_action } ]
 ```
 
 2026-09-11 之前，这一步是控制面人侧端口上的一条 `GET deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`
@@ -460,14 +458,14 @@ FetchAssignments(node_id)
 各自拼字符串。历史上吃过这个亏：本文档此前把登记接口写成 `POST .../register`，而代码里
 一直是 `PUT .../registration`——这正是当初把这类名字单独放进 `deis-wire` 共用的理由，
 传输层换了，理由本身没变。`NODE_ASSIGNMENTS_ROUTE` / `NODE_REGISTRATION_ROUTE` /
-`node_assignments_path` / `node_registration_path` 这几个符号仍在
-`crates/deis-wire/src/conventions.rs` 里，但生产的控制面路由已经不再注册它们，只留给测试用。
+`node_assignments_path` / `node_registration_path` 这几个符号已从
+`crates/deis-wire/src/conventions.rs` 删除，守护它们的文档检查脚本也一并退役。
 
-schema-1 的 `env` 与 `ApplyDeployment.env` 仍是同一张字符串表。schema-2 则传 declaration、精确
-snapshot identity 与按 immutable revision 索引的 secret plaintext；config/string、config/json 和
-secret/string 只从该 snapshot 物化，平台存储 wiring 仍留在内部 `env`，不会进入标准
-`context.env`。节点重启后必须从 assignments 重新取得同一个 snapshot；本地只持 snapshot digest，
-不持 config/secret value，因此控制面不可达时 schema-2 fail closed，不用 bundle 猜值。某个环境的
+每次部署都传 declaration 与精确 snapshot identity；secret 明文由节点按 immutable revision 经
+`FetchSecretValues` 取得。config/string、config/json 和 secret/string 只从该 snapshot 物化，平台
+存储 wiring 留在内部 `env`，不会进入标准 `context.env`。节点重启后必须从 assignments（或离线
+缓存）重新取得同一个 snapshot；bundle 目录只持 snapshot digest，不持 config/secret value，因此
+两者都拿不到时 fail closed，不用 bundle 猜值。某个环境的
 snapshot 或密钥解不开时，该行被整条剔出清单并标为 incomplete，而不是发残缺环境。
 
 authoritative assignment 会按 durable plan state 发 `prepare` 或 `activate`；节点重启遇到未完成计划时只能
@@ -481,7 +479,7 @@ authoritative assignment 会按 durable plan state 发 `prepare` 或 `activate`�
 |---|---|---|---|
 | `DEIS_STORE_ENDPOINT` | deis-store 的 gRPC 地址 | deis-control（配置项 `store_endpoint`） | deis-runtime |
 | `DEIS_QUEUE_ENDPOINT` | deis-queue 的 gRPC 地址 | deis-control（配置项 `queue_endpoint`） | deis-runtime |
-| `DEIS_SERVICES` | 本应用声明了哪些服务 | deis-runtime（读包内 manifest 时补） | deis-runtime |
+| `DEIS_BINDINGS` | 本应用声明的绑定表 | deis-runtime（读包内 manifest 时补） | deis-runtime |
 | `DEIS_QUEUE_CONSUMERS` | 要消费哪些队列及批大小 | 同上 | deis-runtime |
 
 这四个键在进 Isolate 之前被**取出**而不是读取，所以应用的 `ctx.env` 里只剩它自己的变量；应用也无法用同名变量把存储客户端指到别处（拼装 payload 时平台值最后写入，覆盖 manifest 里的同名变量并告警）。
@@ -500,7 +498,7 @@ authoritative assignment 会按 durable plan state 发 `prepare` 或 `activate`�
 
 ## 5. 三个新组件
 
-deis-store 与 deis-queue 按**租户**隔离数据，租户 id 是 `conventions::tenant_id(app, environment)` 的结果（`demo.production`），由调用方在 `x-deis-tenant` 头里带来；deis-telemetry 按应用聚合。三个都用 SQLite 起步（内部规模足够，且省去外部依赖）。
+deis-store 与 deis-queue 按**租户**隔离数据，租户是 capability 命名的 canonical id `v1/<应用 id>/<环境 id>`，请求本身不携带租户；deis-telemetry 按应用聚合。三个都用 SQLite 起步（内部规模足够，且省去外部依赖）。
 
 **现状**：三个组件都已建好并在 `scripts/demo.sh` 里被真实调用。
 
@@ -606,7 +604,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 2. **`context.params`**：`JsRequest` 现在没有 `params` 字段，所以 `context.params` 永远是空对象。按 manifest 的 `routes[].pattern` 匹配，把占位符解析结果填进去。
 3. **`context.env`**：schema-2 从 declaration + deployment snapshot 物化；每次 invocation 得到新的
    null-prototype 对象，JSON 值递归冻结，未声明/provider/host 值不进入其中。`process.env` 只投影
-   config/string，并在每次 invocation 重置；JSON 与 secret 不进入。schema-1 保留旧字符串 map。
+   config/string，并在每次 invocation 重置；JSON 与 secret 不进入。
    secret plaintext 只留在内存，不落盘、不进日志。
 4. **限额可配置**：`isolate.rs` 里写死的 30 秒超时和 `RateLimiter::new(1000.0)` 提到配置，允许按应用覆盖。
 
@@ -682,7 +680,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 **一、环境即身份。** 节点上一个应用原先只按 `app_id` 记，于是同一应用的生产与预览在节点上共用一个槽位——后到的那份会把先到的版本、环境变量和密钥整个盖掉，日志里一个字都没有。现在运行中的应用由 `(app_id, environment)` 这对值标识：
 
 - 数据面 `deis-proxy → deis-runtime` 除 `x-deis-app-id` 外新增 `x-deis-environment`；不带等于 `production`，所以老调用方仍然落到生产而不是被拒。
-- 存储面 `deis-runtime → deis-store / deis-queue` 走 `x-deis-tenant`，值是 `conventions::tenant_id(app, env)`（`demo.production`），见 §5。
+- 存储面 `deis-runtime → deis-store / deis-queue` 的租户由 capability 决定（canonical id `v1/<应用 id>/<环境 id>`），见 §5。
 - 环境名不再允许 `.`（要满足 `is_valid_tenant_part`）：带点会让 `split_tenant` 切出三段被存储拒绝，应用能跑但 kv/db/blob/queue 全废。构造预览环境名请用 `-`（`pr-42-1` 而不是 `pr-42.1`）。
 
 **二、节点通道单独鉴权。** `GET /api/nodes/{id}/assignments` 会把全部环境的明文密钥当 JSON 返回，而它原先只挂在面板的 `api_key_auth` 上，`api_auth_enabled` 默认 false——默认配置下任何能连到控制面 HTTP 端口的人 curl 一次就能拿走整个平台的密钥。后来它和 bundle 下载一起挂在独立的 `node_auth` 上（这个中间态凭据复用节点注册时已在用的 `node_preshared_keys`，不受 `api_auth_enabled` 影响，也不接受面板 API Key；节点侧对应加了 `[control] secret`，只发往配置里那个控制面地址）。
@@ -789,8 +787,8 @@ Rust 那一半；内存截断的计数器从来没人加过，于是运维从它
 
 - `crates/deis-build/.github/` —— 编译器还是独立仓库时留下的 workflow。嵌套的
   `.github` 在 GitHub 上不生效，已删除。仓库根后来建了 `.github/workflows/`，目前
-  只有 `checks.yml` 一个 workflow，跑的是不需要编译的检查（`check-doc-path-literals.sh`）；
-  它自己的注释写明了为什么还没有 cargo job：`deis-control` 在编译期嵌入
+  只有 `checks.yml` 一个 workflow，当时跑的是不需要编译的检查（`check-doc-path-literals.sh`，
+  随 HTTP 路径常量删除已退役）；它自己的注释写明了为什么还没有 cargo job：`deis-control` 在编译期嵌入
   `crates/deis-control/web/dist`，CI 里要先跑 `npm ci && npm run build`，否则构出来的
   二进制对每个面板页面都答 404。要补编译与测试的 job 时还要注意：旧文件里那个
   windows/macOS 矩阵不能照搬到工作区，deis-proxy 依赖 pingora，Windows 上构不出来。

@@ -31,7 +31,7 @@ use tonic::Request;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::transport::{Channel, Endpoint};
 
-use deis_wire::conventions::{MAX_GRPC_MESSAGE_BYTES, TENANT_HEADER, split_tenant};
+use deis_wire::conventions::{MAX_GRPC_MESSAGE_BYTES, split_tenant};
 
 mod queue_proto {
     tonic::include_proto!("deis.queue");
@@ -116,7 +116,9 @@ pub struct ReplayReport {
 /// operator happens to make.
 #[derive(Clone)]
 struct Identity {
-    tenant_header: MetadataValue<Ascii>,
+    /// The `<app>.<environment>` label, for the operator to read. deis-queue
+    /// acts for the tenant the token names.
+    tenant: String,
     token_header: Option<MetadataValue<Ascii>>,
 }
 
@@ -130,9 +132,6 @@ impl Identity {
                  them failed its own name check first."
             );
         }
-        let tenant_header = tenant.parse::<MetadataValue<Ascii>>().map_err(|_| {
-            anyhow!("tenant {tenant:?} cannot be sent as gRPC metadata; every call would fail")
-        })?;
         let token_header = match token.map(str::trim).filter(|t| !t.is_empty()) {
             Some(token) => Some(token.parse::<MetadataValue<Ascii>>().map_err(|_| {
                 anyhow!(
@@ -143,16 +142,13 @@ impl Identity {
             None => None,
         };
         Ok(Self {
-            tenant_header,
+            tenant,
             token_header,
         })
     }
 
     fn stamp<T>(&self, message: T) -> Request<T> {
         let mut request = Request::new(message);
-        request
-            .metadata_mut()
-            .insert(TENANT_HEADER, self.tenant_header.clone());
         if let Some(token) = &self.token_header {
             let bearer = format!("Bearer {}", token.to_str().unwrap_or(""));
             request
@@ -169,10 +165,7 @@ impl Identity {
 impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Identity")
-            .field(
-                "tenant",
-                &self.tenant_header.to_str().unwrap_or("<unprintable>"),
-            )
+            .field("tenant", &self.tenant)
             .field(
                 "token",
                 &if self.token_header.is_some() {
@@ -367,13 +360,10 @@ mod tests {
     }
 
     #[test]
-    fn both_headers_are_stamped_on_every_call() {
+    fn the_capability_and_no_tenant_header_is_stamped_on_every_call() {
         let identity = Identity::new("demo.production".to_string(), Some("token")).unwrap();
         let request = identity.stamp(());
-        assert_eq!(
-            request.metadata().get(TENANT_HEADER).unwrap(),
-            "demo.production"
-        );
+        assert!(request.metadata().get("x-deis-tenant").is_none());
         assert_eq!(
             request.metadata().get("authorization").unwrap(),
             "Bearer token"
@@ -482,6 +472,7 @@ mod tests {
         // this CLI configured to trust the authority that issued it.
         let fleet = crate::platform::service_tls::test_fleet();
         let identity = fleet.service_identity(deis_identity::ServiceKind::Queue);
+        let control = deis_capability::testing::FakeControl::start(signing_key.clone()).client();
         let server = tokio::spawn(async move {
             deis_queue::server::serve(
                 config,
@@ -490,6 +481,7 @@ mod tests {
                     let _ = stopped.await;
                 },
                 deis_capability::KeyRing::from_keys([verifying_key]),
+                control,
                 identity,
             )
             .await
@@ -505,7 +497,7 @@ mod tests {
             0,
             std::time::Duration::from_secs(900),
             vec![deis_capability::CapabilityResource {
-                tenant: TENANT.to_string(),
+                tenant: deis_wire::CanonicalTenantId::derived_from_label(TENANT).to_string(),
                 binding: "queue".to_string(),
                 generation: None,
             }],
@@ -515,9 +507,6 @@ mod tests {
         // types, and a closure would be fixed to whichever one it saw first.
         fn stamp<T>(token: &str, message: T) -> Request<T> {
             let mut request = Request::new(message);
-            request
-                .metadata_mut()
-                .insert(TENANT_HEADER, TENANT.parse().unwrap());
             let bearer = format!("Bearer {}", token);
             request
                 .metadata_mut()
@@ -652,10 +641,7 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(
-            refused.contains("tenant"),
-            "{refused}"
-        );
+        assert!(refused.contains("tenant"), "{refused}");
 
         let _ = stop.send(());
         server.await.unwrap();

@@ -6,7 +6,7 @@ use tracing::{error, info, warn};
 
 use crate::app::types::ResourceLimits;
 use crate::app::{AppKey, ApplicationManager};
-use crate::deployment::{Applied, DeploymentManager, DeploymentOrder, StandardEnvironmentOrder};
+use crate::deployment::{DeploymentManager, DeploymentOrder, StandardEnvironmentOrder};
 use crate::health::NodeHealth;
 use crate::runtime::metrics::{recorder, REQUESTS_TOTAL, REQUEST_ERRORS_TOTAL};
 
@@ -117,50 +117,28 @@ impl RuntimeManagement for RuntimeManagementService {
         let action = DeploymentAction::try_from(req.action).map_err(|_| {
             Status::invalid_argument(format!("unknown deployment action {}", req.action))
         })?;
-        let instruction = match (
-            req.deployment_id.trim().is_empty(),
-            req.routing_generation.trim().is_empty(),
-        ) {
-            (true, true) => (None, None),
-            (false, false) => {
-                if req.deployment_id.parse::<deis_wire::CanonicalId>().is_err()
-                    || req
-                        .routing_generation
-                        .parse::<deis_wire::CanonicalId>()
-                        .is_err()
-                {
-                    return Ok(Response::new(ApplyDeploymentResponse {
-                        success: false,
-                        message: "deployment_id and routing_generation must be lowercase UUIDv7 identities"
-                            .to_string(),
-                        version_id: String::new(),
-                        deployment_id,
-                        routing_generation,
-                        observed_state: "rejected".to_string(),
-                    }));
-                }
-                (
-                    Some(req.deployment_id.clone()),
-                    Some(req.routing_generation.clone()),
-                )
-            }
-            _ => {
-                return Ok(Response::new(ApplyDeploymentResponse {
-                    success: false,
-                    message: "deployment_id and routing_generation must be present together"
-                        .to_string(),
-                    version_id: String::new(),
-                    deployment_id,
-                    routing_generation,
-                    observed_state: "rejected".to_string(),
-                }));
-            }
-        };
-        if !matches!(action, DeploymentAction::Unspecified) && instruction.0.is_none() {
+        if action == DeploymentAction::Unspecified {
+            return Ok(Response::new(ApplyDeploymentResponse {
+                success: false,
+                message: "a deployment names its action: prepare, activate, abort or drain"
+                    .to_string(),
+                version_id: String::new(),
+                deployment_id,
+                routing_generation,
+                observed_state: "rejected".to_string(),
+            }));
+        }
+        if req.deployment_id.parse::<deis_wire::CanonicalId>().is_err()
+            || req
+                .routing_generation
+                .parse::<deis_wire::CanonicalId>()
+                .is_err()
+        {
             return Ok(Response::new(ApplyDeploymentResponse {
                 success: false,
                 message: format!(
-                    "deployment action {} requires deployment_id and routing_generation",
+                    "deployment action {} requires deployment_id and routing_generation, both \
+                     lowercase UUIDv7 identities",
                     action.as_str_name()
                 ),
                 version_id: String::new(),
@@ -178,10 +156,9 @@ impl RuntimeManagement for RuntimeManagementService {
             "Control plane asked this node to run a version"
         );
 
-        // Fields 9 and 10 are additive: an older control plane sends neither.
-        // Once either is present, both are an authority boundary and must be
-        // exact lowercase UUIDv7. Refuse before downloading the bundle rather
-        // than guessing the other half from a display name.
+        // Fields 9 and 10 are the storage authority and must both be exact
+        // lowercase UUIDv7. Refuse before downloading the bundle rather than
+        // guessing either half from a display name.
         let canonical_tenant = match CanonicalTenantId::from_wire_fields(
             &req.canonical_application_id,
             &req.canonical_environment_id,
@@ -311,8 +288,8 @@ impl RuntimeManagement for RuntimeManagementService {
             standard_environment,
             limits,
             compatibility,
-            deployment_id: instruction.0,
-            routing_generation: instruction.1,
+            deployment_id: req.deployment_id.clone(),
+            routing_generation: req.routing_generation.clone(),
         };
 
         let key = order.key();
@@ -385,103 +362,28 @@ impl RuntimeManagement for RuntimeManagementService {
                 })),
             };
         }
-        if action == DeploymentAction::Drain {
-            return match self
-                .deployer
-                .drain_generation(&key, &req.routing_generation)
-                .await
-            {
-                Ok(()) => Ok(Response::new(ApplyDeploymentResponse {
-                    success: true,
-                    message: "Deployment generation drained".to_string(),
-                    version_id: self.running_version(&key),
-                    deployment_id,
-                    routing_generation,
-                    observed_state: "drained".to_string(),
-                })),
-                Err(error) => Ok(Response::new(ApplyDeploymentResponse {
-                    success: false,
-                    message: error.to_string(),
-                    version_id: self.running_version(&key),
-                    deployment_id,
-                    routing_generation,
-                    observed_state: "draining".to_string(),
-                })),
-            };
-        }
-
-        match self.deployer.apply(order).await {
-            Ok(Applied::Installed { reused_bundle }) => {
-                info!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %req.version_id,
-                    reused_bundle,
-                    "Deployment applied"
-                );
-                Ok(Response::new(ApplyDeploymentResponse {
-                    success: true,
-                    message: "Deployment applied".to_string(),
-                    version_id: req.version_id,
-                    deployment_id,
-                    routing_generation,
-                    observed_state: "legacy_applied".to_string(),
-                }))
-            }
-            Ok(Applied::AlreadyRunning) => Ok(Response::new(ApplyDeploymentResponse {
+        // The one action left: unspecified was refused above.
+        match self
+            .deployer
+            .drain_generation(&key, &req.routing_generation)
+            .await
+        {
+            Ok(()) => Ok(Response::new(ApplyDeploymentResponse {
                 success: true,
-                message: "Already running this version".to_string(),
-                version_id: req.version_id,
+                message: "Deployment generation drained".to_string(),
+                version_id: self.running_version(&key),
                 deployment_id,
                 routing_generation,
-                observed_state: "legacy_applied".to_string(),
+                observed_state: "drained".to_string(),
             })),
-            // A push is never superseded: only a reconciliation carries a
-            // stamp saying how old its instruction is, and `apply` has none.
-            // Matched rather than caught by a wildcard so that a future path
-            // returning it here has to be thought about instead of silently
-            // reported as a successful deployment.
-            Ok(Applied::Superseded { running_version_id }) => {
-                let kept = running_version_id.unwrap_or_else(|| self.running_version(&key));
-                error!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %req.version_id,
-                    kept_version = %kept,
-                    "A pushed deployment came back as superseded, which only a reconciliation \
-                     can be; this node did not switch to version {} and the control plane is \
-                     told the push failed",
-                    req.version_id
-                );
-                Ok(Response::new(ApplyDeploymentResponse {
-                    success: false,
-                    message: "deployment was superseded by a newer change on this node".to_string(),
-                    version_id: kept,
-                    deployment_id,
-                    routing_generation,
-                    observed_state: "rejected".to_string(),
-                }))
-            }
-            Err(e) => {
-                let kept = self.running_version(&key);
-                error!(
-                    app_id = %key.app_id(),
-                    environment = %key.environment(),
-                    version_id = %req.version_id,
-                    kept_version = %kept,
-                    error = %e,
-                    "Deployment rejected; this node did not switch to version {}",
-                    req.version_id
-                );
-                Ok(Response::new(ApplyDeploymentResponse {
-                    success: false,
-                    message: e.to_string(),
-                    version_id: kept,
-                    deployment_id,
-                    routing_generation,
-                    observed_state: "rejected".to_string(),
-                }))
-            }
+            Err(error) => Ok(Response::new(ApplyDeploymentResponse {
+                success: false,
+                message: error.to_string(),
+                version_id: self.running_version(&key),
+                deployment_id,
+                routing_generation,
+                observed_state: "draining".to_string(),
+            })),
         }
     }
 
@@ -753,11 +655,7 @@ fn decode_standard_environment(
     snapshot_id: &str,
     version_id: &str,
     environment_id: &str,
-) -> Result<Option<StandardEnvironmentOrder>, String> {
-    let absent = declarations_json.is_empty() && snapshot_json.is_empty() && snapshot_id.is_empty();
-    if absent {
-        return Ok(None);
-    }
+) -> Result<StandardEnvironmentOrder, String> {
     if declarations_json.is_empty()
         || snapshot_json.is_empty()
         || snapshot_id.is_empty()
@@ -780,7 +678,6 @@ fn decode_standard_environment(
         version_id,
         environment_id,
     )
-    .map(Some)
 }
 
 /// Read the wire's `ResourceLimits` into the node's own.

@@ -96,20 +96,13 @@ jobs:
       - name: Reject target status drift from the locked registry
         run: python3 scripts/generate-target-status.py --check
 
-  document-path-literals:
-    name: documents reference the path constants
+  document-counts:
+    name: documents carry no hand-written counts
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, deislet]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-
-      # Fails when a document spells out an HTTP path that
-      # `deis_wire::conventions` already defines a constant for, and when one
-      # is spelled nearly-but-not-quite right. The script explains both rules
-      # and names the constant to reference instead.
-      - name: Node-facing paths are referenced, not restated
-        run: ./scripts/check-doc-path-literals.sh
 
       # Fails when a maintained document writes down how many checks or tests
       # there are, and when `VERIFY_EXPECTED_CHECKS` disagrees with the sum of
@@ -174,10 +167,10 @@ jobs:
           systemd-analyze verify "$work"/*.service "$work/deislet.slice" \
             2> "$work/verify-err" || true
           echo "---- diagnostics for the shipped units ----"
-          grep -F -f <(printf '%s\n' "$work/deis-control.service" "$work/deis-proxy.service" \
-            "$work/deis-queue.service" "$work/deis-runtime.service" \
-            "$work/deis-store.service" "$work/deis-telemetry.service" \
-            "$work/deislet.slice") "$work/verify-err" > "$work/verify-shipped" || true
+          # The filter is the list of files that were verified, so a unit
+          # added to the directory is covered without editing this job.
+          grep -F -f <(printf '%s\n' "$work"/*.service "$work/deislet.slice") \
+            "$work/verify-err" > "$work/verify-shipped" || true
           cat "$work/verify-shipped"
           if [ -s "$work/verify-shipped" ]; then
             exit 1

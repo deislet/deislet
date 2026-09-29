@@ -30,7 +30,7 @@
 //! source still on screen; the control plane refuses one it cannot honour at
 //! upload and checks who is entitled to name another application; the node
 //! turns each entry into a client or a call route when it installs the
-//! version; and the isolate publishes them on `context.bindings` and on `env`.
+//! version; and the isolate publishes them on `env`.
 //! Four copies of these rules would drift, and the symptom - an application
 //! writing into a namespace it did not name, or calling an application that
 //! never agreed to be called - is invisible until somebody's data is in the
@@ -43,8 +43,8 @@
 //! know which object a line of code touches, and two bindings can never differ
 //! only by a kind the call site does not mention. The cost is that `HOT`
 //! cannot be both a KV and a bucket in one application, which is a sentence an
-//! author can act on; the alternative cost - `services.kv.HOT` and
-//! `services.blob.HOT` being different things - is a bug an author cannot see.
+//! author can act on; the alternative cost - a KV `HOT` and a bucket `HOT`
+//! being different things - is a bug an author cannot see.
 //!
 //! Names are compared **ignoring ASCII case** when they are checked for
 //! uniqueness, and kept as written everywhere else. A binding name becomes a
@@ -343,7 +343,7 @@ impl<'de> Deserialize<'de> for DeclaredBindings {
             // string, an `app` that is not one - is a shape this format has
             // never had, which is a change no older build could have ignored
             // safely and therefore takes a new `schema` number rather than
-            // arriving inside schema 1. Those still fail here, by name.
+            // arriving inside this one. Those still fail here, by name.
             if let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str)
                 && BindingKind::from_name(kind).is_none()
             {

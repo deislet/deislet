@@ -172,6 +172,43 @@ impl std::fmt::Debug for TelemetryCredential {
     }
 }
 
+/// Which canonical tenant each `<app>.<environment>` label this node has run
+/// stands for.
+///
+/// Inside the node an application environment is its label: that is the key
+/// its isolate runs under and what every log line, counter and trace record
+/// names in `app_id`. deis-telemetry decides who may push and read a record
+/// by its canonical tenant `v1/<application id>/<environment id>` instead,
+/// so that an application deleted and created again under the same name is
+/// another tenant and reads none of the old one's records. The runtime pool
+/// records the pair here whenever it builds an isolate, and the shippers
+/// stamp each record with it on the way out.
+///
+/// Never shrunk: an entry is a few dozen bytes per environment ever run, and
+/// a line logged while an environment is being unloaded must still find its
+/// tenant. A name re-used by a new application overwrites the old pair when
+/// the new one's first isolate is built.
+static TENANTS: std::sync::LazyLock<RwLock<std::collections::HashMap<String, String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Record that `label` runs as the canonical tenant `canonical`.
+pub fn record_tenant(label: &str, canonical: &str) {
+    let mut tenants = TENANTS.write().unwrap_or_else(|e| e.into_inner());
+    if tenants.get(label).map(String::as_str) != Some(canonical) {
+        tenants.insert(label.to_string(), canonical.to_string());
+    }
+}
+
+/// The canonical tenant `label` runs as, when this node has built an isolate
+/// for it.
+pub fn canonical_tenant(label: &str) -> Option<String> {
+    TENANTS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(label)
+        .cloned()
+}
+
 /// What a shipper says when it starts, so an operator can tell from the
 /// first lines of a node's log where its credential comes from.
 ///

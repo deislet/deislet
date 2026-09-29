@@ -22,7 +22,6 @@ pub enum OperationKind {
     Deploy,
     Promote,
     Rollback,
-    Migrate,
     Export,
     Delete,
     Restore,
@@ -38,7 +37,6 @@ impl OperationKind {
             Self::Deploy => "deploy",
             Self::Promote => "promote",
             Self::Rollback => "rollback",
-            Self::Migrate => "migrate",
             Self::Export => "export",
             Self::Delete => "delete",
             Self::Restore => "restore",
@@ -51,13 +49,12 @@ impl OperationKind {
         Self::ALL.into_iter().find(|kind| kind.as_str() == value)
     }
 
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 10] = [
         Self::Build,
         Self::Provision,
         Self::Deploy,
         Self::Promote,
         Self::Rollback,
-        Self::Migrate,
         Self::Export,
         Self::Delete,
         Self::Restore,

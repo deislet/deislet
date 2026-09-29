@@ -101,7 +101,7 @@ fn delete_expired_cursor_batch(
 /// collection or another set of filters are one answer on purpose, because
 /// telling them apart would say whether a guessed token exists.
 ///
-/// One sentence in one place: it is the legacy body of every list route
+/// One sentence in one place: it is the plain body of every list route
 /// that refuses a cursor, and `crate::api::error` reads it to answer
 /// `cursor-invalid` on the structured surfaces without the message moving.
 pub const INVALID_CURSOR_MESSAGE: &str = "cursor is invalid, expired, or belongs to another query";

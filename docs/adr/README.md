@@ -34,7 +34,7 @@
 | [020](020-reference-vendor-intersection.md) | 参考供应商主流语义交集 | Accepted |
 | [021](021-conformance-evidence-and-certification.md) | 证据成熟度与合规认证 | Accepted |
 | [022](022-entry-plan-resource-baseline.md) | 最低免费或入门档共同资源基线 | Accepted；局部取代 ADR-005 |
-| [023](023-backend-migration-fence-and-inventory.md) | 后端迁移清单与真实写入栅栏 | Accepted |
+| [023](023-backend-migration-fence-and-inventory.md) | 后端迁移清单与真实写入栅栏 | Deprecated |
 | [024](024-coordinated-embedded-backend-restore.md) | Embedded 后端一致恢复与可对账拓扑驱动 | Accepted |
 | [025](025-machine-identity-and-capabilities.md) | 每实例机器身份、独立管理通道与持有证明能力 | Accepted |
 

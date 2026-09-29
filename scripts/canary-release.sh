@@ -26,6 +26,19 @@ REWRITE_CONFIG=0
 WITH_APPS=0
 BINS=(deis-control deis-runtime deis-proxy deis-store deis-queue deis-telemetry deis-backend-topology deis)
 
+# The control plane's continuous backup, shipped with every release so the
+# canary never runs without it. Pinned: the configuration in
+# scripts/canary/litestream.yml, the replica format and the restore drill are
+# written for the 0.5 series, and the digests below are the ones the v0.5.17
+# release publishes in its checksums.txt.
+LITESTREAM_VERSION=0.5.17
+LITESTREAM_ARCH="${LITESTREAM_ARCH:-x86_64}"
+LITESTREAM_CACHE="${LITESTREAM_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/deislet}"
+declare -A LITESTREAM_SHA256=(
+  [x86_64]=cfb371176d164437ae869f8351cfde49bd1804ae71c61923f75c9cba9c9c006d
+  [arm64]=f8ca4a050095c1efbda2c4365172e61bf9d955ea0d9ac42f448b52e51819baa5
+)
+
 log() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
@@ -54,7 +67,8 @@ Options:
   --apps             with release: also run the apps step
   -h, --help
 
-Environment: SSH_HOST, LAN_IP, ZONE, NODE_ID, CARGO_TARGET_DIR, STAGE.
+Environment: SSH_HOST, LAN_IP, ZONE, NODE_ID, CARGO_TARGET_DIR, STAGE,
+LITESTREAM_ARCH (the canary's CPU: x86_64 or arm64), LITESTREAM_CACHE.
 Build and ship from the same workstation: deis-runtime still opens isolate
 JS at the absolute paths recorded when it was compiled.
 EOF
@@ -108,6 +122,32 @@ cmd_build() {
   log "binaries in ${BIN_DIR}"
 }
 
+# Fetch the pinned Litestream release once, verify it against the digest
+# recorded above, and put the binary in the payload. A mismatch stops the
+# release: a backup tool that is not the one this repository was written for
+# is not a backup anyone has tested.
+stage_litestream() {
+  local expected=${LITESTREAM_SHA256[${LITESTREAM_ARCH}]:-}
+  [[ -n ${expected} ]] || die "no pinned Litestream digest for ${LITESTREAM_ARCH}; use x86_64 or arm64"
+  local tarball="litestream-${LITESTREAM_VERSION}-linux-${LITESTREAM_ARCH}.tar.gz"
+  local cached="${LITESTREAM_CACHE}/${tarball}"
+  mkdir -p "${LITESTREAM_CACHE}"
+  if [[ ! -f ${cached} ]]; then
+    log "==> fetching ${tarball}"
+    curl -fsSLo "${cached}.part" \
+      "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/${tarball}"
+    mv "${cached}.part" "${cached}"
+  fi
+  local actual
+  actual=$(sha256sum "${cached}" | cut -d' ' -f1)
+  if [[ ${actual} != "${expected}" ]]; then
+    rm -f "${cached}"
+    die "${tarball} has digest ${actual}, expected ${expected}; the cached copy was removed"
+  fi
+  tar -xzf "${cached}" -C "${STAGE}/bin" litestream
+  chmod 755 "${STAGE}/bin/litestream"
+}
+
 stage_payload() {
   local name
   rm -rf "${STAGE}"
@@ -116,7 +156,9 @@ stage_payload() {
     [[ -x ${BIN_DIR}/${name} ]] || die "missing ${BIN_DIR}/${name}; run: $0 build"
     install -m 755 "${BIN_DIR}/${name}" "${STAGE}/bin/${name}"
   done
+  stage_litestream
   cp -a "${CANARY_DIR}/systemd/." "${STAGE}/systemd/"
+  install -m 644 "${CANARY_DIR}/litestream.yml" "${STAGE}/litestream.yml"
   install -m 755 "${CANARY_DIR}/remote-install.sh" "${STAGE}/remote-install.sh"
   python3 "${CANARY_DIR}/extract-runtime-fs.py" \
     "${BIN_DIR}/deis-runtime" "${STAGE}/runtime-fs"

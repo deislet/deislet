@@ -6,7 +6,7 @@
 //! `control_endpoint`) and kept current. There is no setting that turns the
 //! check off. See [`crate::auth`].
 //!
-//! Health is public and optional migration management has its own credential.
+//! Health is public.
 //!
 //! `[machine_identity]` is required to serve: the gRPC listener speaks TLS
 //! only, presenting this service's own certificate
@@ -52,15 +52,6 @@ pub struct Config {
     /// and the T8 degraded-mode clock is reset.
     #[serde(default)]
     pub machine_identity: Option<deis_capability::ServiceIdentityConfig>,
-    /// Independent bearer credential for the backend migration management
-    /// RPCs. When absent those RPCs are not registered; ingest still opens
-    /// and enforces the durable fence journal so removing this credential
-    /// cannot bypass an already acquired fence.
-    ///
-    /// Application telemetry callers never inherit authority to freeze,
-    /// inventory or release a tenant: this is a separate credential.
-    #[serde(default)]
-    pub migration_admin_token: Option<String>,
     /// How many days of logs to keep. Logs live in one table per UTC day;
     /// the sweeper drops whole tables older than this.
     #[serde(default = "default_log_retention_days")]
@@ -162,7 +153,6 @@ impl Default for Config {
             metrics_listen: default_metrics_listen(),
             data_dir: default_data_dir(),
             machine_identity: None,
-            migration_admin_token: None,
             log_retention_days: default_log_retention_days(),
             metric_retention_days: default_metric_retention_days(),
             trace_retention_days: default_trace_retention_days(),
@@ -183,10 +173,6 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("metrics_listen", &self.metrics_listen)
             .field("data_dir", &self.data_dir)
-            .field(
-                "migration_admin_token",
-                &self.migration_admin_token.as_ref().map(|_| "<redacted>"),
-            )
             .field("log_retention_days", &self.log_retention_days)
             .field("metric_retention_days", &self.metric_retention_days)
             .field("trace_retention_days", &self.trace_retention_days)
@@ -331,20 +317,6 @@ mod tests {
             err.to_string().contains("retention_days"),
             "error should name the unknown key, got: {err}"
         );
-    }
-
-    #[test]
-    fn credentials_are_parsed_but_never_printed_by_debug() {
-        let config: Config =
-            toml::from_str("migration_admin_token = \"migration-administrator-secret-000001\"")
-                .unwrap();
-        assert_eq!(
-            config.migration_admin_token.as_deref(),
-            Some("migration-administrator-secret-000001")
-        );
-        let debug = format!("{config:?}");
-        assert!(!debug.contains("migration-administrator-secret-000001"));
-        assert!(debug.contains("<redacted>"));
     }
 
     #[test]

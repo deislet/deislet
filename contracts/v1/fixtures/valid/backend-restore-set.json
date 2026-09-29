@@ -30,8 +30,7 @@
       "snapshotManifestDigest": {"algorithm": "sha256", "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
       "sourceBackendIncarnationId": "01990f44-1000-7000-8000-000000000064",
       "sizeBytes": 4096,
-      "capturedAt": "2026-09-03T20:50:30Z",
-      "containsFenceJournal": false
+      "capturedAt": "2026-09-03T20:50:30Z"
     },
     {
       "backend": "deis-queue",
@@ -40,8 +39,7 @@
       "snapshotManifestDigest": {"algorithm": "sha256", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
       "sourceBackendIncarnationId": "01990f44-1000-7000-8000-000000000066",
       "sizeBytes": 2048,
-      "capturedAt": "2026-09-03T20:50:40Z",
-      "containsFenceJournal": false
+      "capturedAt": "2026-09-03T20:50:40Z"
     },
     {
       "backend": "deis-telemetry",
@@ -50,8 +48,7 @@
       "snapshotManifestDigest": {"algorithm": "sha256", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
       "sourceBackendIncarnationId": "01990f44-1000-7000-8000-000000000068",
       "sizeBytes": 8192,
-      "capturedAt": "2026-09-03T20:50:50Z",
-      "containsFenceJournal": false
+      "capturedAt": "2026-09-03T20:50:50Z"
     }
   ],
   "createdAt": "2026-09-03T20:51:00Z"

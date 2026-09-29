@@ -157,7 +157,7 @@ test('the refusal classes a console must tell apart are told apart', () => {
 })
 
 test('a database that is not answering is a wait, not a crash', () => {
-  // An older control plane reports a dependency it dialled with a 500; the
+  // A dependency the control plane dialled can come back as a 500; the
   // code is the more precise of the two and decides what the console says.
   const state = describeRefusal(
     refusalFrom(
@@ -177,7 +177,7 @@ test('a database that is not answering is a wait, not a crash', () => {
   assert.equal(state.kind, 'unavailable')
 })
 
-test('the legacy flat refusal and a bodiless one still reach the operator', () => {
+test('the flat refusal and a bodiless one still reach the operator', () => {
   // The authorization gate answers outside the envelope, and a proxy in
   // front of the control plane answers with no JSON at all.
   const flat = refusalFrom(403, 'Forbidden', { requestId: REQUEST_ID }, '{"error":"missing api key"}')

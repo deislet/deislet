@@ -40,8 +40,9 @@ pub const DEFAULT_CACHE_FILE: &str = "routing-table.json";
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RoutingConfig {
-    /// Seconds between polls of `GET /api/routing-table`. Lower means a new
-    /// route takes effect sooner and costs one small request more often.
+    /// Seconds between `FetchRoutingTable` calls on the machine channel.
+    /// Lower means a new route takes effect sooner and costs one small call
+    /// more often.
     pub control_poll_interval_secs: Option<u64>,
     /// Ceiling on the fetched table, in bytes.
     pub max_table_bytes: Option<usize>,

@@ -1,4 +1,4 @@
-//! `ctx.services.blob`: object storage, backed by deis-store's blob service.
+//! `ctx.env.BLOB`: object storage, backed by deis-store's blob service.
 //!
 //! Errors are returned as [`JsErrorBox`] rather than `std::io::Error`, because
 //! only the former's message survives the trip into JavaScript; see
@@ -23,8 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// The object store one call means: the tenant's unnamed namespace when
-/// `binding` is empty, and the named one otherwise. See
+/// The object store one call means: the binding `binding` names. See
 /// [`super::ops::bound_client`] for why a name that is not declared is refused
 /// rather than falling back.
 fn client(state: &Rc<RefCell<OpState>>, binding: &str) -> Result<BlobClient, JsErrorBox> {
@@ -79,7 +78,7 @@ pub struct BlobRangeResult {
     pub length: u64,
 }
 
-/// Which bytes of an object `ctx.services.blob.get` asked for.
+/// Which bytes of an object `ctx.env.BLOB.get` asked for.
 ///
 /// `header` is a raw HTTP `Range` header value, which is how an application
 /// forwards the one it was given; the rest is the same range spelled as
@@ -99,7 +98,7 @@ pub struct BlobRangeOption {
     pub suffix: Option<i64>,
 }
 
-/// What `ctx.services.blob.get` may ask for beyond the key.
+/// What `ctx.env.BLOB.get` may ask for beyond the key.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlobGetOptions {
@@ -107,7 +106,7 @@ pub struct BlobGetOptions {
     pub range: Option<BlobRangeOption>,
 }
 
-/// What `ctx.services.blob.put` and `.delete` may require of the object first.
+/// What `ctx.env.BLOB.put` and `.delete` may require of the object first.
 ///
 /// Exactly one of the two is set; both being set is a caller bug and is
 /// refused rather than silently resolved in some order the caller cannot see.
@@ -136,7 +135,7 @@ pub struct BlobDeleteOptions {
     pub only_if: Option<BlobConditionOption>,
 }
 
-/// What `ctx.services.blob.list` may ask a listing for.
+/// What `ctx.env.BLOB.list` may ask a listing for.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BlobListOptions {

@@ -1,7 +1,7 @@
-//! Durable product operations shared by build/deploy/migrate/lifecycle work.
+//! Durable product operations shared by build/deploy/restore/lifecycle work.
 //!
-//! The database representation is deliberately generic. Identity migration
-//! is the first producer, not a special operation shape clients must learn.
+//! The database representation is deliberately generic: every producer
+//! writes the same operation shape, and clients learn one.
 
 use chrono::{DateTime, Utc};
 use deis_wire::{
@@ -65,20 +65,6 @@ impl OperationRequestContext {
         })
     }
 
-    /// Context for internal callers and pre-Operation migration records.
-    /// Public mutation handlers always use [`Self::new`] with the caller's
-    /// actual idempotency key and identity.
-    pub fn system_for_migration(application_id: CanonicalId, revision: i64) -> Self {
-        let fingerprint = format!("migrate:{application_id}:{revision}");
-        Self {
-            idempotency_key_sha256: sha256_hex(format!("system:{fingerprint}").as_bytes()),
-            request_fingerprint_sha256: sha256_hex(fingerprint.as_bytes()),
-            actor_subject: "system:identity-migration-coordinator".to_string(),
-            request_id: CanonicalId::new_v7(),
-            correlation_id: CanonicalId::new_v7(),
-        }
-    }
-
     /// Bind the method/path/body fingerprint to the immutable resource that
     /// the catalog resolved. This prevents a deleted name from making an old
     /// idempotency key refer to a newly created application with that name.
@@ -138,7 +124,7 @@ impl CatalogStore {
     /// an id at all, and refuse every id they may not see with one fixed
     /// body. A second query issued only for a provider workflow in a live
     /// environment would make such a record's existence measurable in the
-    /// time the refusal took; here an unknown id, a migration and a
+    /// time the refusal took; here an unknown id, a restore and a
     /// workflow all cost the same single point read.
     pub async fn product_operation_with_scope_names(
         &self,
@@ -230,93 +216,6 @@ impl CatalogStore {
             })
             .await
     }
-}
-
-pub(super) fn create_migration_operation_tx(
-    connection: &Connection,
-    operation_id: CanonicalId,
-    canonical_application_id: CanonicalId,
-    expected_revision: i64,
-    created_at: i64,
-    context: &OperationRequestContext,
-) -> CatalogResult<()> {
-    let organization_id = default_organization_id(connection)?;
-    let actor_id = actor_id(connection, &context.actor_subject, created_at)?;
-    if let Some((existing_id, existing_fingerprint)) = connection
-        .query_row(
-            "SELECT operation_id, request_fingerprint_sha256
-               FROM product_operations
-              WHERE organization_id = ?1 AND actor_id = ?2 AND kind = 'migrate'
-                AND idempotency_key_sha256 = ?3",
-            params![
-                organization_id.to_string(),
-                actor_id.to_string(),
-                context.idempotency_key_sha256
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?
-    {
-        if existing_fingerprint != context.request_fingerprint_sha256 {
-            return Err(CatalogError::conflict(format!(
-                "the Idempotency-Key already belongs to operation {existing_id} with a different request target"
-            )));
-        }
-        return Err(CatalogError::conflict(format!(
-            "the Idempotency-Key already belongs to operation {existing_id}; its product record is not linked to this migration"
-        )));
-    }
-    connection.execute(
-        "INSERT INTO product_operations
-           (operation_id, kind, organization_id, application_id, environment_id,
-            target_kind, target_id, expected_revision, state, phase, revision,
-            idempotency_key_sha256, request_fingerprint_sha256, actor_id,
-            request_id, correlation_id, progress, cancellable, retryable,
-            child_operation_ids, provider_operations, error_json,
-            created_at, started_at, updated_at, finished_at)
-         VALUES (?1, 'migrate', ?2, ?3, NULL, 'application', ?3, ?4,
-                 'queued', 'inventory', 1, ?5, ?6, ?7, ?8, ?9, NULL, 1, 1,
-                 '[]', '[]', NULL, ?10, NULL, ?10, NULL)",
-        params![
-            operation_id.to_string(),
-            organization_id.to_string(),
-            canonical_application_id.to_string(),
-            expected_revision,
-            context.idempotency_key_sha256,
-            context.request_fingerprint_sha256,
-            actor_id.to_string(),
-            context.request_id.to_string(),
-            context.correlation_id.to_string(),
-            created_at,
-        ],
-    )?;
-    Ok(())
-}
-
-/// A second public request may reuse an active migration only when it is the
-/// same actor, idempotency key and request target. Internal recovery callers
-/// do not have a new request context and deliberately bypass this check.
-pub(super) fn ensure_migration_operation_request_tx(
-    connection: &Connection,
-    operation_id: CanonicalId,
-    context: &OperationRequestContext,
-) -> CatalogResult<()> {
-    if find_migration_operation_request_tx(connection, context)? != Some(operation_id) {
-        return Err(CatalogError::conflict(format!(
-            "application already has active migration operation {operation_id}; use its original actor and Idempotency-Key or wait for a terminal state"
-        )));
-    }
-    Ok(())
-}
-
-/// Find the operation already owned by this actor/key. A matching key with a
-/// different request fingerprint is a conflict, including name reuse that
-/// resolves to a different canonical target.
-pub(super) fn find_migration_operation_request_tx(
-    connection: &Connection,
-    context: &OperationRequestContext,
-) -> CatalogResult<Option<CanonicalId>> {
-    find_operation_request_tx(connection, OperationKind::Migrate, context)
 }
 
 pub(super) fn find_operation_request_tx(
@@ -762,6 +661,60 @@ fn sha256_hex(value: &[u8]) -> String {
 }
 
 #[cfg(test)]
+impl CatalogStore {
+    /// Write one queued operation of `kind` straight into the table, for
+    /// tests of the generic operation routes and readers that need a record
+    /// no producer in the test has a reason to create. Scoped to
+    /// `application_id` when one is given, platform-wide otherwise.
+    pub(crate) async fn insert_test_operation(
+        &self,
+        kind: OperationKind,
+        application_id: Option<CanonicalId>,
+    ) -> CanonicalId {
+        let operation_id = CanonicalId::new_v7();
+        self.database()
+            .with_connection(move |connection| {
+                let now = now_secs();
+                let organization_id = default_organization_id(connection)?;
+                let actor_id = actor_id(connection, "system:test", now)?;
+                let (target_kind, target_id) = match application_id {
+                    Some(application_id) => ("application", application_id),
+                    None => ("installation", CanonicalId::new_v7()),
+                };
+                connection.execute(
+                    "INSERT INTO product_operations
+                       (operation_id, kind, organization_id, application_id, environment_id,
+                        target_kind, target_id, expected_revision, state, phase, revision,
+                        idempotency_key_sha256, request_fingerprint_sha256, actor_id,
+                        request_id, correlation_id, progress, cancellable, retryable,
+                        child_operation_ids, provider_operations, error_json,
+                        created_at, started_at, updated_at, finished_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, 1, 'queued', 'queued', 1,
+                             ?7, ?8, ?9, ?10, ?10, NULL, 1, 1, '[]', '[]', NULL,
+                             ?11, NULL, ?11, NULL)",
+                    params![
+                        operation_id.to_string(),
+                        kind.as_str(),
+                        organization_id.to_string(),
+                        application_id.map(|id| id.to_string()),
+                        target_kind,
+                        target_id.to_string(),
+                        sha256_hex(operation_id.to_string().as_bytes()),
+                        sha256_hex(b"test"),
+                        actor_id.to_string(),
+                        CanonicalId::new_v7().to_string(),
+                        now,
+                    ],
+                )?;
+                Ok::<_, CatalogError>(())
+            })
+            .await
+            .unwrap();
+        operation_id
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -780,24 +733,19 @@ mod tests {
                 .unwrap(),
         );
         let store = CatalogStore::new(database);
-        store.create_app("shop").await.unwrap();
-        store
-            .create_environment("shop", "production")
-            .await
-            .unwrap();
-        let plan = store.plan_identity_migration("shop").await.unwrap();
+        let application = store.create_app("shop").await.unwrap().canonical_id;
+        let operation_id = store
+            .insert_test_operation(OperationKind::Build, Some(application))
+            .await;
         let queued = store
-            .product_operation(plan.operation_id)
+            .product_operation(operation_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(queued.kind, OperationKind::Migrate);
+        assert_eq!(queued.kind, OperationKind::Build);
         assert_eq!(queued.state, OperationState::Queued);
-        assert_eq!(
-            queued.scope.application_id,
-            Some(plan.canonical_application_id)
-        );
-        assert_eq!(queued.target.expected_revision, 2);
+        assert_eq!(queued.scope.application_id, Some(application));
+        assert_eq!(queued.target.expected_revision, 1);
         assert!(queued.started_at.is_none());
         let json = serde_json::to_value(&queued).unwrap();
         for field in [
@@ -829,13 +777,7 @@ mod tests {
         }
 
         let running = store
-            .transition_product_operation(
-                plan.operation_id,
-                1,
-                OperationEvent::Start,
-                "inventory",
-                None,
-            )
+            .transition_product_operation(operation_id, 1, OperationEvent::Start, "inventory", None)
             .await
             .unwrap();
         assert_eq!(running.state, OperationState::Running);
@@ -844,7 +786,7 @@ mod tests {
         assert!(
             store
                 .transition_product_operation(
-                    plan.operation_id,
+                    operation_id,
                     1,
                     OperationEvent::Wait,
                     "inventory",
@@ -870,21 +812,23 @@ mod tests {
                 .unwrap(),
         );
         let store = CatalogStore::new(database);
-        store.create_app("shop").await.unwrap();
+        let application = store.create_app("shop").await.unwrap().canonical_id;
         let production = store
             .create_environment("shop", "production")
             .await
             .unwrap()
             .canonical_id;
-        let plan = store.plan_identity_migration("shop").await.unwrap();
+        let original = store
+            .insert_test_operation(OperationKind::Build, Some(application))
+            .await;
 
-        // A migration is scoped to the application alone.
+        // This one is scoped to the application alone.
         let (operation, names) = store
-            .product_operation_with_scope_names(plan.operation_id)
+            .product_operation_with_scope_names(original)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(operation.kind, OperationKind::Migrate);
+        assert_eq!(operation.kind, OperationKind::Build);
         assert_eq!(operation.scope.environment_id, None);
         assert_eq!(names, None);
 
@@ -925,7 +869,7 @@ mod tests {
                 .unwrap();
             copy
         }
-        let live = copy_scoped_to(&store, plan.operation_id, production.to_string()).await;
+        let live = copy_scoped_to(&store, original, production.to_string()).await;
         let (operation, names) = store
             .product_operation_with_scope_names(live)
             .await
@@ -934,7 +878,7 @@ mod tests {
         assert_eq!(
             names,
             Some(OperationScopeNames {
-                application_id: plan.canonical_application_id,
+                application_id: application,
                 environment_id: production,
                 application_name: "shop".to_string(),
                 environment_name: "production".to_string(),
@@ -943,8 +887,7 @@ mod tests {
         assert_eq!(operation.operation_id, live);
         assert_eq!(operation.scope.environment_id, Some(production));
 
-        let gone =
-            copy_scoped_to(&store, plan.operation_id, CanonicalId::new_v7().to_string()).await;
+        let gone = copy_scoped_to(&store, original, CanonicalId::new_v7().to_string()).await;
         let (_, names) = store
             .product_operation_with_scope_names(gone)
             .await
@@ -970,13 +913,9 @@ mod tests {
                 .unwrap(),
         );
         let store = CatalogStore::new(Arc::clone(&database));
-        store.create_app("shop").await.unwrap();
-        store
-            .create_environment("shop", "production")
-            .await
-            .unwrap();
-        let plan = store.plan_identity_migration("shop").await.unwrap();
-        let operation_id = plan.operation_id;
+        let operation_id = store
+            .insert_test_operation(OperationKind::Restore, None)
+            .await;
         let duplicated = serde_json::to_string(&[operation_id, operation_id]).unwrap();
         database
             .with_connection(move |connection| {
@@ -1006,86 +945,5 @@ mod tests {
         assert!(valid_driver_id("tencent-edgeone.cli1"));
         assert!(!valid_driver_id("wrangler"));
         assert!(!valid_driver_id("cloudflare..wrangler"));
-    }
-
-    #[tokio::test]
-    async fn idempotency_replays_a_terminal_operation_and_rejects_name_reuse() {
-        let directory = TempDir::new().unwrap();
-        let database = Arc::new(
-            Database::init(directory.path().join("control.sqlite"))
-                .await
-                .unwrap(),
-        );
-        let store = CatalogStore::new(Arc::clone(&database));
-        store.create_app("shop").await.unwrap();
-        store
-            .create_environment("shop", "production")
-            .await
-            .unwrap();
-        let context = OperationRequestContext::new(
-            "terminal-replay-key",
-            "POST\n/api/apps/shop/identity-migration\nv1",
-            "account:operator".to_string(),
-            CanonicalId::new_v7(),
-            CanonicalId::new_v7(),
-        )
-        .unwrap();
-        let planned = store
-            .plan_identity_migration_with_operation("shop", context.clone(), None)
-            .await
-            .unwrap();
-        let cancelling = store
-            .transition_product_operation(
-                planned.operation_id,
-                1,
-                OperationEvent::CancelRequested,
-                "release-fences",
-                None,
-            )
-            .await
-            .unwrap();
-        store
-            .transition_product_operation(
-                planned.operation_id,
-                cancelling.revision,
-                OperationEvent::Cancelled,
-                "release-fences",
-                None,
-            )
-            .await
-            .unwrap();
-        let migration_id = planned.migration_id;
-        database
-            .with_connection(move |connection| {
-                connection.execute(
-                    "UPDATE identity_migrations
-                        SET state = 'failed', error_code = 'OPERATION_CANCELLED'
-                      WHERE migration_id = ?1",
-                    [migration_id.to_string()],
-                )?;
-                Ok::<(), crate::database::DatabaseError>(())
-            })
-            .await
-            .unwrap();
-
-        let replayed = store
-            .plan_identity_migration_with_operation("shop", context.clone(), None)
-            .await
-            .unwrap();
-        assert_eq!(replayed.migration_id, planned.migration_id);
-        assert_eq!(replayed.operation_id, planned.operation_id);
-
-        store.delete_app("shop").await.unwrap();
-        store.release_retired_name("shop").await.unwrap();
-        store.create_app("shop").await.unwrap();
-        store
-            .create_environment("shop", "production")
-            .await
-            .unwrap();
-        let error = store
-            .plan_identity_migration_with_operation("shop", context, None)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("different request target"));
     }
 }

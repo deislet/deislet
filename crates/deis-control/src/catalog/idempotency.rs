@@ -26,11 +26,13 @@
 //! naming `secret_key_file`) rather than falling back to a weaker digest.
 //!
 //! Every record names the scheme its digest was computed under
-//! (`digest_scheme`, currently [`DIGEST_SCHEME`]). A replay that finds a
-//! record written under another scheme cannot compare digests, so it is
-//! refused as `idempotency-key-reused`, exactly like a changed request:
-//! the client sends a new key. Records expire within a day, so this only
-//! touches keys first used just before an upgrade that changed the scheme.
+//! (`digest_scheme`, [`DIGEST_SCHEME`]; the table's CHECK admits that one
+//! value). A scheme change is a schema change: it adds its tag to the CHECK,
+//! and a replay that then finds a record written under the other scheme
+//! cannot compare digests, so it is refused as `idempotency-key-reused`,
+//! exactly like a changed request: the client sends a new key. Records
+//! expire within a day, so this only touches keys first used just before
+//! such an upgrade.
 //!
 //! Life cycle of a record:
 //!
@@ -98,9 +100,8 @@ pub const IDEMPOTENCY_REQUEST_IN_PROGRESS: &str = "idempotency-request-in-progre
 /// [`DIGEST_SCHEME`] with it so old records are refused instead of never
 /// matching silently.
 pub const DIGEST_KEY_PURPOSE: &str = "deislet-control-idempotency-digest-v1";
-/// The scheme tag new records are written with. `sha256-v1` (an unkeyed
-/// SHA-256 salted only with the client key) was the scheme before the
-/// keyed digest and is only ever read, never written.
+/// The scheme tag every record is written with: an HMAC-SHA-256 under the
+/// key derived for [`DIGEST_KEY_PURPOSE`].
 pub const DIGEST_SCHEME: &str = "hmac-sha256-v1";
 
 const DIGEST_DOMAIN: &str = "deislet-api-idempotency-v1";
@@ -901,82 +902,6 @@ mod tests {
             IdempotencyDigestKey::for_tests(42).key.as_bytes()
         );
         assert_eq!(derived.key.purpose(), DIGEST_KEY_PURPOSE);
-    }
-
-    /// A record written before the keyed digest existed (`sha256-v1`)
-    /// cannot be compared with a keyed digest, so the key is refused as
-    /// reused instead of being replayed or silently re-run.
-    #[tokio::test]
-    async fn a_record_under_another_digest_scheme_is_refused_as_reused() {
-        let store = store().await;
-        let request =
-            keyed_request("provider_installation.register", "key-0001", b"{\"a\":1}").unwrap();
-        let guard = expect_fresh(&store, "account:alice", &request).await;
-        let resource = sample_resource(1);
-        complete_in_transaction(&store, &guard, 201, &resource, true).await;
-        // Rows are immutable, so the legacy scheme is put in place by
-        // rewriting the row with the same identity under the old tag.
-        let record_id = guard.record_id();
-        store
-            .db
-            .with_connection(move |connection| {
-                let transaction = connection.unchecked_transaction()?;
-                transaction.execute_batch(
-                    "CREATE TEMP TABLE legacy AS SELECT * FROM api_idempotency_records;
-                     DELETE FROM api_idempotency_records;
-                     INSERT INTO api_idempotency_records
-                        (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
-                         digest_scheme, request_sha256, state, response_status, resource_kind,
-                         resource_id, resource_revision, created_at, completed_at, expires_at)
-                     SELECT record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
-                            'sha256-v1', request_sha256, state, response_status, resource_kind,
-                            resource_id, resource_revision, created_at, completed_at, expires_at
-                       FROM legacy;
-                     DROP TABLE legacy;",
-                )?;
-                let scheme: String = transaction.query_row(
-                    "SELECT digest_scheme FROM api_idempotency_records WHERE record_id = ?1",
-                    [record_id.to_string()],
-                    |row| row.get(0),
-                )?;
-                assert_eq!(scheme, "sha256-v1");
-                transaction.commit()?;
-                Ok::<_, CatalogError>(())
-            })
-            .await
-            .unwrap();
-
-        let error = store
-            .begin(scope("account:alice"), &request)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, CatalogError::Conflict(_)));
-        assert!(error.to_string().starts_with(IDEMPOTENCY_KEY_REUSED));
-        assert!(error.to_string().contains("digest scheme"));
-        assert!(
-            error
-                .to_string()
-                .contains(&resource.installation_id.to_string())
-        );
-        // A new key is the way forward, and it records the current scheme.
-        let fresh =
-            keyed_request("provider_installation.register", "key-0002", b"{\"a\":1}").unwrap();
-        let guard = expect_fresh(&store, "account:alice", &fresh).await;
-        let record_id = guard.record_id();
-        let scheme = store
-            .db
-            .with_connection(move |connection| {
-                connection
-                    .query_row(
-                        "SELECT digest_scheme FROM api_idempotency_records WHERE record_id = ?1",
-                        [record_id.to_string()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map_err(CatalogError::from)
-            })
-            .await
-            .unwrap();
-        assert_eq!(scheme, DIGEST_SCHEME);
     }
 
     /// A clock that steps backwards between `begin` and the mutation's

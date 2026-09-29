@@ -47,18 +47,15 @@ all parsing and compiling to this crate.
 ```bash
 deis validate
 deis build                      # 全部目标 | every target
-deis build --vendor cloudflare
-cargo run -p deis-build -- node-npm-limits  # build ceilings as JSON
+deis build --target cloudflare
 ```
 
-`deis-build` 自己也有一个同名二进制，参数相同，用于不带平台侧功能时直接调编译器。
-There is also a `deis-build` binary with the same flags, for driving the
-compiler without any of the platform-side commands.
+这个 crate 没有自己的二进制；命令行只有 `deis`。
+This crate has no binary of its own; the command line is `deis`.
 
-`node-npm-limits` is side-effect free and reports the exact Node/npm
-toolchain, package/file/octet, expansion, timeout, and live-monitor ceilings
-before a build starts. The same values are available to library callers as
-`deis_build::node_npm_build_limits()`.
+`deis_build::node_npm_build_limits()` reports the exact Node/npm toolchain,
+package/file/octet, expansion, timeout and live-monitor ceilings a build
+enforces, without reading a project.
 
 ### 作为库使用 | Use as Library
 
@@ -92,11 +89,10 @@ let result = compiler.build().await?;
 
 | 中文 | English | 说明 Description |
 |------|---------|-----------------|
-| [快速开始](./docs/quickstart.zh.md) | [Quick Start](./docs/quickstart.md) | 5 分钟上手 |
+| — | [Quick Start](../deis/QUICKSTART.md) | 从 `deis init` 到部署 From `deis init` to a deployment |
 | [库使用指南](./docs/library-usage.zh.md) | — (stub) | 作为 Rust 库使用 |
 | [输出模式](./docs/output-modes.zh.md) | [Output Modes](./docs/output-modes.md) | Files/Memory/Both 模式 |
 | [基础服务](./docs/basic-services.zh.md) | [Basic Services](./docs/basic-services.md) | KV 和 Cache 说明 |
-| [错误系统](./docs/error-system.zh.md) | — (stub) | 错误分类和处理 |
 | [适配器规范](./docs/adapter-specs.zh.md) | — (stub) | 各平台适配器要产出什么 |
 | [贡献指南](./docs/contributing.zh.md) | [CONTRIBUTING.md](../deis/CONTRIBUTING.md) | 如何参与开发 |
 | [deislet 目标](./docs/deislet-target.zh.md) | [The deislet target](./docs/deislet-target.md) | 应用包格式与自建平台目标 Bundle format and the platform's own target |
@@ -145,14 +141,14 @@ deis-build/
 └── docs/                # Documentation, *.md and *.zh.md side by side
 
 ../deis-build-core/              # Core types & target artifact coverage
-../deis-build-adapter-cloudflare/  # --vendor cloudflare
-../deis-build-adapter-deno/        # --vendor deno
-../deis-build-adapter-tencent/     # --vendor tencent  (Tencent EdgeOne)
-../deis-build-adapter-deislet/     # --vendor deislet  (the application bundle)
+../deis-build-adapter-cloudflare/  # --target cloudflare
+../deis-build-adapter-deno/        # --target deno
+../deis-build-adapter-tencent/     # --target tencent  (Tencent EdgeOne)
+../deis-build-adapter-deislet/     # --target deislet  (the application bundle)
 ```
 
-适配器 crate 名就是 `--vendor` 的取值本身，一一对应，不用查表。
-Each adapter crate is named after the `--vendor` value it answers for, so no
+适配器 crate 名就是 `--target` 的取值本身，一一对应，不用查表。
+Each adapter crate is named after the `--target` value it answers for, so no
 table has to be consulted; a `VENDOR` constant and a test comparing it with
 `CARGO_PKG_NAME` keep the two from drifting.
 

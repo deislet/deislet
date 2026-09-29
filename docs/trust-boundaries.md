@@ -138,9 +138,8 @@ The control plane's human listener still carries `EstablishChannel` as well,
 and it admits nobody there: that listener has no acceptor, so no connection on
 it proves a name, and the handshake message says so rather than checking a
 field (`crates/deis-control/src/api/grpc.rs`). The HTTP routes a node used to
-call are not mounted anywhere - `deis_wire::conventions::NODE_REGISTRATION_ROUTE`,
-`deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`, `/api/routing-table` and the
-bundle download all answer **404** on the human listener, to every caller, with
+call are not mounted anywhere - node registration, the assignment list,
+`/api/routing-table` and the bundle download all answer **404** on the human listener, to every caller, with
 or without a credential. Not 401: a credential cannot bring them back.
 
 ## How a person proves who they are
@@ -184,7 +183,6 @@ one file.
 
 | Value | Held by | What holding it is worth |
 |---|---|---|
-| `store_migration_admin_token`, `queue_migration_admin_token`, `telemetry_migration_admin_token` | deis-control and the backend it names | Freeze and inventory any tenant in that backend. Each is independent of the others and of every other credential. |
 | the master key in `secret_key_file` | deis-control alone | Not shared between machines, but one key for every tenant: every environment's secrets in the database are encrypted with it (`crates/deis-control/src/catalog/secrets.rs`). The encrypted rows are worth nothing without it and everything with it. |
 
 ## Telemetry
@@ -203,9 +201,9 @@ what it may touch, one (tenant, binding) pair each:
 
 | Binding | Issued to | What it allows |
 |---|---|---|
-| `ingest` for `<app>.<env>` | a node, over the machine channel (`IssueCapability`), for each application environment it runs | Push that tenant's logs, traces and metric samples. A record for any tenant the capability does not name is refused and counted as rejected. It reads nothing. |
+| `ingest` for `v1/<application id>/<environment id>` | a node, over the machine channel (`IssueCapability`), for each application environment it runs | Push that tenant's logs, traces and metric samples. Every application record carries its canonical tenant beside the `app_id` and environment names, and a record whose tenant the capability does not name is refused and counted as rejected. It reads nothing. |
 | `ingest` for `@platform` | every node, whatever it runs | Push the node's own records - the ones with no application (process metrics, component log lines). |
-| `read` for `<app>.<env>` | a person, from `GET /api/v1/apps/{app}/environments/{env}/telemetry-token` (needs `read:{app}/{env}`) or `GET /api/v1/apps/{app}/telemetry-token` (needs `read:{app}/*`, every environment) | Query and follow that tenant's records and nothing else: a read must name an application the capability reaches, and whatever comes back is filtered to the tenants it names. It writes nothing. |
+| `read` for `v1/<application id>/<environment id>` | a person, from `GET /api/v1/apps/{app}/environments/{env}/telemetry-token` (needs `read:{app}/{env}`) or `GET /api/v1/apps/{app}/telemetry-token` (needs `read:{app}/*`, every environment) | Query and follow that tenant's records and nothing else: a read must name an application, and whatever comes back is filtered to the tenants the capability names - by id, so an application deleted and created again under the same name reads none of the old one's records. It writes nothing. |
 | `read` for `@platform` | a person holding `read:*/*`, from `GET /api/platform/telemetry-token` | Read everything, every tenant and the nodes' own records. The Prometheus page is every series at once, so it accepts only this. |
 
 Every mint on the human side is recorded in the audit log whatever its
@@ -354,13 +352,13 @@ Everything below is therefore the operator's to enforce:
 
 | File | Required |
 |---|---|
-| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds `store_migration_admin_token`, `queue_migration_admin_token` and `telemetry_migration_admin_token`, and names the `[machine]` identity files. The three migration values must be different from each other and from every other credential. |
+| The control plane's configuration (`-c`) | `0600`, owned by the service user. It holds no credential value; it names the `[machine]` identity files and the `secret_key_file`. |
 | The control plane's `secret_key_file` | `0600`. This is the master key every secret in the database is encrypted with; the encrypted rows are worth nothing without it, and everything with it. |
 | The control plane's `<data_dir>/bootstrap.token` | `0600`, written by the control plane itself on a first start and deleted the moment the bootstrap token is used. Until then it is an operator credential - it exists to create the first owner account and nothing else - so treat it like one and do not let it out of the host. It is not part of a backup of the data directory: it is short-lived by design, and backing one up means carrying an unused way in. |
 | Every machine's `[machine]` / `[machine_identity]` private key, with its certificate and trust root | `0600` on the private key at least, owned by that process's service user. This file is not shared - that is the whole reason a leaked copy only ever names the one machine it belongs to - but a node's private key still opens that node's certificate identity, and a compromised node's `FetchSecretValues` still answers for every environment's secrets. Certificate issuance, renewal and revocation are outside this platform; only the mode and the ownership are this document's business. What the platform can do with a compromised node's name is revoke the node (see "Taking capabilities back"): the control plane then answers that name nothing and every verifier refuses its capabilities, whatever certificate proves it. |
 | Every node's configuration | `0600`, owned by the node's service user. It holds no shared credential - its telemetry capability is issued by the control plane at run time - but the file names the path of this node's private key and the one control plane this node obeys - which is what decides who may deploy to it. |
 | deis-proxy's configuration | `0600`, owned by the proxy's service user. Same contents, same reasoning, on the one host that faces the internet. |
-| deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. They hold the independent `migration_admin_token` - possession of it can freeze and inventory any tenant in that backend - and name the service's `[machine_identity]` files. The private key is `0600` like every other machine's: whoever holds a store's key can answer for a store and collect the capabilities sent to it. |
+| deis-store, deis-queue and deis-telemetry configurations | `0600`, owned by the service user. They hold no credential value and name the service's `[machine_identity]` files. The private key is `0600` like every other machine's: whoever holds a store's key can answer for a store and collect the capabilities sent to it. |
 | `.demo/` written by `scripts/demo.sh` | The demo writes every configuration it generates, `state.env`, `secret.key` and every private key it mints as `0600`; `scripts/test-demo-witnesses.sh` holds it to that statically. Five of those files carry a credential value - `state.env`, `secret.key` and the store, queue and control-plane configurations - and the node's and the proxy's carry a path to a key file instead. It is still a workstation tool: it puts every process under one user, so the mode separates the demo from other accounts on the host and nothing else. Do not copy a `.demo/` configuration into a real deployment. |
 
 ## Rotating the credential
@@ -508,10 +506,17 @@ if it was still valid (give or take 30 seconds) when the last list arrived,
 is at most 24 hours past its expiry, and neither it nor its node is revoked
 by that list. Human
 capabilities never get grace. Each verifier exports `deis_auth_degraded`,
-`deis_auth_degraded_since_seconds`, `deis_auth_grace_accepted_total` and
+`deis_auth_degraded_since_seconds`, `deis_auth_grace_accepted_total` (per
+`tenant` the accepted capability named) and
 `deis_auth_revocation_last_sync_seconds` - deis-telemetry on its `/metrics`,
 deis-store and deis-queue on `metrics_listen` when it is set (loopback
 only, like every Prometheus port here).
+
+A verifier refuses every capability - UNAVAILABLE, not a verdict on the
+caller - until it has adopted its first signed revocation list: before that,
+"not revoked" would only mean "not known to be revoked". It makes its first
+attempt before it starts serving, so beside a reachable control plane this
+costs nothing.
 
 A verifier **restarted** while the control plane is unreachable has adopted
 no list and holds no keys (the JWKS is not persisted either), so it refuses
@@ -541,9 +546,9 @@ looks like a missing filter and is not one.
 takes a `node_id`, uses it for log lines, and builds the answer from
 `list_assignments()` - the whole catalog. The machine channel does check that a
 caller asks for its *own* id and refuses a mismatch, so no node can ask for
-another node's list. But the list it gets for itself carries every
-application's decrypted secrets, and adding a filter there would change
-nothing: a deployment plan's `target_ids` comes from
+another node's list. But the list it gets for itself names every
+application's deployment, and with it every secret revision the node may then
+fetch with `FetchSecretValues`; adding a filter there would change nothing: a deployment plan's `target_ids` comes from
 `Deliverer::serving_target_ids` (`crates/deis-control/src/delivery/mod.rs`),
 which is every node the control plane knows of. There is no placement model in
 this release - no way to say that an application runs on some nodes and not
@@ -581,6 +586,7 @@ application), and then the scoping follows from it. See
   deploying the control plane, including the firewall rules this document sets
   the requirements for.
 - [crates/deis-control/API_DOCUMENTATION.md](../crates/deis-control/API_DOCUMENTATION.md) -
-  the HTTP API in detail.
+  the rules every HTTP route shares; the endpoint reference is
+  [contracts/openapi/v1.json](../contracts/openapi/v1.json).
 - [docs/architecture.zh.md](architecture.zh.md) - the design these boundaries
   fall out of.

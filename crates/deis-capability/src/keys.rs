@@ -151,7 +151,9 @@ impl KeyRing {
 /// strings in a log line helps nobody.
 impl std::fmt::Debug for KeyRing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KeyRing").field("kids", &self.kids()).finish()
+        f.debug_struct("KeyRing")
+            .field("kids", &self.kids())
+            .finish()
     }
 }
 

@@ -351,15 +351,3 @@ fn restrict(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-
-#[cfg(not(unix))]
-fn restrict(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a plain directory", path.display()),
-        ));
-    }
-    Ok(())
-}

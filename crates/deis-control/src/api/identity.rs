@@ -138,10 +138,10 @@ pub async fn create_account(
 /// Read one account.
 #[utoipa::path(
     get,
-    path = "/api/v1/accounts/{name}",
+    path = "/api/v1/accounts/{account}",
     operation_id = "getAccount",
     tag = "product",
-    params(("name" = String, Path, description = "The account's name.")),
+    params(("account" = String, Path, description = "The account's name.")),
     responses(
         (status = 200, description = "The account.", body = Account),
         (status = 404, response = openapi::NotFound),
@@ -170,10 +170,10 @@ pub struct UpdateAccountRequest {
 /// Change an account's role, or disable it.
 #[utoipa::path(
     patch,
-    path = "/api/v1/accounts/{name}",
+    path = "/api/v1/accounts/{account}",
     operation_id = "updateAccount",
     tag = "product",
-    params(("name" = String, Path, description = "The account's name.")),
+    params(("account" = String, Path, description = "The account's name.")),
     request_body = UpdateAccountRequest,
     responses(
         (status = 200, description = "The account after the change.", body = Account),

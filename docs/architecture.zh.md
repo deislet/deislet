@@ -130,8 +130,9 @@ secret / logs / tail），后来又加了读调用轨迹的 `trace` 和数据面
 新构建的部署链不再只把 Deislet bundle 当作来源。CLI 先上传同一 provider-neutral Edge Canon
 Build Output；Control 在隔离目录中完整验证并按 application UUIDv7/manifest SHA-256 保存，再接收
 绑定该 parent 的 Deislet derivation 与 native bundle。版本记录同时保存两项 lineage，后续 deployment
-继续引用不可变 version。历史 `--bundle` 仍可经兼容入口上传，但没有 lineage；它不会被标成已验证
-canonical artifact。当前 Edge Canon 锁仍是 proposal，因而 catalog record 的 `deployable` 保持 false，
+继续引用不可变 version。CLI 只走这条链路：没有 canonical artifact 与 derivation 证据的 bundle
+不部署。控制面的 native bundle 直传入口仍在，由它上传的版本没有 lineage，也就不能派生到其他
+provider。当前 Edge Canon 锁仍是 proposal，因而 catalog record 的 `deployable` 保持 false，
 这与实验性自建后端允许测试部署是两个不同状态，也不构成 provider compliance/support 证据。
 
 ### deis-runtime 的定位变化
@@ -226,17 +227,17 @@ deis-runtime 本地 SQLite 只缓存「本节点当前该跑哪些应用的哪�
 
 | 对象 | 现状 |
 |---|---|
-| APP | 有。`apps` 表 + `/api/apps` |
+| APP | 有。`apps` 表 + `/api/v1/apps` |
 | ENVIRONMENT | 有。`environments` 表；名字必须满足 `is_valid_tenant_part`（不许含 `.` `/` `\`，半边不超 64 字节），否则存储租户会被拆成三段而全废 |
 | VERSION | 有。`versions` 表，写入后永不修改；包体存控制面本地，`bundle_sha` 是内容哈希 |
 | DEPLOYMENT | 有。`deployments` 表只追加；某环境的当前版本 = 该 env 下最新一行。schema-2 行同时固定 immutable environment snapshot identity |
-| ROUTE | 有，且被消费了。`routes` 表存 host + path_prefix + priority；`GET /api/routes` 给控制台看，另有一份给数据面看的路由表（多带环境名、所有存在的环境、整表版本号），deis-proxy 每 5 秒经机队通道的 `FetchRoutingTable` 拉一次并按它选应用，没配机队身份的 proxy 仍走 `GET /api/routing-table`（见 §4） |
+| ROUTE | 有，且被消费了。`routes` 表存 host + path_prefix + priority；`GET /api/platform/routes` 给控制台看，另有一份给数据面看的路由表（多带环境名、所有存在的环境、整表版本号），deis-proxy 每 5 秒经机队通道的 `FetchRoutingTable` 拉一次并按它选应用；没有机队身份的 proxy 拉不到（见 §4） |
 | SECRET | 有。AES-256-GCM immutable revision + 每环境/name head；主密钥从 `secret_key_file` 读。面板与 CLI 只能写、列 metadata 和删 head，明文读不回来 |
 | CRON | 有，且挂对了对象：调度器按 `(app_id, environment)` 维护，到点调某一个节点的 `Trigger.OnScheduled` |
 | ASSET | 有。打进包里，节点建内存索引，命中直接返回并带 ETag。同一份包里还带着这个站点自己的规则——`_redirects`、`_headers` 和「路径谁都没认领时答什么」，构建期解析、装载时编译（见 §4） |
 | BINDING / NAMESPACE | 控制面**没有**这张表，也不打算建——具名绑定是**包的属性**，`bindings` 块写在 manifest 里随版本走，形状由 `deis-bundle` 唯一定义。所以「一个应用一个环境只有一份 KV」这条限制早已不在，见 §8 |
 | ACCOUNT / API_TOKEN | 有。`accounts`（名字、角色、停用时刻）与 `api_tokens`（所属账号、来源、作用域、是否无作用域、最后使用与吊销时刻）。token 在库里只留密的那一半的 sha256，所以读到这两张表的人手上没有一把能用的钥匙 |
-| AUDIT_LOG | 有，且**只增不改**：全仓没有一处 UPDATE 或 DELETE 它，`DELETE /api/audit` 是 405（连没有作用域的那把 key 也一样）。改状态的调用和被拒的调用一样记，被拒的那条还记下「本来需要什么作用域」 |
+| AUDIT_LOG | 有，且**只增不改**：全仓没有一处 UPDATE 或 DELETE 它，`DELETE /api/v1/audit` 是 405（连没有作用域的那把 key 也一样）。改状态的调用和被拒的调用一样记，被拒的那条还记下「本来需要什么作用域」 |
 | RETIRED_APP_NAME | 有。删掉一个应用并不能删掉它在 deis-store / deis-queue 里的数据（两个服务都没有「丢掉一个租户」这个动作），所以名字被扣下而不是放回去：`retired_app_names` 记着它铺到过哪些租户，有人明确放出来之前，没有第二个应用能用这个名字接手那些数据 |
 
 ---
@@ -255,10 +256,10 @@ sequenceDiagram
 
     Dev->>CLI: deis deploy
     CLI->>CLI: 编译打包（函数 + 路由表 + 静态资产 → bundle.zip）
-    CLI->>R: POST /api/apps（不存在才建）
-    CLI->>R: POST /api/apps/{app}/versions（上传 zip）
+    CLI->>R: POST /api/v1/apps（不存在才建）
+    CLI->>R: POST /api/v1/apps/{app}/versions（上传 zip）
     R->>R: 算 sha256，建 VERSION v(N+1)
-    CLI->>R: POST /api/apps/{app}/environments（不存在才建）
+    CLI->>R: POST /api/v1/apps/{app}/environments（不存在才建）
     CLI->>R: POST .../deployments（先持久化 immutable plan）
     par PREPARE 全部冻结节点
         R->>X: ApplyDeployment(PREPARE, plan, generation, snapshot)
@@ -437,7 +438,7 @@ sequenceDiagram
 
     rect rgb(232, 245, 233)
     Note over X,D: ⑥ 存储
-    X->>D: 带 x-deis-tenant 调用（值是 <应用>.<环境>）
+    X->>D: 带 capability 调用（租户是它命名的 v1/<应用 id>/<环境 id>）
     loop 队列消费
         X->>D: Pull（带租约时长）→ 交给 queue 导出 → Ack / Nack
     end
@@ -477,11 +478,10 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 **协议名字不在这份文档里写死。** 机队通道认的是 `deis_wire::machine::MachineChannel`
 里的 `Register`、`Deregister`、`FetchAssignments`、`FetchRoutingTable`，定义在
 `crates/deis-wire/proto/machine.proto`。放进 deis-wire 是因为没有任何东西会检查
-两个 crate 有没有把同一个方法名对上——这正是从前这里的坑：`deis_wire::conventions::
-{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}` 这两个 HTTP 路径常量当年就因为
-两边拼得不一样（节点请求 `/register`、控制面提供 `/registration`）造成过一支永远
-学不会自己有哪些节点的机队。那两个 HTTP 常量还在 deis-wire 里，但现在只挂在测试用的
-路由上；真正跑起来的节点和 proxy 走的是上面那几个 RPC 名字。上面时序图里的中文标注
+两个 crate 有没有把同一个方法名对上——这正是从前这里的坑：节点登记还走 HTTP 时，
+两边把路径拼得不一样（节点请求 `/register`、控制面提供 `/registration`），造成过一支
+永远学不会自己有哪些节点的机队。那组 HTTP 路径常量已随 HTTP 回落路径一起删除；节点和
+proxy 只走上面那几个 RPC 名字。上面时序图里的中文标注
 是为了看得懂，真值以 `machine.proto` 为准。
 
 ---
@@ -502,14 +502,16 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 ### 租户维度只有一个，值是「应用 + 环境」
 
 两个组件都只认**一个**租户维度，**不认版本、不认部署，也不知道「环境」是什么**。
-它们收到的租户 id 是一个不透明的字符串，走带外的 `x-deis-tenant` 头传递
-（gRPC metadata），所以 proto 消息里没有租户字段。
+租户是一个应用环境的 canonical id `v1/<应用 id>/<环境 id>`（`deis_wire::CanonicalTenantId`），
+它不在请求里：服务从调用携带的已验证 capability 中取出它为本 binding 命名的唯一租户
+（为同一 binding 命名零个或多个租户的 capability 整次被拒），所以 proto 消息里没有租户字段，
+也没有可以伪造的租户头。
 
-这个串由调用方用 `deis_wire::conventions::tenant_id(app, environment)` 拼出来，形如
-`demo.production`；服务端用同一个 crate 的 `split_tenant` 校验，只接受恰好两段合法
-部分，因此没有哪个取值能拼出上级目录（租户 id 会变成磁盘路径 `db/<tenant>.sqlite`、
-`blob/<tenant>/…`）。缺头、非可打印 ASCII、或校验不过（裸 app id、三段、空段、含
-`.` `/` `\`、半边超 64 字节）一律回 `PermissionDenied`，绝不退回某个默认命名空间。
+落盘时租户编码为 `ct1_<应用 id>_<环境 id>`，named binding 追加 `@<名字>`（数据库文件
+`db/<key>.sqlite`、对象目录 `blob/<key>/…`）。这个 key 不含 `.` `/` `\`，没有哪个取值能
+拼出上级目录；binding 名不合法（含 `.`、`@`、`/`、空、超 64 字节）一律回
+`PermissionDenied`，绝不退回某个默认命名空间。因为是永久 id，删掉一个应用再用同名重建，
+新应用拿到的是新 id，看不到旧数据。
 
 **为什么把环境揉进这把钥匙**：原则 10 说每个环境有自己的数据。如果预览环境和生产共用
 一个命名空间，预览的一次写就能覆盖掉生产的键——而这是回滚救不回来的，回滚只换代码，
@@ -564,9 +566,7 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 
 ### 授权：调用方要证明自己有资格声称这个租户
 
-**这里写清楚，免得被上面那段租户校验误导**：`split_tenant` 只检查
-`x-deis-tenant` 的**形状**（两段合法部分，不含 `.` `/` `\`）。这一节说的是**身份**
-——凭什么相信提出这个租户的调用方真的有权代表它。
+这一节说的是**身份**——凭什么相信调用方有权代表 capability 命名的那个租户。
 
 做法是能力令牌：调用方在 `Authorization: Bearer` 头里带一个控制面用 Ed25519 签发的
 capability（`deis_capability`），写明 audience（`store` / `queue`）、若干
@@ -579,9 +579,8 @@ channel 拉取 JWKS 公钥与签名的吊销名单，按 `kid` 验签。部署�
 Blob / Queue 调用都把它带上（`crates/deis-store/src/auth.rs`、`deis-queue` 的对应
 实现），应用代码摸不到它。
 
-验证的顺序刻意是「先看调用方声称的租户，再看令牌是否为这个租户、这个 binding 签发」，
-而不是反过来拿令牌去决定租户——一份从某个应用那里泄漏出去的令牌，换到别的租户身上
-立刻被拒，包括同一个应用的另一个环境。令牌 15 分钟过期，可按 `jti`、节点、租户单独
+租户由令牌决定，请求里没有任何字段能改它——一份从某个应用那里泄漏出去的令牌，只能
+碰到签发给它的那个租户，碰不到别的租户，包括同一个应用的另一个环境。令牌 15 分钟过期，可按 `jti`、节点、租户单独
 吊销，也可递增 `auth_epoch` 批量作废（见 `docs/trust-boundaries.md` 的「Taking
 capabilities back」）。
 
@@ -589,10 +588,10 @@ capabilities back」）。
 gRPC 监听只说 TLS。启动时缺 `[machine_identity]` 直接拒绝启动。这和控制面的节点通道
 是同一个形状：a7ba508 起那条通道只认证书，`node_preshared_keys` 这个字段已删除。
 
-没带令牌、令牌对不上租户或 binding、或者干脆没带 `x-deis-tenant`，三种
+没带令牌、令牌对不上 binding、或者令牌没有为这个 binding 恰好命名一个租户，三种
 情况都在拿到任何数据**之前**被拒——tonic 拦截器挡在每个 handler 前面
 （`crates/deis-store/src/server.rs` 的 `guarded`），新增第四个服务也不可能漏掉这一层。
-拒绝一律以 `warn` 记日志，带上声称的租户，可追查。健康检查端点刻意例外：它不回答
+拒绝一律以 `warn` 记日志，可追查。健康检查端点刻意例外：它不回答
 任何租户的数据，只说这个进程能不能应答，要求它也带令牌，控制面就做不出一个不知道
 任何租户令牌的存活探针了。
 
@@ -725,24 +724,16 @@ fence，不把这种管理能力交给普通 producer/reader。
 
 ## 8. 服务声明与密钥
 
-### 服务：先有「用不用」，后来又有了 bindings 表
+### 服务：只有具名绑定
 
-第一层是**用不用**某个服务，写在包的 manifest 里：
+应用用到的存储服务只有一种声明方式：manifest 里的**具名绑定**。没有「按种类开关」的
+无名声明，也没有与具名绑定并列的无名命名空间。节点按绑定表构造对应的客户端放进
+Isolate 的 `OpState`；没声明的绑定连接都不建，`context.env.<名字>` 上也就没有它。地址来自
+控制面下发的环境表里的保留键（`DEIS_STORE_ENDPOINT` / `DEIS_QUEUE_ENDPOINT` /
+`DEIS_BINDINGS` / `DEIS_QUEUE_CONSUMERS`），这些键在进 Isolate 之前被取走。
 
-```json
-{ "services": { "kv": true, "database": true, "blob": false, "queue": true } }
-```
-
-节点按这份声明构造对应的客户端放进 Isolate 的 `OpState`；没声明的服务连接都不建，
-对应的 `context.env.<binding>` 就是「不可用」。地址来自控制面下发的环境表里的保留键
-（`DEIS_STORE_ENDPOINT` / `DEIS_QUEUE_ENDPOINT` / `DEIS_SERVICES` /
-`DEIS_QUEUE_CONSUMERS`），这些键在进 Isolate 之前被取走。
-
-第二层是**具名绑定**。早前这里写的是「不做 bindings 表」，理由是那张表上的
-`namespace` 一列没内容可填：租户已经由 `(应用, 环境)` 唯一决定。这条判断后来被推翻了
-——不是因为租户变了，而是因为「一个应用一个环境只有一份 KV」本身就是个限制：热数据和
-冷数据、两套互不相干的索引，只能挤在同一个键空间里靠前缀分家。现在 manifest 里有一张
-`bindings` 表（形状定义在 `deis-bundle/src/bindings.rs`，构建 / 控制面 / 节点 / isolate
+一个应用一个环境可以有多个同种绑定：热数据和冷数据、两套互不相干的索引，各占一个
+命名空间，而不是挤在同一个键空间里靠前缀分家。manifest 里的 `bindings` 表（形状定义在 `deis-bundle/src/bindings.rs`，构建 / 控制面 / 节点 / isolate
 四方共用一份）：
 
 ```json
@@ -759,8 +750,7 @@ fence，不把这种管理能力交给普通 producer/reader。
 **租户边界一点没动**：绑定名是在能力令牌验过之后、由
 `deis_wire::conventions::namespace_id` 拼到租户后面的（`shop.production@HOT`），
 分隔符 `@` 在租户两段和绑定名里都非法，所以这个拼法是单射的——没有哪一对
-`(租户, 绑定)` 能拼出另一对的命名空间。schema 1 原生 bundle 仍能读取旧的无名
-`services` 声明，使既有部署与数据可迁移；生成的标准 HTTP context 不暴露这套入口。
+`(租户, 绑定)` 能拼出另一对的命名空间。
 绑定名判重
 不分大小写（它会变成 deis-store 里的目录名和文件名），`ASSETS` 和 `DEIS_` 开头的名字
 是保留的。队列绑定不需要这套拼法：deis-queue 本来就是按 `(租户, 队列名, id)` 存的。
@@ -1048,7 +1038,7 @@ Edge Canon 合规或正式支持；这些当前状态只来自
 | 环境变量 | 成立 | 控制面下发的 `env` 表注入 `context.env`，平台保留键先被取走 |
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
 | KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本。读写删之外还有四样：`put` 可带 `expirationTtl`（从写入起算的相对秒数）与一段不透明的 `metadata`；`get` 可以按 `type: text / json / arrayBuffer` 取；`getWithMetadata` 一次把值、metadata 和到期时刻取回来（它们本来就是同一行的三列）；`list({ prefix, limit, cursor })` 按游标翻页，每条自带 metadata 与到期时刻。服务端另有一个 `Has`，**目前没有任何调用方**——op 表、JS 绑定和命令行都够不到它，只有 `KvClient` 自己的测试在调 |
-| Cache API | 成立 | 标准应用入口是 `globalThis.caches.default`；`caches.open(name)` 另开一个互不串门的命名空间。原生迁移对象 `context.services.cache` 指向同一实例，但不会穿过标准 HTTP 桥。后端是 moka 进程内缓存，语义上是单 Isolate 缓存；body 已按字节传递 |
+| Cache API | 成立 | 标准应用入口是 `globalThis.caches.default`；`caches.open(name)` 另开一个互不串门的命名空间。后端是 moka 进程内缓存，语义上是单 Isolate 缓存；body 已按字节传递 |
 | 生命周期 `waitUntil` | HTTP Draft 语义已落实；其他事件待独立能力族 | HTTP context 在 handler 与响应 body 生命周期结束后关闭登记；多任务 all-settled，拒绝不截断同伴，短响应流结束也不会清掉仍被后台任务使用的定时器。后台宽限仍未冻结。WebSocket 消息处理器没有标准 tail，登记项会被丢弃并记录 warn，不能把该路径算作 HTTP 合规证据 |
 | 结构化日志 | 成立 | 环形缓冲 + `LogShipper` → deis-telemetry，`Query` 能查回来 |
 | Web 标准 | 成立（8.1 节的部分） | 见下方「Web 标准这一格的实情」 |
@@ -1209,7 +1199,7 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | 对象存储 | Deislet 实现成立，标准仍 Draft | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；标准 HTTP 应用从声明的 `context.env.<BLOB_BINDING>` 取得。读写之外还有 `list`、`head`、范围读取与条件写；当前接口仍等待 Edge Canon `logical-resource-bindings` 能力族冻结，不能只凭本地端到端测试宣称跨平台合规 |
 | 消息队列 | 成立 | deis-queue 的 `Send`/`SendBatch`/`Pull`/`Ack`/`Nack`/`ListDeadLetters`/`ReplayDeadLetters` + 节点的 `queue_consumer` 轮询任务；`sendBatch()` 一次投一批，落库是一个事务，所以整批要么都进去要么一条都没有，失败之后原样重发是安全的；试过太多次的消息进死信表，`deis queue dead-letters` 能看、`deis queue replay` 能放回；消息体按字节走（`queue.proto` 的 `body` 是 `bytes`），`send()` 接受字符串、普通对象或 `ArrayBuffer`/`ArrayBufferView`；消费端 `message.body` 是发送时的原文，body 不是合法 UTF-8 时为 `null`，只能靠 `message.bytes()` 读 |
 | 定时任务 | 成立 | 控制面按 `(app, environment)` 调度 → 节点 `Trigger.OnScheduled` → 跑 `scheduled` 导出 |
-| 具名绑定 | Deislet 实现成立，标准仍 Draft | manifest 的 `bindings` 块由构建、控制面、节点、isolate 共用。标准 HTTP 应用只从 `context.env.<名字>` 取得；`context.bindings` / `context.services` 不属于四字段 ABI。租户与命名空间隔离已实现，但跨平台资源接口和部署映射仍须由 Edge Canon 能力族及真实供应商证据冻结 |
+| 具名绑定 | Deislet 实现成立，标准仍 Draft | manifest 的 `bindings` 块由构建、控制面、节点、isolate 共用。应用只从 `context.env.<名字>` 取得；运行时没有 `context.bindings` / `context.services`，任何类型的 handler 读它们都会被构建拒绝。租户与命名空间隔离已实现，但跨平台资源接口和部署映射仍须由 Edge Canon 能力族及真实供应商证据冻结 |
 | 应用间调用（service bindings） | Deislet 实现成立，标准仍 Draft | `bindings` 里 `"kind": "service"` 的那一种，标准 HTTP 入口为 `context.env.AUTH.fetch(...)`。节点内无地址派发、双方授权、默认同环境、子请求计费、深度上限 4 与环拒绝均已实现；跨平台语义仍等待对应能力族冻结 |
 | 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match`。站点自己的规则也在：`_redirects`（按作者顺序，首条命中者胜；200 是改写、404 是带 404 状态返回目标）、`_headers`（所有命中的块叠加、靠后的覆盖靠前的，同一个块里一个名字写两遍就发两条——`Link` 与 `Set-Cookie` 不许合并成一条，`! 名字` 去掉前面设过的该名字的全部取值）、以及 `assets.notFound` 三选一的兜底（`none` / `404-page` / `single-page-app`）。三样都在构建期解析、写错就构建失败并报出行号，在节点装载那一版时编译成表。函数想主动取包里的文件走 `env.ASSETS.fetch()`——`ASSETS` 是保留键，应用设不了同名变量把它顶掉 |
 | WebAssembly | 成立 | V8 自带 |

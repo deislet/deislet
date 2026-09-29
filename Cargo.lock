@@ -1022,15 +1022,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "camino"
-version = "1.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb1307f12aa967b5a58416e87b3653360e0fd614a016b6e970db08fecbb1b80d"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
 name = "capacity_builder"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1050,29 +1041,6 @@ checksum = "3b4a6cae9efc04cc6cbb8faf338d2c497c165c83e74509cf4dbedea948bbf6e5"
 dependencies = [
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "cargo-platform"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e35af189006b9c0f00a064685c727031e3ed2d8020f7ba284d78cc2671bd36ea"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "cargo_metadata"
-version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d886547e41f740c616ae73108f6eb70afe6d940c7bc697cb30f13daec073037"
-dependencies = [
- "camino",
- "cargo-platform",
- "semver",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1423,19 +1391,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7feb5cb312f774e8a24540e27206db4e890f7d488563671d24a16389cf4c2e4e"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "console"
-version = "0.15.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "054ccb5b10f9f2cbf51eb355ca1d05c2d279ce1804688d0db74b4733a5aeafd8"
-dependencies = [
- "encode_unicode",
- "libc",
- "once_cell",
- "unicode-width 0.2.2",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2040,7 +1995,6 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-build",
- "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -2066,30 +2020,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "deis-backend-migration"
-version = "0.1.0"
-dependencies = [
- "deis-wire",
- "prost 0.13.5",
- "prost-build",
- "protoc-bin-vendored",
- "rusqlite",
- "sha2",
- "tempfile",
- "tokio",
- "tonic",
- "tonic-build",
- "tracing",
-]
-
-[[package]]
 name = "deis-backend-topology"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
  "clap 4.6.6",
- "deis-backend-migration",
  "deis-queue",
  "deis-store",
  "deis-telemetry",
@@ -2101,7 +2037,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
  "tracing-subscriber",
 ]
 
@@ -2111,7 +2046,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "clap 4.6.6",
  "colored",
  "deis-artifact",
  "deis-build-adapter-cloudflare",
@@ -2123,14 +2057,11 @@ dependencies = [
  "deis-runtime",
  "deis-wire",
  "hex",
- "indicatif",
  "pathdiff",
  "serde",
- "serde_jcs",
  "serde_json",
  "sha2",
  "swc_common 18.0.1",
- "swc_core",
  "swc_ecma_ast 20.0.1",
  "swc_ecma_parser 34.0.0",
  "swc_ecma_transforms_base 37.0.0",
@@ -2138,7 +2069,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "unicode-normalization",
  "walkdir",
  "windows-sys 0.61.2",
@@ -2152,10 +2082,7 @@ dependencies = [
  "anyhow",
  "deis-build-core",
  "deis-wire",
- "handlebars",
- "serde",
  "serde_json",
- "walkdir",
 ]
 
 [[package]]
@@ -2167,7 +2094,6 @@ dependencies = [
  "deis-bundle",
  "deis-wire",
  "hex",
- "serde",
  "serde_json",
  "sha2",
  "walkdir",
@@ -2180,9 +2106,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "deis-build-core",
- "serde",
  "serde_json",
- "walkdir",
 ]
 
 [[package]]
@@ -2192,7 +2116,6 @@ dependencies = [
  "anyhow",
  "deis-build-core",
  "serde_json",
- "walkdir",
 ]
 
 [[package]]
@@ -2218,10 +2141,8 @@ name = "deis-bundle"
 version = "0.1.0"
 dependencies = [
  "deis-wire",
- "hex",
  "serde",
  "serde_json",
- "sha2",
  "tracing",
  "zip",
 ]
@@ -2260,7 +2181,6 @@ dependencies = [
  "chrono",
  "dashmap 6.2.1",
  "deis-artifact",
- "deis-backend-migration",
  "deis-build-adapter-cloudflare",
  "deis-build-core",
  "deis-bundle",
@@ -2311,6 +2231,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "yasm",
+ "zeroize",
  "zip",
 ]
 
@@ -2369,7 +2290,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -2377,7 +2297,6 @@ dependencies = [
 name = "deis-provider-driver-cloudflare"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "chrono",
  "deis-build-adapter-cloudflare",
@@ -2438,17 +2357,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
- "deis-backend-migration",
  "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",
  "deis-wire",
  "ed25519-dalek",
- "hex",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
- "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2477,7 +2393,6 @@ dependencies = [
  "axum-server",
  "base64 0.22.1",
  "bytes",
- "chrono",
  "clap 4.6.6",
  "ctor",
  "dashmap 5.5.3",
@@ -2504,6 +2419,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
+ "libc",
  "moka",
  "num_cpus",
  "once_cell",
@@ -2540,17 +2456,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap 4.6.6",
- "deis-backend-migration",
  "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",
  "deis-wire",
  "ed25519-dalek",
- "hex",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
- "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2576,7 +2489,6 @@ dependencies = [
  "axum",
  "chrono",
  "clap 4.6.6",
- "deis-backend-migration",
  "deis-capability",
  "deis-identity",
  "deis-identity-test-pki",
@@ -2585,7 +2497,6 @@ dependencies = [
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
- "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2607,9 +2518,7 @@ dependencies = [
 name = "deis-wire"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
- "futures-util",
  "hex",
  "prost 0.13.5",
  "prost-build",
@@ -4579,12 +4488,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
-name = "encode_unicode"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
-
-[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5327,20 +5230,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "handlebars"
-version = "5.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d08485b96a0e6393e9e4d1b8d48cf74ad6c063cd905eb33f42c1ce3f0377539b"
-dependencies = [
- "log",
- "pest",
- "pest_derive",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "hash2curve"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6027,19 +5916,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
-]
-
-[[package]]
-name = "indicatif"
-version = "0.17.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
-dependencies = [
- "console",
- "number_prefix",
- "portable-atomic",
- "unicode-width 0.2.2",
- "web-time",
 ]
 
 [[package]]
@@ -7154,12 +7030,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "number_prefix"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
-
-[[package]]
 name = "objc2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8177,48 +8047,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pest"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a07a60cc7a4d00c91f95c685609d1d2f79050e6804b70ebedd7650f0b839bcf"
-dependencies = [
- "memchr",
- "ucd-trie",
-]
-
-[[package]]
-name = "pest_derive"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3a83744a5c8455b8b3e0dc5031362780a347c878bdd11584d1a8984228cc88d"
-dependencies = [
- "pest",
- "pest_generator",
-]
-
-[[package]]
-name = "pest_generator"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0cd3451aa3de60d4b9a1e736885e4dea6b31617598026f12256ad566d63304a"
-dependencies = [
- "pest",
- "pest_meta",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "pest_meta"
-version = "2.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e04d3a0849e241d7dfce834c83b1c5edc8622009e8dd51a12ba1927c32f05496"
-dependencies = [
- "pest",
-]
-
-[[package]]
 name = "petgraph"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9022,26 +8850,6 @@ checksum = "4dcd034599e63b970727f70d79e02d62390a4a84f7c6b827c27c46d5ac3fa622"
 dependencies = [
  "ar_archive_writer",
  "cc",
-]
-
-[[package]]
-name = "ptr_meta"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0738ccf7ea06b608c10564b31debd4f5bc5e197fc8bfe088f68ae5ce81e7a4f1"
-dependencies = [
- "ptr_meta_derive",
-]
-
-[[package]]
-name = "ptr_meta_derive"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16b845dbfca988fa33db069c0e230574d15a3088f147a87b64c7589eb662c9ac"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
 ]
 
 [[package]]
@@ -10383,10 +10191,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-dependencies = [
- "serde",
- "serde_core",
-]
 
 [[package]]
 name = "seq-macro"
@@ -11011,19 +10815,6 @@ dependencies = [
 
 [[package]]
 name = "swc_allocator"
-version = "0.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76aa0eb65c0f39f9b6d82a7e5192c30f7ac9a78f084a21f270de1d8c600ca388"
-dependencies = [
- "bumpalo",
- "hashbrown 0.14.5",
- "ptr_meta",
- "rustc-hash 1.1.0",
- "triomphe",
-]
-
-[[package]]
-name = "swc_allocator"
 version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d7eefd2c8b228a8c73056482b2ae4b3a1071fbe07638e3b55ceca8570cc48bb"
@@ -11124,16 +10915,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "swc_core"
-version = "0.100.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ff548cf185b9bb1ddaff5e5c74c1b79fb06b5f5e6f34a80d0faab211cb9972"
-dependencies = [
- "swc_allocator 0.1.10",
- "vergen",
-]
-
-[[package]]
 name = "swc_ecma_ast"
 version = "18.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11187,7 +10968,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "ryu-js 1.0.3",
  "serde",
- "swc_allocator 4.0.1",
+ "swc_allocator",
  "swc_atoms",
  "swc_common 17.0.1",
  "swc_ecma_ast 18.0.0",
@@ -12460,12 +12241,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
-name = "ucd-trie"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
-
-[[package]]
 name = "unarray"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12718,18 +12493,6 @@ name = "vec_map"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
-
-[[package]]
-name = "vergen"
-version = "8.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2990d9ea5967266ea0ccf413a4aa5c42a93dbcfda9cb49a97de6931726b12566"
-dependencies = [
- "anyhow",
- "cargo_metadata",
- "regex",
- "rustversion",
-]
 
 [[package]]
 name = "version_check"

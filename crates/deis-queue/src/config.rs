@@ -48,11 +48,6 @@ pub struct Config {
     /// IP address is accepted; anything else refuses to start.
     #[serde(default)]
     pub metrics_listen: Option<String>,
-    /// Independent credential for migration inventory and writer fencing.
-    /// If absent, the management gRPC service does not exist; there is no
-    /// loopback bypass and this must not reuse the application data secret.
-    #[serde(default)]
-    pub migration_admin_token: Option<String>,
     /// Directory holding the SQLite database.
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
@@ -184,7 +179,6 @@ impl Default for Config {
             listen: default_listen(),
             machine_identity: None,
             metrics_listen: None,
-            migration_admin_token: None,
             data_dir: default_data_dir(),
             connections: default_connections(),
             max_body_bytes: default_max_body_bytes(),
@@ -251,7 +245,6 @@ mod tests {
         let defaults = Config::default();
         assert_eq!(parsed.listen, defaults.listen);
         assert_eq!(parsed.machine_identity, defaults.machine_identity);
-        assert_eq!(parsed.migration_admin_token, defaults.migration_admin_token);
         assert_eq!(parsed.data_dir, defaults.data_dir);
         assert_eq!(parsed.connections, defaults.connections);
         assert_eq!(parsed.max_body_bytes, defaults.max_body_bytes);
@@ -342,8 +335,7 @@ mod tests {
     #[test]
     fn the_machine_identity_table_is_read_from_a_file() {
         let parsed: Config = toml::from_str(
-            "migration_admin_token = \"an-independent-migration-secret\"\n\
-             [machine_identity]\n\
+            "[machine_identity]\n\
              certificate = \"/etc/deis/queue.crt\"\n\
              private_key = \"/etc/deis/queue.key\"\n\
              trust_root = \"/etc/deis/ca.crt\"\n\
@@ -353,10 +345,6 @@ mod tests {
         assert_eq!(
             parsed.machine_identity.expect("the table").control_endpoint,
             "https://control.internal:8101"
-        );
-        assert_eq!(
-            parsed.migration_admin_token.as_deref(),
-            Some("an-independent-migration-secret")
         );
         assert!(Config::default().machine_identity.is_none());
     }

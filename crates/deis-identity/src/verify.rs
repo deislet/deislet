@@ -123,10 +123,10 @@ impl ClientCertVerifier for VerifyPeerIsInTrustDomain {
 /// Checks the certificate a connecting peer presents against one role.
 ///
 /// [`VerifyPeerIsInTrustDomain`] accepts any machine this fleet signed. Some
-/// listeners take traffic from one kind of machine only - the runtime node's
-/// data port takes application traffic forwarded by proxies and nothing else
-/// - and a name that is in the trust domain but is a node's, or a control
-/// plane's, is refused here for the same reason the management plane refuses
+/// listeners take traffic from one kind of machine only (the runtime node's
+/// data port takes application traffic forwarded by proxies and nothing
+/// else), and a name that is in the trust domain but is a node's, or a
+/// control plane's, is refused here for the same reason the management plane refuses
 /// a node's name: a certificate signed by our own authority is still only the
 /// machine its name says it is.
 #[derive(Debug)]

@@ -30,9 +30,9 @@
 
 mod assignments;
 pub mod capability_renewer;
-pub mod offline_cache;
 mod credential;
 mod fetch;
+pub mod offline_cache;
 mod registration;
 mod secret_cache;
 mod store;
@@ -80,16 +80,21 @@ pub use store::{
 /// decrypted.
 pub struct DeploymentOrder {
     pub app_id: String,
-    /// Permanent storage authority delivered by a canonical-aware control
-    /// plane. `None` is accepted only for rolling compatibility with an older
-    /// producer; it never means that the legacy name has become canonical.
-    pub canonical_tenant: Option<CanonicalTenantId>,
+    /// Permanent storage authority: the canonical application and
+    /// environment ids. The names above are what routing and application
+    /// code read; this is what storage and telemetry are charged to.
+    pub canonical_tenant: CanonicalTenantId,
     pub version_id: String,
     pub environment: String,
     pub bundle_url: String,
     pub bundle_sha: String,
+    /// The platform's wiring for this deployment: storage addresses and the
+    /// other reserved keys. The application's own config values and secrets
+    /// travel in [`Self::standard_environment`], never here.
     pub env: HashMap<String, String>,
-    pub standard_environment: Option<StandardEnvironmentOrder>,
+    /// The deployment's environment snapshot: every config value the version
+    /// declares and a revision for every secret it declares.
+    pub standard_environment: StandardEnvironmentOrder,
     /// What this version's manifest asked to be held to, as the control plane
     /// read it out of the manifest and sent it. `None` means the application
     /// declared nothing and takes this node's own ceilings.
@@ -102,26 +107,19 @@ pub struct DeploymentOrder {
     /// Which of the platform's answers this version expects, as the control
     /// plane resolved them out of the manifest it stored.
     ///
-    /// `None` means the control plane said nothing - an older one, or the
-    /// recovery path below, which reads nothing off the wire at all. It does
-    /// **not** mean "the oldest behaviour": the bundle's own manifest carries
-    /// the declaration and is what [`DeploymentManager::install`] resolves, so
-    /// a version recovered from this node's disk comes back on exactly the
-    /// date it was deployed with. That is the one difference from
-    /// [`Self::limits`], which cannot survive a disk recovery, and it is
-    /// deliberate: a narrower ceiling lost for a while is a slower
-    /// application, while a compatibility date lost for a while is an
-    /// application that quietly behaves differently.
+    /// `None` means the order carried nothing this node could resolve. It
+    /// does **not** mean "the oldest behaviour": the bundle's own manifest
+    /// carries the declaration and is what [`DeploymentManager::install`]
+    /// resolves.
     ///
     /// What this field is for is the refusal that has to happen *before* a
     /// bundle is downloaded, and the cross-check afterwards: if the control
     /// plane and the bundle disagree about what a version declared, one of
     /// them is wrong and an operator has to be told which.
     pub compatibility: Option<deis_bundle::CompatibilityProfile>,
-    /// Durable control-plane operation and immutable route generation. Both
-    /// are absent together only for a legacy/local producer.
-    pub deployment_id: Option<String>,
-    pub routing_generation: Option<String>,
+    /// Durable control-plane operation and immutable route generation.
+    pub deployment_id: String,
+    pub routing_generation: String,
 }
 
 /// Typed Edge Canon environment material sent beside a schema-2 bundle.
@@ -518,7 +516,7 @@ impl DeploymentManager {
     /// cannot be had is refused before its bundle is even downloaded.
     async fn resolve_secrets(
         &self,
-        deployment_id: Option<&str>,
+        deployment_id: &str,
         order: StandardEnvironmentOrder,
     ) -> Result<StandardEnvironmentOrder, DeployError> {
         let complete = order.snapshot.bindings.iter().all(|binding| match binding {
@@ -612,12 +610,15 @@ impl DeploymentManager {
             .clone()
     }
 
-    /// Apply a deployment the control plane pushed.
+    /// Install and activate a deployment in one step, with no coordinator
+    /// in between. The control plane never asks for this - it prepares and
+    /// then activates - but it is how a caller with a complete order in hand
+    /// puts it in service.
     ///
-    /// Always reloads, even when the version has not moved: a secret change
+    /// Always reloads, even when the version has not moved: a new snapshot
     /// produces no new version but does change what the isolate must see, and
     /// `context.env` is read when the isolate is built.
-    pub async fn apply(&self, mut order: DeploymentOrder) -> Result<Applied, DeployError> {
+    pub async fn apply(&self, order: DeploymentOrder) -> Result<Applied, DeployError> {
         let key = order.key();
         // Taken before `install` consumes the order, for the readiness below.
         let version_id = order.version_id.clone();
@@ -625,10 +626,10 @@ impl DeploymentManager {
         let _guard = lock.lock().await;
         let applied = match self
             .store
-            .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
+            .check_canonical_tenant(&key, order.canonical_tenant)
             .await
         {
-            Ok(()) => self.install(order, false, true).await,
+            Ok(()) => self.install(order, true).await,
             Err(error) => Err(DeployError::Identity(error.to_string())),
         };
 
@@ -660,24 +661,16 @@ impl DeploymentManager {
     }
 
     /// Prepare one immutable generation without moving the current selector.
-    pub async fn prepare(&self, mut order: DeploymentOrder) -> Result<Applied, DeployError> {
+    pub async fn prepare(&self, order: DeploymentOrder) -> Result<Applied, DeployError> {
         let key = order.key();
-        let generation = order
-            .routing_generation
-            .clone()
-            .ok_or_else(|| DeployError::Load("prepare requires routing_generation".to_string()))?;
-        if order.deployment_id.is_none() {
-            return Err(DeployError::Load(
-                "prepare requires deployment_id".to_string(),
-            ));
-        }
+        let generation = order.routing_generation.clone();
         let lock = self.lock_for(&key);
         let _guard = lock.lock().await;
         self.store
-            .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
+            .check_canonical_tenant(&key, order.canonical_tenant)
             .await
             .map_err(|error| DeployError::Identity(error.to_string()))?;
-        let result = self.install(order, false, false).await;
+        let result = self.install(order, false).await;
         if result.is_ok() {
             debug!(
                 app_id = %key.app_id(),
@@ -797,23 +790,13 @@ impl DeploymentManager {
     /// one, so "the version differs" says nothing about which instruction came
     /// first.
     ///
-    /// Skips an app that is already running the same version *with an
-    /// environment the control plane confirmed*, because that can only mean a
-    /// control-plane push landed while startup was still working through its
-    /// list - and that push is the newer instruction, plus it is the one that
-    /// carried the secrets.
-    ///
-    /// The second half of that condition is what makes it safe. The other way
-    /// to be "already on this version" is a legacy schema-1 deployment
-    /// recovered from local disk, where secret values are never written: that
-    /// copy runs the right code with an incomplete environment. Schema-2
-    /// standard deployments fail closed instead of recovering without their
-    /// exact snapshot. Comparing version ids alone would still wave the real
-    /// legacy delivery through, leaving it without secrets and storage
-    /// addresses while the node reported itself ready.
+    /// Skips an app that is already running the same version under the same
+    /// environment snapshot, because that can only mean a control-plane push
+    /// landed while startup was still working through its list - and that
+    /// push is the newer instruction.
     pub async fn apply_from_assignment(
         &self,
-        mut order: DeploymentOrder,
+        order: DeploymentOrder,
         as_of: u64,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
@@ -840,17 +823,14 @@ impl DeploymentManager {
         }
 
         self.store
-            .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
+            .check_canonical_tenant(&key, order.canonical_tenant)
             .await
             .map_err(|error| DeployError::Identity(error.to_string()))?;
 
         if let Some(current) = self.app_manager.installed_version(&key) {
-            let assigned_snapshot = order
-                .standard_environment
-                .as_ref()
-                .map(|environment| environment.snapshot_id.as_str());
+            let assigned_snapshot = order.standard_environment.snapshot_id.as_str();
             if current.version_id == order.version_id
-                && current.environment_snapshot_id.as_deref() == assigned_snapshot
+                && current.environment_snapshot_id.as_deref() == Some(assigned_snapshot)
             {
                 // The version record is this node's memory of what it
                 // installed; whether an isolate is still there is a separate
@@ -860,7 +840,7 @@ impl DeploymentManager {
                 // made that permanent: the control plane was told the
                 // assignment was satisfied on every pass, so the one thing
                 // that could have put the application back never ran.
-                if current.env_confirmed && self.app_manager.is_hosted(&key).await {
+                if self.app_manager.is_hosted(&key).await {
                     // A node can learn canonical identity while the deployed
                     // version stays unchanged. Persist that additive upgrade
                     // even though there is no reason to rebuild the isolate.
@@ -874,31 +854,20 @@ impl DeploymentManager {
                     );
                     return Ok(Applied::AlreadyRunning);
                 }
-                if current.env_confirmed {
-                    warn!(
-                        app_id = %key.app_id(),
-                        environment = %key.environment(),
-                        version_id = %order.version_id,
-                        "This node has version {} of {} installed but nothing running for it: \
-                         its isolate is gone. Installing it again so the application serves \
-                         here",
-                        order.version_id,
-                        key
-                    );
-                } else {
-                    info!(
-                        app_id = %key.app_id(),
-                        environment = %key.environment(),
-                        version_id = %order.version_id,
-                        "This legacy version was recovered from local disk and is running without the \
-                         secrets and storage addresses it declares; reloading it from the \
-                         control plane's copy so that its environment is complete"
-                    );
-                }
+                warn!(
+                    app_id = %key.app_id(),
+                    environment = %key.environment(),
+                    version_id = %order.version_id,
+                    "This node has version {} of {} installed but nothing running for it: \
+                     its isolate is gone. Installing it again so the application serves \
+                     here",
+                    order.version_id,
+                    key
+                );
             }
         }
 
-        self.install(order, false, true).await
+        self.install(order, true).await
     }
 
     /// Prepare an assignment-list generation without making it current.
@@ -910,18 +879,11 @@ impl DeploymentManager {
     /// selectors and background consumers untouched.
     pub async fn prepare_from_assignment(
         &self,
-        mut order: DeploymentOrder,
+        order: DeploymentOrder,
         as_of: u64,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
-        let generation = order.routing_generation.clone().ok_or_else(|| {
-            DeployError::Load("prepare assignment requires routing_generation".to_string())
-        })?;
-        if order.deployment_id.is_none() {
-            return Err(DeployError::Load(
-                "prepare assignment requires deployment_id".to_string(),
-            ));
-        }
+        let generation = order.routing_generation.clone();
         let lock = self.lock_for(&key);
         let _guard = lock.lock().await;
         if self.changed_since(&key, as_of) {
@@ -932,10 +894,10 @@ impl DeploymentManager {
             return Ok(Applied::Superseded { running_version_id });
         }
         self.store
-            .reconcile_canonical_tenant(&key, &mut order.canonical_tenant)
+            .check_canonical_tenant(&key, order.canonical_tenant)
             .await
             .map_err(|error| DeployError::Identity(error.to_string()))?;
-        let applied = self.install(order, false, false).await?;
+        let applied = self.install(order, false).await?;
         debug!(
             app_id = %key.app_id(),
             environment = %key.environment(),
@@ -952,121 +914,13 @@ impl DeploymentManager {
     fn record_for_order(order: &DeploymentOrder) -> InstalledRecord {
         InstalledRecord {
             app_id: order.app_id.clone(),
-            canonical_application_id: order.canonical_tenant.map(|tenant| tenant.application_id()),
+            canonical_application_id: order.canonical_tenant.application_id(),
             version_id: order.version_id.clone(),
             environment: order.environment.clone(),
-            canonical_environment_id: order.canonical_tenant.map(|tenant| tenant.environment_id()),
+            canonical_environment_id: order.canonical_tenant.environment_id(),
             bundle_sha: order.bundle_sha.clone(),
-            environment_snapshot_id: order
-                .standard_environment
-                .as_ref()
-                .map(|environment| environment.snapshot_id.clone()),
+            environment_snapshot_id: order.standard_environment.snapshot_id.clone(),
         }
-    }
-
-    /// Load whatever this node already has on disk.
-    ///
-    /// This is the answer to an unreachable control plane: the node keeps
-    /// serving what it was serving instead of coming up empty. The bundles on
-    /// disk carry no secrets. A legacy schema-1 application may therefore
-    /// start with an explicitly unconfirmed environment until reconciliation.
-    /// A schema-2 application cannot reconstruct its immutable typed snapshot
-    /// from the bundle alone and is not started at all until the control plane
-    /// redelivers it.
-    ///
-    /// The control loop runs this after the offline cache
-    /// (`offline_cache`), which restores deployments whole; what the cache
-    /// already brought back is skipped here, so this covers only the rest.
-    pub async fn recover_from_disk(&self) -> usize {
-        let records = self.store.records().await;
-        if records.is_empty() {
-            return 0;
-        }
-
-        let mut recovered = 0;
-        for record in records {
-            let key = record.key();
-            let canonical_tenant = match record.canonical_tenant() {
-                Ok(identity) => identity,
-                Err(error) => {
-                    // `BundleStore::records` already filters this shape. Keep
-                    // the check here as the authority boundary in case a
-                    // different record source is added later.
-                    error!(
-                        app_id = %record.app_id,
-                        environment = %record.environment,
-                        error = %error,
-                        "Refusing to recover a deployment with a partial canonical identity"
-                    );
-                    continue;
-                }
-            };
-            let lock = self.lock_for(&key);
-            let _guard = lock.lock().await;
-
-            if self.app_manager.installed_version(&key).is_some() {
-                continue;
-            }
-
-            let order = DeploymentOrder {
-                app_id: record.app_id.clone(),
-                canonical_tenant,
-                version_id: record.version_id.clone(),
-                environment: record.environment.clone(),
-                bundle_url: String::new(),
-                bundle_sha: record.bundle_sha.clone(),
-                env: HashMap::new(),
-                standard_environment: None,
-                // Not on disk, for the same reason the secrets are not: the
-                // record this node keeps is a pointer, and the limits arrive
-                // with the deployment. Coming back on the node's own ceilings
-                // is the safe direction - they are what the operator allows,
-                // and an application can only ever have asked for less - but
-                // an application that narrowed its own budget loses that
-                // narrowing until the control plane redelivers, which is why
-                // the recovery log below says so.
-                limits: None,
-                // Nothing is lost here, unlike the limits above: the
-                // compatibility declaration lives in the bundle's own
-                // manifest, which is on this node's disk, so `install` reads
-                // it back and the application comes up on the same date it
-                // was deployed with. A node restart that quietly moved an
-                // application onto different platform answers is exactly the
-                // failure the mechanism exists to prevent, so it must not be
-                // the recovery path that causes it.
-                compatibility: None,
-                deployment_id: None,
-                routing_generation: None,
-            };
-
-            match self.install(order, true, true).await {
-                Ok(_) => {
-                    recovered += 1;
-                    warn!(
-                        app_id = %record.app_id,
-                        version_id = %record.version_id,
-                        environment = %record.environment,
-                        "Recovered legacy {} version {} from this node's own disk because the control \
-                         plane could not be reached; it is serving, but any secret this app \
-                         declares is missing until the control plane redelivers, because \
-                         the offline cache did not cover it, and it runs on this node's \
-                         default ceilings rather than any narrower ones its manifest asked for",
-                        record.app_id,
-                        record.version_id
-                    );
-                }
-                Err(e) => error!(
-                    app_id = %record.app_id,
-                    version_id = %record.version_id,
-                    error = %e,
-                    "Could not recover {} from local disk; it is not serving on this node until \
-                     the control plane becomes reachable",
-                    record.app_id
-                ),
-            }
-        }
-
-        recovered
     }
 
     /// Stop serving an application here.
@@ -1192,21 +1046,14 @@ impl DeploymentManager {
     }
 
     /// The one path that ever changes what an app runs.
-    ///
-    /// `local_only` is the recovery case: no URL to fetch from, so the bundle
-    /// must already be on disk and is used as it stands.
     async fn install(
         &self,
         mut order: DeploymentOrder,
-        local_only: bool,
         activate: bool,
     ) -> Result<Applied, DeployError> {
         let key = order.key();
-        let environment_snapshot_id = order
-            .standard_environment
-            .as_ref()
-            .map(|environment| environment.snapshot_id.clone());
-        let installed_record = (!local_only).then(|| Self::record_for_order(&order));
+        let environment_snapshot_id = Some(order.standard_environment.snapshot_id.clone());
+        let installed_record = Self::record_for_order(&order);
         let routing_generation = order.routing_generation.clone();
         // Taken before the rest of the order is consumed piece by piece below.
         let limits = order.limits.take();
@@ -1223,14 +1070,11 @@ impl DeploymentManager {
 
         // Before the download: a deployment whose secrets cannot be had is
         // refused without spending a bundle fetch on it.
-        if let Some(environment) = order.standard_environment.take() {
-            order.standard_environment = Some(
-                self.resolve_secrets(order.deployment_id.as_deref(), environment)
-                    .await?,
-            );
-        }
+        order.standard_environment = self
+            .resolve_secrets(&order.deployment_id, order.standard_environment)
+            .await?;
 
-        let (bytes, reused_bundle) = self.bundle_bytes(&key, &order, local_only).await?;
+        let (bytes, reused_bundle) = self.bundle_bytes(&key, &order).await?;
         let bundle_bytes = bytes.len();
 
         // Inflating a zip and hashing every file in it is CPU work measured in
@@ -1277,10 +1121,9 @@ impl DeploymentManager {
 
         // The bundle's own manifest is the authority on which of the
         // platform's answers this version expects. It has to be: it is inside
-        // the archive whose digest this node just verified, it is what the
-        // control plane read, and it is still here on the recovery path where
-        // no order was ever received. A version's semantics belong to the
-        // version, not to the message that happened to deliver it.
+        // the archive whose digest this node just verified, and it is what the
+        // control plane read. A version's semantics belong to the version, not
+        // to the message that happened to deliver it.
         //
         // Refused rather than defaulted when it cannot be resolved. Every
         // answer this node could pick for an application whose declaration it
@@ -1346,69 +1189,28 @@ impl DeploymentManager {
             ),
         }
 
-        let (standard_env, standard_node_process_env) = materialize_standard_environment(
-            &manifest,
-            order.standard_environment.as_ref(),
-            local_only,
-        )?;
+        let (standard_env, node_process_env) =
+            materialize_standard_environment(&manifest, &order.standard_environment)?;
 
-        // The control plane already merges manifest variables with decrypted
-        // secrets, so its map wins. The manifest's own variables are the base
-        // so that a bundle recovered from disk still has them.
-        let mut env: HashMap<String, String> = manifest
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        // A bundle may not name a reserved platform key. deis-control drops
-        // these when it assembles a delivery, but a bundle recovered from this
-        // node's own disk never went through it, and a value left here would
-        // be read below as the address to build this app's storage clients
-        // against - letting the application pick where its own data goes.
-        // The values are dropped unlogged: they are the app's own text and one
-        // of these names can just as well hold a secret.
-        let declared_reserved = crate::runtime::strip_reserved_env(&mut env);
-        if !declared_reserved.is_empty() {
-            warn!(
-                app_id = %key.app_id(),
-                environment = %key.environment(),
-                version_id = %order.version_id,
-                keys = ?declared_reserved,
-                "This bundle's manifest declares {} variable(s) named like reserved platform \
-                 keys; they are dropped, so the application never sees them and cannot point \
-                 its storage clients at a host of its own choosing",
-                declared_reserved.len()
-            );
-        }
-        let declared_secrets = manifest.secrets.len();
-        env.extend(order.env);
-
-        if local_only && declared_secrets > 0 {
-            warn!(
-                app_id = %key.app_id(),
-                environment = %key.environment(),
-                secrets = declared_secrets,
-                "This app declares {} secret(s) and is being loaded from disk, where secret \
-                 values are deliberately never stored; handlers reading them will find them \
-                 missing until the control plane redelivers this deployment",
-                declared_secrets
-            );
-        }
+        // The platform's wiring, exactly as the control plane sent it; the
+        // application's own values are in `standard_env`.
+        let mut env: HashMap<String, String> = order.env;
 
         // The two halves of the storage wiring meet here. The control plane
         // knows the addresses and puts them in the deployment env; only the
-        // bundle's manifest says which services this app declared and which
+        // bundle's manifest says which bindings this app declared and which
         // queues it consumes. Without this call the reserved keys are
-        // incomplete, no storage client is ever built, and every
-        // `ctx.services.*` call answers "service not available".
+        // incomplete, no storage client is ever built, and every binding
+        // answers "service not available".
         crate::runtime::wire_deployment_env(&manifest, &mut env);
-        let mut legacy_node_process_env = env.clone();
-        crate::runtime::strip_reserved_env(&mut legacy_node_process_env);
-        let wired_services = env
-            .get(crate::runtime::SERVICES_KEY)
-            .cloned()
-            .unwrap_or_default();
-        if !wired_services.is_empty()
+        let wired_services = manifest.bindings.describe();
+        let wants_storage = manifest
+            .bindings
+            .kinds()
+            .into_iter()
+            .any(deis_bundle::BindingKind::is_storage)
+            || !manifest.queues.is_empty();
+        if wants_storage
             && !env.contains_key(crate::runtime::STORE_ENDPOINT_KEY)
             && !env.contains_key(crate::runtime::QUEUE_ENDPOINT_KEY)
         {
@@ -1416,17 +1218,17 @@ impl DeploymentManager {
                 app_id = %key.app_id(),
                 environment = %key.environment(),
                 version_id = %order.version_id,
-                services = %wired_services,
-                "This deployment carries no storage addresses, so the services this app \
-                 declares cannot be built; every ctx.services call it makes will fail until \
-                 the control plane is configured with store_endpoint / queue_endpoint"
+                bindings = %wired_services,
+                "This deployment carries no storage addresses, so the bindings and queue \
+                 consumers this app declares cannot be built; every call through them will fail \
+                 until the control plane is configured with store_endpoint / queue_endpoint"
             );
         }
 
         let config = AppConfig {
             env,
-            standard_env,
-            node_process_env: standard_node_process_env.unwrap_or(legacy_node_process_env),
+            standard_env: Some(standard_env),
+            node_process_env,
             routes: manifest.route_patterns(),
             // What the order carried, with anything it left out taken from
             // the version's own manifest; unjudged either way.
@@ -1438,6 +1240,7 @@ impl DeploymentManager {
             // Resolved once, here, and asked as a bit test on every request
             // from here on; see `deis_bundle::compatibility`.
             compatibility,
+            storage_tenant: Some(order.canonical_tenant),
             ..Default::default()
         };
 
@@ -1456,17 +1259,12 @@ impl DeploymentManager {
         let install = VersionInstall {
             key: key.clone(),
             version_id: order.version_id.clone(),
-            deployment_id: order.deployment_id.clone(),
-            routing_generation: order.routing_generation.clone(),
+            deployment_id: Some(order.deployment_id.clone()),
+            routing_generation: Some(order.routing_generation.clone()),
             environment_snapshot_id,
             entry_point: manifest.entry.clone(),
             code,
             config,
-            // A local recovery reconstructs everything except the secrets,
-            // which are never on disk. Saying so here is what lets the
-            // next delivery of this same version be recognised as the one
-            // that completes it, instead of being skipped as redundant.
-            env_confirmed: !local_only,
             assets: Arc::new(assets),
         };
         if activate {
@@ -1476,14 +1274,11 @@ impl DeploymentManager {
         }
         .map_err(|e| DeployError::Load(e.to_string()))?;
 
-        if let Some(record) = installed_record {
-            if activate {
-                self.store.remember(record).await;
-            } else {
-                let generation = routing_generation.expect("prepare validated a generation");
-                self.prepared_records
-                    .insert((key.clone(), generation), record);
-            }
+        if activate {
+            self.store.remember(installed_record).await;
+        } else {
+            self.prepared_records
+                .insert((key.clone(), routing_generation), installed_record);
         }
         if activate {
             self.store.prune(&key, &order.version_id).await;
@@ -1503,7 +1298,6 @@ impl DeploymentManager {
         &self,
         key: &AppKey,
         order: &DeploymentOrder,
-        local_only: bool,
     ) -> Result<(Vec<u8>, bool), DeployError> {
         let path = self
             .store
@@ -1557,14 +1351,6 @@ impl DeploymentManager {
             }
         }
 
-        if local_only {
-            return Err(DeployError::Storage(format!(
-                "no verified bundle for {} version {} on this node's disk, and there is no \
-                 control plane to fetch one from",
-                key, order.version_id
-            )));
-        }
-
         let temp = self.store.temp_path();
         let fetched = self
             .fetcher
@@ -1612,30 +1398,17 @@ impl DeploymentManager {
 /// `crate::app::ApplicationManager::effective_limits`'s decision, made once,
 /// where the node's own configuration is in scope.
 type MaterializedStandardEnvironment = (
-    Option<std::collections::BTreeMap<String, serde_json::Value>>,
-    Option<HashMap<String, String>>,
+    std::collections::BTreeMap<String, serde_json::Value>,
+    HashMap<String, String>,
 );
 
 fn materialize_standard_environment(
     manifest: &deis_bundle::Manifest,
-    order: Option<&StandardEnvironmentOrder>,
-    local_only: bool,
+    order: &StandardEnvironmentOrder,
 ) -> Result<MaterializedStandardEnvironment, DeployError> {
-    match (&manifest.environment, order) {
-        (None, None) => Ok((None, None)),
-        (None, Some(_)) => Err(DeployError::Environment(
-            "EC_ENV_DECLARATION_IDENTITY_MISMATCH: wire carries an environment snapshot but the bundle is schema 1"
-                .to_string(),
-        )),
-        (Some(_), None) if local_only => Err(DeployError::Environment(
-            "EC_ENV_SECRET_REVISION_UNAVAILABLE: a schema-2 deployment cannot recover from disk without its in-memory secret revision values; wait for control-plane reconciliation"
-                .to_string(),
-        )),
-        (Some(_), None) => Err(DeployError::Environment(
-            "EC_ENV_SNAPSHOT_INVALID: schema-2 bundle has no environment snapshot"
-                .to_string(),
-        )),
-        (Some(declarations), Some(order)) => {
+    let declarations = &manifest.environment;
+    {
+        {
             if declarations != &order.declarations {
                 return Err(DeployError::Environment(
                     "EC_ENV_DECLARATION_IDENTITY_MISMATCH: wire declaration differs from the bundle"
@@ -1681,10 +1454,7 @@ fn materialize_standard_environment(
                                         .to_string(),
                                 )
                             })?;
-                            node_process_env.insert(
-                                config.name.clone(),
-                                value.to_string(),
-                            );
+                            node_process_env.insert(config.name.clone(), value.to_string());
                         }
                     }
                     deis_wire::EnvironmentBinding::Secret(secret) => {
@@ -1704,7 +1474,7 @@ fn materialize_standard_environment(
                     }
                 }
             }
-            Ok((Some(values), Some(node_process_env)))
+            Ok((values, node_process_env))
         }
     }
 }

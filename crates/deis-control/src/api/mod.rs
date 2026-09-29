@@ -12,7 +12,6 @@ pub mod grpc;
 pub mod headers;
 pub mod identity;
 pub mod metrics;
-pub mod migrations;
 pub mod nodes;
 pub mod openapi;
 pub mod operations;
@@ -149,16 +148,8 @@ pub async fn build_api_router(
         catalog: Arc::clone(&catalog_state.store),
     };
 
-    let migration_state =
-        migrations::MigrationApiState::new(Arc::clone(&catalog_state.store), &config);
-    migration_state.resume_on_start();
-    let restore_state = restores::RestoreApiState::new(
-        Arc::clone(&catalog_state.store),
-        &config,
-        deis_runtime_manager
-            .machine_identity()
-            .map(deis_identity::ServiceTrust::from_identity),
-    );
+    let operation_state = operations::OperationApiState::new(Arc::clone(&catalog_state.store));
+    let restore_state = restores::RestoreApiState::new(Arc::clone(&catalog_state.store), &config);
     restore_state.resume_on_start();
 
     // One gate for the whole human surface. It resolves the credential into
@@ -192,7 +183,7 @@ pub async fn build_api_router(
         identity: identity_state,
         audit: audit_api_state,
         catalog: catalog_state.clone(),
-        migrations: migration_state,
+        operations: operation_state,
         restores: restore_state,
     };
 
@@ -271,7 +262,7 @@ struct HumanStates {
     identity: identity::IdentityApiState,
     audit: audit::AuditApiState,
     catalog: catalog::CatalogState,
-    migrations: migrations::MigrationApiState,
+    operations: operations::OperationApiState,
     restores: restores::RestoreApiState,
 }
 
@@ -308,11 +299,11 @@ fn product_router(prefix: &str, states: &HumanStates) -> Router {
         // log has no delete anywhere in this process.
         .route(&at("/audit"), get(audit::read_audit))
         .with_state(states.audit.clone())
-        // The catalog, the migrations and the restores bring their own
+        // The catalog, the operations and the restores bring their own
         // state, so they are merged as finished routers rather than threaded
         // through the chain above.
         .merge(catalog::router(prefix, states.catalog.clone()))
-        .merge(migrations::router(prefix, states.migrations.clone()))
+        .merge(operations::router(prefix, states.operations.clone()))
         .merge(restores::router(prefix, states.restores.clone()))
 }
 
@@ -630,7 +621,7 @@ async fn build_catalog_state(
     );
     if storage.has_no_endpoints() {
         warn!(
-            "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so every ctx.services.kv / database / blob / queue call an application makes answers \"service not available\" and declared queue consumers never start"
+            "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so no application's kv / database / blob / queue binding is available and declared queue consumers never start"
         );
     } else {
         info!(
@@ -663,15 +654,13 @@ async fn build_catalog_state(
     ) {
         (Some(root), Some(trust_root_path), trust_root_rotation_path) => {
             let trust_metadata =
-                deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file_compatible(
-                    trust_root_path,
-                )
-                .and_then(|trust_root| {
-                    trust_root_rotation_path
-                        .map(deis_provider_driver::ValidatedDriverTrustRootRotation::load_file)
-                        .transpose()
-                        .map(|rotation| (trust_root, rotation))
-                });
+                deis_provider_driver::ValidatedDriverReleaseTrustRoot::load_file(trust_root_path)
+                    .and_then(|trust_root| {
+                        trust_root_rotation_path
+                            .map(deis_provider_driver::ValidatedDriverTrustRootRotation::load_file)
+                            .transpose()
+                            .map(|rotation| (trust_root, rotation))
+                    });
             match trust_metadata {
                 Ok((trust_root, trust_root_rotation)) => {
                     match crate::catalog::ProviderDriverReleaseRegistry::new(
@@ -683,55 +672,47 @@ async fn build_catalog_state(
                     .await
                     {
                         Ok(registry) => {
-                            if registry
-                                .trust_root()
-                                .uses_legacy_missing_transparency_policy()
-                            {
-                                warn!(
-                                    installation_root = %registry.installation_root().display(),
-                                    host = %registry.host(),
-                                    trust_root_version = registry.trust_root().get().root_version,
-                                    trust_root_sha256 = %registry.trust_root().canonical_sha256(),
-                                    "Legacy provider driver trust root was loaded for recovery and rotation only; external provider execution remains disabled until a transparently governed root is active"
-                                );
-                                None
-                            } else {
-                                info!(
-                                    installation_root = %registry.installation_root().display(),
-                                    host = %registry.host(),
-                                    trust_root_version = registry.trust_root().get().root_version,
-                                    trust_root_sha256 = %registry.trust_root().canonical_sha256(),
-                                    "Signed and transparent provider driver release registry is enabled"
-                                );
-                                let work_root = config.data_dir.join("provider-work");
-                                let workspaces = deis_provider_driver::DriverWorkspaceRoot::new(
-                                    &work_root,
-                                    Arc::new(crate::catalog::CatalogPayloadSource::new(
-                                        Arc::clone(&provider_payloads),
+                            info!(
+                                installation_root = %registry.installation_root().display(),
+                                host = %registry.host(),
+                                trust_root_version = registry.trust_root().get().root_version,
+                                trust_root_sha256 = %registry.trust_root().canonical_sha256(),
+                                "Signed and transparent provider driver release registry is enabled"
+                            );
+                            let work_root = config.data_dir.join("provider-work");
+                            let workspaces = deis_provider_driver::DriverWorkspaceRoot::new(
+                                &work_root,
+                                Arc::new(crate::catalog::CatalogPayloadSource::new(Arc::clone(
+                                    &provider_payloads,
+                                ))),
+                            )
+                            .map_err(|error| {
+                                crate::catalog::CatalogError::BundleStorage(format!(
+                                    "provider driver workspace root {} is not usable: {error}",
+                                    work_root.display()
+                                ))
+                            });
+                            match workspaces.and_then(|workspaces| {
+                                crate::catalog::ProviderDriverDispatcher::new(
+                                    registry,
+                                    Arc::clone(&provider_credentials),
+                                    Arc::new(crate::catalog::CatalogOperationInputs::new(
+                                        store.as_ref().clone(),
+                                        Arc::clone(&secrets),
+                                        Arc::new(AuditStore::new(store.database())),
                                     )),
+                                    workspaces,
+                                    crate::catalog::provider_driver_release::driver_process_config(
+                                    ),
                                 )
-                                .map_err(|error| {
-                                    crate::catalog::CatalogError::BundleStorage(format!(
-                                        "provider driver workspace root {} is not usable: {error}",
-                                        work_root.display()
-                                    ))
-                                });
-                                match workspaces.and_then(|workspaces| {
-                                    crate::catalog::ProviderDriverDispatcher::new(
-                                        registry,
-                                        Arc::clone(&provider_credentials),
-                                        workspaces,
-                                        crate::catalog::provider_driver_release::driver_process_config(),
-                                    )
-                                }) {
-                                    Ok(dispatcher) => Some(Arc::new(dispatcher)),
-                                    Err(error) => {
-                                        error!(
-                                            error = %error,
-                                            "Provider driver dispatcher is unusable; external provider execution is disabled"
-                                        );
-                                        None
-                                    }
+                            }) {
+                                Ok(dispatcher) => Some(Arc::new(dispatcher)),
+                                Err(error) => {
+                                    error!(
+                                        error = %error,
+                                        "Provider driver dispatcher is unusable; external provider execution is disabled"
+                                    );
+                                    None
                                 }
                             }
                         }
@@ -768,6 +749,24 @@ async fn build_catalog_state(
             None
         }
     };
+
+    // A node revoked before this process started stays out of the fleet: a
+    // configured one is not driven, and none may register back. A ledger
+    // that cannot be read here is a control plane that cannot start safely.
+    match issuer.ledger().revoked_nodes().await {
+        Ok(revoked) => {
+            for node in &revoked {
+                nodes.revoke(node);
+            }
+            if !revoked.is_empty() {
+                warn!(nodes = ?revoked, "Revoked nodes are kept out of the fleet until an operator lifts their revocation");
+            }
+        }
+        Err(error) => panic!(
+            "cannot read which nodes are revoked, so no node could be told apart from a revoked \
+             one: {error}"
+        ),
+    }
 
     catalog::CatalogState {
         store: Arc::clone(&store),

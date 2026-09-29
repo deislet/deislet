@@ -7,15 +7,15 @@
 use deis_build_adapter_deno::{generate, ASSETS_DIR};
 use deis_build_core::{ProjectConfig, StaticAsset};
 
-fn test_config(name: &str, kv_enabled: bool) -> ProjectConfig {
+fn test_config(name: &str, kv_binding: bool) -> ProjectConfig {
     let mut v = serde_json::json!({
         "version": "1.0",
         "name": name,
         "runtime": "edge",
         "language": "typescript",
     });
-    if kv_enabled {
-        v["services"] = serde_json::json!({ "kv": { "enabled": true } });
+    if kv_binding {
+        v["bindings"] = serde_json::json!({ "KV": { "kind": "kv" } });
     }
     serde_json::from_value(v).expect("valid test project config")
 }

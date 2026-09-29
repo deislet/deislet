@@ -54,9 +54,6 @@ pub enum StoreError {
     /// act on: this one is understood perfectly well and declined. See
     /// [`crate::database`] for what is allowed and why.
     Refused(String),
-    /// A migration coordinator has durably fenced this tenant's writers.
-    /// Reads remain available for inventory and copy.
-    WriteFenced(String),
     /// SQLite refused or failed.
     Sqlite(rusqlite::Error),
     /// The filesystem refused or failed - or an inbound stream broke, which
@@ -70,9 +67,6 @@ pub enum StoreError {
     /// The peer stopped sending in the middle of a streamed request and did
     /// not close it either. Whatever it had sent is discarded.
     Stalled(String),
-    /// The data directory was written before storage was keyed by tenant, so
-    /// nothing in it can be read back. Startup only; see [`crate::legacy`].
-    LegacyData(String),
 }
 
 impl fmt::Display for StoreError {
@@ -88,12 +82,10 @@ impl fmt::Display for StoreError {
             Self::Exhausted(m) => write!(f, "at capacity: {m}"),
             Self::Expired(m) => write!(f, "expired: {m}"),
             Self::Refused(m) => write!(f, "refused: {m}"),
-            Self::WriteFenced(m) => write!(f, "write fenced: {m}"),
             Self::Sqlite(e) => write!(f, "sqlite: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::BlockingTask(m) => write!(f, "blocking task: {m}"),
             Self::Stalled(m) => write!(f, "stalled: {m}"),
-            Self::LegacyData(m) => write!(f, "data predates the tenant contract: {m}"),
         }
     }
 }
@@ -126,18 +118,6 @@ impl From<tokio::task::JoinError> for StoreError {
     }
 }
 
-impl From<deis_backend_migration::FenceError> for StoreError {
-    fn from(error: deis_backend_migration::FenceError) -> Self {
-        match error {
-            deis_backend_migration::FenceError::Fenced(receipt) => Self::WriteFenced(format!(
-                "tenant {:?} is frozen by migration {} at fence epoch {}; retry only after the migration coordinator releases or cuts over the namespace",
-                receipt.tenant, receipt.migration_id, receipt.fence_epoch
-            )),
-            other => Self::BlockingTask(other.to_string()),
-        }
-    }
-}
-
 impl From<StoreError> for Status {
     fn from(e: StoreError) -> Self {
         let code = match &e {
@@ -152,7 +132,6 @@ impl From<StoreError> for Status {
             // another tenant's handle, and for the same reason: retrying it
             // or getting a fresh token changes nothing.
             StoreError::Refused(_) => Code::PermissionDenied,
-            StoreError::WriteFenced(_) => Code::FailedPrecondition,
             StoreError::NotFound(_) => Code::NotFound,
             // The row exists but the bytes it points at do not: the caller
             // will never get this object back without operator repair.
@@ -176,7 +155,6 @@ impl From<StoreError> for Status {
             // Nothing the caller sent is wrong and no retry helps: the
             // service is standing on data it cannot use, and an operator has
             // to move it aside first.
-            StoreError::LegacyData(_) => Code::FailedPrecondition,
             StoreError::Sqlite(_) | StoreError::Io(_) | StoreError::BlockingTask(_) => {
                 Code::Internal
             }
@@ -216,15 +194,10 @@ mod tests {
             (StoreError::Expired("x".into()), Code::DeadlineExceeded),
             (StoreError::Refused("x".into()), Code::PermissionDenied),
             (
-                StoreError::WriteFenced("x".into()),
-                Code::FailedPrecondition,
-            ),
-            (
                 StoreError::Sqlite(rusqlite::Error::QueryReturnedNoRows),
                 Code::Internal,
             ),
             (StoreError::BlockingTask("x".into()), Code::Internal),
-            (StoreError::LegacyData("x".into()), Code::FailedPrecondition),
         ];
         for (err, want) in cases {
             let status: Status = err.into();

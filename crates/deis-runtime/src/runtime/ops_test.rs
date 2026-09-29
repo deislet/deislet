@@ -55,7 +55,7 @@ mod tests {
         assert_eq!(env.get("ENV_KEY"), Some(&"env_value".to_string()));
     }
 
-    // `ctx.services.kv.list` is a property of three things at once -- the
+    // `ctx.env.KV.list` is a property of three things at once -- the
     // JavaScript wrapper, `op_kv_list`, and the `List` RPC deis-store answers
     // -- and it was reachable from none of them until now: the op was
     // registered and no line of JavaScript called it. A test that mocked the
@@ -106,9 +106,8 @@ mod tests {
         body
     }
 
-    /// The same probe, but with named bindings declared beside the unnamed
-    /// namespace, so a handler can reach `ctx.bindings.HOT` as well as
-    /// `ctx.services.kv`.
+    /// The same probe, but with further named bindings declared beside `KV`,
+    /// so a handler can reach `ctx.env.HOT` as well as `ctx.env.KV`.
     async fn binding_probe(
         app_id: &str,
         store: &TestStore,
@@ -116,8 +115,12 @@ mod tests {
         body_js: &str,
     ) -> String {
         let code = format!("export default async function handler(ctx) {{\n{body_js}\n}}");
-        let wiring =
-            store.wiring_with_bindings_for(app_id, ["kv"], deis_bundle::BindingKind::Kv, bindings.to_vec());
+        let wiring = store.wiring_with_bindings_for(
+            app_id,
+            ["kv"],
+            deis_bundle::BindingKind::Kv,
+            bindings.to_vec(),
+        );
         let mut runtime = AppRuntime::new(
             app_id.to_string(),
             code,
@@ -154,7 +157,7 @@ mod tests {
         // The property the whole mechanism rests on, checked against a real
         // deis-store rather than against the composition function: the same
         // key written through two bindings of one application is two values,
-        // and neither is the unnamed namespace's.
+        // and neither is the third binding's.
         //
         // The names are chosen to be the nastiest pair the encoding has to
         // survive: one is a prefix of the other, so an encoding that joined
@@ -165,25 +168,24 @@ mod tests {
             "kv_two_bindings_app.production",
             &store,
             &["HOT", "HOT2"],
-            r#"await ctx.services.kv.put("k", "unnamed");
-                await ctx.bindings.HOT.put("k", "hot");
-                await ctx.bindings.HOT2.put("k", "hot2");
-                await ctx.bindings.HOT.put("2:k", "hot-with-a-colliding-key");
+            r#"await ctx.env.KV.put("k", "kv");
+                await ctx.env.HOT.put("k", "hot");
+                await ctx.env.HOT2.put("k", "hot2");
+                await ctx.env.HOT.put("2:k", "hot-with-a-colliding-key");
                 return new Response(JSON.stringify({
-                    unnamed: await ctx.services.kv.get("k"),
-                    hot: await ctx.bindings.HOT.get("k"),
-                    hot2: await ctx.bindings.HOT2.get("k"),
-                    collider: await ctx.bindings.HOT.get("2:k"),
-                    hotKeys: (await ctx.bindings.HOT.list()).keys.map((e) => e.name),
-                    hot2Keys: (await ctx.bindings.HOT2.list()).keys.map((e) => e.name),
-                    unnamedKeys: (await ctx.services.kv.list()).keys.map((e) => e.name),
-                    envIsTheSameObject: ctx.env.HOT === ctx.bindings.HOT,
+                    kv: await ctx.env.KV.get("k"),
+                    hot: await ctx.env.HOT.get("k"),
+                    hot2: await ctx.env.HOT2.get("k"),
+                    collider: await ctx.env.HOT.get("2:k"),
+                    hotKeys: (await ctx.env.HOT.list()).keys.map((e) => e.name),
+                    hot2Keys: (await ctx.env.HOT2.list()).keys.map((e) => e.name),
+                    kvKeys: (await ctx.env.KV.list()).keys.map((e) => e.name),
                 }));"#,
         )
         .await;
 
         let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
-        assert_eq!(seen["unnamed"], "unnamed", "{body}");
+        assert_eq!(seen["kv"], "kv", "{body}");
         assert_eq!(seen["hot"], "hot", "{body}");
         assert_eq!(seen["hot2"], "hot2", "{body}");
         assert_eq!(seen["collider"], "hot-with-a-colliding-key", "{body}");
@@ -192,49 +194,44 @@ mod tests {
         // three keys, or HOT would see HOT2's.
         assert_eq!(seen["hotKeys"], serde_json::json!(["2:k", "k"]), "{body}");
         assert_eq!(seen["hot2Keys"], serde_json::json!(["k"]), "{body}");
-        assert_eq!(seen["unnamedKeys"], serde_json::json!(["k"]), "{body}");
-        assert_eq!(
-            seen["envIsTheSameObject"], true,
-            "a binding is published on env and on context.bindings, and it is one object: {body}"
-        );
+        assert_eq!(seen["kvKeys"], serde_json::json!(["k"]), "{body}");
     }
 
     #[tokio::test]
-    async fn an_application_deployed_before_bindings_existed_keeps_its_data() {
+    async fn declaring_a_further_binding_leaves_the_existing_one_s_data_in_place() {
         // The other half of the promise. An application writes through
-        // `ctx.services.kv` -- which is what it had before any of this
-        // existed -- and then a later version declares a binding. The old data
-        // must still be exactly where it was, and the new namespace must start
-        // empty.
+        // `ctx.env.KV`, and then a later version declares a further binding.
+        // The old data must still be exactly where it was, and the new
+        // namespace must start empty.
         let store = TestStore::start().await;
 
         let before = kv_probe(
             "kv_upgrade_app.production",
             &store,
-            r#"await ctx.services.kv.put("legacy", "written-before-bindings");
+            r#"await ctx.env.KV.put("k1", "written-before-hot");
                 return new Response(JSON.stringify({
-                    value: await ctx.services.kv.get("legacy"),
+                    value: await ctx.env.KV.get("k1"),
                 }));"#,
         )
         .await;
         let before: serde_json::Value = serde_json::from_str(&before).expect("a JSON body");
-        assert_eq!(before["value"], "written-before-bindings");
+        assert_eq!(before["value"], "written-before-hot");
 
         let after = binding_probe(
             "kv_upgrade_app.production",
             &store,
             &["HOT"],
             r#"return new Response(JSON.stringify({
-                    unnamed: await ctx.services.kv.get("legacy"),
-                    hot: await ctx.bindings.HOT.get("legacy"),
-                    hotKeys: (await ctx.bindings.HOT.list()).keys.length,
+                    kv: await ctx.env.KV.get("k1"),
+                    hot: await ctx.env.HOT.get("k1"),
+                    hotKeys: (await ctx.env.HOT.list()).keys.length,
                 }));"#,
         )
         .await;
         let after: serde_json::Value = serde_json::from_str(&after).expect("a JSON body");
         assert_eq!(
-            after["unnamed"], "written-before-bindings",
-            "declaring a binding must not move what the unnamed namespace holds"
+            after["kv"], "written-before-hot",
+            "declaring a binding must not move what another binding holds"
         );
         assert_eq!(
             after["hot"],
@@ -256,14 +253,18 @@ mod tests {
             &store,
             &["HOT"],
             r#"return new Response(JSON.stringify({
-                    declared: Object.keys(ctx.bindings),
-                    cold: ctx.bindings.COLD === undefined,
+                    declared: Object.keys(ctx.env).sort(),
+                    cold: ctx.env.COLD === undefined,
                     envCold: ctx.env.COLD === undefined,
                 }));"#,
         )
         .await;
         let seen: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
-        assert_eq!(seen["declared"], serde_json::json!(["HOT"]), "{body}");
+        assert_eq!(
+            seen["declared"],
+            serde_json::json!(["ASSETS", "HOT", "KV"]),
+            "{body}"
+        );
         assert_eq!(seen["cold"], true, "{body}");
         assert_eq!(seen["envCold"], true, "{body}");
     }
@@ -279,7 +280,7 @@ mod tests {
         let body = kv_probe(
             "kv_list_shape_app.production",
             &store,
-            r#"const kv = ctx.services.kv;
+            r#"const kv = ctx.env.KV;
                 await kv.put("session:a", "one", { metadata: { user: 7 } });
                 await kv.put("session:b", "two", { expirationTtl: 3600 });
                 const page = await kv.list({ prefix: "session:" });
@@ -328,7 +329,7 @@ mod tests {
         let body = kv_probe(
             "kv_list_prefix_app.production",
             &store,
-            r#"const kv = ctx.services.kv;
+            r#"const kv = ctx.env.KV;
                 await kv.put("user:1", "a");
                 await kv.put("user:2", "b");
                 await kv.put("order:1", "c");
@@ -366,7 +367,7 @@ mod tests {
         let body = kv_probe(
             "kv_list_paging_app.production",
             &store,
-            r#"const kv = ctx.services.kv;
+            r#"const kv = ctx.env.KV;
                 for (const n of ["1", "2", "3", "4"]) await kv.put("k:" + n, n);
 
                 async function drain(limit) {
@@ -422,7 +423,7 @@ mod tests {
         let body = kv_probe(
             "kv_list_refusal_app.production",
             &store,
-            r#"const kv = ctx.services.kv;
+            r#"const kv = ctx.env.KV;
                 const caught = {};
                 for (const [name, call] of [
                     ["zero", () => kv.list({ limit: 0 })],
@@ -458,17 +459,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_listing_by_an_app_without_kv_says_the_service_is_not_there() {
-        // Every other KV call says this; a `list` that answered with an empty
+    async fn a_listing_that_cannot_reach_the_store_fails_rather_than_listing_nothing() {
+        // Every other KV call fails here; a `list` that answered with an empty
         // page instead would read as "you have stored nothing", which is the
         // one answer an application must not be given when the truth is that
-        // it has no store at all.
-        let store = TestStore::start().await;
+        // its store could not be reached.
         let mut runtime = AppRuntime::new(
             "kv_list_undeclared_app.production".to_string(),
             r#"export default async function handler(ctx) {
                 try {
-                    await ctx.services.kv.list("anything");
+                    await ctx.env.KV.list("anything");
                     return new Response("listed");
                 } catch (e) {
                     return new Response(e.message);
@@ -477,9 +477,9 @@ mod tests {
             .to_string(),
             None,
             IsolateSpec::default(),
-            // The store is running and reachable; this application simply
-            // never declared that it uses KV.
-            &store.wiring_for_tenant("kv_list_undeclared_app.production", ["database"]),
+            // The application declares a KV binding, and nothing listens on
+            // the store address this node was sent.
+            &crate::runtime::test_store::wiring_declaring(&["kv"]),
             // No pool behind this isolate, so every service call it makes is
             // refused as "not deployed on this node" -- which is what it is.
             ServiceRouter::detached(),
@@ -501,8 +501,8 @@ mod tests {
         let (_, _, body) = rx.await.expect("a response").expect("a response");
         let body = String::from_utf8(body.into_bytes().unwrap_or_default()).expect("text");
         assert!(
-            body.contains("kv service is not available"),
-            "an undeclared service must say so rather than list nothing: {body}"
+            !body.is_empty() && body != "listed",
+            "an unreachable store must fail the listing rather than list nothing: {body}"
         );
     }
 

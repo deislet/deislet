@@ -214,7 +214,7 @@ key_path = "key.pem"
 
 ```bash
 curl -k -H "Authorization: Bearer your-secret-key" \
-     https://localhost:8080/api/sessions
+     https://localhost:8080/api/platform/sessions
 ```
 
 ## Frequently Asked Questions

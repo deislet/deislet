@@ -5,11 +5,10 @@
 //! INTO` to produce one complete database under a read transaction. The
 //! manifest records its digest, row counts and source backend incarnation.
 //! [`restore`] accepts only an empty target, verifies the source and copied
-//! database, and creates a fresh incarnation instead of copying writer fences.
+//! database, and mints a fresh backend incarnation for the restored directory.
 
 use crate::error::{QueueError, QueueResult};
 use crate::unix_seconds;
-use deis_backend_migration::TenantWriteFences;
 use deis_wire::CanonicalId;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -59,9 +58,7 @@ pub fn take(data_dir: &Path, out: &Path) -> QueueResult<Manifest> {
         )));
     }
     prepare_destination(out, "snapshot")?;
-    let source_backend_incarnation_id =
-        TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?
-            .backend_incarnation_id();
+    let source_backend_incarnation_id = deis_wire::incarnation::load_or_create(data_dir)?;
 
     let source = data_dir.join(DATABASE_NAME);
     let destination = out.join(DATABASE_NAME);
@@ -146,9 +143,7 @@ pub fn restore(snapshot: &Path, data_dir: &Path) -> QueueResult<RestoreReport> {
         None
     };
 
-    let restored_backend_incarnation_id =
-        TenantWriteFences::open_blocking(data_dir.join("migration-fences.sqlite"))?
-            .backend_incarnation_id();
+    let restored_backend_incarnation_id = deis_wire::incarnation::load_or_create(data_dir)?;
     if restored_backend_incarnation_id == manifest.source_backend_incarnation_id {
         return Err(QueueError::Corrupt(
             "restore generated the same backend incarnation as its source".to_string(),
@@ -291,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_restores_messages_dead_letters_and_a_new_incarnation() {
         let source = TempDir::new().unwrap();
-        let tenant = TenantId::parse("shop.production").unwrap();
+        let tenant = TenantId::for_label("shop.production");
         let queue = QueueService::open(
             source.path(),
             2,
@@ -336,7 +331,11 @@ mod tests {
         let database = manifest.database.as_ref().unwrap();
         assert_eq!(database.messages, 1);
         assert_eq!(database.dead_letters, 1);
-        assert!(!snapshot.join("migration-fences.sqlite").exists());
+        assert!(
+            !snapshot
+                .join(deis_wire::incarnation::INCARNATION_FILE)
+                .exists()
+        );
 
         let restored_root = TempDir::new().unwrap();
         let restored = restored_root.path().join("data");
@@ -357,8 +356,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            reopened.fences().backend_incarnation_id(),
-            report.restored_backend_incarnation_id
+            deis_wire::incarnation::read(&restored).unwrap(),
+            Some(report.restored_backend_incarnation_id)
         );
         assert_eq!(
             reopened

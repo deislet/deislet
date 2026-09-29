@@ -6,15 +6,31 @@
   "functionRoot": "./functions",
   "compatibilityDate": "2026-09-01",
   "environment": {
-    "variables": {
+    "declarations": [
+      {
+        "name": "BUILD_LABEL",
+        "kind": "config",
+        "valueType": "string",
+        "required": true
+      }
+    ],
+    "values": {
       "BUILD_LABEL": "portable"
     }
   },
   "vendors": {
-    "deislet": { "enabled": true },
-    "cloudflare": { "enabled": true },
-    "deno": { "enabled": true },
-    "tencent": { "enabled": true }
+    "deislet": {
+      "enabled": true
+    },
+    "cloudflare": {
+      "enabled": true
+    },
+    "deno": {
+      "enabled": true
+    },
+    "tencent": {
+      "enabled": true
+    }
   },
   "build": {
     "outDir": "./dist"

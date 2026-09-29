@@ -44,7 +44,6 @@ use crate::proto::queue::{
 };
 use crate::sqlite::{PoolSize, SqlitePool};
 use crate::tenant::{TenantId, tenant_of};
-use deis_backend_migration::{ComponentInventory, InventoryHasher, TenantWriteFences};
 use rusqlite::{OptionalExtension, Transaction};
 use tonic::{Request, Response, Status};
 
@@ -205,7 +204,6 @@ pub struct ReplayOutcome {
 #[derive(Clone)]
 pub struct QueueService {
     pool: SqlitePool,
-    fences: TenantWriteFences,
     limits: QueueLimits,
     clock: Clock,
 }
@@ -228,16 +226,14 @@ impl QueueService {
         limits: QueueLimits,
         clock: Clock,
     ) -> QueueResult<Self> {
-        let fences = TenantWriteFences::open(data_dir.join("migration-fences.sqlite")).await?;
-        Self::open_with_clock_and_fences(data_dir, connections, limits, clock, fences).await
+        Self::open_inner(data_dir, connections, limits, clock).await
     }
 
-    async fn open_with_clock_and_fences(
+    async fn open_inner(
         data_dir: &std::path::Path,
         connections: usize,
         mut limits: QueueLimits,
         clock: Clock,
-        fences: TenantWriteFences,
     ) -> QueueResult<Self> {
         if limits.max_body_bytes > limits.max_pull_response_bytes {
             tracing::warn!(
@@ -263,12 +259,6 @@ impl QueueService {
             PoolSize::new(connections),
         );
         pool.migrate(|conn| {
-            // Before anything is created: a queue.sqlite from before the
-            // tenant change would otherwise gain a second, empty pair of
-            // tables beside the rows nobody can reach any more.
-            for table in ["messages", "dead_letter"] {
-                crate::legacy::reject_pre_tenant_table(conn, table)?;
-            }
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS messages (
                      tenant      TEXT    NOT NULL,
@@ -282,7 +272,7 @@ impl QueueService {
                      -- is waiting, because nobody holds it.
                      lease_token TEXT    NOT NULL DEFAULT '',
                      -- Deployment generation that acquired the current
-                     -- lease; empty for a legacy consumer.
+                     -- lease; empty for a consumer that names none.
                      lease_generation TEXT NOT NULL DEFAULT '',
                      PRIMARY KEY (tenant, queue, id)
                  );
@@ -298,8 +288,7 @@ impl QueueService {
                      attempts   INTEGER NOT NULL,
                      created_at INTEGER NOT NULL,
                      died_at    INTEGER NOT NULL,
-                     -- Why it was given up on; empty on a row written before
-                     -- the queue recorded it.
+                     -- Why it was given up on.
                      reason     TEXT    NOT NULL DEFAULT '',
                      PRIMARY KEY (tenant, queue, id)
                  );
@@ -320,12 +309,6 @@ impl QueueService {
                            (last_aborted_generation IS NULL))
                  );",
             )?;
-            add_lease_token_column(conn)?;
-            add_lease_generation_column(conn)?;
-            add_active_deployment_id_column(conn)?;
-            add_expected_previous_deployment_id_column(conn)?;
-            add_consumer_abort_tombstone_columns(conn)?;
-            add_dead_letter_reason_column(conn)?;
             Ok(())
         })
         .await?;
@@ -337,7 +320,6 @@ impl QueueService {
         );
         Ok(Self {
             pool,
-            fences,
             limits,
             clock,
         })
@@ -346,10 +328,6 @@ impl QueueService {
     /// The ceilings this service applies.
     pub fn limits(&self) -> &QueueLimits {
         &self.limits
-    }
-
-    pub(crate) fn fences(&self) -> &TenantWriteFences {
-        &self.fences
     }
 
     /// Enqueue one message, visible immediately. Returns its id.
@@ -370,7 +348,6 @@ impl QueueService {
         queue: &str,
         bodies: Vec<Vec<u8>>,
     ) -> QueueResult<Vec<String>> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         if bodies.is_empty() {
             return Err(QueueError::InvalidArgument(
@@ -457,7 +434,6 @@ impl QueueService {
         lease_seconds: Option<i32>,
         consumer_generation: Option<&str>,
     ) -> QueueResult<Vec<LeasedMessage>> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         let wanted = self.clamp_pull_size(max_messages);
         let lease = self.clamp_lease(lease_seconds);
@@ -578,7 +554,6 @@ impl QueueService {
         expected_previous_generation: Option<&str>,
         expected_previous_deployment_id: Option<&str>,
     ) -> QueueResult<PrepareConsumerGenerationResponse> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         validate_generation_identity("deployment_id", deployment_id)?;
         validate_generation_identity("generation", generation)?;
         if let Some(previous) = expected_previous_generation.filter(|value| !value.is_empty()) {
@@ -621,7 +596,6 @@ impl QueueService {
         deployment_id: &str,
         generation: &str,
     ) -> QueueResult<ActivateConsumerGenerationResponse> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         validate_generation_identity("deployment_id", deployment_id)?;
         validate_generation_identity("generation", generation)?;
         let tenant = tenant.as_str().to_string();
@@ -642,7 +616,6 @@ impl QueueService {
         deployment_id: &str,
         generation: &str,
     ) -> QueueResult<AbortConsumerGenerationResponse> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         validate_generation_identity("deployment_id", deployment_id)?;
         validate_generation_identity("generation", generation)?;
         let tenant = tenant.as_str().to_string();
@@ -670,7 +643,6 @@ impl QueueService {
         queue: &str,
         handles: Vec<MessageHandle>,
     ) -> QueueResult<AckOutcome> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         if handles.is_empty() {
             return Ok(AckOutcome::default());
@@ -782,7 +754,6 @@ impl QueueService {
         delay_seconds: Option<i32>,
         refund_attempt: bool,
     ) -> QueueResult<NackOutcome> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         if handles.is_empty() {
             return Ok(NackOutcome::default());
@@ -1031,7 +1002,6 @@ impl QueueService {
         ids: Vec<String>,
         delay_seconds: Option<i32>,
     ) -> QueueResult<ReplayOutcome> {
-        let _permit = self.fences.permit(tenant.as_str()).await?;
         let queue = self.check_queue(queue)?;
         if ids.is_empty() {
             tracing::warn!(
@@ -1128,87 +1098,6 @@ impl QueueService {
         })
     }
 
-    /// Deterministic evidence for ready/delayed/leased and dead-letter rows
-    /// under an active writer fence.
-    pub async fn inventory(&self, tenant: &TenantId) -> QueueResult<ComponentInventory> {
-        let (_receipt, _fence) = self.fences.fenced_read(tenant.as_str()).await?;
-        self.inventory_with_fence_held(tenant).await
-    }
-
-    /// Build inventory while the caller holds this tenant's fence read guard.
-    pub(crate) async fn inventory_with_fence_held(
-        &self,
-        tenant: &TenantId,
-    ) -> QueueResult<ComponentInventory> {
-        let tenant_id = tenant.as_str().to_string();
-        self.pool
-            .with_conn(move |conn| {
-                let tx = conn.transaction()?;
-                let mut hash = InventoryHasher::new("queue");
-                let mut count = 0u64;
-                let mut logical_bytes = 0u64;
-                {
-                    let mut statement = tx.prepare(
-                        "SELECT queue, id, body, attempts, visible_at, created_at, lease_token
-                           FROM messages
-                          WHERE tenant = ?1
-                          ORDER BY queue, id",
-                    )?;
-                    let mut rows = statement.query([&tenant_id])?;
-                    while let Some(row) = rows.next()? {
-                        let queue: String = row.get(0)?;
-                        let id: String = row.get(1)?;
-                        let body: Vec<u8> = row.get(2)?;
-                        let attempts: i32 = row.get(3)?;
-                        let visible_at: i64 = row.get(4)?;
-                        let created_at: i64 = row.get(5)?;
-                        let lease_token: String = row.get(6)?;
-                        hash.field(b"message");
-                        hash.field(queue.as_bytes());
-                        hash.field(id.as_bytes());
-                        hash.field(&body);
-                        hash.field(&attempts.to_be_bytes());
-                        hash.field(&visible_at.to_be_bytes());
-                        hash.field(&created_at.to_be_bytes());
-                        hash.field(lease_token.as_bytes());
-                        count += 1;
-                        logical_bytes = logical_bytes.saturating_add(body.len() as u64);
-                    }
-                }
-                {
-                    let mut statement = tx.prepare(
-                        "SELECT queue, id, body, attempts, created_at, died_at, reason
-                           FROM dead_letter
-                          WHERE tenant = ?1
-                          ORDER BY queue, id",
-                    )?;
-                    let mut rows = statement.query([&tenant_id])?;
-                    while let Some(row) = rows.next()? {
-                        let queue: String = row.get(0)?;
-                        let id: String = row.get(1)?;
-                        let body: Vec<u8> = row.get(2)?;
-                        let attempts: i32 = row.get(3)?;
-                        let created_at: i64 = row.get(4)?;
-                        let died_at: i64 = row.get(5)?;
-                        let reason: String = row.get(6)?;
-                        hash.field(b"dead-letter");
-                        hash.field(queue.as_bytes());
-                        hash.field(id.as_bytes());
-                        hash.field(&body);
-                        hash.field(&attempts.to_be_bytes());
-                        hash.field(&created_at.to_be_bytes());
-                        hash.field(&died_at.to_be_bytes());
-                        hash.field(reason.as_bytes());
-                        count += 1;
-                        logical_bytes = logical_bytes.saturating_add(body.len() as u64);
-                    }
-                }
-                tx.commit()?;
-                Ok(hash.finish("queue", count, logical_bytes, 0, 0))
-            })
-            .await
-    }
-
     /// Delete dead letters older than the configured retention, across all
     /// tenants. A retention of zero keeps them forever and this does nothing.
     /// Returns how many rows went away.
@@ -1218,40 +1107,13 @@ impl QueueService {
             return Ok(0);
         }
         let cutoff = self.clock.now().saturating_sub(retention);
-        let tenants = self
-            .pool
-            .with_conn(|conn| {
-                let mut statement =
-                    conn.prepare("SELECT DISTINCT tenant FROM dead_letter ORDER BY tenant")?;
-                let tenants = statement
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(tenants)
+        self.pool
+            .with_conn(move |conn| {
+                let count =
+                    conn.execute("DELETE FROM dead_letter WHERE died_at <= ?1", [cutoff])?;
+                Ok(count)
             })
-            .await?;
-        let mut removed = 0usize;
-        for tenant in tenants {
-            // Retention is a mutation too. A fenced tenant keeps its dead
-            // letters unchanged until migration completes or rolls back.
-            let permit = match self.fences.permit(&tenant).await {
-                Ok(permit) => permit,
-                Err(deis_backend_migration::FenceError::Fenced(_)) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let scoped_tenant = tenant.clone();
-            removed += self
-                .pool
-                .with_conn(move |conn| {
-                    let count = conn.execute(
-                        "DELETE FROM dead_letter WHERE tenant = ?1 AND died_at <= ?2",
-                        rusqlite::params![scoped_tenant, cutoff],
-                    )?;
-                    Ok(count)
-                })
-                .await?;
-            drop(permit);
-        }
-        Ok(removed)
+            .await
     }
 
     /// Reject queue names that are empty, oversized, or carry characters that
@@ -1557,6 +1419,13 @@ fn prepare_consumer_generation_tx(
     expected_previous_deployment_id: Option<&str>,
     now: i64,
 ) -> QueueResult<PrepareConsumerGenerationResponse> {
+    // The previous generation and the deployment that owns it come from the
+    // same pointer row: both, or neither for a first deployment.
+    if expected_previous_generation.is_some() != expected_previous_deployment_id.is_some() {
+        return Err(QueueError::ConsumerGenerationFenced(format!(
+            "tenant {tenant:?}: a previous generation and its owning deployment are named together"
+        )));
+    }
     let stored = load_consumer_fence(tx, tenant)?;
     let active_before = stored
         .as_ref()
@@ -1573,10 +1442,10 @@ fn prepare_consumer_generation_tx(
 
     match stored {
         None => {
-            // Adopt the generation already selected by a pre-fence control
-            // plane when one exists; otherwise the active side is the legacy
-            // unlabelled consumer generation. Either way pending closes all
-            // Pull admission before leases are inspected.
+            // The tenant's first fence: its active side is the deployment
+            // the control plane names as the previous one, or nothing for a
+            // first deployment. Either way pending closes all Pull admission
+            // before leases are inspected.
             tx.execute(
                 "INSERT INTO consumer_generation_fences
                    (tenant, active_generation, active_deployment_id, pending_generation,
@@ -1597,7 +1466,7 @@ fn prepare_consumer_generation_tx(
         }
         Some((
             active,
-            mut active_deployment,
+            active_deployment,
             pending,
             pending_deployment,
             stored_expected,
@@ -1606,33 +1475,8 @@ fn prepare_consumer_generation_tx(
             _,
         )) => {
             if active == generation && pending.is_none() {
-                if active_deployment.is_empty() {
-                    let Some(previous_owner) = expected_previous_deployment_id else {
-                        return Err(QueueError::ConsumerGenerationFenced(format!(
-                            "tenant {tenant:?} generation {generation:?} has no recorded deployment owner; PrepareConsumerGeneration must provide its legacy ownership baseline"
-                        )));
-                    };
-                    if expected_previous_generation != Some(active.as_str()) {
-                        return Err(QueueError::ConsumerGenerationFenced(format!(
-                            "tenant {tenant:?} cannot adopt generation {active:?} from a different previous generation"
-                        )));
-                    }
-                    let adopted_owner = if previous_owner.is_empty() {
-                        deployment_id
-                    } else if previous_owner == deployment_id {
-                        previous_owner
-                    } else {
-                        return Err(QueueError::ConsumerGenerationFenced(format!(
-                            "tenant {tenant:?} generation {generation:?} is reported as owned by deployment {previous_owner:?}, not {deployment_id:?}"
-                        )));
-                    };
-                    tx.execute(
-                        "UPDATE consumer_generation_fences
-                            SET active_deployment_id = ?2, updated_at = ?3
-                          WHERE tenant = ?1 AND active_deployment_id = ''",
-                        rusqlite::params![tenant, adopted_owner, now],
-                    )?;
-                } else if active_deployment != deployment_id {
+                // A retry after the generation was activated.
+                if active_deployment != deployment_id {
                     return Err(QueueError::ConsumerGenerationFenced(format!(
                         "tenant {tenant:?} generation {generation:?} is owned by deployment {active_deployment:?}, not {deployment_id:?}"
                     )));
@@ -1642,11 +1486,7 @@ fn prepare_consumer_generation_tx(
                     active_generation: active,
                     pending_generation: String::new(),
                     outstanding_leases: 0,
-                    active_deployment_id: if active_deployment.is_empty() {
-                        deployment_id.to_string()
-                    } else {
-                        active_deployment
-                    },
+                    active_deployment_id: active_deployment,
                     pending_deployment_id: String::new(),
                 });
             }
@@ -1661,46 +1501,14 @@ fn prepare_consumer_generation_tx(
                     )));
                 }
                 let stored_owner = stored_expected_owner.as_deref();
-                let adopts_known_legacy_owner = active_deployment.is_empty()
-                    && expected_previous_generation == Some(active.as_str())
-                    && expected_previous_deployment_id.is_some_and(|owner| !owner.is_empty())
-                    && stored_owner.is_none_or(str::is_empty);
-                if stored_owner != expected_previous_deployment_id && !adopts_known_legacy_owner {
+                if stored_owner != expected_previous_deployment_id {
                     return Err(QueueError::ConsumerGenerationFenced(format!(
                         "tenant {tenant:?} pending generation {pending:?} was prepared against deployment owner {:?}, not {:?}",
                         stored_owner.unwrap_or("<none>"),
                         expected_previous_deployment_id.unwrap_or("<none>")
                     )));
                 }
-                if active_deployment.is_empty()
-                    && expected_previous_generation == Some(active.as_str())
-                    && let Some(previous_owner) =
-                        expected_previous_deployment_id.filter(|owner| !owner.is_empty())
-                {
-                    tx.execute(
-                        "UPDATE consumer_generation_fences
-                            SET active_deployment_id = ?2,
-                                expected_previous_deployment_id = ?2,
-                                updated_at = ?3
-                          WHERE tenant = ?1 AND active_deployment_id = ''",
-                        rusqlite::params![tenant, previous_owner, now],
-                    )?;
-                }
             } else {
-                if active_deployment.is_empty()
-                    && !active.is_empty()
-                    && expected_previous_generation == Some(active.as_str())
-                    && let Some(previous_owner) =
-                        expected_previous_deployment_id.filter(|owner| !owner.is_empty())
-                {
-                    tx.execute(
-                        "UPDATE consumer_generation_fences
-                            SET active_deployment_id = ?2, updated_at = ?3
-                          WHERE tenant = ?1 AND active_deployment_id = ''",
-                        rusqlite::params![tenant, previous_owner, now],
-                    )?;
-                    active_deployment = previous_owner.to_string();
-                }
                 if !consumer_baseline_matches(
                     &active,
                     &active_deployment,
@@ -1710,7 +1518,7 @@ fn prepare_consumer_generation_tx(
                     return Err(QueueError::ConsumerGenerationFenced(format!(
                         "tenant {tenant:?} currently admits generation {active:?} owned by {:?}; deployment {deployment_id} expected generation {:?} owned by {:?}",
                         if active_deployment.is_empty() {
-                            "<legacy>"
+                            "<none>"
                         } else {
                             active_deployment.as_str()
                         },
@@ -1780,7 +1588,7 @@ fn activate_consumer_generation_tx(
         }
         if active_deployment.is_empty() {
             return Err(QueueError::ConsumerGenerationFenced(format!(
-                "tenant {tenant:?} generation {generation:?} has no recorded deployment owner; PrepareConsumerGeneration must explicitly adopt the legacy generation first"
+                "tenant {tenant:?} generation {generation:?} has no recorded deployment owner"
             )));
         }
         return Ok(ActivateConsumerGenerationResponse {
@@ -1908,184 +1716,6 @@ fn abort_consumer_generation_tx(
         active_generation: active,
         active_deployment_id: active_deployment,
     })
-}
-
-/// Add the `lease_token` column to a `messages` table written before it
-/// existed.
-///
-/// The rows are otherwise fine - a queue.sqlite from the tenant era holds
-/// messages that still have to be delivered - so this widens the table rather
-/// than refusing it. Existing rows get the empty token, which is what a
-/// message that nobody holds carries anyway, so the first `Pull` issues a
-/// real one. `CREATE TABLE IF NOT EXISTS` above cannot do this: it does
-/// nothing at all when the table is already there.
-fn add_lease_token_column(conn: &rusqlite::Connection) -> QueueResult<()> {
-    let mut present = false;
-    conn.pragma(None, "table_info", "messages", |row| {
-        let column: String = row.get(1)?;
-        if column == "lease_token" {
-            present = true;
-        }
-        Ok(())
-    })?;
-    if present {
-        return Ok(());
-    }
-    conn.execute_batch("ALTER TABLE messages ADD COLUMN lease_token TEXT NOT NULL DEFAULT ''")?;
-    tracing::info!(
-        "added the lease_token column to an existing queue database; messages already in it keep \
-         their place in line and are given a token by their next delivery"
-    );
-    Ok(())
-}
-
-/// Add generation attribution to leases written by older queue builds.
-fn add_lease_generation_column(conn: &rusqlite::Connection) -> QueueResult<()> {
-    let mut present = false;
-    conn.pragma(None, "table_info", "messages", |row| {
-        let column: String = row.get(1)?;
-        if column == "lease_generation" {
-            present = true;
-        }
-        Ok(())
-    })?;
-    if present {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "ALTER TABLE messages ADD COLUMN lease_generation TEXT NOT NULL DEFAULT ''",
-    )?;
-    tracing::info!(
-        "added generation attribution to existing queue leases; legacy in-flight leases drain before the first fenced deployment activates"
-    );
-    Ok(())
-}
-
-/// Bind an active consumer generation to the deployment intent that created
-/// it. Older rows are adopted by the first exact retry after upgrade.
-fn add_active_deployment_id_column(conn: &rusqlite::Connection) -> QueueResult<()> {
-    let mut present = false;
-    conn.pragma(None, "table_info", "consumer_generation_fences", |row| {
-        let column: String = row.get(1)?;
-        if column == "active_deployment_id" {
-            present = true;
-        }
-        Ok(())
-    })?;
-    if present {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "ALTER TABLE consumer_generation_fences ADD COLUMN active_deployment_id TEXT NOT NULL DEFAULT ''",
-    )?;
-    tracing::info!(
-        "added active deployment attribution to existing queue generation fences; the first exact post-upgrade retry adopts each legacy row"
-    );
-    Ok(())
-}
-
-/// Persist the deployment owner that formed a pending transition's CAS
-/// baseline. Existing pending rows predate this field, so their current
-/// active owner is the only lossless baseline that can be backfilled.
-fn add_expected_previous_deployment_id_column(conn: &rusqlite::Connection) -> QueueResult<()> {
-    let mut present = false;
-    conn.pragma(None, "table_info", "consumer_generation_fences", |row| {
-        let column: String = row.get(1)?;
-        if column == "expected_previous_deployment_id" {
-            present = true;
-        }
-        Ok(())
-    })?;
-    if present {
-        return Ok(());
-    }
-    conn.execute_batch(
-        "ALTER TABLE consumer_generation_fences
-             ADD COLUMN expected_previous_deployment_id TEXT;
-         UPDATE consumer_generation_fences
-            SET expected_previous_deployment_id = active_deployment_id
-          WHERE pending_generation IS NOT NULL;",
-    )?;
-    tracing::info!(
-        "added previous deployment ownership to consumer generation fences; pending legacy rows inherit their active owner"
-    );
-    Ok(())
-}
-
-/// Retain the identity of the most recently completed abort so a lost gRPC
-/// response can be retried without turning every unrelated candidate into a
-/// successful no-op.
-fn add_consumer_abort_tombstone_columns(conn: &rusqlite::Connection) -> QueueResult<()> {
-    let mut deployment_present = false;
-    let mut generation_present = false;
-    conn.pragma(None, "table_info", "consumer_generation_fences", |row| {
-        let column: String = row.get(1)?;
-        deployment_present |= column == "last_aborted_deployment_id";
-        generation_present |= column == "last_aborted_generation";
-        Ok(())
-    })?;
-    if !deployment_present {
-        conn.execute(
-            "ALTER TABLE consumer_generation_fences ADD COLUMN last_aborted_deployment_id TEXT",
-            [],
-        )?;
-    }
-    if !generation_present {
-        conn.execute(
-            "ALTER TABLE consumer_generation_fences ADD COLUMN last_aborted_generation TEXT",
-            [],
-        )?;
-    }
-    if !deployment_present || !generation_present {
-        tracing::info!("added exact abort retry tombstones to existing consumer generation fences");
-    }
-    conn.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS consumer_abort_tombstone_pair_insert_v1
-         BEFORE INSERT ON consumer_generation_fences
-         WHEN (NEW.last_aborted_deployment_id IS NULL) !=
-              (NEW.last_aborted_generation IS NULL)
-         BEGIN
-             SELECT RAISE(ABORT, 'consumer abort tombstone identity must be complete');
-         END;
-         CREATE TRIGGER IF NOT EXISTS consumer_abort_tombstone_pair_update_v1
-         BEFORE UPDATE OF last_aborted_deployment_id, last_aborted_generation
-         ON consumer_generation_fences
-         WHEN (NEW.last_aborted_deployment_id IS NULL) !=
-              (NEW.last_aborted_generation IS NULL)
-         BEGIN
-             SELECT RAISE(ABORT, 'consumer abort tombstone identity must be complete');
-         END;",
-    )?;
-    Ok(())
-}
-
-/// Add the `reason` column to a `dead_letter` table written before it
-/// existed.
-///
-/// Same shape as [`add_lease_token_column`] and for the same reason: the rows
-/// are fine, they simply predate the column, and `CREATE TABLE IF NOT EXISTS`
-/// does nothing at all to a table that is already there. Existing rows keep
-/// the empty string, which is the one value a reader renders as "unknown" -
-/// inventing a reason for a message this service never recorded one for would
-/// point an operator at the wrong half of the system.
-fn add_dead_letter_reason_column(conn: &rusqlite::Connection) -> QueueResult<()> {
-    let mut present = false;
-    conn.pragma(None, "table_info", "dead_letter", |row| {
-        let column: String = row.get(1)?;
-        if column == "reason" {
-            present = true;
-        }
-        Ok(())
-    })?;
-    if present {
-        return Ok(());
-    }
-    conn.execute_batch("ALTER TABLE dead_letter ADD COLUMN reason TEXT NOT NULL DEFAULT ''")?;
-    tracing::info!(
-        "added the reason column to an existing queue database; dead letters already in it are \
-         listed with no reason, because this service never recorded one for them"
-    );
-    Ok(())
 }
 
 /// Move every ready message that has already used its attempts into the dead
@@ -2455,7 +2085,6 @@ impl From<DeadLetter> for DeadLetterMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tenant::TENANT_HEADER;
     use tempfile::TempDir;
 
     /// A fixed instant well past 1970, so a lease never lands on a negative
@@ -2486,7 +2115,7 @@ mod tests {
     }
 
     fn tenant(name: &str) -> TenantId {
-        TenantId::parse(name).unwrap()
+        TenantId::for_label(name)
     }
 
     /// Send and Ack throughput of one producer and one consumer, measured at
@@ -2605,13 +2234,6 @@ mod tests {
     fn median(values: &mut [f64]) -> f64 {
         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
         values[values.len() / 2]
-    }
-
-    fn canonical_tenant() -> TenantId {
-        TenantId::from_canonical(deis_wire::CanonicalTenantId::new(
-            "018f2518-7e38-7f80-8000-000000000001".parse().unwrap(),
-            "018f2518-7e38-7f80-8000-000000000002".parse().unwrap(),
-        ))
     }
 
     fn bodies(messages: &[LeasedMessage]) -> Vec<String> {
@@ -2769,78 +2391,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_active_generation_requires_explicit_owner_takeover() {
-        const LEGACY_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000071";
-        const CANDIDATE_PLAN: &str = "018f2518-7e38-7f80-8000-000000000072";
-        const CANDIDATE_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000073";
-        const ADOPTING_PLAN: &str = "018f2518-7e38-7f80-8000-000000000074";
-        let f = fixture().await;
-        let tenant = tenant("shop.production");
-
-        // A queue with no fence may be introduced to a control-plane
-        // generation whose historical deployment owner was never stored.
-        assert!(
-            f.service
-                .prepare_consumer_generation(
-                    &tenant,
-                    CANDIDATE_PLAN,
-                    CANDIDATE_GENERATION,
-                    Some(LEGACY_GENERATION),
-                    Some(""),
-                )
-                .await
-                .unwrap()
-                .prepared
-        );
-        f.service
-            .abort_consumer_generation(&tenant, CANDIDATE_PLAN, CANDIDATE_GENERATION)
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            f.service
-                .activate_consumer_generation(&tenant, ADOPTING_PLAN, LEGACY_GENERATION)
-                .await,
-            Err(QueueError::ConsumerGenerationFenced(_))
-        ));
-        assert!(matches!(
-            f.service
-                .prepare_consumer_generation(
-                    &tenant,
-                    ADOPTING_PLAN,
-                    LEGACY_GENERATION,
-                    Some(LEGACY_GENERATION),
-                    None,
-                )
-                .await,
-            Err(QueueError::InvalidArgument(_))
-        ));
-        let adopted = f
-            .service
-            .prepare_consumer_generation(
-                &tenant,
-                ADOPTING_PLAN,
-                LEGACY_GENERATION,
-                Some(LEGACY_GENERATION),
-                Some(""),
-            )
-            .await
-            .unwrap();
-        assert!(adopted.prepared);
-        assert_eq!(adopted.active_generation, LEGACY_GENERATION);
-        assert_eq!(adopted.active_deployment_id, ADOPTING_PLAN);
-        assert!(adopted.pending_generation.is_empty());
-        assert!(adopted.pending_deployment_id.is_empty());
-        assert!(
-            f.service
-                .activate_consumer_generation(&tenant, ADOPTING_PLAN, LEGACY_GENERATION)
-                .await
-                .unwrap()
-                .activated
-        );
-    }
-
-    #[tokio::test]
     async fn a_historical_uuidv4_previous_owner_is_a_valid_strict_baseline() {
         const HISTORICAL_PLAN: &str = "550e8400-e29b-41d4-a716-446655440000";
         const PREVIOUS_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000081";
@@ -2924,152 +2474,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_fence_rows_adopt_the_catalog_previous_owner_during_prepare() {
-        const HISTORICAL_PLAN: &str = "550e8400-e29b-41d4-a716-446655440000";
-        const PREVIOUS_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000091";
-        const PENDING_PLAN: &str = "018f2518-7e38-7f80-8000-000000000092";
-        const PENDING_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000093";
-        const OTHER_PLAN: &str = "018f2518-7e38-7f80-8000-000000000094";
-        const OTHER_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000095";
-        let dir = TempDir::new().unwrap();
-        let database = dir.path().join("queue.sqlite");
-        {
-            let connection = rusqlite::Connection::open(&database).unwrap();
-            connection
-                .execute_batch(&format!(
-                    "CREATE TABLE consumer_generation_fences (
-                         tenant                       TEXT PRIMARY KEY,
-                         active_generation            TEXT NOT NULL,
-                         active_deployment_id         TEXT NOT NULL DEFAULT '',
-                         pending_generation           TEXT,
-                         pending_deployment_id         TEXT,
-                         expected_previous_generation TEXT,
-                         updated_at                   INTEGER NOT NULL
-                     );
-                     INSERT INTO consumer_generation_fences
-                         (tenant, active_generation, active_deployment_id,
-                          pending_generation, pending_deployment_id,
-                          expected_previous_generation, updated_at)
-                     VALUES
-                         ('shop.production', '{PREVIOUS_GENERATION}', '',
-                          '{PENDING_GENERATION}', '{PENDING_PLAN}',
-                          '{PREVIOUS_GENERATION}', {T0}),
-                         ('shop.preview', '{PREVIOUS_GENERATION}', '',
-                          NULL, NULL, NULL, {T0});"
-                ))
-                .unwrap();
-        }
-        let queue =
-            QueueService::open_with_clock(dir.path(), 4, QueueLimits::default(), Clock::fixed(T0))
-                .await
-                .unwrap();
-        let pending_tenant = tenant("shop.production");
-
-        assert!(matches!(
-            queue
-                .prepare_consumer_generation(
-                    &pending_tenant,
-                    PENDING_PLAN,
-                    PENDING_GENERATION,
-                    Some(OTHER_GENERATION),
-                    Some(HISTORICAL_PLAN),
-                )
-                .await,
-            Err(QueueError::ConsumerGenerationFenced(_))
-        ));
-        assert!(matches!(
-            queue
-                .prepare_consumer_generation(
-                    &pending_tenant,
-                    OTHER_PLAN,
-                    OTHER_GENERATION,
-                    Some(PREVIOUS_GENERATION),
-                    Some(HISTORICAL_PLAN),
-                )
-                .await,
-            Err(QueueError::ConsumerGenerationFenced(_))
-        ));
-        let owner_before: String = queue
-            .pool
-            .with_conn(|connection| {
-                connection
-                    .query_row(
-                        "SELECT active_deployment_id
-                           FROM consumer_generation_fences
-                          WHERE tenant = 'shop.production'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(QueueError::from)
-            })
-            .await
-            .unwrap();
-        assert!(owner_before.is_empty());
-
-        assert!(
-            queue
-                .prepare_consumer_generation(
-                    &pending_tenant,
-                    PENDING_PLAN,
-                    PENDING_GENERATION,
-                    Some(PREVIOUS_GENERATION),
-                    Some(HISTORICAL_PLAN),
-                )
-                .await
-                .unwrap()
-                .prepared
-        );
-        assert!(
-            queue
-                .prepare_consumer_generation(
-                    &pending_tenant,
-                    PENDING_PLAN,
-                    PENDING_GENERATION,
-                    Some(PREVIOUS_GENERATION),
-                    Some(HISTORICAL_PLAN),
-                )
-                .await
-                .unwrap()
-                .prepared,
-            "the upgraded pending tuple must remain idempotent"
-        );
-        let adopted: (String, String) = queue
-            .pool
-            .with_conn(|connection| {
-                connection
-                    .query_row(
-                        "SELECT active_deployment_id, expected_previous_deployment_id
-                           FROM consumer_generation_fences
-                          WHERE tenant = 'shop.production'",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .map_err(QueueError::from)
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            adopted,
-            (HISTORICAL_PLAN.to_string(), HISTORICAL_PLAN.to_string())
-        );
-
-        let idle_tenant = tenant("shop.preview");
-        assert!(
-            queue
-                .prepare_consumer_generation(
-                    &idle_tenant,
-                    OTHER_PLAN,
-                    OTHER_GENERATION,
-                    Some(PREVIOUS_GENERATION),
-                    Some(HISTORICAL_PLAN),
-                )
-                .await
-                .unwrap()
-                .prepared
-        );
-    }
-
-    #[tokio::test]
     async fn aborting_a_prepared_generation_reopens_only_the_previous_one() {
         const PLAN_ONE: &str = "018f2518-7e38-7f80-8000-000000000021";
         const GEN_ONE: &str = "018f2518-7e38-7f80-8000-000000000022";
@@ -3142,7 +2546,7 @@ mod tests {
         let f = fixture().await;
         let tenant = tenant("shop.production");
         f.service
-            .send(&tenant, "jobs", b"still legacy".to_vec())
+            .send(&tenant, "jobs", b"unfenced".to_vec())
             .await
             .unwrap();
 
@@ -3160,7 +2564,7 @@ mod tests {
         ));
         assert_eq!(
             bodies(&f.service.pull(&tenant, "jobs", None, None).await.unwrap()),
-            ["still legacy"]
+            ["unfenced"]
         );
     }
 
@@ -3382,35 +2786,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_migration_target_rows_remain_separate_and_survive_reopen() {
+    async fn rows_are_keyed_by_the_canonical_tenant_and_survive_reopen() {
         let dir = TempDir::new().unwrap();
-        let canonical = canonical_tenant();
-        let legacy = tenant("shop.production");
+        let production = tenant("shop.production");
+        let preview = tenant("shop.preview");
         {
             let queue = QueueService::open(dir.path(), 4, QueueLimits::default())
                 .await
                 .unwrap();
             queue
-                .send(&canonical, "jobs", b"canonical".to_vec())
+                .send(&production, "jobs", b"production".to_vec())
                 .await
                 .unwrap();
             queue
-                .send(&legacy, "jobs", b"legacy".to_vec())
+                .send(&preview, "jobs", b"preview".to_vec())
                 .await
                 .unwrap();
         }
 
-        let decoded = TenantId::parse_persisted(canonical.as_str()).unwrap();
+        let decoded = TenantId::parse_persisted(production.as_str()).unwrap();
         let queue = QueueService::open(dir.path(), 4, QueueLimits::default())
             .await
             .unwrap();
         assert_eq!(
             bodies(&queue.pull(&decoded, "jobs", None, None).await.unwrap()),
-            ["canonical"]
+            ["production"]
         );
         assert_eq!(
-            bodies(&queue.pull(&legacy, "jobs", None, None).await.unwrap()),
-            ["legacy"]
+            bodies(&queue.pull(&preview, "jobs", None, None).await.unwrap()),
+            ["preview"]
         );
     }
 
@@ -3440,11 +2844,7 @@ mod tests {
     /// Stamp the tenant the way deis-runtime does, for the tests that go
     /// through the gRPC surface rather than the queue methods.
     fn as_tenant<T>(tenant: &str, message: T) -> Request<T> {
-        let mut request = Request::new(message);
-        request
-            .metadata_mut()
-            .insert(TENANT_HEADER, tenant.parse().unwrap());
-        request
+        TenantId::for_label(tenant).request(message)
     }
 
     #[tokio::test]
@@ -4295,105 +3695,6 @@ mod tests {
         assert_eq!(clamp_dead_letter_page(Some(0)), DEFAULT_DEAD_LETTER_PAGE);
         assert_eq!(clamp_dead_letter_page(Some(10)), 10);
         assert_eq!(clamp_dead_letter_page(Some(100_000)), MAX_DEAD_LETTER_PAGE);
-    }
-
-    /// A queue.sqlite written before the lease token existed holds messages
-    /// that still have to be delivered. Refusing it would strand them; adding
-    /// the column keeps them in line and gives them a token on their next
-    /// delivery.
-    #[tokio::test]
-    async fn a_database_written_before_lease_tokens_is_widened_rather_than_refused() {
-        let dir = TempDir::new().unwrap();
-        let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE messages (
-                 tenant     TEXT    NOT NULL,
-                 queue      TEXT    NOT NULL,
-                 id         TEXT    NOT NULL,
-                 body       BLOB    NOT NULL,
-                 attempts   INTEGER NOT NULL DEFAULT 0,
-                 visible_at INTEGER NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 PRIMARY KEY (tenant, queue, id)
-             );
-             INSERT INTO messages (tenant, queue, id, body, attempts, visible_at, created_at)
-                  VALUES ('app-one.production', 'jobs', 'waiting', CAST('work' AS BLOB), 0, 1, 1);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let clock = Clock::fixed(T0);
-        let service = QueueService::open_with_clock(dir.path(), 4, QueueLimits::default(), clock)
-            .await
-            .expect("an existing queue must open, not be refused");
-        let a = tenant("app-one.production");
-
-        let leased = service.pull(&a, "jobs", None, None).await.unwrap();
-        assert_eq!(leased.len(), 1, "the waiting message must still be there");
-        assert_eq!(leased[0].id, "waiting");
-        assert!(
-            !leased[0].lease_token.is_empty(),
-            "its first delivery under the new schema issues a token"
-        );
-        assert_eq!(
-            service.ack(&a, "jobs", handles(&leased)).await.unwrap(),
-            AckOutcome {
-                acknowledged: 1,
-                stale_leases: 0
-            }
-        );
-    }
-
-    /// The same for the dead letter table. A queue.sqlite written before the
-    /// reason was recorded holds messages an operator still has to be able to
-    /// list and replay, so the column is added and the rows already there are
-    /// listed with no reason rather than with an invented one.
-    #[tokio::test]
-    async fn dead_letters_from_before_the_reason_existed_are_still_readable() {
-        let dir = TempDir::new().unwrap();
-        let conn = rusqlite::Connection::open(dir.path().join("queue.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE dead_letter (
-                 tenant     TEXT    NOT NULL,
-                 queue      TEXT    NOT NULL,
-                 id         TEXT    NOT NULL,
-                 body       BLOB    NOT NULL,
-                 attempts   INTEGER NOT NULL,
-                 created_at INTEGER NOT NULL,
-                 died_at    INTEGER NOT NULL,
-                 PRIMARY KEY (tenant, queue, id)
-             );
-             INSERT INTO dead_letter (tenant, queue, id, body, attempts, created_at, died_at)
-                  VALUES ('app-one.production', 'jobs', 'old', CAST('poison' AS BLOB), 5, 1, 2);",
-        )
-        .unwrap();
-        drop(conn);
-
-        let clock = Clock::fixed(T0);
-        let service = QueueService::open_with_clock(dir.path(), 4, QueueLimits::default(), clock)
-            .await
-            .expect("an existing queue must open, not be refused");
-        let a = tenant("app-one.production");
-
-        let dead = service.dead_letters(&a, "jobs").await.unwrap();
-        assert_eq!(dead.len(), 1, "the message must still be listed");
-        assert_eq!(dead[0].id, "old");
-        assert_eq!(dead[0].attempts, 5);
-        assert_eq!(
-            dead[0].reason, "",
-            "no reason was ever recorded for this row, and none may be invented for it"
-        );
-        // And it can still be put back, which is the whole point of listing it.
-        assert_eq!(
-            service
-                .replay_dead_letters(&a, "jobs", vec!["old".to_string()], None)
-                .await
-                .unwrap(),
-            ReplayOutcome {
-                replayed: 1,
-                not_found: 0
-            }
-        );
     }
 
     #[tokio::test]

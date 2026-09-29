@@ -37,8 +37,6 @@ EXPECTED_DOCUMENTS = {
     "provider-driver-release-envelope",
     "provider-driver-transparency-proof",
     "provider-driver-process",
-    "identity-migration",
-    "backend-migration-evidence",
     "backend-restore-set",
     "backend-restore-report",
     "control-list-page",
@@ -57,16 +55,6 @@ EXPECTED_PROVIDER_OPERATIONS = [
     "reconcile",
     "delete",
     "cleanup",
-]
-EXPECTED_MIGRATION_PHASES = [
-    "inventory",
-    "allocate-canonical-ids",
-    "dual-read",
-    "copy-or-rename",
-    "verify",
-    "cutover",
-    "revoke-legacy-capabilities",
-    "tombstone",
 ]
 CONTROL_ERROR_SCHEMA = "contracts/v1/control-error.schema.json"
 # Failure classes whose contract is "the identical request may succeed later".
@@ -284,7 +272,6 @@ def validate_control_error_invariants(registry: dict) -> None:
 def validate_cross_document_invariants(registry: dict) -> None:
     require(registry.get("identifierScheme") == "uuidv7-lowercase", "v1 identity scheme drifted")
     require(registry.get("requiredProviderOperations") == EXPECTED_PROVIDER_OPERATIONS, "provider operation order/set drifted")
-    require(registry.get("identityMigrationPhases") == EXPECTED_MIGRATION_PHASES, "identity migration phases drifted")
 
     lock = load_json(registry["standardLock"])
     artifact = load_json("contracts/v1/fixtures/valid/canonical-artifact.json")
@@ -634,27 +621,12 @@ def validate_cross_document_invariants(registry: dict) -> None:
         "provider operation canonical IDs are duplicated",
     )
 
-    migration = load_json("contracts/v1/fixtures/valid/identity-migration.json")
-    phase_names = [phase["name"] for phase in migration["phases"]]
-    require(phase_names == EXPECTED_MIGRATION_PHASES, "migration fixture phases are incomplete or reordered")
-    backend_evidence = load_json("contracts/v1/fixtures/valid/backend-migration-evidence.json")
-    require(
-        backend_evidence.get("authenticationDomain") == "migration-admin",
-        "backend migration evidence must use the independent administrator domain",
-    )
-    require("fenceToken" not in backend_evidence.get("fence", {}), "backend evidence leaked a fence token")
-    components = [entry["component"] for entry in backend_evidence.get("components", [])]
-    require(len(components) == len(set(components)), "backend evidence repeats a component")
     restore_set = load_json("contracts/v1/fixtures/valid/backend-restore-set.json")
     restore_components = restore_set.get("components", [])
     require(
         [entry.get("backend") for entry in restore_components]
         == ["deis-store", "deis-queue", "deis-telemetry"],
         "backend restore set must contain store, queue and telemetry exactly once in canonical order",
-    )
-    require(
-        not any(entry.get("containsFenceJournal") for entry in restore_components),
-        "backend restore set must never copy a migration fence journal",
     )
     require(
         restore_set["consistencyBarrier"].get("kind") == "full-platform-outage",
@@ -688,13 +660,7 @@ def validate_cross_document_invariants(registry: dict) -> None:
         == hashlib.sha256(restore_set_canonical).hexdigest(),
         "backend restore report fixture must bind canonical restore set bytes",
     )
-    for environment in migration["environments"]:
-        expected_key = (
-            f"v1/{migration['canonicalApplicationId']}/"
-            f"{environment['canonicalEnvironmentId']}"
-        )
-        require(environment["canonicalTenantKey"] == expected_key, "canonical tenant key is not ID-based")
-        require(environment["legacyTenantKey"] != expected_key, "legacy and canonical tenant keys unexpectedly match")
+
 
     # The driver request grew `rollbackTarget` and `reconciles` after drivers
     # were already parsing v1 requests with unknown members rejected, so both
@@ -779,8 +745,7 @@ def main() -> int:
     print(
         "shared contract validation passed: "
         f"{len(registry['documents'])} schemas, {len(fixtures)} positive/negative fixtures, "
-        f"{len(load_json(registry['operationTransitions'])['transitions'])} operation transitions, "
-        "identity migration remains explicit"
+        f"{len(load_json(registry['operationTransitions'])['transitions'])} operation transitions"
     )
     return 0
 

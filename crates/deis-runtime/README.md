@@ -25,15 +25,13 @@ Chinese: [README.zh.md](README.zh.md).
 - **Consumes queues and cron.** It polls deis-queue for every queue the
   manifest declares and hands messages to the app's `queue` export; the
   control plane triggers one node per cron occurrence, which runs `scheduled`.
-- **Talks to the control plane.** On startup it registers itself, asks for its
-  assignment list, downloads each bundle over HTTP, verifies the sha256, loads
-  it, and only then reports healthy. New deployments arrive afterwards as
-  pushes over gRPC. The two HTTP paths are
-  `deis_wire::conventions::{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}`
-  and both need the node credential (`[control] secret`), because the
-  assignment list carries decrypted secrets. That credential is one value for
-  the whole fleet and this node's data port is a trust boundary; both are
-  stated once, in
+- **Talks to the control plane.** On startup it dials the machine channel
+  (`deis.machine.MachineChannel`, gRPC over mutual TLS with this node's own
+  certificate), registers, asks for its assignment list, downloads each
+  bundle, verifies the sha256, loads it, and only then reports healthy. New
+  deployments arrive afterwards over the same channel. Secret values are
+  fetched separately, per deployment, and only for the node the certificate
+  proves. This node's data port is a trust boundary; that is stated once, in
   [docs/trust-boundaries.md](../../docs/trust-boundaries.md).
 - **Ships logs, metrics and traces** to deis-telemetry in batches, dropping the
   oldest when the buffer fills rather than growing without bound. One trace per
@@ -210,10 +208,11 @@ every one of them is sent.
 
 Those are the context's only four fields. Request metadata comes from
 `context.request`; application logs use `console`; the Cache API uses
-`caches.default`/`caches.open(name)`. Native `context.services`,
-`context.bindings` and `context.log` objects still exist below the generated
-bridge for schema-1 migration and non-HTTP event internals, but are not part of
-the standard HTTP ABI. A logical binding the application did not declare is
+`caches.default`/`caches.open(name)`. Declared bindings are on `env` and
+nowhere else: there is no `context.services` or `context.bindings`, and no
+unnamed namespace beside the declared bindings. The queue and scheduled
+handlers' context additionally carries `context.log`, which is not part of the
+standard HTTP ABI. A logical binding the application did not declare is
 absent rather than simulated. Its concrete resource interfaces remain Draft
 until Edge Canon's `logical-resource-bindings` capability family is frozen.
 

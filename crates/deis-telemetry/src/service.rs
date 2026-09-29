@@ -10,7 +10,7 @@
 //! component in question - never through this service, which would make an
 //! outage here look like an outage everywhere.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -18,8 +18,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, warn};
-
-use deis_backend_migration::{FenceError, TenantWriteFences, WritePermit};
 
 use crate::auth::{Owner, ReadScope, grant_of};
 use crate::identity;
@@ -332,7 +330,6 @@ impl QueryLimits {
 #[derive(Clone)]
 pub struct LogService {
     store: TelemetryStore,
-    fences: TenantWriteFences,
     hub: Arc<TailHub>,
     stats: Arc<ServiceStats>,
     limits: QueryLimits,
@@ -342,7 +339,6 @@ pub struct LogService {
 impl LogService {
     pub fn new(
         store: TelemetryStore,
-        fences: TenantWriteFences,
         hub: Arc<TailHub>,
         stats: Arc<ServiceStats>,
         limits: QueryLimits,
@@ -350,7 +346,6 @@ impl LogService {
     ) -> Self {
         Self {
             store,
-            fences,
             hub,
             stats,
             limits,
@@ -367,7 +362,6 @@ impl LogService {
 #[derive(Clone)]
 pub struct MetricService {
     store: TelemetryStore,
-    fences: TenantWriteFences,
     stats: Arc<ServiceStats>,
     limits: QueryLimits,
     retention: Retention,
@@ -376,14 +370,12 @@ pub struct MetricService {
 impl MetricService {
     pub fn new(
         store: TelemetryStore,
-        fences: TenantWriteFences,
         stats: Arc<ServiceStats>,
         limits: QueryLimits,
         retention: Retention,
     ) -> Self {
         Self {
             store,
-            fences,
             stats,
             limits,
             retention,
@@ -401,7 +393,6 @@ impl MetricService {
 #[derive(Clone)]
 pub struct TraceService {
     store: TelemetryStore,
-    fences: TenantWriteFences,
     hub: Arc<TraceHub>,
     stats: Arc<ServiceStats>,
     limits: QueryLimits,
@@ -411,7 +402,6 @@ pub struct TraceService {
 impl TraceService {
     pub fn new(
         store: TelemetryStore,
-        fences: TenantWriteFences,
         hub: Arc<TraceHub>,
         stats: Arc<ServiceStats>,
         limits: QueryLimits,
@@ -419,70 +409,12 @@ impl TraceService {
     ) -> Self {
         Self {
             store,
-            fences,
             hub,
             stats,
             limits,
             retention,
         }
     }
-}
-
-/// Acquire one durable write permit per tenant represented by `records`.
-///
-/// A telemetry batch may mix applications. A fence for one tenant filters
-/// only that tenant's records; the others keep flowing and are committed in
-/// the original single database transaction. Every returned permit must be
-/// moved into that blocking transaction so it remains held through commit.
-#[allow(clippy::result_large_err)] // tonic's service contract returns Status by value.
-async fn admit_records<T>(
-    fences: &TenantWriteFences,
-    records: &mut Vec<T>,
-    owner_of: impl Fn(&T) -> Result<Owner, String>,
-) -> Result<(Vec<WritePermit>, usize, Option<String>), Status> {
-    // A node's own records belong to no tenant, so no tenant's fence holds
-    // them back.
-    let tenant_of = |record: &T| -> Result<Option<String>, Status> {
-        match owner_of(record).map_err(Status::internal)? {
-            Owner::Tenant(tenant) => Ok(Some(tenant)),
-            Owner::Platform => Ok(None),
-        }
-    };
-    let mut tenants = BTreeSet::new();
-    for record in records.iter() {
-        if let Some(tenant) = tenant_of(record)? {
-            tenants.insert(tenant);
-        }
-    }
-
-    let mut permits = Vec::with_capacity(tenants.len());
-    let mut fenced = BTreeSet::new();
-    let mut first_rejection = None;
-    for tenant in tenants {
-        match fences.permit(&tenant).await {
-            Ok(permit) => permits.push(permit),
-            Err(error @ FenceError::Fenced(_)) => {
-                first_rejection.get_or_insert_with(|| error.to_string());
-                fenced.insert(tenant);
-            }
-            Err(error) => return Err(Status::from(error)),
-        }
-    }
-
-    if fenced.is_empty() {
-        return Ok((permits, 0, None));
-    }
-
-    let before = records.len();
-    let mut admitted = Vec::with_capacity(before);
-    for record in records.drain(..) {
-        match tenant_of(&record)? {
-            Some(tenant) if fenced.contains(&tenant) => {}
-            _ => admitted.push(record),
-        }
-    }
-    *records = admitted;
-    Ok((permits, before - records.len(), first_rejection))
 }
 
 /// Why a record the capability does not cover is dropped.
@@ -618,6 +550,7 @@ fn to_record(
     }
     for (field, value) in [
         ("app_id", &entry.app_id),
+        ("tenant", &entry.tenant),
         ("component", &entry.component),
         ("trace_id", &entry.trace_id),
         ("span_id", &entry.span_id),
@@ -635,6 +568,7 @@ fn to_record(
         fields,
         trace_id: entry.trace_id,
         span_id: entry.span_id,
+        tenant: entry.tenant,
     })
 }
 
@@ -669,6 +603,7 @@ fn to_entry(record: &LogRecord) -> LogEntry {
             .collect(),
         trace_id: record.trace_id.clone(),
         span_id: record.span_id.clone(),
+        tenant: record.tenant.clone(),
     }
 }
 
@@ -686,7 +621,11 @@ fn to_metric_record(sample: MetricSample, window: &Window) -> Result<MetricRecor
     let timestamp_us = window
         .accept(sample.timestamp_us, &mut stamped)
         .map_err(|fault| fault.describe("timestamp_us"))?;
-    for (field, value) in [("name", &sample.name), ("app_id", &sample.app_id)] {
+    for (field, value) in [
+        ("name", &sample.name),
+        ("app_id", &sample.app_id),
+        ("tenant", &sample.tenant),
+    ] {
         check_identifier(field, value).map_err(|fault| fault.describe("labels"))?;
     }
     // Labels name the series, so no label is ever cut and kept: the total
@@ -701,6 +640,7 @@ fn to_metric_record(sample: MetricSample, window: &Window) -> Result<MetricRecor
         labels,
         value: sample.value,
         timestamp_us,
+        tenant: sample.tenant,
     })
 }
 
@@ -715,6 +655,7 @@ fn to_metric_sample(record: &MetricRecord) -> MetricSample {
             .collect(),
         value: record.value,
         timestamp_us: record.timestamp_us,
+        tenant: record.tenant.clone(),
     }
 }
 
@@ -845,20 +786,12 @@ impl LogServiceRpc for LogService {
             first_rejection.get_or_insert_with(|| Rejection::TooManyDays.describe());
         }
 
-        let (permits, fenced, fence_rejection) =
-            admit_records(&self.fences, &mut records, identity::log).await?;
-        if fenced > 0 {
-            rejected += fenced as u64;
-            ServiceStats::add(&self.stats.logs_write_fenced, fenced as u64);
-            first_rejection = first_rejection.or(fence_rejection);
-        }
-
         if rejected > 0 {
             warn!(
                 rejected,
                 received,
                 reason = first_rejection.as_deref().unwrap_or(""),
-                "log entries were malformed or write-fenced and are dropped; they will never appear in Query or Tail"
+                "log entries were malformed and are dropped; they will never appear in Query or Tail"
             );
             ServiceStats::add(&self.stats.logs_rejected, rejected);
         }
@@ -885,7 +818,6 @@ impl LogServiceRpc for LogService {
             // The records come back out of the blocking task so they can be
             // fanned out without a second copy.
             let stored = match blocking(&self.stats, Access::Write, "store log batch", move || {
-                let _permits = permits;
                 store.insert_logs(&records)?;
                 Ok(records)
             })
@@ -1126,6 +1058,7 @@ fn to_trace_record(
     for (field, value) in [
         ("trace_id", &record.trace_id),
         ("app_id", &record.app_id),
+        ("tenant", &record.tenant),
         ("environment", &record.environment),
         ("node", &record.node),
         ("method", &record.method),
@@ -1148,6 +1081,7 @@ fn to_trace_record(
         status: record.status,
         error: truncate_to(record.error, MAX_TRACE_ERROR_BYTES, truncated),
         attributes,
+        tenant: record.tenant,
     })
 }
 
@@ -1170,6 +1104,7 @@ fn to_proto_trace(record: &TraceRecord) -> ProtoTraceRecord {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        tenant: record.tenant.clone(),
     }
 }
 
@@ -1267,20 +1202,12 @@ impl TraceServiceRpc for TraceService {
             first_rejection.get_or_insert_with(|| TraceRejection::TooManyDays.describe());
         }
 
-        let (permits, fenced, fence_rejection) =
-            admit_records(&self.fences, &mut records, identity::trace).await?;
-        if fenced > 0 {
-            rejected += fenced as u64;
-            ServiceStats::add(&self.stats.traces_write_fenced, fenced as u64);
-            first_rejection = first_rejection.or(fence_rejection);
-        }
-
         if rejected > 0 {
             warn!(
                 rejected,
                 received,
                 reason = first_rejection.as_deref().unwrap_or(""),
-                "trace records were malformed or write-fenced and are dropped; those invocations will never \
+                "trace records were malformed and are dropped; those invocations will never \
                  appear in QueryTraces or TailTraces"
             );
             ServiceStats::add(&self.stats.traces_rejected, rejected);
@@ -1312,7 +1239,6 @@ impl TraceServiceRpc for TraceService {
                 Access::Write,
                 "store trace batch",
                 move || {
-                    let _permits = permits;
                     store.insert_traces(&records)?;
                     Ok(records)
                 },
@@ -1501,19 +1427,12 @@ impl MetricServiceRpc for MetricService {
                  does not name; a node is issued ingest only for what it runs"
             );
         }
-        let (permits, fenced, fence_rejection) =
-            admit_records(&self.fences, &mut records, identity::metric).await?;
-        if fenced > 0 {
-            rejected += fenced as u64;
-            ServiceStats::add(&self.stats.metric_samples_write_fenced, fenced as u64);
-            first_rejection = first_rejection.or(fence_rejection);
-        }
         if rejected > 0 {
             warn!(
                 rejected,
                 received,
                 reason = first_rejection.as_deref().unwrap_or(""),
-                "metric samples were malformed or write-fenced and are dropped; they will appear in neither QueryMetrics nor /metrics"
+                "metric samples were malformed and are dropped; they will appear in neither QueryMetrics nor /metrics"
             );
             ServiceStats::add(&self.stats.metric_samples_rejected, rejected);
         }
@@ -1525,10 +1444,7 @@ impl MetricServiceRpc for MetricService {
                 &self.stats,
                 Access::Write,
                 "store metric batch",
-                move || {
-                    let _permits = permits;
-                    store.insert_metrics(&records)
-                },
+                move || store.insert_metrics(&records),
             )
             .await
             {
@@ -1630,6 +1546,7 @@ mod tests {
             fields: Default::default(),
             trace_id: String::new(),
             span_id: String::new(),
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         }
     }
 
@@ -1717,6 +1634,7 @@ mod tests {
             labels: Default::default(),
             value: f64::NAN,
             timestamp_us: 1,
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         };
         assert!(to_metric_record(sample, &window(10)).is_err());
     }
@@ -1729,6 +1647,7 @@ mod tests {
             labels: Default::default(),
             value: 1.0,
             timestamp_us: 1,
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         };
         assert!(to_metric_record(sample, &window(10)).is_err());
     }
@@ -1748,6 +1667,7 @@ mod tests {
             status: 200,
             error: String::new(),
             attributes: Default::default(),
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         }
     }
 
@@ -1888,6 +1808,7 @@ mod tests {
             labels: Default::default(),
             value: 1.0,
             timestamp_us: days_before(now, 31),
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         };
         let err = to_metric_record(old, &metrics).expect_err("must be refused");
         assert!(err.contains("30-day metric retention"), "{err}");
@@ -1905,6 +1826,7 @@ mod tests {
                 fields: Default::default(),
                 trace_id: String::new(),
                 span_id: String::new(),
+                tenant: crate::identity::fixture_tenant("clock", "production"),
             })
             .collect();
         let dropped = cap_distinct_days(&mut records, |r| day_of(r.timestamp_us));
@@ -2004,6 +1926,7 @@ mod tests {
                 .collect(),
             value: 1.0,
             timestamp_us: 1_787_961_600_000_000,
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         };
         let err = to_metric_record(
             sample(vec![("route", "r".repeat(MAX_LABELS_BYTES + 1))]),

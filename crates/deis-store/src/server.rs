@@ -27,12 +27,9 @@ use crate::blob::BlobService;
 use crate::config::Config;
 use crate::database::{DatabaseService, SqlLimits, TransactionLimits};
 use crate::kv::KvService;
-use crate::migration::StoreMigrationService;
 use crate::proto::blob::blob_store_server::BlobStoreServer;
 use crate::proto::storage::{database_server::DatabaseServer, kv_store_server::KvStoreServer};
 use anyhow::{Context, Result};
-use deis_backend_migration::proto::backend_migration_server::BackendMigrationServer;
-use deis_backend_migration::{MigrationAuth, TenantWriteFences};
 use std::future::Future;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -60,7 +57,6 @@ pub struct Stores {
     pub kv: KvService,
     pub database: DatabaseService,
     pub blob: BlobService,
-    pub(crate) fences: TenantWriteFences,
 }
 
 impl Stores {
@@ -68,39 +64,31 @@ impl Stores {
     pub async fn open(config: &Config) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("cannot create data dir {}", config.data_dir.display()))?;
-        let fences = TenantWriteFences::open(config.data_dir.join("migration-fences.sqlite"))
-            .await
-            .context("cannot open the storage migration fence journal")?;
-        let kv = KvService::open_with_fences(
+        let incarnation = deis_wire::incarnation::load_or_create(&config.data_dir)
+            .context("cannot read or record this data directory's backend incarnation")?;
+        tracing::info!(backend_incarnation_id = %incarnation, "storage data directory opened");
+        let kv = KvService::open_with(
             &config.data_dir,
             config.shared_connections,
             config.durability,
-            fences.clone(),
         )
         .await
         .context("cannot open the KV store")?;
-        let database = DatabaseService::open_with_fences(
+        let database = DatabaseService::open_with(
             &config.data_dir,
             config.tenant_connections,
             config.durability,
-            fences.clone(),
         )
         .context("cannot open the database service")?;
-        let blob = BlobService::open_with_fences(
+        let blob = BlobService::open_with(
             &config.data_dir,
             config.shared_connections,
             config.durability,
             config.blob_limits(),
-            fences.clone(),
         )
         .await
         .context("cannot open the blob store")?;
-        Ok(Self {
-            kv,
-            database,
-            blob,
-            fences,
-        })
+        Ok(Self { kv, database, blob })
     }
 }
 
@@ -225,12 +213,16 @@ fn report_interrupt(result: std::io::Result<()>) {
 /// can learn the port before the server starts accepting. `keys` is the
 /// control plane's key ring; whoever keeps it current (the binary starts a
 /// JWKS refresher, tests fill it by hand) shares it with every guard here.
+/// `control` reaches the control plane's machine channel, where the
+/// revocation list is polled from; until the first list is adopted every
+/// capability is refused.
 /// `identity` is the certificate every connection is served with.
 pub async fn serve(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
     keys: deis_capability::KeyRing,
+    control: deis_capability::ControlClient,
     identity: Arc<deis_identity::MachineIdentity>,
 ) -> Result<()> {
     let addr = listener.local_addr().context("listener has no address")?;
@@ -240,13 +232,13 @@ pub async fn serve(
     let auth_kv = StorageAuth::new(verifier.clone(), "kv");
     let auth_sql = StorageAuth::new(verifier.clone(), "sql");
     let auth_blob = StorageAuth::new(verifier.clone(), "blob");
-    deis_capability::fetch::poll_revocations_for_service(
+    deis_capability::fetch::poll_revocations(
         verifier.clone(),
         "store",
-        config.machine_identity.as_ref(),
-        Arc::clone(&identity),
+        control,
+        identity.id().trust_domain(),
     )
-    .context("cannot reach the control plane's machine channel as configured")?;
+    .await;
     if let Some(listen) = config.metrics_listen.as_deref() {
         deis_capability::exposition::require_loopback("metrics_listen", listen)
             .map_err(anyhow::Error::msg)?;
@@ -268,13 +260,6 @@ pub async fn serve(
             }),
         );
     }
-    let migration_auth = match config.migration_admin_token.as_deref() {
-        Some(token) => Some(
-            MigrationAuth::new(token)
-                .context("invalid migration_admin_token; the management service was not started")?,
-        ),
-        None => None,
-    };
     let stores = Stores::open(&config).await?;
     let sweeper = spawn_kv_sweeper(stores.kv.clone(), config.kv_sweep_interval_secs);
     let snapshots = spawn_snapshots(&config);
@@ -293,32 +278,6 @@ pub async fn serve(
     health_reporter
         .set_serving::<BlobStoreServer<BlobService>>()
         .await;
-    if migration_auth.is_some() {
-        health_reporter
-            .set_serving::<BackendMigrationServer<StoreMigrationService>>()
-            .await;
-    }
-
-    let migration_service = match migration_auth {
-        Some(auth) => {
-            tracing::info!(
-                "storage migration management enabled with independent bearer authentication"
-            );
-            Some(InterceptedService::new(
-                BackendMigrationServer::new(StoreMigrationService::new(stores.clone()))
-                    .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
-                    .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
-                auth,
-            ))
-        }
-        None => {
-            tracing::warn!(
-                "migration_admin_token is not configured, so storage inventory and writer-fence RPCs are not registered"
-            );
-            None
-        }
-    };
-
     info_ready(
         &config,
         addr,
@@ -348,7 +307,6 @@ pub async fn serve(
                 .max_encoding_message_size(MAX_GRPC_MESSAGE_BYTES),
             &auth_blob,
         ))
-        .add_optional_service(migration_service)
         .serve_with_incoming_shutdown(tls_incoming(listener, identity), shutdown)
         .await;
 
@@ -541,198 +499,11 @@ mod tests {
         assert!(dir.path().join("blob").is_dir());
     }
 
-    #[tokio::test]
-    async fn migration_management_without_auth_secret_still_works() {
-        // With capability-based auth, there is no auth_secret to check
-        // against. The migration_admin_token is always independent.
-        let dir = TempDir::new().unwrap();
-        let secret = "an-independent-migration-secret".to_string();
-        let config = Config {
-            migration_admin_token: Some(secret),
-            data_dir: dir.path().to_path_buf(),
-            ..Config::default()
-        };
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let fleet = deis_identity_test_pki::TestFleet::new();
-        // Serve will just create the migration auth independently
-        let result = serve(
-            config,
-            listener,
-            async {},
-            deis_capability::KeyRing::from_keys([ed25519_dalek::SigningKey::from_bytes(
-                &[0u8; 32],
-            )
-            .verifying_key()]),
-            fleet.service_identity(deis_identity::ServiceKind::Store),
-        )
-        .await;
-        // This will fail on store open (empty data dir structure) but NOT on
-        // the credential check - which is the point.
-        let _ = result;
-    }
-
-    /// A data directory written before the tenant change holds data nothing
-    /// will look for again. Opening over it would create empty stores beside
-    /// it and answer every read with "not found", so each of the three
-    /// stores refuses to open instead. One case per store, because they are
-    /// three separate pieces of evidence on disk.
-    #[tokio::test]
-    async fn a_data_directory_from_before_the_tenant_change_is_refused() {
-        for (what, plant) in [
-            ("kv.sqlite", plant_pre_tenant_kv as fn(&std::path::Path)),
-            ("blob.sqlite", plant_pre_tenant_blob_metadata),
-            ("db/<app>.sqlite", plant_pre_tenant_database_file),
-            ("blob/<app>/", plant_pre_tenant_blob_directory),
-        ] {
-            let dir = TempDir::new().unwrap();
-            plant(dir.path());
-            let error = match Stores::open(&config_for(&dir)).await {
-                Ok(_) => panic!("{what} must not be served over"),
-                Err(e) => e,
-            };
-            // `{:#}` so the whole chain is searched: the outer context only
-            // says which store failed to open.
-            assert!(
-                format!("{error:#}").contains("predates the tenant contract"),
-                "the refusal for {what} must say what is wrong: {error:#}"
-            );
-        }
-    }
-
-    fn plant_pre_tenant_kv(data_dir: &std::path::Path) {
-        let conn = rusqlite::Connection::open(data_dir.join("kv.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE kv (
-                 app_id     TEXT NOT NULL,
-                 key        TEXT NOT NULL,
-                 value      BLOB NOT NULL,
-                 metadata   TEXT,
-                 expires_at INTEGER,
-                 PRIMARY KEY (app_id, key)
-             )",
-        )
-        .unwrap();
-    }
-
-    fn plant_pre_tenant_blob_metadata(data_dir: &std::path::Path) {
-        let conn = rusqlite::Connection::open(data_dir.join("blob.sqlite")).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE blob (
-                 app_id       TEXT NOT NULL,
-                 key          TEXT NOT NULL,
-                 sha256       TEXT NOT NULL,
-                 size         INTEGER NOT NULL,
-                 content_type TEXT,
-                 created_at   INTEGER NOT NULL,
-                 PRIMARY KEY (app_id, key)
-             )",
-        )
-        .unwrap();
-    }
-
-    fn plant_pre_tenant_database_file(data_dir: &std::path::Path) {
-        std::fs::create_dir_all(data_dir.join("db")).unwrap();
-        std::fs::write(data_dir.join("db").join("app-one.sqlite"), b"").unwrap();
-    }
-
-    fn plant_pre_tenant_blob_directory(data_dir: &std::path::Path) {
-        std::fs::create_dir_all(data_dir.join("blob").join("app-one")).unwrap();
-    }
-
-    /// The whole-node outage this pair of checks caused, driven end to end
-    /// through the same calls a runtime makes.
-    ///
-    /// A call carrying `x-deis-binding` is stored under
-    /// `<tenant>@<BINDING>`, so the first application on a node to use a
-    /// named db or blob binding left `db/shop.production@MEDIA.sqlite` and
-    /// `blob/shop.production@MEDIA/` behind. The next start of the same
-    /// binary on the same data directory then refused - not for that tenant,
-    /// for the process - and KV, SQL and blob went down for every tenant on
-    /// the node, with "point data_dir at an empty directory" as the only
-    /// remedy the message offered.
-    #[tokio::test]
-    async fn a_data_directory_holding_a_named_binding_opens_again() {
-        let dir = TempDir::new().unwrap();
-        let config = config_for(&dir);
-        let media = TenantId::of_binding("shop.production", Some("MEDIA")).unwrap();
-        assert_eq!(media.as_str(), "shop.production@MEDIA");
-
-        {
-            let stores = Stores::open(&config).await.unwrap();
-            stores
-                .database
-                .exec_statement(&media, "CREATE TABLE t (a INTEGER)", &[])
-                .await
-                .unwrap();
-            stores
-                .kv
-                .set(&media, "k", b"v".to_vec(), None, None)
-                .await
-                .unwrap();
-            stores
-                .blob
-                .store_object(
-                    &media,
-                    "object",
-                    None,
-                    None,
-                    Box::pin(tokio_stream::iter(vec![Ok(b"bytes".to_vec())])),
-                )
-                .await
-                .unwrap();
-        }
-
-        // The names the binding actually put on disk, so this test keeps
-        // meaning what it says if the layout is ever changed.
-        assert!(
-            dir.path()
-                .join("db")
-                .join("shop.production@MEDIA.sqlite")
-                .is_file()
-        );
-        assert!(
-            dir.path()
-                .join("blob")
-                .join("shop.production@MEDIA")
-                .is_dir()
-        );
-
-        let stores = Stores::open(&config)
-            .await
-            .expect("a data directory holding a named binding must open again");
-        // And the data is still the binding's own, not the tenant's unnamed
-        // namespace: a check that "fixed" the refusal by rewriting the name
-        // would pass the line above and fail here.
-        assert_eq!(
-            stores.kv.get(&media, "k").await.unwrap().map(|e| e.value),
-            Some(b"v".to_vec())
-        );
-        assert!(stores.blob.head(&media, "object").await.unwrap().is_some());
-    }
-
-    /// A file this service never wrote must not be able to stop it. The
-    /// refusal takes every tenant on the node offline, so it is reserved for
-    /// evidence of pre-tenant data and never spent on a stray name.
-    #[tokio::test]
-    async fn a_stray_file_in_the_data_directory_does_not_stop_the_node() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("db")).unwrap();
-        std::fs::create_dir_all(dir.path().join("blob")).unwrap();
-        std::fs::write(dir.path().join("db").join(".DS_Store"), b"").unwrap();
-        std::fs::write(dir.path().join("db").join("app-one.sqlite.bak"), b"").unwrap();
-        std::fs::create_dir(dir.path().join("blob").join("lost+found")).unwrap();
-        std::fs::write(dir.path().join("blob").join("README"), b"").unwrap();
-
-        Stores::open(&config_for(&dir))
-            .await
-            .expect("a stray name is not evidence that any tenant's data is unreachable");
-    }
-
     #[tokio::test(start_paused = true)]
     async fn the_sweeper_reclaims_expired_entries() {
         let dir = TempDir::new().unwrap();
         let stores = Stores::open(&config_for(&dir)).await.unwrap();
-        let tenant = TenantId::parse("app-one.production").unwrap();
+        let tenant = TenantId::for_label("app-one.production");
         stores
             .kv
             .set(

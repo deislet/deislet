@@ -17,7 +17,6 @@
             "not-found",
             "invalid-argument",
             "limit-out-of-range",
-            "offset-out-of-range",
             "cursor-invalid",
             "idempotency-key-required",
             "idempotency-key-reused",

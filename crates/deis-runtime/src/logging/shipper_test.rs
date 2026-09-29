@@ -337,6 +337,29 @@ mod tests {
         assert!(proto.timestamp_us > 0);
     }
 
+    /// The logging layer splits the label before a line reaches the
+    /// shipper; the canonical tenant is still found for it, in both spellings
+    /// a line can arrive in.
+    #[test]
+    fn to_proto_stamps_the_canonical_tenant_of_the_environment() {
+        let canonical =
+            deis_wire::CanonicalTenantId::derived_from_label("stamped.preview").to_string();
+        crate::telemetry::record_tenant("stamped.preview", &canonical);
+
+        let split = LogEntry::new("node-1".to_string(), LogLevel::Info, "hi".to_string())
+            .with_app_id("stamped".to_string())
+            .with_field("environment".to_string(), "preview".to_string());
+        assert_eq!(to_proto(&split).tenant, canonical);
+
+        let whole = LogEntry::new("node-1".to_string(), LogLevel::Info, "hi".to_string())
+            .with_app_id("stamped.preview".to_string());
+        assert_eq!(to_proto(&whole).tenant, canonical);
+
+        let unknown = LogEntry::new("node-1".to_string(), LogLevel::Info, "hi".to_string())
+            .with_app_id("never-ran".to_string());
+        assert_eq!(to_proto(&unknown).tenant, "");
+    }
+
     #[test]
     fn to_proto_normalises_a_tenant_supplied_directly_to_a_log_entry() {
         let entry = LogEntry::new("node-1".to_string(), LogLevel::Info, "ready".to_string())

@@ -38,7 +38,7 @@ use utoipa::ToSchema;
 use super::CatalogState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::openapi;
-use crate::capability_ledger::{CapabilityLedger, RevocationScope};
+use crate::capability_ledger::RevocationScope;
 
 /// What a revocation took back.
 #[derive(Debug, Serialize, ToSchema)]
@@ -57,17 +57,10 @@ pub struct AuthEpoch {
     pub auth_epoch: u64,
 }
 
-fn ledger(state: &CatalogState) -> ApiResult<&CapabilityLedger> {
-    state.issuer.ledger().ok_or_else(|| {
-        ApiError::NotConfigured(
-            "this control plane keeps no issuance record, so there is nothing to revoke from"
-                .to_string(),
-        )
-    })
-}
-
 async fn revoke(state: &CatalogState, scope: RevocationScope) -> ApiResult<Vec<String>> {
-    ledger(state)?
+    state
+        .issuer
+        .ledger()
         .revoke(scope)
         .await
         .map_err(|error| ApiError::DatabaseError(error.to_string()))
@@ -129,11 +122,11 @@ pub async fn revoke_node(
     Path(node_id): Path<String>,
 ) -> ApiResult<Json<CapabilityRevocation>> {
     let revoked = revoke(&state, RevocationScope::Node(node_id.clone())).await?;
-    // Out of the fleet as well: nothing is pushed to it and no proxy routes
-    // to it, and the machine channel refuses its attempts to register again.
-    // A node named in `deis_runtime_nodes` stays listed until it is taken
-    // out of that file, but is answered nothing all the same.
-    let removed = state.nodes.deregister(&node_id);
+    // Out of the fleet as well - a node named in `deis_runtime_nodes`
+    // included: nothing is pushed to it, no cron fire is handed to it, no
+    // proxy routes to it, and a registration racing this one cannot put it
+    // back (see `RuntimeNodeManager::revoke`).
+    let removed = state.nodes.revoke(&node_id);
     warn!(
         node = %node_id,
         revoked = revoked.len(),
@@ -164,11 +157,17 @@ pub async fn lift_node_revocation(
     State(state): State<CatalogState>,
     Path(node_id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let lifted = ledger(&state)?
+    let lifted = state
+        .issuer
+        .ledger()
         .lift_node(&node_id)
         .await
         .map_err(|error| ApiError::DatabaseError(error.to_string()))?;
-    if !lifted {
+    // The fleet is told whatever the ledger said: a revocation this process
+    // held in memory but the ledger no longer does must not keep the node
+    // out.
+    let held = state.nodes.lift_revocation(&node_id);
+    if !lifted && !held {
         return Err(ApiError::NotFound(format!("node {node_id} is not revoked")));
     }
     warn!(node = %node_id, "Lifted a node's revocation; it may register and be issued capabilities again");
@@ -197,9 +196,10 @@ pub async fn revoke_tenant_capabilities(
     Path((app_id, env_name)): Path<(String, String)>,
 ) -> ApiResult<Json<CapabilityRevocation>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
-    let tenant = deis_wire::conventions::tenant_id(&app_id, &env.name);
-    let revoked = revoke(&state, RevocationScope::Tenant(tenant.clone())).await?;
-    info!(tenant = %tenant, revoked = revoked.len(), "Revoked every capability naming a tenant");
+    // Store, queue and telemetry capabilities all name the canonical tenant.
+    let canonical = super::assignments::canonical_tenant_of(&state, &env.app_id, &env.id).await?;
+    let revoked = revoke(&state, RevocationScope::Tenant(canonical.clone())).await?;
+    info!(tenant = %canonical, revoked = revoked.len(), "Revoked every capability naming a tenant");
     Ok(Json(CapabilityRevocation { revoked }))
 }
 
@@ -221,7 +221,6 @@ pub async fn revoke_tenant_capabilities(
     )
 )]
 pub async fn bump_auth_epoch(State(state): State<CatalogState>) -> ApiResult<Json<AuthEpoch>> {
-    ledger(&state)?;
     let auth_epoch = state
         .issuer
         .bump_auth_epoch()
@@ -244,7 +243,13 @@ mod tests {
 
     async fn platform() -> Harness {
         let h = harness_with_storage(true, storage_wiring()).await;
-        json(&h.router, "POST", "/api/apps", serde_json::json!({"id": "demo"})).await;
+        json(
+            &h.router,
+            "POST",
+            "/api/apps",
+            serde_json::json!({"id": "demo"}),
+        )
+        .await;
         json(
             &h.router,
             "POST",
@@ -304,7 +309,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let listed = published_list(&h).await.revoked_jtis;
-        for token in [&first["queue_token"], &second["token"], &second["queue_token"]] {
+        for token in [
+            &first["queue_token"],
+            &second["token"],
+            &second["queue_token"],
+        ] {
             assert!(listed.contains(&jti(token.as_str().unwrap())));
         }
 
