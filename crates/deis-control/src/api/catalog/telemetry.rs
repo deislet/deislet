@@ -44,8 +44,8 @@ use crate::identity::Principal;
 /// A read credential for deis-telemetry.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TelemetryTokenResponse {
-    /// The `<app>.<environment>` tenants the token reads, or `@platform` for
-    /// a token that reads everything.
+    /// The canonical tenants (`v1/<application id>/<environment id>`) the
+    /// token reads, or `@platform` for a token that reads everything.
     pub tenants: Vec<String>,
     /// The capability, for the `Authorization: Bearer` header on calls to
     /// deis-telemetry. Valid for 15 minutes; it may query and follow, and
@@ -74,7 +74,8 @@ pub async fn environment_telemetry_token(
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<TelemetryTokenResponse>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
-    let tenants = vec![deis_wire::conventions::tenant_id(&app_id, &env.name)];
+    let tenants =
+        vec![super::assignments::canonical_tenant_of(&state, &env.app_id, &env.id).await?];
     Ok(Json(mint(&state, &principal, peer, tenants).await?))
 }
 
@@ -98,13 +99,15 @@ pub async fn app_telemetry_token(
     peer: Option<ConnectInfo<SocketAddr>>,
     Extension(principal): Extension<Principal>,
 ) -> ApiResult<Json<TelemetryTokenResponse>> {
-    state.store.get_app(&app_id).await?;
+    let app = state.store.get_app(&app_id).await?;
     let tenants = state
         .store
         .list_environments(&app_id)
         .await?
         .iter()
-        .map(|env| deis_wire::conventions::tenant_id(&app_id, &env.name))
+        .map(|env| {
+            deis_wire::CanonicalTenantId::new(app.canonical_id, env.canonical_id).to_string()
+        })
         .collect();
     Ok(Json(mint(&state, &principal, peer, tenants).await?))
 }
@@ -185,6 +188,16 @@ mod tests {
         TELEMETRY_READ,
     };
 
+    /// The canonical tenant of one of `demo`'s environments.
+    async fn tenant(h: &super::super::tests::Harness, env: &str) -> String {
+        let environment = super::super::apps::resolve_environment(&h.state, "demo", env)
+            .await
+            .unwrap();
+        super::super::assignments::canonical_tenant_of(&h.state, "demo", &environment.id)
+            .await
+            .unwrap()
+    }
+
     async fn platform() -> super::super::tests::Harness {
         let h = harness_with_storage(true, storage_wiring()).await;
         json(
@@ -217,7 +230,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["tenants"], serde_json::json!(["demo.production"]));
+        let production = tenant(&h, "production").await;
+        assert_eq!(body["tenants"], serde_json::json!([production]));
 
         let mut verifier = CapabilityVerifier::new(h.state.issuer.verifying_key().await);
         verifier
@@ -229,7 +243,7 @@ mod tests {
             .expect("deis-telemetry accepts it");
         assert_eq!(
             grant.tenants_with(TELEMETRY_READ).collect::<Vec<_>>(),
-            ["demo.production"]
+            [production.as_str()]
         );
         assert_eq!(
             grant.tenants_with(TELEMETRY_INGEST).count(),
@@ -251,7 +265,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let mut tenants: Vec<String> = serde_json::from_value(body["tenants"].clone()).unwrap();
         tenants.sort();
-        assert_eq!(tenants, ["demo.preview", "demo.production"]);
+        let mut expected = vec![tenant(&h, "preview").await, tenant(&h, "production").await];
+        expected.sort();
+        assert_eq!(tenants, expected);
 
         let (status, _) = json(
             &h.router,

@@ -440,6 +440,7 @@ mod tests {
                 .collect(),
             value,
             timestamp_us: ts,
+            tenant: crate::identity::fixture_tenant(app_id, "production"),
         }
     }
 

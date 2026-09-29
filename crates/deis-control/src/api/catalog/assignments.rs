@@ -344,11 +344,8 @@ pub(crate) struct VisibleDeployment {
     /// `None` for a deployment that predates typed snapshots, which binds no
     /// secret revisions and so has nothing to fetch.
     pub snapshot_id: Option<String>,
-    /// `<app>.<environment>`, as `deis_wire::conventions::tenant_id` spells
-    /// it: the tenant label a telemetry capability names.
-    pub tenant: String,
-    /// `v1/<application id>/<environment id>`: the tenant a store or queue
-    /// capability names.
+    /// `v1/<application id>/<environment id>`: the tenant a store, queue or
+    /// telemetry capability names.
     pub canonical_tenant: String,
     /// The routing generation this deployment serves under.
     pub routing_generation: String,
@@ -384,10 +381,6 @@ pub(crate) async fn deployments_visible_to(
                 VisibleDeployment {
                     env_id: assignment.environment_id,
                     snapshot_id: assignment.snapshot_id,
-                    tenant: deis_wire::conventions::tenant_id(
-                        &assignment.app_id,
-                        &assignment.environment,
-                    ),
                     canonical_tenant,
                     routing_generation: assignment.routing_generation,
                 },
@@ -399,14 +392,12 @@ pub(crate) async fn deployments_visible_to(
         {
             continue;
         }
-        let environment = state.store.get_environment_by_id(&plan.env_id).await?;
         let canonical_tenant = canonical_tenant_of(state, &plan.app_id, &plan.env_id).await?;
         visible.insert(
             plan.id,
             VisibleDeployment {
                 env_id: plan.env_id,
                 snapshot_id: plan.snapshot_id,
-                tenant: deis_wire::conventions::tenant_id(&plan.app_id, &environment.name),
                 canonical_tenant,
                 routing_generation: plan.routing_generation.to_string(),
             },

@@ -593,7 +593,9 @@ async fn run(
                 running
                     .running()
                     .into_iter()
-                    .map(|(key, _)| key.tenant_id())
+                    .filter_map(|(key, _)| {
+                        deis_runtime::telemetry::canonical_tenant(&key.tenant_id())
+                    })
                     .collect()
             },
         );

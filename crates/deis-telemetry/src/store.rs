@@ -144,6 +144,10 @@ pub struct LogRecord {
     pub fields: BTreeMap<String, String>,
     pub trace_id: String,
     pub span_id: String,
+    /// The canonical tenant `v1/<application id>/<environment id>` the record
+    /// belongs to; empty for a node's own records. What decides who may read
+    /// it back (see `crate::identity`).
+    pub tenant: String,
 }
 
 /// One numeric sample of one series at one point in time.
@@ -154,6 +158,10 @@ pub struct MetricRecord {
     pub labels: BTreeMap<String, String>,
     pub value: f64,
     pub timestamp_us: i64,
+    /// The canonical tenant `v1/<application id>/<environment id>` the record
+    /// belongs to; empty for a node's own records. What decides who may read
+    /// it back (see `crate::identity`).
+    pub tenant: String,
 }
 
 /// One stored trace record: a single invocation of one application.
@@ -184,6 +192,10 @@ pub struct TraceRecord {
     pub error: String,
     /// Extra dimensions, kept ordered so the stored JSON is canonical.
     pub attributes: BTreeMap<String, String>,
+    /// The canonical tenant `v1/<application id>/<environment id>` the record
+    /// belongs to; empty for a node's own records. What decides who may read
+    /// it back (see `crate::identity`).
+    pub tenant: String,
 }
 
 impl WireSize for LogRecord {
@@ -191,6 +203,7 @@ impl WireSize for LogRecord {
         RECORD_FIXED_COST
             + string_cost(&self.component)
             + string_cost(&self.app_id)
+            + string_cost(&self.tenant)
             + string_cost(&self.message)
             + string_cost(&self.trace_id)
             + string_cost(&self.span_id)
@@ -207,6 +220,7 @@ impl WireSize for MetricRecord {
         RECORD_FIXED_COST
             + string_cost(&self.name)
             + string_cost(&self.app_id)
+            + string_cost(&self.tenant)
             + self
                 .labels
                 .iter()
@@ -220,6 +234,7 @@ impl WireSize for TraceRecord {
         RECORD_FIXED_COST
             + string_cost(&self.trace_id)
             + string_cost(&self.app_id)
+            + string_cost(&self.tenant)
             + string_cost(&self.environment)
             + string_cost(&self.node)
             + string_cost(&self.target)
@@ -547,7 +562,8 @@ impl TelemetryStore {
                  app_id       TEXT NOT NULL,
                  labels       TEXT NOT NULL,
                  value        REAL NOT NULL,
-                 timestamp_us INTEGER NOT NULL
+                 timestamp_us INTEGER NOT NULL,
+                 tenant       TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS ix_metrics_series_time
                  ON metrics (name, app_id, timestamp_us DESC, id DESC);
@@ -644,8 +660,9 @@ impl TelemetryStore {
             create_partition(&tx, &table)?;
             let sql = format!(
                 "INSERT INTO {table}
-                     (timestamp_us, level, component, app_id, message, fields, trace_id, span_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+                     (timestamp_us, level, component, app_id, message, fields, trace_id, span_id,
+                      tenant)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
             );
             let mut stmt = tx
                 .prepare_cached(&sql)
@@ -662,6 +679,7 @@ impl TelemetryStore {
                     fields,
                     record.trace_id,
                     record.span_id,
+                    record.tenant,
                 ])
                 .with_context(|| format!("cannot insert log into {table}"))?;
                 written += 1;
@@ -768,8 +786,8 @@ impl TelemetryStore {
             let sql = format!(
                 "INSERT INTO {table}
                      (trace_id, started_us, duration_us, app_id, environment, node,
-                      kind, outcome, target, method, status, error, attributes)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                      kind, outcome, target, method, status, error, attributes, tenant)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             );
             let mut stmt = tx
                 .prepare_cached(&sql)
@@ -791,6 +809,7 @@ impl TelemetryStore {
                     record.status,
                     record.error,
                     attributes,
+                    record.tenant,
                 ])
                 .with_context(|| format!("cannot insert trace into {table}"))?;
                 written += 1;
@@ -871,8 +890,8 @@ impl TelemetryStore {
         {
             let mut stmt = tx
                 .prepare_cached(
-                    "INSERT INTO metrics (name, app_id, labels, value, timestamp_us)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO metrics (name, app_id, labels, value, timestamp_us, tenant)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )
                 .context("cannot prepare metric insert")?;
             for record in records {
@@ -884,6 +903,7 @@ impl TelemetryStore {
                     labels,
                     record.value,
                     record.timestamp_us,
+                    record.tenant,
                 ])
                 .context("cannot insert metric sample")?;
             }
@@ -942,6 +962,7 @@ impl TelemetryStore {
                     labels,
                     value: row.get(4)?,
                     timestamp_us,
+                    tenant: row.get(6)?,
                 };
                 if !budget.admit(&record) {
                     break;
@@ -981,7 +1002,7 @@ impl TelemetryStore {
         self.with_reader(|conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT name, app_id, labels, value, MAX(timestamp_us)
+                    "SELECT name, app_id, labels, value, MAX(timestamp_us), tenant
                  FROM metrics
                  WHERE timestamp_us >= ?1
                  GROUP BY name, app_id, labels
@@ -997,6 +1018,7 @@ impl TelemetryStore {
                         labels: serde_json::from_str(&labels_json).unwrap_or_default(),
                         value: row.get(3)?,
                         timestamp_us: row.get(4)?,
+                        tenant: row.get(5)?,
                     })
                 })
                 .context("cannot run metric export")?;
@@ -1295,7 +1317,8 @@ fn create_partition(conn: &Connection, table: &str) -> Result<()> {
              message      TEXT NOT NULL,
              fields       TEXT NOT NULL,
              trace_id     TEXT NOT NULL,
-             span_id      TEXT NOT NULL
+             span_id      TEXT NOT NULL,
+             tenant       TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS ix_{table}_app_time
              ON {table} (app_id, timestamp_us DESC, id DESC);
@@ -1328,7 +1351,8 @@ fn create_trace_partition(conn: &Connection, table: &str) -> Result<()> {
              method      TEXT NOT NULL,
              status      INTEGER NOT NULL,
              error       TEXT NOT NULL,
-             attributes  TEXT NOT NULL
+             attributes  TEXT NOT NULL,
+             tenant      TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS ix_{table}_app_time
              ON {table} (app_id, started_us DESC, id DESC);
@@ -1446,7 +1470,8 @@ fn build_partition_query(
     let limit_slot = args.len() + 1;
     args.push(SqlValue::Integer(limit as i64));
     let sql = format!(
-        "SELECT id, timestamp_us, level, component, app_id, message, fields, trace_id, span_id
+        "SELECT id, timestamp_us, level, component, app_id, message, fields, trace_id, span_id,
+                tenant
          FROM {table}{where_sql}
          ORDER BY timestamp_us DESC, id DESC
          LIMIT ?{limit_slot}"
@@ -1496,7 +1521,7 @@ fn build_metric_query(
         format!(" WHERE {}", clauses.join(" AND "))
     };
     let sql = format!(
-        "SELECT id, name, app_id, labels, value, timestamp_us
+        "SELECT id, name, app_id, labels, value, timestamp_us, tenant
          FROM metrics{where_sql}
          ORDER BY timestamp_us DESC, id DESC"
     );
@@ -1544,6 +1569,7 @@ fn query_partition(
                     }),
                     trace_id: row.get(7)?,
                     span_id: row.get(8)?,
+                    tenant: row.get(9)?,
                 },
             ))
         })
@@ -1632,7 +1658,7 @@ fn build_trace_partition_query(
     args.push(SqlValue::Integer(limit as i64));
     let sql = format!(
         "SELECT id, trace_id, started_us, duration_us, app_id, environment, node,
-                kind, outcome, target, method, status, error, attributes
+                kind, outcome, target, method, status, error, attributes, tenant
          FROM {table}{where_sql}
          ORDER BY started_us DESC, id DESC
          LIMIT ?{limit_slot}"
@@ -1684,6 +1710,7 @@ fn query_trace_partition(
                         );
                         BTreeMap::new()
                     }),
+                    tenant: row.get(14)?,
                 },
             ))
         })
@@ -1721,6 +1748,7 @@ mod tests {
             fields: BTreeMap::new(),
             trace_id: String::new(),
             span_id: String::new(),
+            tenant: crate::identity::fixture_tenant(app, "production"),
         }
     }
 
@@ -2200,6 +2228,7 @@ mod tests {
             status: if outcome == OUTCOME_OK { 200 } else { 500 },
             error: String::new(),
             attributes: BTreeMap::new(),
+            tenant: crate::identity::fixture_tenant(app, "production"),
         }
     }
 
@@ -2480,6 +2509,7 @@ mod tests {
                 .collect(),
             value,
             timestamp_us: ts,
+            tenant: crate::identity::fixture_tenant(app, "production"),
         }
     }
 

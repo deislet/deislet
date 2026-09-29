@@ -9,12 +9,10 @@
 //! - the audience is one whose services check per-tenant bindings
 //!   ([`deis_capability::bindings_for_audience`]) - no `telemetry.read`, no
 //!   audience string nothing verifies;
-//! - the tenant is one of a deployment
+//! - the tenant is the canonical `v1/<application id>/<environment id>` of
+//!   a deployment
 //!   [`deployments_visible_to`](crate::api::catalog::assignments::deployments_visible_to)
-//!   that node - the one place placement will narrow. For deis-store and
-//!   deis-queue that is the canonical `v1/<application id>/<environment id>`;
-//!   for deis-telemetry, whose records carry names, the `<app>.<environment>`
-//!   label;
+//!   that node - the one place placement will narrow;
 //! - the binding is one that audience defines;
 //! - a generation, if the resource names one, is that deployment's routing
 //!   generation;
@@ -38,22 +36,15 @@ use deis_capability::{
 
 use crate::api::catalog::assignments::VisibleDeployment;
 
-/// The tenants a node may name for `audience`, each with the routing
-/// generations it may name for that tenant: canonical tenants for the data
-/// services, labels for deis-telemetry.
-pub(crate) fn tenants_of<'a>(
-    audience: &str,
-    visible: &'a BTreeMap<String, VisibleDeployment>,
-) -> BTreeMap<&'a str, BTreeSet<&'a str>> {
+/// The canonical tenants a node may name, each with the routing generations
+/// it may name for that tenant.
+pub(crate) fn tenants_of(
+    visible: &BTreeMap<String, VisibleDeployment>,
+) -> BTreeMap<&str, BTreeSet<&str>> {
     let mut tenants: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for deployment in visible.values() {
-        let tenant = if audience == AUD_TELEMETRY {
-            deployment.tenant.as_str()
-        } else {
-            deployment.canonical_tenant.as_str()
-        };
         tenants
-            .entry(tenant)
+            .entry(deployment.canonical_tenant.as_str())
             .or_default()
             .insert(deployment.routing_generation.as_str());
     }
@@ -76,7 +67,7 @@ pub(crate) fn authorize(
     if resources.is_empty() {
         return Err("at least one resource must be requested".to_string());
     }
-    let tenants = tenants_of(audience, visible);
+    let tenants = tenants_of(visible);
     for resource in resources {
         if audience == AUD_TELEMETRY && resource.binding != TELEMETRY_INGEST {
             return Err(format!(
@@ -131,7 +122,6 @@ mod tests {
             VisibleDeployment {
                 env_id: "env-a".to_string(),
                 snapshot_id: None,
-                tenant: "a.production".to_string(),
                 canonical_tenant: canonical("a.production"),
                 routing_generation: "gen-a".to_string(),
             },
@@ -210,7 +200,10 @@ mod tests {
         authorize(
             "n",
             AUD_TELEMETRY,
-            &[ingest("a.production"), ingest(TELEMETRY_PLATFORM_TENANT)],
+            &[
+                ingest(&canonical("a.production")),
+                ingest(TELEMETRY_PLATFORM_TENANT),
+            ],
             &visible(),
         )
         .unwrap();
@@ -222,15 +215,29 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert!(authorize("n", AUD_TELEMETRY, &[ingest("b.production")], &visible()).is_err());
+        assert!(
+            authorize(
+                "n",
+                AUD_TELEMETRY,
+                &[ingest(&canonical("b.production"))],
+                &visible()
+            )
+            .is_err()
+        );
+        // The label names no tenant: a recreated application of the same
+        // name would otherwise push into the old one's records.
+        assert!(authorize("n", AUD_TELEMETRY, &[ingest("a.production")], &visible()).is_err());
     }
 
     #[test]
     fn a_node_may_never_read_telemetry() {
-        for tenant in ["a.production", TELEMETRY_PLATFORM_TENANT] {
+        for tenant in [
+            canonical("a.production"),
+            TELEMETRY_PLATFORM_TENANT.to_string(),
+        ] {
             let read = CapabilityResource {
                 binding: TELEMETRY_READ.to_string(),
-                ..ingest(tenant)
+                ..ingest(&tenant)
             };
             let refusal = authorize("n", AUD_TELEMETRY, &[read], &visible()).unwrap_err();
             assert!(refusal.contains("reads none"), "{refusal}");

@@ -666,6 +666,7 @@ mod tests {
             status,
             error: String::new(),
             attributes: Default::default(),
+            tenant: String::new(),
         }
     }
 
@@ -796,6 +797,7 @@ mod terminal_safety_test {
             status: 200,
             error: String::new(),
             attributes: Default::default(),
+            tenant: String::new(),
         }
     }
 

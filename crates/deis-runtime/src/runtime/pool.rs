@@ -2140,6 +2140,9 @@ impl RuntimePool {
         {
             spec.storage_tenant = Some(storage_tenant.clone());
         }
+        if !storage_tenant.is_empty() {
+            crate::telemetry::record_tenant(&tenant, &storage_tenant);
+        }
         let execution_timeout = Duration::from_millis(spec.limits.timeout_ms);
 
         // Reserved before the isolate is built, so no second load can be sent

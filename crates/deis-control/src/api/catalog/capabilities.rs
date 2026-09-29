@@ -196,14 +196,10 @@ pub async fn revoke_tenant_capabilities(
     Path((app_id, env_name)): Path<(String, String)>,
 ) -> ApiResult<Json<CapabilityRevocation>> {
     let env = super::apps::resolve_environment(&state, &app_id, &env_name).await?;
-    // Store and queue capabilities name the canonical tenant, telemetry
-    // capabilities the `<app>.<environment>` label its records carry; both
-    // are this environment.
+    // Store, queue and telemetry capabilities all name the canonical tenant.
     let canonical = super::assignments::canonical_tenant_of(&state, &env.app_id, &env.id).await?;
-    let label = deis_wire::conventions::tenant_id(&app_id, &env.name);
-    let mut revoked = revoke(&state, RevocationScope::Tenant(canonical.clone())).await?;
-    revoked.extend(revoke(&state, RevocationScope::Tenant(label.clone())).await?);
-    info!(tenant = %canonical, label = %label, revoked = revoked.len(), "Revoked every capability naming a tenant");
+    let revoked = revoke(&state, RevocationScope::Tenant(canonical.clone())).await?;
+    info!(tenant = %canonical, revoked = revoked.len(), "Revoked every capability naming a tenant");
     Ok(Json(CapabilityRevocation { revoked }))
 }
 

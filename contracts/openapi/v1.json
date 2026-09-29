@@ -7303,7 +7303,7 @@
         "description": "A read credential for deis-telemetry.",
         "properties": {
           "tenants": {
-            "description": "The `<app>.<environment>` tenants the token reads, or `@platform` for\na token that reads everything.",
+            "description": "The canonical tenants (`v1/<application id>/<environment id>`) the\ntoken reads, or `@platform` for a token that reads everything.",
             "items": {
               "type": "string"
             },

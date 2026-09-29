@@ -550,6 +550,7 @@ fn to_record(
     }
     for (field, value) in [
         ("app_id", &entry.app_id),
+        ("tenant", &entry.tenant),
         ("component", &entry.component),
         ("trace_id", &entry.trace_id),
         ("span_id", &entry.span_id),
@@ -567,6 +568,7 @@ fn to_record(
         fields,
         trace_id: entry.trace_id,
         span_id: entry.span_id,
+        tenant: entry.tenant,
     })
 }
 
@@ -601,6 +603,7 @@ fn to_entry(record: &LogRecord) -> LogEntry {
             .collect(),
         trace_id: record.trace_id.clone(),
         span_id: record.span_id.clone(),
+        tenant: record.tenant.clone(),
     }
 }
 
@@ -618,7 +621,11 @@ fn to_metric_record(sample: MetricSample, window: &Window) -> Result<MetricRecor
     let timestamp_us = window
         .accept(sample.timestamp_us, &mut stamped)
         .map_err(|fault| fault.describe("timestamp_us"))?;
-    for (field, value) in [("name", &sample.name), ("app_id", &sample.app_id)] {
+    for (field, value) in [
+        ("name", &sample.name),
+        ("app_id", &sample.app_id),
+        ("tenant", &sample.tenant),
+    ] {
         check_identifier(field, value).map_err(|fault| fault.describe("labels"))?;
     }
     // Labels name the series, so no label is ever cut and kept: the total
@@ -633,6 +640,7 @@ fn to_metric_record(sample: MetricSample, window: &Window) -> Result<MetricRecor
         labels,
         value: sample.value,
         timestamp_us,
+        tenant: sample.tenant,
     })
 }
 
@@ -647,6 +655,7 @@ fn to_metric_sample(record: &MetricRecord) -> MetricSample {
             .collect(),
         value: record.value,
         timestamp_us: record.timestamp_us,
+        tenant: record.tenant.clone(),
     }
 }
 
@@ -1049,6 +1058,7 @@ fn to_trace_record(
     for (field, value) in [
         ("trace_id", &record.trace_id),
         ("app_id", &record.app_id),
+        ("tenant", &record.tenant),
         ("environment", &record.environment),
         ("node", &record.node),
         ("method", &record.method),
@@ -1071,6 +1081,7 @@ fn to_trace_record(
         status: record.status,
         error: truncate_to(record.error, MAX_TRACE_ERROR_BYTES, truncated),
         attributes,
+        tenant: record.tenant,
     })
 }
 
@@ -1093,6 +1104,7 @@ fn to_proto_trace(record: &TraceRecord) -> ProtoTraceRecord {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        tenant: record.tenant.clone(),
     }
 }
 
@@ -1534,6 +1546,7 @@ mod tests {
             fields: Default::default(),
             trace_id: String::new(),
             span_id: String::new(),
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         }
     }
 
@@ -1621,6 +1634,7 @@ mod tests {
             labels: Default::default(),
             value: f64::NAN,
             timestamp_us: 1,
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         };
         assert!(to_metric_record(sample, &window(10)).is_err());
     }
@@ -1633,6 +1647,7 @@ mod tests {
             labels: Default::default(),
             value: 1.0,
             timestamp_us: 1,
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         };
         assert!(to_metric_record(sample, &window(10)).is_err());
     }
@@ -1652,6 +1667,7 @@ mod tests {
             status: 200,
             error: String::new(),
             attributes: Default::default(),
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         }
     }
 
@@ -1792,6 +1808,7 @@ mod tests {
             labels: Default::default(),
             value: 1.0,
             timestamp_us: days_before(now, 31),
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         };
         let err = to_metric_record(old, &metrics).expect_err("must be refused");
         assert!(err.contains("30-day metric retention"), "{err}");
@@ -1809,6 +1826,7 @@ mod tests {
                 fields: Default::default(),
                 trace_id: String::new(),
                 span_id: String::new(),
+                tenant: crate::identity::fixture_tenant("clock", "production"),
             })
             .collect();
         let dropped = cap_distinct_days(&mut records, |r| day_of(r.timestamp_us));
@@ -1908,6 +1926,7 @@ mod tests {
                 .collect(),
             value: 1.0,
             timestamp_us: 1_787_961_600_000_000,
+            tenant: crate::identity::fixture_tenant("shop", "production"),
         };
         let err = to_metric_record(
             sample(vec![("route", "r".repeat(MAX_LABELS_BYTES + 1))]),

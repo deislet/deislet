@@ -53,7 +53,6 @@ use deis_capability::{
     AUD_TELEMETRY, CapabilityError, CapabilityVerifier, KeyRing, SharedVerifier, TELEMETRY_INGEST,
     TELEMETRY_PLATFORM_TENANT, TELEMETRY_READ, VerifiedGrant,
 };
-use deis_wire::conventions::tenant_id;
 use tonic::{Request, Status};
 
 /// The header carrying the capability token.
@@ -67,7 +66,8 @@ const BEARER_PREFIX: &str = "bearer ";
 pub enum Owner {
     /// A node's own record, about no application.
     Platform,
-    /// One application environment, as `<app>.<environment>`.
+    /// One application environment, by its canonical tenant
+    /// `v1/<application id>/<environment id>`.
     Tenant(String),
 }
 
@@ -180,7 +180,7 @@ impl Ingest<'_> {
 pub enum ReadScope {
     /// Everything: every tenant and the platform's own records.
     All,
-    /// These `<app>.<environment>` tenants and nothing else.
+    /// These canonical tenants and nothing else.
     Tenants(Arc<BTreeSet<String>>),
 }
 
@@ -194,42 +194,18 @@ impl ReadScope {
         }
     }
 
-    /// Whether a record of `app_id` in `environment` may be handed back.
-    pub fn admits_parts(&self, app_id: &str, environment: &str) -> bool {
-        match self {
-            Self::All => true,
-            Self::Tenants(tenants) => tenants.contains(&tenant_id(app_id, environment)),
-        }
-    }
-
-    /// Refuse a read that does not name an application this scope reaches.
+    /// Refuse a read by a narrow reader that does not name an application.
     ///
-    /// A narrow reader has to say which application it is asking about. The
-    /// records coming back are filtered anyway; refusing up front is what
-    /// makes asking about somebody else's application an error rather than
-    /// an empty page that looks like silence.
+    /// The records coming back are filtered to the capability's canonical
+    /// tenants either way. A capability names tenants by id, not by name, so
+    /// whether `app_id` is one of them cannot be decided here: asking about
+    /// somebody else's application answers with an empty page.
     pub fn check_app(&self, app_id: Option<&str>) -> Result<(), Status> {
-        let Self::Tenants(tenants) = self else {
-            return Ok(());
-        };
-        let Some(app_id) = app_id else {
-            return Err(Status::permission_denied(
+        match (self, app_id) {
+            (Self::Tenants(_), None) => Err(Status::permission_denied(
                 "this capability reads named applications only; set app_id",
-            ));
-        };
-        let reachable = tenants.iter().any(|tenant| {
-            deis_wire::conventions::split_tenant(tenant).is_some_and(|(app, _)| app == app_id)
-        });
-        if reachable {
-            Ok(())
-        } else {
-            tracing::warn!(
-                app_id,
-                "refused a telemetry read for an application its capability does not name"
-            );
-            Err(Status::permission_denied(format!(
-                "this capability does not allow reading telemetry of {app_id}"
-            )))
+            )),
+            _ => Ok(()),
         }
     }
 }
@@ -477,8 +453,13 @@ mod tests {
         grant_of(&passed)
     }
 
-    fn tenant(name: &str) -> Owner {
-        Owner::Tenant(name.to_string())
+    /// The canonical tenant a test names by label.
+    fn ct(label: &str) -> String {
+        deis_wire::CanonicalTenantId::derived_from_label(label).to_string()
+    }
+
+    fn tenant(label: &str) -> Owner {
+        Owner::Tenant(ct(label))
     }
 
     /// Until the first revocation list is adopted, a sound capability is
@@ -490,9 +471,12 @@ mod tests {
         let mut request = Request::new(());
         request.metadata_mut().insert(
             AUTHORIZATION_HEADER,
-            format!("Bearer {}", token(&[("shop.production", TELEMETRY_INGEST)]))
-                .parse()
-                .unwrap(),
+            format!(
+                "Bearer {}",
+                token(&[(ct("shop.production").as_str(), TELEMETRY_INGEST)])
+            )
+            .parse()
+            .unwrap(),
         );
         let status = tonic::service::Interceptor::call(&mut fresh, request).unwrap_err();
         assert_eq!(status.code(), tonic::Code::Unavailable);
@@ -509,7 +493,7 @@ mod tests {
     #[test]
     fn an_ingest_capability_writes_its_tenants_and_reads_nothing() {
         let grant = call(Some(&token(&[
-            ("shop.production", TELEMETRY_INGEST),
+            (ct("shop.production").as_str(), TELEMETRY_INGEST),
             (TELEMETRY_PLATFORM_TENANT, TELEMETRY_INGEST),
         ])))
         .unwrap();
@@ -526,7 +510,11 @@ mod tests {
 
     #[test]
     fn a_read_capability_reads_its_tenants_and_writes_nothing() {
-        let grant = call(Some(&token(&[("shop.production", TELEMETRY_READ)]))).unwrap();
+        let grant = call(Some(&token(&[(
+            ct("shop.production").as_str(),
+            TELEMETRY_READ,
+        )])))
+        .unwrap();
         assert_eq!(
             grant.ingest().unwrap_err().code(),
             tonic::Code::PermissionDenied
@@ -536,11 +524,9 @@ mod tests {
         assert!(scope.admits(&tenant("shop.production")));
         assert!(!scope.admits(&tenant("shop.preview")));
         assert!(!scope.admits(&Owner::Platform));
+        // Names are not what the capability grants, so any named
+        // application may be asked about and the answer is filtered.
         assert!(scope.check_app(Some("shop")).is_ok());
-        assert_eq!(
-            scope.check_app(Some("bank")).unwrap_err().code(),
-            tonic::Code::PermissionDenied
-        );
         assert_eq!(
             scope.check_app(None).unwrap_err().code(),
             tonic::Code::PermissionDenied

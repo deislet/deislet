@@ -328,6 +328,7 @@ mod tests {
                 fields: BTreeMap::from([("environment".into(), "production".into())]),
                 trace_id: "trace-1".into(),
                 span_id: "span-1".into(),
+                tenant: crate::identity::fixture_tenant("shop", "production"),
             }])
             .unwrap();
         store
@@ -337,6 +338,7 @@ mod tests {
                 labels: BTreeMap::from([("environment".into(), "production".into())]),
                 value: 1.0,
                 timestamp_us: stamp,
+                tenant: crate::identity::fixture_tenant("shop", "production"),
             }])
             .unwrap();
         store
@@ -354,6 +356,7 @@ mod tests {
                 status: 200,
                 error: String::new(),
                 attributes: BTreeMap::new(),
+                tenant: crate::identity::fixture_tenant("shop", "production"),
             }])
             .unwrap();
 

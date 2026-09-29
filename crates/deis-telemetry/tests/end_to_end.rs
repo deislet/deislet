@@ -146,6 +146,7 @@ fn invocation(app_id: &str, outcome: i32, target: &str, started_us: i64) -> Trac
             "boom".to_string()
         },
         attributes: HashMap::new(),
+        tenant: support::tenant(app_id, "production"),
     }
 }
 
@@ -159,6 +160,7 @@ fn entry(app_id: &str, level: i32, message: &str, timestamp_us: i64) -> LogEntry
         fields: HashMap::new(),
         trace_id: String::new(),
         span_id: String::new(),
+        tenant: support::tenant(app_id, "production"),
     }
 }
 
@@ -395,6 +397,7 @@ async fn metrics_are_stored_queryable_and_scrapable() {
                     labels: HashMap::from([("route".to_string(), "/api".to_string())]),
                     value: 12.0,
                     timestamp_us: now - 1_000,
+                    tenant: support::tenant("shop", "production"),
                 },
                 MetricSample {
                     name: "deis_runtime_requests_total".to_string(),
@@ -402,6 +405,7 @@ async fn metrics_are_stored_queryable_and_scrapable() {
                     labels: HashMap::from([("route".to_string(), "/api".to_string())]),
                     value: 15.0,
                     timestamp_us: now,
+                    tenant: support::tenant("shop", "production"),
                 },
                 MetricSample {
                     // Nameless samples cannot be exported, so they are refused.
@@ -410,6 +414,7 @@ async fn metrics_are_stored_queryable_and_scrapable() {
                     labels: HashMap::new(),
                     value: 1.0,
                     timestamp_us: now,
+                    tenant: support::tenant("shop", "production"),
                 },
             ],
             metadata: HashMap::new(),
@@ -688,6 +693,7 @@ async fn a_pushed_histogram_is_scraped_as_a_histogram() {
             labels: HashMap::from([("le".to_string(), bound.to_string())]),
             value: count,
             timestamp_us: now,
+            tenant: support::tenant("shop", "production"),
         });
     }
     samples.push(MetricSample {
@@ -696,6 +702,7 @@ async fn a_pushed_histogram_is_scraped_as_a_histogram() {
         labels: HashMap::new(),
         value: 275.0,
         timestamp_us: now,
+        tenant: support::tenant("shop", "production"),
     });
     samples.push(MetricSample {
         name: "deis_runtime_isolate_execution_ms_count".to_string(),
@@ -703,6 +710,7 @@ async fn a_pushed_histogram_is_scraped_as_a_histogram() {
         labels: HashMap::new(),
         value: 10.0,
         timestamp_us: now,
+        tenant: support::tenant("shop", "production"),
     });
     client
         .push_metrics(PushMetricsRequest {
@@ -778,6 +786,7 @@ fn entry_in(app_id: &str, environment: &str, message: &str) -> LogEntry {
     entry
         .fields
         .insert("environment".to_string(), environment.to_string());
+    entry.tenant = support::tenant(app_id, environment);
     entry
 }
 
@@ -1086,28 +1095,38 @@ async fn a_read_capability_sees_only_its_own_tenant() {
     let messages: Vec<&str> = page.entries.iter().map(|e| e.message.as_str()).collect();
     assert_eq!(messages, ["mine"], "another environment's lines leaked");
 
-    for request in [
-        QueryRequest {
+    // Another application's name is not refused - the capability names
+    // tenants by id, not by name - but nothing of it comes back.
+    let foreign = logs
+        .query(QueryRequest {
             app_id: "bank".to_string(),
             ..Default::default()
-        },
-        QueryRequest::default(),
-    ] {
-        let status = logs
-            .query(request.clone())
-            .await
-            .expect_err("a cross-tenant or unnamed read must be refused");
-        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{request:?}");
-    }
-    let status = traces_as(&server, &reader)
+        })
+        .await
+        .expect("a named read is answered")
+        .into_inner();
+    assert!(
+        foreign.entries.is_empty(),
+        "another application's lines leaked"
+    );
+    let status = logs
+        .query(QueryRequest::default())
+        .await
+        .expect_err("an unnamed read must be refused");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    let foreign = traces_as(&server, &reader)
         .await
         .query_traces(QueryTracesRequest {
             app_id: "bank".to_string(),
             ..Default::default()
         })
         .await
-        .expect_err("a cross-tenant trace read must be refused");
-    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        .expect("a named trace read is answered")
+        .into_inner();
+    assert!(
+        foreign.records.is_empty(),
+        "another application's traces leaked"
+    );
 
     // An operator holding the platform-wide read sees all three.
     let all = connect(&server)
@@ -1163,6 +1182,7 @@ async fn a_node_may_push_only_what_it_runs_and_its_own_records() {
                     labels: HashMap::new(),
                     value: 3.0,
                     timestamp_us: now_us(),
+                    tenant: support::tenant("", "production"),
                 },
                 MetricSample {
                     name: "requests".to_string(),
@@ -1170,6 +1190,7 @@ async fn a_node_may_push_only_what_it_runs_and_its_own_records() {
                     labels: HashMap::new(),
                     value: 1.0,
                     timestamp_us: now_us(),
+                    tenant: support::tenant("bank", "production"),
                 },
             ],
             ..Default::default()

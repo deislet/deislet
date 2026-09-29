@@ -202,9 +202,9 @@ what it may touch, one (tenant, binding) pair each:
 
 | Binding | Issued to | What it allows |
 |---|---|---|
-| `ingest` for `<app>.<env>` | a node, over the machine channel (`IssueCapability`), for each application environment it runs | Push that tenant's logs, traces and metric samples. A record for any tenant the capability does not name is refused and counted as rejected. It reads nothing. |
+| `ingest` for `v1/<application id>/<environment id>` | a node, over the machine channel (`IssueCapability`), for each application environment it runs | Push that tenant's logs, traces and metric samples. Every application record carries its canonical tenant beside the `app_id` and environment names, and a record whose tenant the capability does not name is refused and counted as rejected. It reads nothing. |
 | `ingest` for `@platform` | every node, whatever it runs | Push the node's own records - the ones with no application (process metrics, component log lines). |
-| `read` for `<app>.<env>` | a person, from `GET /api/v1/apps/{app}/environments/{env}/telemetry-token` (needs `read:{app}/{env}`) or `GET /api/v1/apps/{app}/telemetry-token` (needs `read:{app}/*`, every environment) | Query and follow that tenant's records and nothing else: a read must name an application the capability reaches, and whatever comes back is filtered to the tenants it names. It writes nothing. |
+| `read` for `v1/<application id>/<environment id>` | a person, from `GET /api/v1/apps/{app}/environments/{env}/telemetry-token` (needs `read:{app}/{env}`) or `GET /api/v1/apps/{app}/telemetry-token` (needs `read:{app}/*`, every environment) | Query and follow that tenant's records and nothing else: a read must name an application, and whatever comes back is filtered to the tenants the capability names - by id, so an application deleted and created again under the same name reads none of the old one's records. It writes nothing. |
 | `read` for `@platform` | a person holding `read:*/*`, from `GET /api/platform/telemetry-token` | Read everything, every tenant and the nodes' own records. The Prometheus page is every series at once, so it accepts only this. |
 
 Every mint on the human side is recorded in the audit log whatever its

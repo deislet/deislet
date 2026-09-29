@@ -10,9 +10,11 @@
 //!
 //! # In log lines
 //!
-//! Log lines still carry the `<app>.<environment>` label in the field named
-//! `app_id`, because deis-telemetry attributes records to that label and an
-//! operator reads names (see `crate::logging::layer`).
+//! Log lines carry the `<app>.<environment>` label in the field named
+//! `app_id`, because an operator reads names (see `crate::logging::layer`).
+//! Each record is stamped with the canonical tenant on its way to
+//! deis-telemetry, which attributes records by that and not by the label
+//! (see `crate::telemetry::canonical_tenant`).
 
 use anyhow::{anyhow, Result};
 use deis_wire::CanonicalTenantId;

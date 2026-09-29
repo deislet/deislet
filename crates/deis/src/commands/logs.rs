@@ -428,6 +428,7 @@ mod tests {
             fields,
             trace_id: "t-1".to_string(),
             span_id: String::new(),
+            tenant: String::new(),
         }
     }
 
@@ -496,6 +497,7 @@ mod terminal_safety_test {
             fields: HashMap::new(),
             trace_id: String::new(),
             span_id: String::new(),
+            tenant: String::new(),
         }
     }
 

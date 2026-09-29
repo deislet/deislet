@@ -707,6 +707,7 @@ impl MetricsRegistry {
                     labels: labels.into_iter().collect(),
                     value: samples[key],
                     timestamp_us,
+                    tenant: crate::telemetry::canonical_tenant(&key.app_id).unwrap_or_default(),
                 }
             })
             .collect();
@@ -726,6 +727,7 @@ impl MetricsRegistry {
             labels: HashMap::new(),
             value: self.started_us as f64 / 1_000_000.0,
             timestamp_us,
+            tenant: String::new(),
         });
         out
     }
@@ -869,6 +871,7 @@ impl InvocationTrace {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            tenant: crate::telemetry::canonical_tenant(&self.tenant).unwrap_or_default(),
         }
     }
 }

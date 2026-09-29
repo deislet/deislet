@@ -103,6 +103,7 @@ fn entry(message: &str) -> LogEntry {
         fields: HashMap::new(),
         trace_id: String::new(),
         span_id: String::new(),
+        tenant: support::tenant("shop", "production"),
     }
 }
 

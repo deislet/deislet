@@ -772,6 +772,7 @@ mod tests {
             fields: BTreeMap::new(),
             trace_id: String::new(),
             span_id: String::new(),
+            tenant: crate::identity::fixture_tenant(app_id, "production"),
         })
     }
 
@@ -790,6 +791,7 @@ mod tests {
             status: 200,
             error: String::new(),
             attributes: BTreeMap::new(),
+            tenant: crate::identity::fixture_tenant(app_id, environment),
         })
     }
 
