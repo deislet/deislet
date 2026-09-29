@@ -176,11 +176,6 @@ impl Compiler {
 
             let code = fs::read_to_string(&handler_path)?;
 
-            // Parse handler
-            let handler_info = self.parser.parse(
-                &code,
-                &Self::portable_display_path(Path::new(&handler_path)),
-            )?;
             let relative_path = Path::new(&handler_path).strip_prefix(
                 function_root
                     .as_deref()
@@ -188,6 +183,13 @@ impl Compiler {
             )?;
             let handler_kind =
                 deis_build_core::routes::handler_kind(&relative_path.to_string_lossy());
+
+            // Parse handler
+            let handler_info = self.parser.parse_handler(
+                &code,
+                &Self::portable_display_path(Path::new(&handler_path)),
+                handler_kind,
+            )?;
 
             // Validate handler
             self.validator.validate(
@@ -1275,7 +1277,14 @@ impl Compiler {
         Ok(())
     }
 
-    fn refuse_non_standard_context_fields(path: &str, info: &HandlerInfo) -> anyhow::Result<()> {
+    /// Stop a build over a handler that reads a field its context does not
+    /// have; see [`deis_build_core::routes::HandlerKind::refuses_context_field`]
+    /// for which fields that is on each kind. The parser records only those.
+    fn refuse_non_standard_context_fields(
+        path: &str,
+        kind: deis_build_core::routes::HandlerKind,
+        info: &HandlerInfo,
+    ) -> anyhow::Result<()> {
         if info.non_standard_context_references.is_empty() {
             return Ok(());
         }
@@ -1290,6 +1299,11 @@ impl Compiler {
             })
             .collect::<Vec<_>>()
             .join(", ");
+        if kind != deis_build_core::routes::HandlerKind::Http {
+            return Err(anyhow::anyhow!(
+                "EC_WEB_CONTEXT_FIELD_NONSTANDARD: {references}. A handler reaches the platform's logical resources only as env.<NAME>: declare a binding and read it from the env parameter or from context.env"
+            ));
+        }
         Err(anyhow::anyhow!(
             "EC_WEB_CONTEXT_FIELD_NONSTANDARD: {references}. The selected Edge Canon HTTP context has exactly request, env, params, and waitUntil. Read method and headers from context.request; parse path and query from new URL(context.request.url); use console for logs; and declare logical resources under context.env.<NAME>"
         ))
@@ -2230,18 +2244,18 @@ impl Compiler {
 
             let code = fs::read_to_string(&handler_path)?;
             let handler_name = Self::portable_display_path(&source_path);
-            let parsed = self.parser.parse(&code, &handler_name)?;
+            let handler_kind =
+                deis_build_core::routes::handler_kind(&relative_path.to_string_lossy());
+            let parsed = self
+                .parser
+                .parse_handler(&code, &handler_name, handler_kind)?;
             Self::refuse_interactive_transactions(vendor, &handler_name, &code)?;
             Self::refuse_a_handler_with_no_default_export(&handler_name, Some(&parsed))?;
             Self::refuse_non_literal_module_loads(&handler_name, &parsed)?;
             Self::refuse_external_runtime_module_edges(&handler_name, &parsed)?;
             Self::refuse_provider_only_globals(&handler_name, &parsed)?;
             Self::refuse_non_portable_stream_constructors(&handler_name, &parsed)?;
-            if deis_build_core::routes::handler_kind(&relative_path.to_string_lossy())
-                == deis_build_core::routes::HandlerKind::Http
-            {
-                Self::refuse_non_standard_context_fields(&handler_name, &parsed)?;
-            }
+            Self::refuse_non_standard_context_fields(&handler_name, handler_kind, &parsed)?;
             module_references.push((handler_name.clone(), parsed.module_references.clone()));
             handler_specifiers.push((handler_name.clone(), parsed.imports.clone()));
             module_queue.push_back((source_path.clone(), parsed.imports));
@@ -2636,7 +2650,11 @@ impl Compiler {
                     Self::refuse_external_runtime_module_edges(&derived_path, &derived)?;
                     Self::refuse_provider_only_globals(&derived_path, &derived)?;
                     Self::refuse_non_portable_stream_constructors(&derived_path, &derived)?;
-                    Self::refuse_non_standard_context_fields(&derived_path, &derived)?;
+                    Self::refuse_non_standard_context_fields(
+                        &derived_path,
+                        deis_build_core::routes::HandlerKind::Http,
+                        &derived,
+                    )?;
                     validate_node_npm_project(
                         &project_root,
                         &[(derived_path, derived.module_references)],

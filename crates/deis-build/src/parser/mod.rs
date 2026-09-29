@@ -1,3 +1,4 @@
+use deis_build_core::routes::HandlerKind;
 use deis_build_core::{
     HandlerInfo, ModuleReference, ModuleReferenceKind, ModuleSourcePosition,
     NonPortableStreamConstructorReference, NonStandardContextReference,
@@ -29,7 +30,24 @@ impl TypeScriptParser {
         }
     }
 
+    /// Parse a module as an HTTP handler, or as a module that is not a
+    /// handler at all (whose context references are then never looked at).
     pub fn parse(&self, code: &str, filename: &str) -> anyhow::Result<HandlerInfo> {
+        self.parse_handler(code, filename, HandlerKind::Http)
+    }
+
+    /// Parse a handler of the given kind.
+    ///
+    /// The kind decides which parameter of the default export is the
+    /// platform's context ([`HandlerKind::context_parameter`]) and which of the
+    /// fields read off it are recorded as refused
+    /// ([`HandlerKind::refuses_context_field`]).
+    pub fn parse_handler(
+        &self,
+        code: &str,
+        filename: &str,
+        kind: HandlerKind,
+    ) -> anyhow::Result<HandlerInfo> {
         let source_file = self.source_map.new_source_file(
             FileName::Custom(filename.to_string()).into(),
             code.to_string(),
@@ -68,7 +86,8 @@ impl TypeScriptParser {
                     break;
                 }
             }
-            let mut contexts = DefaultHandlerContextCollector::new(exported.callables);
+            let mut contexts =
+                DefaultHandlerContextCollector::new(exported.callables, kind.context_parameter());
             module.visit_with(&mut contexts);
             loop {
                 let before = contexts.contexts.len();
@@ -89,6 +108,7 @@ impl TypeScriptParser {
                 file_start,
                 unresolved_context,
                 contexts,
+                kind,
             );
             for (field, span) in destructured_fields {
                 visitor.record_context_field(field, span);
@@ -205,27 +225,30 @@ impl Visit for DefaultHandlerAliasCollector<'_> {
 
 struct DefaultHandlerContextCollector {
     callables: HashSet<Id>,
+    /// Which parameter is the context; see [`HandlerKind::context_parameter`].
+    context_parameter: usize,
     contexts: HashSet<Id>,
     destructured_fields: Vec<(String, Span)>,
 }
 
 impl DefaultHandlerContextCollector {
-    fn new(callables: HashSet<Id>) -> Self {
+    fn new(callables: HashSet<Id>, context_parameter: usize) -> Self {
         Self {
             callables,
+            context_parameter,
             contexts: HashSet::new(),
             destructured_fields: Vec::new(),
         }
     }
 
-    fn record_first_parameter(&mut self, parameters: &[Param]) {
-        if let Some(parameter) = parameters.first() {
+    fn record_context_parameter(&mut self, parameters: &[Param]) {
+        if let Some(parameter) = parameters.get(self.context_parameter) {
             self.record_context_pattern(&parameter.pat);
         }
     }
 
-    fn record_first_pattern(&mut self, parameters: &[Pat]) {
-        if let Some(parameter) = parameters.first() {
+    fn record_context_parameter_pattern(&mut self, parameters: &[Pat]) {
+        if let Some(parameter) = parameters.get(self.context_parameter) {
             self.record_context_pattern(parameter);
         }
     }
@@ -278,15 +301,15 @@ impl DefaultHandlerContextCollector {
 impl Visit for DefaultHandlerContextCollector {
     fn visit_export_default_decl(&mut self, declaration: &ExportDefaultDecl) {
         if let DefaultDecl::Fn(function) = &declaration.decl {
-            self.record_first_parameter(&function.function.params);
+            self.record_context_parameter(&function.function.params);
         }
         declaration.visit_children_with(self);
     }
 
     fn visit_export_default_expr(&mut self, expression: &ExportDefaultExpr) {
         match &*expression.expr {
-            Expr::Fn(function) => self.record_first_parameter(&function.function.params),
-            Expr::Arrow(arrow) => self.record_first_pattern(&arrow.params),
+            Expr::Fn(function) => self.record_context_parameter(&function.function.params),
+            Expr::Arrow(arrow) => self.record_context_parameter_pattern(&arrow.params),
             _ => {}
         }
         expression.visit_children_with(self);
@@ -294,7 +317,7 @@ impl Visit for DefaultHandlerContextCollector {
 
     fn visit_fn_decl(&mut self, declaration: &FnDecl) {
         if self.callables.contains(&declaration.ident.to_id()) {
-            self.record_first_parameter(&declaration.function.params);
+            self.record_context_parameter(&declaration.function.params);
         }
         declaration.visit_children_with(self);
     }
@@ -309,8 +332,8 @@ impl Visit for DefaultHandlerContextCollector {
             return;
         }
         match declaration.init.as_deref() {
-            Some(Expr::Fn(function)) => self.record_first_parameter(&function.function.params),
-            Some(Expr::Arrow(arrow)) => self.record_first_pattern(&arrow.params),
+            Some(Expr::Fn(function)) => self.record_context_parameter(&function.function.params),
+            Some(Expr::Arrow(arrow)) => self.record_context_parameter_pattern(&arrow.params),
             _ => {}
         }
         declaration.visit_children_with(self);
@@ -364,6 +387,7 @@ struct HandlerVisitor {
     provider_only_global_references: Vec<ProviderOnlyGlobalReference>,
     non_portable_stream_constructors: Vec<NonPortableStreamConstructorReference>,
     context_bindings: HashSet<Id>,
+    kind: HandlerKind,
     non_standard_context_references: Vec<NonStandardContextReference>,
 }
 
@@ -373,6 +397,7 @@ impl HandlerVisitor {
         file_start: BytePos,
         unresolved_context: SyntaxContext,
         context_bindings: HashSet<Id>,
+        kind: HandlerKind,
     ) -> Self {
         Self {
             source_map,
@@ -389,6 +414,7 @@ impl HandlerVisitor {
             provider_only_global_references: Vec::new(),
             non_portable_stream_constructors: Vec::new(),
             context_bindings,
+            kind,
             non_standard_context_references: Vec::new(),
         }
     }
@@ -413,7 +439,9 @@ impl HandlerVisitor {
     }
 
     fn record_context_field(&mut self, field: String, span: Span) {
-        if matches!(field.as_str(), "request" | "env" | "params" | "waitUntil") {
+        if matches!(field.as_str(), "request" | "env" | "params" | "waitUntil")
+            || !self.kind.refuses_context_field(&field)
+        {
             return;
         }
         let location = self.source_map.lookup_char_pos(span.lo());
@@ -1254,6 +1282,32 @@ export default async function handler() { return new Response(String(value)); }
             .map(|reference| reference.field.as_str())
             .collect::<Vec<_>>();
         assert_eq!(fields, ["path", "services", "<dynamic>"]);
+    }
+
+    #[test]
+    fn an_event_handler_context_is_its_third_parameter_and_only_platform_fields_are_refused() {
+        let parser = TypeScriptParser::new();
+        for kind in [HandlerKind::Queue, HandlerKind::Scheduled] {
+            let info = parser
+                .parse_handler(
+                    r#"
+                    export default async function handler(context, env, ctx) {
+                      const { bindings } = ctx;
+                      ctx.waitUntil(ctx.log);
+                      return context.services + context.bindings + ctx.services.kv + bindings + env.KV;
+                    }
+                    "#,
+                    "functions/_queue.ts",
+                    kind,
+                )
+                .expect("module parses");
+            let fields = info
+                .non_standard_context_references
+                .iter()
+                .map(|reference| reference.field.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(fields, ["bindings", "services"], "{kind:?}");
+        }
     }
 
     #[test]

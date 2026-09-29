@@ -48,6 +48,39 @@ pub enum HandlerKind {
     Reserved,
 }
 
+impl HandlerKind {
+    /// Which parameter of the handler's default export is the context the
+    /// platform hands it.
+    ///
+    /// An HTTP handler is `handler(context)`. A queue or scheduled handler is
+    /// `handler(batch | event, env, context)`, the shape Edge Canon fixes for
+    /// both event families, so its context is the third parameter and the
+    /// first one is the event, whose fields are the event's own.
+    pub fn context_parameter(self) -> usize {
+        match self {
+            Self::Http | Self::Reserved => 0,
+            Self::Queue | Self::Scheduled => 2,
+        }
+    }
+
+    /// Whether the build refuses a handler of this kind that reads `field` off
+    /// its context.
+    ///
+    /// An HTTP context has exactly `request`, `env`, `params` and `waitUntil`,
+    /// and anything else is refused. An event context is not an EC-WEB
+    /// request context and is not judged as one, but `bindings` and
+    /// `services` are refused on every kind: a platform's logical resources
+    /// are reached as `context.env.<NAME>` and nowhere else.
+    pub fn refuses_context_field(self, field: &str) -> bool {
+        match self {
+            Self::Http => true,
+            Self::Queue | Self::Scheduled | Self::Reserved => {
+                matches!(field, "bindings" | "services")
+            }
+        }
+    }
+}
+
 pub const QUEUE_HANDLER_STEM: &str = "_queue";
 pub const SCHEDULED_HANDLER_STEM: &str = "_scheduled";
 
