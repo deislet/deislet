@@ -4018,13 +4018,10 @@ mod tests {
         let pool = pool();
 
         let code = r#"export default function handler() { return new Response("ok"); }"#;
-        let env: HashMap<String, String> = [
-            ("DEIS_SERVICES", "queue"),
-            ("DEIS_QUEUE_CONSUMERS", "jobs:5"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+        let env: HashMap<String, String> = [("DEIS_QUEUE_CONSUMERS", "jobs:5")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
 
         pool.load_app(
             "queueless_app".to_string(),

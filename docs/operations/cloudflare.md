@@ -17,7 +17,7 @@ preflight, plan, prepare, upload, verify, activate and observe.
 | Control plane end to end: product API → provider deployment → signed driver release launched as a process → `wrangler` | covered by `crates/deis-control/src/api/catalog/cloudflare_e2e.rs` against the fake `wrangler`: the first deploy creates the Worker before uploading a version; resolved, namespaced `wrangler.toml`; cron schedule, queue consumer and workers.dev applied after activation; a second deploy reuses every resource; an undeploy removes the Worker and keeps the data, and one with purge consent destroys the data too |
 | Against a real Cloudflare account | **not yet verified**; run [`scripts/cloudflare-smoke.sh`](../../scripts/cloudflare-smoke.sh) |
 | Environment secrets and deployment-time config values handed from the control plane to the driver | implemented, covered by `cloudflare_e2e.rs` against the fake `wrangler`: the config value fills its `[vars]` placeholder, the bound secret reaches `wrangler versions upload` on stdin and never argv, a rotated secret reaches the next deployment, and a delivery the audit log cannot record does not happen (see [Secrets and config](#secrets-and-config)) |
-| Undeploying through the control plane | implemented, covered by `cloudflare_e2e.rs` against the fake `wrangler`: `deis undeploy --target cloudflare` (`POST /api/v1/apps/{app}/environments/{env}/provider-undeployments`) removes the Worker and keeps the data; with `--purge-data <environment>` the environment's KV, D1, R2 and queue resources are destroyed too, and a consent naming another environment is refused (see [Undeploying](#undeploying)) |
+| Undeploying through the control plane | implemented, covered by `cloudflare_e2e.rs` against the fake `wrangler`: `deis undeploy --target cloudflare` (`POST /api/v1/apps/{app_id}/environments/{env_name}/provider-undeployments`) removes the Worker and keeps the data; with `--purge-data <environment>` the environment's KV, D1, R2 and queue resources are destroyed too, and a consent naming another environment is refused (see [Undeploying](#undeploying)) |
 | D1 migrations before activate (ADR-008 T5-3) | out of scope until the Edge Canon standard defines how an application declares its migrations; D1 databases are created empty (see [D1 migrations](#d1-migrations)) |
 
 Until the smoke script has passed against a real account, treat Cloudflare
@@ -83,7 +83,7 @@ All of these are control plane API calls made by an admin credential.
    /api/v1/providers/installations` with that credential binding, then `POST
    /api/v1/providers/installations/{installation_id}/targets`.
 5. **Grant the target to an environment.** `POST
-   /api/v1/apps/{app}/environments/{env}/provider-target-grants` with the
+   /api/v1/apps/{app_id}/environments/{env_name}/provider-target-grants` with the
    target id.
 6. **Deploy.** From the project directory: `deis deploy --target cloudflare
    -e <env>`. When the environment holds grants on more than one Cloudflare
@@ -196,7 +196,7 @@ consent mechanism are documented in the driver crate,
 
 `deis undeploy --target cloudflare` asks the control plane to take the
 environment's deployment down (`POST
-/api/v1/apps/{app}/environments/{env}/provider-undeployments`, which needs
+/api/v1/apps/{app_id}/environments/{env_name}/provider-undeployments`, which needs
 `deploy:<app>/<env>` like a deployment). The control plane records an
 `undeploy` operation - a product operation of kind `delete`, with its actor,
 on the audit log like every state change - whose one step runs the driver's
