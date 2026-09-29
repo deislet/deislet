@@ -1909,13 +1909,12 @@ mod memory_ceiling {
     /// This holds the same application through three trips and asserts the
     /// other side of the trade: each trip recycles the isolate (the
     /// `deis_runtime_isolate_recycled_total{reason="memory"}` counter is the
-    /// generation count an observer would watch), the application is
-    /// installed again after each trip -- the same `load_app` the reconcile
-    /// pass makes when it finds a version installed with no isolate behind
-    /// it -- and the request that reinstall serves succeeds *because* the
-    /// isolate is fresh, which is the generation claim made observable: the
-    /// handler only answers a request made of an isolate that has never run
-    /// it.
+    /// generation count an observer would watch), the runtime thread builds
+    /// the replacement itself before it takes the next message -- nothing is
+    /// reinstalled from outside -- and the next request succeeds *because*
+    /// the isolate is fresh, which is the generation claim made observable:
+    /// the handler only answers a request made of an isolate that has never
+    /// run it.
     ///
     /// The handler arms itself: on a fresh isolate `__armed` is unset, so the
     /// request succeeds and arms the trip; the next request allocates without
@@ -1979,25 +1978,12 @@ mod memory_ceiling {
                 "trip {trip}: every heap cut-off recycles exactly one isolate"
             );
 
-            // What the deployment machinery's next pass does: install the
-            // version again through `install_version`, the same door a
-            // reconcile pass and a pushed deployment both use. The cut-off
-            // cleared the isolate; this is what puts the application back.
-            manager
-                .install_version(VersionInstall {
-                    key: app.clone(),
-                    version_id: format!("v{trip}"),
-                    deployment_id: None,
-                    routing_generation: None,
-                    environment_snapshot_id: None,
-                    entry_point: "app.ts".to_string(),
-                    code: ARMED_RUNAWAY.to_string(),
-                    config: limits(64),
-                    env_confirmed: true,
-                    assets: Arc::new(AssetBundle::empty(Arc::from("max-age=60"))),
-                })
-                .await
-                .unwrap_or_else(|e| panic!("trip {trip}: the app is installable again: {e:?}"));
+            // Still placed: the recycle replaced the isolate in place, so
+            // the node never reports the application missing.
+            assert!(
+                manager.is_hosted(&app).await,
+                "trip {trip}: a recycled isolate is replaced, not forgotten"
+            );
         }
 
         // The last line of the acceptance: after three trips the application
@@ -2009,6 +1995,111 @@ mod memory_ceiling {
             .expect("the application is served again after three cut-offs");
         assert_eq!(status, 200);
 
+        let _ = manager.unload_app(&app).await;
+    }
+
+    /// ADR-010 (D-7): V8 terminates an isolate, not an invocation, so a
+    /// wall-clock cut-off costs the isolate it ran in -- and nothing else.
+    ///
+    /// The handler spins on its second call, on an isolate that armed it on
+    /// the first; the watchdog cuts it off at the application's 300ms
+    /// timeout. The next call must be answered, and answered by a fresh
+    /// isolate: `__armed` reads unset only on one this application has never
+    /// run in. The recycle is counted with `reason="timeout"`.
+    #[tokio::test]
+    async fn a_timed_out_invocation_recycles_its_isolate_and_the_next_request_is_served() {
+        use crate::runtime::metrics::ISOLATE_RECYCLES_TOTAL;
+
+        const ARMED_SPINNER: &str = r#"
+            export default function handler() {
+                if (globalThis.__armed) {
+                    for (;;) {}
+                }
+                globalThis.__armed = true;
+                return new Response("armed");
+            }
+        "#;
+
+        let manager = ApplicationManager::with_threads(Some(1)).with_memory_limit_mb(64);
+        let app = AppKey::production("timed_out_spinner");
+        let mut config = limits(64);
+        if let Some(limits) = config.limits.as_mut() {
+            limits.timeout_ms = Some(300);
+        }
+        manager
+            .load_app(app.clone(), ARMED_SPINNER.to_string(), config, None)
+            .await
+            .expect("the app loads");
+
+        let (status, _) = call(&manager, &app).await.expect("the first call arms");
+        assert_eq!(status, 200);
+        assert!(
+            call(&manager, &app).await.is_err(),
+            "the armed call spins and must be cut off"
+        );
+        let recycled = wait_for_counter(ISOLATE_RECYCLES_TOTAL, &app.tenant_id(), 1.0).await;
+        assert_eq!(recycled, 1.0, "the cut-off recycles exactly one isolate");
+        assert_eq!(
+            crate::runtime::metrics::recorder().recycled_for(
+                &app.tenant_id(),
+                crate::runtime::metrics::RECYCLE_REASON_TIMEOUT
+            ),
+            1.0,
+            "and names the wall-clock ceiling as the reason"
+        );
+
+        let (status, body) = call(&manager, &app)
+            .await
+            .expect("the request after a cut-off is served, on a fresh isolate");
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8(body.unwrap_or_default()).as_deref(),
+            Ok("armed"),
+            "only an isolate that has never run the handler answers \"armed\" again"
+        );
+        let _ = manager.unload_app(&app).await;
+    }
+
+    /// The ArrayBuffer half of the memory ceiling (RA-2). Backing stores live
+    /// outside the V8 heap, so the heap ceiling never saw them; the
+    /// isolate's own allocator refuses one past the application's ceiling,
+    /// the application gets a `RangeError` it can catch, and the isolate --
+    /// which allocated nothing -- keeps serving.
+    #[tokio::test]
+    async fn an_array_buffer_past_the_ceiling_is_refused_inside_the_application() {
+        const GREEDY: &str = r#"
+            export default function handler() {
+                let refused = "allocated";
+                try {
+                    new ArrayBuffer(96 * 1024 * 1024);
+                } catch (error) {
+                    refused = error instanceof RangeError ? "range-error" : String(error);
+                }
+                const kept = new Uint8Array(8 * 1024 * 1024);
+                kept[0] = 1;
+                return new Response(refused + ":" + kept.length);
+            }
+        "#;
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let manager = ApplicationManager::with_threads(Some(1)).with_memory_limit_mb(64);
+        let app = AppKey::production("greedy_buffers");
+        manager
+            .load_app(app.clone(), GREEDY.to_string(), limits(64), None)
+            .await
+            .expect("the app loads");
+
+        for attempt in 0..2 {
+            let (status, body) = call(&manager, &app)
+                .await
+                .unwrap_or_else(|e| panic!("attempt {attempt}: the handler answers: {e:?}"));
+            assert_eq!(status, 200);
+            assert_eq!(
+                String::from_utf8(body.unwrap_or_default()).as_deref(),
+                Ok("range-error:8388608"),
+                "attempt {attempt}: 96MB is past the 64MB ceiling, 8MB is inside it"
+            );
+        }
         let _ = manager.unload_app(&app).await;
     }
 

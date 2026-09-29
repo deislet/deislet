@@ -220,7 +220,9 @@ Invocation-local 值不得放在可被另一 invocation 覆写的 runtime single
 截至 2026-09-24 修订时：
 
 - Admission 过载的 `overloaded` outcome 与排队超时的最小形态（R3/R4）已实现：`DispatchError`（`Overloaded`/`Stopped`/`NotFound`/`GenerationNotPrepared`）、HTTP `503` + `Retry-After`（`runtime.overload_retry_after_seconds`，默认 1）+ `x-deis-outcome: overloaded` + `x-deis-outcome-detail: admission`、独立指标 `deis_runtime_overloaded_total` 与 `deis_runtime_abandoned_before_start_total`、queue 过载 nack 带 `refund_attempt` 不计投递尝试次数。
-- 超限即回收 isolate 的 poisoned 语义随 RA-1 落地（批次 3），按本文修订后的取消语义实现。
+- 超限即回收（2026-09-29 落地）：heap、CPU、wall time 超限以及 op 速率限制触发 `terminate_execution` 前都会在 isolate 上置回收标记（`runtime/recycle.rs` 的 `RecycleLatch`）；runtime 线程处理完当前消息（或一轮 response stream 泵送）后读取标记，丢弃该 isolate，并在取下一条消息前用同一份代码与配置原地重建。排在其后的请求直接在新 isolate 上执行，不返回错误，应用也不会离开本节点的放置；重建失败时才按 panic 路径遗忘放置，交给 control 下一轮 reconcile 重装。回收计入 `deis_runtime_isolate_recycled_total{reason="memory|cpu|timeout|op_rate"}`。
+  - 与上文第 3、5 条的差异：当前每个 isolate 同一时刻只执行一个 invocation（D3 未实施），已返回的 response stream 随旧 isolate 一起结束（客户端看到传输中断，而不是 `overloaded`）；「仅 wall time 超限且挂起在 await 上」的协作式例外尚未实现——watchdog 无法判断触发时刻是否在执行 JS，因此 wall time 超限一律回收。挂起在出站 `fetch`/binding 上的调用会先在自身 deadline 处 reject，应用可以自行返回。这两点随 D3 一起处理。
+- ArrayBuffer 上限（RA-2，2026-09-29 落地）：每个 isolate 通过 `CreateParams::array_buffer_allocator` 使用自带计数的分配器（`ArrayBufferBudget`），上限与该 isolate 的堆上限相同（节点 `memory_limit_mb`，应用只能调低）；超限的分配返回失败，应用得到可捕获的 `RangeError`，本次 invocation 继续执行，isolate 在消息结束后按 `memory` 原因重建（V8 为被拒分配做的末次 GC 会经过 near-heap-limit 回调并抬高堆上限）。计不到的部分：op 用 Rust 侧已有内存构造的 backing store（`fetch`/blob/cache 读回的字节，RA-3）、可变长 `ArrayBuffer` 与 WebAssembly memory 使用的页分配器内存。
 - 本文描述的弹性 isolate pool 尚未实现，按 RD 的分阶段计划落地（批次 4）：
   - D1 有界线程 + 空闲驱逐 + 按 app 的 admission（含 `WorkerHost` 抽象）：待实施。
   - D2 同一版本多 isolate（`max_isolates` 默认 1）：待实施。

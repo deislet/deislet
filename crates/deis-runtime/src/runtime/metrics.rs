@@ -177,19 +177,27 @@ pub const MEMORY_CUTOFFS_TOTAL: &str = "deis_runtime_memory_cutoffs_total";
 /// Isolates discarded and rebuilt because they were no longer fit to serve
 /// from, counted by why.
 ///
-/// The `reason` label says what disqualified the isolate. Today there is one:
-/// `memory`, an isolate whose V8 heap ceiling was tripped. Its heap limit was
-/// raised by the cut-off itself (the room the termination needs), and V8
-/// offers no way to lower a limit back, so the isolate is dropped and the
-/// next request for the application is served on a freshly built one. Without
-/// this counter a node either kept raising the ceiling forever or recycled
-/// invisibly; an operator watching `deis_runtime_memory_cutoffs_total` climb
-/// without any recycle in reply would be reading a node that reuses poisoned
-/// isolates.
+/// The `reason` label says what disqualified the isolate. Every one of them
+/// is a terminated execution, and V8 can only terminate an isolate, never one
+/// invocation in it (ADR-010, D-7): the isolate is dropped and the runtime
+/// thread builds a fresh one from the same inputs before it takes its next
+/// message. `memory` has one more reason of its own - the heap cut-off raised
+/// the isolate's limit to let the termination unwind, and V8 offers no way to
+/// lower it again. Without this counter a node either reused an isolate that
+/// had been terminated mid-execution or recycled invisibly.
 pub const ISOLATE_RECYCLES_TOTAL: &str = "deis_runtime_isolate_recycled_total";
 /// `reason` on [`ISOLATE_RECYCLES_TOTAL`]: the isolate's V8 heap ceiling was
-/// tripped, so it was discarded and rebuilt on its thread.
+/// tripped.
 pub const RECYCLE_REASON_MEMORY: &str = "memory";
+/// `reason` on [`ISOLATE_RECYCLES_TOTAL`]: an execution crossed its CPU-time
+/// ceiling.
+pub const RECYCLE_REASON_CPU: &str = "cpu";
+/// `reason` on [`ISOLATE_RECYCLES_TOTAL`]: an execution crossed its
+/// wall-clock ceiling.
+pub const RECYCLE_REASON_TIMEOUT: &str = "timeout";
+/// `reason` on [`ISOLATE_RECYCLES_TOTAL`]: the op rate limiter terminated an
+/// execution.
+pub const RECYCLE_REASON_OP_RATE: &str = "op_rate";
 /// Label carrying why an isolate was recycled on [`ISOLATE_RECYCLES_TOTAL`].
 const RECYCLE_REASON_LABEL: &str = "reason";
 /// Requests dropped when the runtime thread reached them and their caller had
@@ -620,6 +628,21 @@ impl MetricsRegistry {
             SampleKey::new(OVERLOADED_TOTAL, app_id).with_label("class", class),
             1.0,
         );
+    }
+
+    /// How many isolates of one application were recycled for `reason`.
+    #[cfg(test)]
+    pub fn recycled_for(&self, app_id: &str, reason: &str) -> f64 {
+        let samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        samples
+            .iter()
+            .filter(|(key, _)| {
+                key.name == ISOLATE_RECYCLES_TOTAL
+                    && key.app_id == app_id
+                    && key.labels.get(RECYCLE_REASON_LABEL).map(String::as_str) == Some(reason)
+            })
+            .map(|(_, value)| *value)
+            .sum()
     }
 
     /// Current value of one sample for one application, summed across label

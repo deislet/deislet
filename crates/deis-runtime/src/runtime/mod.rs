@@ -21,6 +21,7 @@ mod queue_client;
 pub mod queue_consumer;
 mod queue_ops;
 pub mod rate_limit;
+mod recycle;
 mod response_stream;
 pub mod route_match;
 mod runtime_init;
