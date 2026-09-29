@@ -18,6 +18,10 @@ Group=deis
 # format, and `-json` in the restore drill are all written for the 0.5 series.
 # Installing a different build is a change to the backup, not an upgrade to a
 # tool.
+# The replica URL and any bucket credentials. Required: without it
+# /etc/litestream.yml names no replica, and a backup that silently goes nowhere
+# is worse than a unit that refuses to start.
+EnvironmentFile=/etc/deis/litestream.env
 ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream.yml
 Restart=always
 RestartSec=3
@@ -41,6 +45,8 @@ ProtectHome=true
 # failing to start.
 ReadWritePaths=-/var/lib/deis-control
 ReadWritePaths=-/var/lib/deis/control
+# The canary's default replica, a file:// URL (see /etc/deis/litestream.env).
+ReadWritePaths=-/var/backups/deis-control
 
 [Install]
 WantedBy=deislet.target

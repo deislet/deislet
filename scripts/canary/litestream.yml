@@ -1,9 +1,9 @@
 # Litestream configuration: continuous backup of the control plane's SQLite
 # database, and of nothing else.
 #
-# Install this as /etc/litestream.yml - the path `litestream` reads by default -
-# and run it as litestream.service, which sits in the same slice as
-# deis-control. The RPO/RTO this buys, the full list of what a restore needs,
+# Installed verbatim as /etc/litestream.yml - the path `litestream` reads by
+# default - by scripts/canary/remote-install.sh, which also installs the pinned
+# binary and enables litestream.service in the same slice as deis-control. The RPO/RTO this buys, the full list of what a restore needs,
 # and the constraints everyone else has to respect are in
 # docs/adr/012-pluggable-persistence.md and
 # docs/control-backup-and-restore.md.
@@ -31,7 +31,11 @@ snapshot:
   retention: 168h
 
 dbs:
-  - path: /var/lib/deis-control/control.db
+  # The canary's control database: remote-install.sh starts deis-control with
+  # `--database /var/lib/deis/control/deis-control.db`. An installation that
+  # keeps the defaults has it at <data_dir>/control.db, which is
+  # /var/lib/deis-control/control.db; change this line to match.
+  - path: /var/lib/deis/control/deis-control.db
 
     # The control plane's own busy timeout is 5 seconds (ADR-012): another
     # process may hold the write lock that long, and a reader that gives up
@@ -54,13 +58,15 @@ dbs:
       # nowhere else.
       sync-interval: 1s
 
-      # An S3-compatible bucket, or a path that is not the disk holding the
-      # database:
-      #   url: file:///mnt/backup/deis-control
+      # Where the replica goes, read from the environment of
+      # litestream.service (Litestream expands `$VAR` in its configuration):
+      # remote-install.sh writes LITESTREAM_REPLICA_URL into
+      # /etc/deis/litestream.env, the unit's EnvironmentFile. An S3-compatible
+      # bucket (s3://bucket/prefix) or a path that is not the disk holding
+      # the database (file:///mnt/backup/deis-control).
       #
-      # Credentials come from the environment of litestream.service, never
-      # from this file, which is readable by anyone who can read /etc:
-      # LITESTREAM_ACCESS_KEY_ID and LITESTREAM_SECRET_ACCESS_KEY, or the
-      # usual AWS_* pair.
-      url: s3://deis-control-backup/control
-      region: us-east-1
+      # Credentials come from the same file, never from this one, which is
+      # readable by anyone who can read /etc: LITESTREAM_ACCESS_KEY_ID and
+      # LITESTREAM_SECRET_ACCESS_KEY, or the usual AWS_* pair (and AWS_REGION
+      # where the bucket needs one).
+      url: ${LITESTREAM_REPLICA_URL}
