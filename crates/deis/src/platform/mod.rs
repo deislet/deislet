@@ -315,9 +315,7 @@ pub struct Deployment {
     #[serde(default)]
     pub note: Option<String>,
     /// Immutable Edge Canon environment snapshot selected by this pointer.
-    /// Absent for legacy schema-1 deployments and older control planes.
-    #[serde(default)]
-    pub snapshot_id: Option<String>,
+    pub snapshot_id: String,
 }
 
 /// The top of one environment's deployment history, and how deep the history
@@ -685,9 +683,8 @@ pub const EVERY_ENVIRONMENT: &str = "*";
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SecretMeta {
     pub name: String,
-    /// Opaque immutable revision; absent only on an older control plane.
-    #[serde(default)]
-    pub revision: Option<String>,
+    /// Opaque immutable revision.
+    pub revision: String,
     pub updated_at: i64,
 }
 
@@ -1347,28 +1344,6 @@ impl Control {
     }
 
     // ---- versions -----------------------------------------------------
-
-    /// Upload a bundle as a new version.
-    ///
-    /// `sha256` is sent along so the control plane refuses a truncated upload
-    /// instead of recording it as a version that no node can load.
-    pub async fn upload_version(
-        &self,
-        app_id: &str,
-        bundle: Vec<u8>,
-        sha256: &str,
-    ) -> Result<UploadResponse> {
-        self.send(
-            self.request(
-                Method::POST,
-                &format!("/apps/{app_id}/versions?sha256={sha256}"),
-            )
-            .header(reqwest::header::CONTENT_TYPE, "application/zip")
-            .body(bundle),
-            &format!("uploading a bundle for app {app_id}"),
-        )
-        .await
-    }
 
     /// Upload and revalidate the provider-neutral Build Output before any
     /// provider payload derived from it can become a version.
@@ -2638,7 +2613,8 @@ mod deployment_plan_tests {
             "app_id": "demo",
             "env_id": "environment-1",
             "version_id": "version-1",
-            "created_at": 2
+            "created_at": 2,
+            "snapshot_id": "snapshot-1"
         })
     }
 
@@ -2897,7 +2873,7 @@ mod list_page_tests {
         let secrets = control.list_secrets("demo", "production").await.unwrap();
         let names: Vec<&str> = secrets.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["API_KEY", "DB_URL", "TOKEN"]);
-        assert_eq!(secrets[0].revision.as_deref(), Some("rev-1"));
+        assert_eq!(secrets[0].revision, "rev-1");
         let _ = shutdown.send(());
     }
 

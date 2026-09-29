@@ -55,12 +55,6 @@ pub mod codes {
     /// [`crate::api::pagination::bounded_limit`], which is the one place
     /// every list route bounds it.
     pub const LIMIT_OUT_OF_RANGE: &str = "limit-out-of-range";
-    /// Reserved, and emitted by nothing: offset paging was retired before
-    /// any route shipped it, and every list is keyset-paged behind an
-    /// opaque cursor. The token stays in the closed enum - a code is never
-    /// removed once published, and a client that already branches on it
-    /// keeps compiling - and this is the one place that says so.
-    pub const OFFSET_OUT_OF_RANGE: &str = "offset-out-of-range";
     /// A cursor that was not issued for this collection and these filters,
     /// or has expired; see [`crate::catalog::INVALID_CURSOR_MESSAGE`].
     pub const CURSOR_INVALID: &str = "cursor-invalid";
@@ -103,7 +97,6 @@ pub mod codes {
         NOT_FOUND,
         INVALID_ARGUMENT,
         LIMIT_OUT_OF_RANGE,
-        OFFSET_OUT_OF_RANGE,
         CURSOR_INVALID,
         IDEMPOTENCY_KEY_REQUIRED,
         IDEMPOTENCY_KEY_REUSED,
@@ -132,7 +125,7 @@ pub mod codes {
 
     /// Codes the catalog already spells out as a `<code>: ` prefix on the
     /// message. The structured body lifts the token into `code` and drops
-    /// it from `message`; the legacy string keeps it.
+    /// it from `message`; the plain body a handler writes keeps it.
     pub const MESSAGE_PREFIXES: &[&str] = &[
         IDEMPOTENCY_KEY_REUSED,
         IDEMPOTENCY_REQUEST_IN_PROGRESS,
@@ -985,7 +978,8 @@ mod tests {
     /// request id. The secret store is the one this test was written for:
     /// its text names the master key file by absolute path, and a caller
     /// holding one environment's secret scope must not read it out of a
-    /// 503. The legacy body still carries the sentence, byte for byte.
+    /// 503. The plain body a handler writes still carries the sentence,
+    /// byte for byte.
     #[test]
     fn every_backend_failure_is_opaque_and_keeps_its_text_for_the_log() {
         use crate::catalog::{BackendRestoreCoordinatorError, CatalogError};

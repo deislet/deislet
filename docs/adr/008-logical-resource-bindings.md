@@ -60,7 +60,7 @@ EC-WEB 已把标准 HTTP context 固定为且仅为 `request`、`env`、`params`
 
 - 逻辑资源只能进入 `context.env.<NAME>`；`context.bindings` 和 `context.services` 都不是标准入口。
 - 不在标准 context 上提供兼容别名；否则应用会继续依赖无法在所有目标实现的第二套 ABI。
-- 原生 schema 1 bundle 中既有 `services.kv/database/blob/queue` 只用于读取旧部署及其无名数据。迁移工具把它转换成显式 named binding；新规范、模板和示例不得再生成它。
+- 原生 manifest 的 `services.kv/database/blob/queue` 是无名资源声明，构建拒绝启用它们的项目；规范、模板和示例不生成它，应用使用显式 named binding。
 - validate 必须对 `context.services.*`、`context.bindings.*` 以及 `context.path/method/query/headers/cookies/log/cache` 给出可机械执行的替换提示，并在标准产物生成前拒绝残留引用。
 - `logical-resource-bindings` 能力族冻结前，`env` 内具体资源接口仍是 Draft，实现不能把当前 Deislet 或任一供应商对象倒写成标准，也不能据此宣称 conformance。
 

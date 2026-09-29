@@ -8,8 +8,6 @@
 //!   hand, in the order the routers mount them. The document is opt-in:
 //!   a handler that is not named here is not described, and a route that
 //!   is described but not mounted is caught by `tests::` below.
-//! * The legacy flat `/api/*` tree is the same handlers under a deprecated
-//!   prefix and is not described separately.
 //! * The node channel (`/api/nodes/*`, `/api/routing-table`, the bundle
 //!   download) and the Prometheus exposition at `/api/metrics` are never in
 //!   this document; they are not part of either contract.
@@ -460,7 +458,8 @@ impl Modify for Security {
 // The error envelope.
 //
 // `api::error` renders the envelope by hand from `ErrorDetail`, which also
-// carries the legacy body and the status; these types describe only the
+// carries the plain body a handler writes and the status; these types
+// describe only the
 // wire shape of `/api/v1` and `/api/platform` answers, and the test below
 // holds them to `contracts/v1/control-error.schema.json`.
 // ---------------------------------------------------------------------------
@@ -635,9 +634,7 @@ pub struct ErrorViolation {
 }
 
 /// The closed set of error codes. Rendered from `codes::ALL` so the document
-/// cannot miss a code the server produces, and lists exactly one it does
-/// not: `offset-out-of-range`, kept because a published code is never
-/// withdrawn from a closed enum.
+/// lists exactly the codes the server produces.
 #[derive(Debug, Serialize)]
 pub struct ErrorCode(pub &'static str);
 
@@ -649,10 +646,7 @@ impl PartialSchema for ErrorCode {
                 "Stable machine-readable error class; `contracts/v1/control-error.schema.json` \
                  is the authority. `service-unavailable`, `backend-unavailable`, \
                  `database-unavailable` and `idempotency-request-in-progress` are the \
-                 retryable ones; `retryable` in the envelope is `true` for exactly those. \
-                 `offset-out-of-range` is reserved and emitted by nothing: no route takes \
-                 an offset, and the token stays in the enum for clients that already \
-                 branch on it.",
+                 retryable ones; `retryable` in the envelope is `true` for exactly those.",
             ))
             .enum_values(Some(codes::ALL.iter().copied()))
             .into()
@@ -1253,18 +1247,6 @@ fn document_reference_property(description: &str) -> ObjectBuilder {
         .required("digest")
 }
 
-/// A top-level member the document published before the record's real shape
-/// was described here, which nothing has ever written.
-///
-/// Kept for the same reason `offset-out-of-range` stays in [`ErrorCode`]: a
-/// published member is not withdrawn from a document that promises
-/// compatibility. It is marked deprecated and says where the value it
-/// looked like actually lives, so a client reading it as anything but
-/// `undefined` learns why here rather than at runtime.
-fn never_written_property(description: &str) -> ObjectBuilder {
-    string_property(description).deprecated(Some(utoipa::openapi::Deprecated::True))
-}
-
 impl PartialSchema for CanonicalArtifactDocument {
     fn schema() -> RefOr<Schema> {
         contract_object(
@@ -1440,27 +1422,6 @@ impl PartialSchema for CanonicalArtifactDocument {
             ),
         )
         .required("signatures")
-        // Published by an earlier draft of this document and written by
-        // nothing: the record has never carried a digest or a standard
-        // version at its top level.
-        .property(
-            "artifactSha256",
-            never_written_property(
-                "Never written. The digest of the archive is \
-                 `canonicalOutput.artifactSha256`.",
-            ),
-        )
-        .property(
-            "contentRootSha256",
-            never_written_property(
-                "Never written. The digest of the content root is \
-                 `canonicalOutput.contentRootSha256`.",
-            ),
-        )
-        .property(
-            "standardVersion",
-            never_written_property("Never written. The standard version is `standard.version`."),
-        )
         .into()
     }
 }
@@ -1757,11 +1718,8 @@ mod tests {
     }
 
     /// The artifact record the routes answer with is the one the contract
-    /// defines: every member it requires is described and required here.
-    /// The three top-level digests this document published before anyone
-    /// compared the two are still listed - a published member is not
-    /// withdrawn - and are marked deprecated, because nothing has ever
-    /// written them.
+    /// defines: every member it requires is described and required here,
+    /// and nothing the record never carries is described.
     #[test]
     fn the_canonical_artifact_is_the_contract_record() {
         let document = rendered();
@@ -1801,12 +1759,10 @@ mod tests {
             );
         }
         for member in ["artifactSha256", "contentRootSha256", "standardVersion"] {
-            assert_eq!(
-                artifact["properties"][member]["deprecated"],
-                Value::Bool(true),
-                "{member} is written by nothing and has to say so"
+            assert!(
+                artifact["properties"][member].is_null(),
+                "{member} is written by nothing and is not described"
             );
-            assert!(!required.contains(member), "{member} is not written at all");
         }
     }
 
@@ -2423,8 +2379,8 @@ mod tests {
 
         // The catalog, driven through its own harness: one node key, a
         // secret store, and a runtime stand-in that accepts deliveries.
-        // Its routes are spelled in the legacy prefix; the bodies are the
-        // same on /api/v1.
+        // Its routes are mounted flat under /api, as every unit-test harness
+        // mounts them; the bodies are the same on /api/v1.
         let h = crate::api::catalog::tests::harness(true).await;
         let r = &h.router;
         keep(

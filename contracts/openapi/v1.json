@@ -740,11 +740,6 @@
             "format": "uuid",
             "type": "string"
           },
-          "artifactSha256": {
-            "deprecated": true,
-            "description": "Never written. The digest of the archive is `canonicalOutput.artifactSha256`.",
-            "type": "string"
-          },
           "attestations": {
             "description": "The documents that travel with the artifact.",
             "properties": {
@@ -871,11 +866,6 @@
             ],
             "type": "object"
           },
-          "contentRootSha256": {
-            "deprecated": true,
-            "description": "Never written. The digest of the content root is `canonicalOutput.contentRootSha256`.",
-            "type": "string"
-          },
           "createdAt": {
             "description": "RFC 3339.",
             "format": "date-time",
@@ -994,11 +984,6 @@
               "artifactSchemaDigest"
             ],
             "type": "object"
-          },
-          "standardVersion": {
-            "deprecated": true,
-            "description": "Never written. The standard version is `standard.version`.",
-            "type": "string"
           },
           "state": {
             "description": "Where the record stands: `draft`, `verified` or `published`.",
@@ -1889,11 +1874,6 @@
                   "format": "uuid",
                   "type": "string"
                 },
-                "artifactSha256": {
-                  "deprecated": true,
-                  "description": "Never written. The digest of the archive is `canonicalOutput.artifactSha256`.",
-                  "type": "string"
-                },
                 "attestations": {
                   "description": "The documents that travel with the artifact.",
                   "properties": {
@@ -2020,11 +2000,6 @@
                   ],
                   "type": "object"
                 },
-                "contentRootSha256": {
-                  "deprecated": true,
-                  "description": "Never written. The digest of the content root is `canonicalOutput.contentRootSha256`.",
-                  "type": "string"
-                },
                 "createdAt": {
                   "description": "RFC 3339.",
                   "format": "date-time",
@@ -2143,11 +2118,6 @@
                     "artifactSchemaDigest"
                   ],
                   "type": "object"
-                },
-                "standardVersion": {
-                  "deprecated": true,
-                  "description": "Never written. The standard version is `standard.version`.",
-                  "type": "string"
                 },
                 "state": {
                   "description": "Where the record stands: `draft`, `verified` or `published`.",
@@ -2406,7 +2376,7 @@
                   ]
                 },
                 "snapshot_id": {
-                  "description": "Immutable Edge Canon environment snapshot selected with this pointer.\nAbsent only on deployments written by the legacy schema-1 path.",
+                  "description": "Immutable Edge Canon environment snapshot selected with this pointer.",
                   "type": "string"
                 },
                 "version_id": {
@@ -2419,7 +2389,8 @@
                 "app_id",
                 "env_id",
                 "version_id",
-                "created_at"
+                "created_at",
+                "snapshot_id"
               ],
               "type": "object"
             },
@@ -3812,7 +3783,7 @@
                   "type": "string"
                 },
                 "canonical_artifact_id": {
-                  "description": "Exact provider-neutral parent and provider derivation. Both are absent\nonly for legacy raw-bundle uploads.",
+                  "description": "Exact provider-neutral parent and provider derivation. Both are absent\nfor a native bundle uploaded directly, without a canonical artifact:\nsuch a version runs on Deislet nodes and cannot be derived for another\nprovider.",
                   "format": "uuid",
                   "type": "string"
                 },
@@ -4206,7 +4177,7 @@
             ]
           },
           "snapshot_id": {
-            "description": "Immutable Edge Canon environment snapshot selected with this pointer.\nAbsent only on deployments written by the legacy schema-1 path.",
+            "description": "Immutable Edge Canon environment snapshot selected with this pointer.",
             "type": "string"
           },
           "version_id": {
@@ -4219,7 +4190,8 @@
           "app_id",
           "env_id",
           "version_id",
-          "created_at"
+          "created_at",
+          "snapshot_id"
         ],
         "type": "object"
       },
@@ -4404,6 +4376,7 @@
             "type": "string"
           },
           "snapshot_id": {
+            "description": "The environment snapshot this plan activates.",
             "type": "string"
           },
           "state": {
@@ -4429,6 +4402,7 @@
           "app_id",
           "env_id",
           "version_id",
+          "snapshot_id",
           "expected_secret_heads",
           "compare_secret_heads",
           "target_ids",
@@ -4740,12 +4714,11 @@
         "type": "object"
       },
       "ErrorCode": {
-        "description": "Stable machine-readable error class; `contracts/v1/control-error.schema.json` is the authority. `service-unavailable`, `backend-unavailable`, `database-unavailable` and `idempotency-request-in-progress` are the retryable ones; `retryable` in the envelope is `true` for exactly those. `offset-out-of-range` is reserved and emitted by nothing: no route takes an offset, and the token stays in the enum for clients that already branch on it.",
+        "description": "Stable machine-readable error class; `contracts/v1/control-error.schema.json` is the authority. `service-unavailable`, `backend-unavailable`, `database-unavailable` and `idempotency-request-in-progress` are the retryable ones; `retryable` in the envelope is `true` for exactly those.",
         "enum": [
           "not-found",
           "invalid-argument",
           "limit-out-of-range",
-          "offset-out-of-range",
           "cursor-invalid",
           "idempotency-key-required",
           "idempotency-key-reused",
@@ -7452,7 +7425,7 @@
             "type": "string"
           },
           "canonical_artifact_id": {
-            "description": "Exact provider-neutral parent and provider derivation. Both are absent\nonly for legacy raw-bundle uploads.",
+            "description": "Exact provider-neutral parent and provider derivation. Both are absent\nfor a native bundle uploaded directly, without a canonical artifact:\nsuch a version runs on Deislet nodes and cannot be derived for another\nprovider.",
             "format": "uuid",
             "type": "string"
           },

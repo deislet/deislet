@@ -39,7 +39,9 @@ pub struct VersionView {
     pub number: i64,
     pub bundle_sha: String,
     /// Exact provider-neutral parent and provider derivation. Both are absent
-    /// only for legacy raw-bundle uploads.
+    /// for a native bundle uploaded directly, without a canonical artifact:
+    /// such a version runs on Deislet nodes and cannot be derived for another
+    /// provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = Uuid, nullable = false)]
     pub canonical_artifact_id: Option<CanonicalId>,

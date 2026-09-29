@@ -193,14 +193,13 @@ assets/                  # 静态资产，原样保留目录结构
   `Manifest::parse`/`validate` 里，而在 `Manifest::compatibility_profile()`，所以
   manifest 照样解析、别的字段照样能读，拒绝理由里写着两个日期，同一个包在新一版的节点
   上照样 `Ok`。
-- schema 2 的 `environment` 是 canonical artifact 中同一份 Edge Canon declaration：只含名称、
-  `kind`、`valueType` 与 `required`，不含 config 值或 secret 明文。部署时另建不可变的
-  `environment-binding-snapshot/v1`，把它绑定到版本、环境、config revision 与 secret revision；
-  `context.env` 只从该 snapshot 物化。旧 schema 1 的 `env`/`secrets` 仍可读取以支持历史版本
-  回滚，但新构建不再写入这两个字段；schema 2 若携带它们会被拒绝，避免同时存在两套真源。
+- `schema` 只有 2 一个取值，`environment` 必填：它是 canonical artifact 中同一份 Edge Canon
+  declaration，只含名称、`kind`、`valueType` 与 `required`，不含 config 值或 secret 明文。部署时另建
+  不可变的 `environment-binding-snapshot/v1`，把它绑定到版本、环境、config revision 与 secret
+  revision；`context.env` 只从该 snapshot 物化。manifest 没有携带运行时值的字段。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
-- `services` 的四个键是 schema 1 的旧式无名资源声明，只为迁移既有 bundle 与数据保留；
-  新标准应用只声明 `bindings`，生成的 HTTP context 不暴露 `context.services`。
+- `services` 的四个键是无名资源声明；构建会拒绝启用它们的项目，只有手工拼出的 bundle 才会
+  带 `true`。标准应用只声明 `bindings`，生成的 HTTP context 不暴露 `context.services`。
 - `bindings` 是一张**平表**：名字 → `{ "kind": ... }`，`kind` 五选一
   （`kv` / `database` / `blob` / `queue` / `service`）。前四种是本租户内部又一个命名
   空间（租户边界一点没动：绑定名是验过能力令牌之后用
@@ -303,7 +302,7 @@ CREATE TABLE routes (
   priority    INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE TABLE secrets (                    -- schema-1/滚动升级兼容源
+CREATE TABLE secrets (                    -- secret revision 的密文
   id          TEXT PRIMARY KEY,
   app_id      TEXT NOT NULL,
   env_id      TEXT NOT NULL REFERENCES environments(id),
@@ -428,11 +427,11 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
      string environment = 3;
      string bundle_url  = 4;   // 控制面上的 HTTP 下载地址
      string bundle_sha  = 5;
-     map<string, string> env = 6;   // schema-1 环境 + 平台内部存储 wiring
+     map<string, string> env = 6;   // 平台内部存储 wiring，不含应用的值
      string environment_declarations_json = 11;
      string environment_snapshot_json = 12;
      string environment_snapshot_id = 13;
-     map<string, string> secret_values_by_revision = 14;
+     // 14 已删除：secret 明文只经 FetchSecretValues 按 revision 取得
      string deployment_id = 15;       // lowercase UUIDv7 plan identity
      string routing_generation = 16;  // immutable route/consumer generation
      DeploymentAction action = 17;    // PREPARE / ACTIVATE / ABORT / DRAIN
@@ -448,8 +447,8 @@ CREATE TABLE audit_log (           -- 只增不改：全仓没有一处 UPDATE �
 FetchAssignments(node_id)
 → assignments_json: [ { app_id, version_id, environment, bundle_url, bundle_sha, env,
       environment_declarations, environment_snapshot,
-      environment_snapshot_id, secret_values_by_revision,
-      deployment_id, routing_generation, deployment_action } ]
+      environment_snapshot_id, deployment_id, routing_generation,
+      deployment_action } ]
 ```
 
 2026-09-11 之前，这一步是控制面人侧端口上的一条 `GET deis_wire::conventions::NODE_ASSIGNMENTS_ROUTE`
@@ -463,11 +462,11 @@ FetchAssignments(node_id)
 `node_assignments_path` / `node_registration_path` 这几个符号仍在
 `crates/deis-wire/src/conventions.rs` 里，但生产的控制面路由已经不再注册它们，只留给测试用。
 
-schema-1 的 `env` 与 `ApplyDeployment.env` 仍是同一张字符串表。schema-2 则传 declaration、精确
-snapshot identity 与按 immutable revision 索引的 secret plaintext；config/string、config/json 和
-secret/string 只从该 snapshot 物化，平台存储 wiring 仍留在内部 `env`，不会进入标准
-`context.env`。节点重启后必须从 assignments 重新取得同一个 snapshot；本地只持 snapshot digest，
-不持 config/secret value，因此控制面不可达时 schema-2 fail closed，不用 bundle 猜值。某个环境的
+每次部署都传 declaration 与精确 snapshot identity；secret 明文由节点按 immutable revision 经
+`FetchSecretValues` 取得。config/string、config/json 和 secret/string 只从该 snapshot 物化，平台
+存储 wiring 留在内部 `env`，不会进入标准 `context.env`。节点重启后必须从 assignments（或离线
+缓存）重新取得同一个 snapshot；bundle 目录只持 snapshot digest，不持 config/secret value，因此
+两者都拿不到时 fail closed，不用 bundle 猜值。某个环境的
 snapshot 或密钥解不开时，该行被整条剔出清单并标为 incomplete，而不是发残缺环境。
 
 authoritative assignment 会按 durable plan state 发 `prepare` 或 `activate`；节点重启遇到未完成计划时只能
@@ -606,7 +605,7 @@ deis-proxy、deis-store、deis-queue、deis-control 都还只写自己的 stdout
 2. **`context.params`**：`JsRequest` 现在没有 `params` 字段，所以 `context.params` 永远是空对象。按 manifest 的 `routes[].pattern` 匹配，把占位符解析结果填进去。
 3. **`context.env`**：schema-2 从 declaration + deployment snapshot 物化；每次 invocation 得到新的
    null-prototype 对象，JSON 值递归冻结，未声明/provider/host 值不进入其中。`process.env` 只投影
-   config/string，并在每次 invocation 重置；JSON 与 secret 不进入。schema-1 保留旧字符串 map。
+   config/string，并在每次 invocation 重置；JSON 与 secret 不进入。
    secret plaintext 只留在内存，不落盘、不进日志。
 4. **限额可配置**：`isolate.rs` 里写死的 30 秒超时和 `RateLimiter::new(1000.0)` 提到配置，允许按应用覆盖。
 

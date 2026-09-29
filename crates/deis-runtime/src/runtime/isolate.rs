@@ -1030,9 +1030,9 @@ pub struct IsolateSpec {
     /// Values visible to the app through `Deno.env` / `ctx.env`.
     pub env: HashMap<String, String>,
     pub standard_env: Option<std::collections::BTreeMap<String, serde_json::Value>>,
-    /// Explicit process.env projection. Production deployment construction
-    /// always supplies this, including `Some(empty)`. Direct legacy callers
-    /// may leave it absent to retain the historical env-derived projection.
+    /// Explicit process.env projection. Every deployment supplies this,
+    /// including `Some(empty)`; an isolate built without a deployment (tests)
+    /// may leave it absent, and then projects `env` minus the reserved keys.
     pub node_process_env: Option<HashMap<String, String>>,
 
     /// Storage authority presented by KV, SQL, blob and queue clients.

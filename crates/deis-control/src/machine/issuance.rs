@@ -121,7 +121,7 @@ mod tests {
             "dep-a".to_string(),
             VisibleDeployment {
                 env_id: "env-a".to_string(),
-                snapshot_id: None,
+                snapshot_id: "snapshot-a".to_string(),
                 canonical_tenant: canonical("a.production"),
                 routing_generation: "gen-a".to_string(),
             },

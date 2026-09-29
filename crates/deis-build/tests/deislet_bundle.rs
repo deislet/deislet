@@ -193,10 +193,7 @@ async fn the_manifest_carries_what_the_project_declared() {
     assert!(manifest.uses_service("database"));
     assert!(!manifest.uses_service("blob"));
 
-    let environment = manifest
-        .environment
-        .as_ref()
-        .expect("schema-2 carries declarations instead of runtime values");
+    let environment = &manifest.environment;
     assert!(environment.declarations.iter().any(|declaration| {
         declaration.name == "LOG_LEVEL"
             && declaration.kind == deis_wire::EnvironmentKind::Config
@@ -210,8 +207,8 @@ async fn the_manifest_carries_what_the_project_declared() {
             && declaration.required
     }));
     assert!(
-        manifest.env.is_empty() && manifest.secrets.is_empty(),
-        "runtime values or legacy secret names leaked back into schema-2"
+        !read_manifest(&bytes).unwrap().json.contains("\"info\""),
+        "a config value leaked into the manifest"
     );
     assert_eq!(manifest.cron, vec!["0 */6 * * *"]);
     assert_eq!(manifest.queues[0].name, "jobs");

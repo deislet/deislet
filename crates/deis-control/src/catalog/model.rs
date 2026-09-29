@@ -49,8 +49,8 @@ pub struct Version {
     pub bundle_path: String,
     /// Verbatim `manifest.json` text as it was found inside the bundle.
     pub manifest: String,
-    /// Exact provider-neutral parent. `None` identifies an upload made
-    /// through the legacy raw-bundle endpoint before lineage was recorded.
+    /// Exact provider-neutral parent. `None` for a native bundle uploaded
+    /// directly, without a canonical artifact.
     pub canonical_artifact_id: Option<CanonicalId>,
     /// SHA-256 identity of the immutable provider derivation manifest.
     pub provider_derivation_sha256: Option<String>,
@@ -111,10 +111,7 @@ pub struct Deployment {
     pub created_at: i64,
     pub note: Option<String>,
     /// Immutable Edge Canon environment snapshot selected with this pointer.
-    /// Absent only on deployments written by the legacy schema-1 path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub snapshot_id: Option<String>,
+    pub snapshot_id: String,
 }
 
 /// Immutable deployment intent plus its durable coordinator state.
@@ -126,9 +123,8 @@ pub struct DeploymentPlan {
     pub app_id: String,
     pub env_id: String,
     pub version_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(nullable = false)]
-    pub snapshot_id: Option<String>,
+    /// The environment snapshot this plan activates.
+    pub snapshot_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub previous_deployment_id: Option<String>,
@@ -274,12 +270,12 @@ pub struct Assignment {
     pub environment: String,
     pub version_id: String,
     pub bundle_sha: String,
-    pub snapshot_id: Option<String>,
+    pub snapshot_id: String,
     pub deployment_id: String,
     pub routing_generation: String,
-    /// Durable coordinator state for this pointer. `None` identifies a
-    /// deployment written before plans existed and is treated as active for
-    /// rolling compatibility.
+    /// Durable coordinator state for this pointer. `None` is a pointer
+    /// committed outside a plan (`CatalogStore::activate_deployment`), which
+    /// is active.
     pub deployment_state: Option<String>,
 }
 

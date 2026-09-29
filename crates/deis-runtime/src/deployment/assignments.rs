@@ -35,13 +35,11 @@
 //! request was in flight - is the newer instruction and is left alone.
 //!
 //! The bundle itself is never in the list: each line is a pointer - app,
-//! version, environment, URL, digest - plus the environment map that a push
-//! would have carried, so an app that comes back this way comes back with its
-//! variables and its storage addresses rather than with an empty environment;
-//! the secrets its snapshot binds are fetched separately.
-//! An older control plane that sends no `env` still works; the app then runs
-//! on its manifest's own variables until the next push, which is what this
-//! path used to do for every app and is said out loud when it happens.
+//! version, environment, URL, digest - plus everything a push would have
+//! carried: the platform's wiring, the limits and compatibility declaration,
+//! and the environment snapshot, so an app that comes back this way comes
+//! back with its config values and its storage addresses rather than with an
+//! empty environment. The secrets its snapshot binds are fetched separately.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -61,38 +59,30 @@ use super::{Applied, DeploymentManager, DeploymentOrder};
 use crate::app::{AppKey, InstalledVersion};
 use crate::health::NodeHealth;
 
-/// One line of `GET /api/nodes/{node_id}/assignments`, in exactly the shape
-/// the control plane serves (see deis-control `api::catalog::assignments`).
+/// One line of the assignment list, in exactly the shape the control plane
+/// serves (see deis-control `api::catalog::assignments`).
 #[derive(Clone, Deserialize)]
 pub struct Assignment {
     pub app_id: String,
-    /// Additive for a rolling upgrade. Both canonical fields must be present
-    /// together; an older control plane sends neither.
-    #[serde(default)]
-    pub canonical_application_id: Option<CanonicalId>,
+    pub canonical_application_id: CanonicalId,
     pub version_id: String,
-    #[serde(default)]
-    pub deployment_id: Option<String>,
-    #[serde(default)]
-    pub routing_generation: Option<String>,
-    /// Absent on older control planes, where every assignment was an
-    /// immediate activation. New control planes explicitly hold an
-    /// in-flight generation in prepare state until the durable plan commits.
-    #[serde(default)]
+    pub deployment_id: String,
+    pub routing_generation: String,
+    /// `prepare` holds an in-flight generation addressable without starting
+    /// it until the durable plan commits; `activate` makes it current.
     pub deployment_action: AssignmentDeploymentAction,
     pub environment: String,
-    #[serde(default)]
-    pub canonical_environment_id: Option<CanonicalId>,
+    pub canonical_environment_id: CanonicalId,
     pub bundle_url: String,
     pub bundle_sha: String,
-    /// Variables and platform wiring, exactly as a push would have sent
-    /// them; never a secret value. Absent from an older control plane.
+    /// The platform's wiring, exactly as a push would have sent it; never an
+    /// application value or a secret. Empty for a deployment that reaches no
+    /// storage service.
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
     /// What this version's manifest asked to be held to, exactly as a push
-    /// would have sent it. Absent from an older control plane, and absent for
-    /// an application that declared nothing; either way the node's own
-    /// ceilings apply.
+    /// would have sent it; absent for an application that declared nothing,
+    /// which gets the node's own ceilings.
     ///
     /// Carried here and not only on the push because this is the path a node
     /// comes back on after a restart: without it an application that narrowed
@@ -101,9 +91,7 @@ pub struct Assignment {
     #[serde(default)]
     pub limits: Option<crate::app::types::ResourceLimits>,
     /// Which of the platform's answers this version expects, exactly as a
-    /// push would have sent them. Absent from an older control plane, in
-    /// which case the version's own manifest is the only thing that says -
-    /// and it always does, because the declaration lives in the bundle.
+    /// push would have sent them.
     ///
     /// Held as the *declaration* rather than as resolved answers so that this
     /// field can never fail to parse. A control plane newer than this node
@@ -113,14 +101,10 @@ pub struct Assignment {
     /// other forty, which are fine. Resolving happens per application in
     /// [`Assignment::into_order`], and the application this node genuinely
     /// cannot honour is refused on its own when its bundle is unpacked.
-    #[serde(default)]
-    pub compatibility: Option<deis_bundle::DeclaredCompatibility>,
-    #[serde(default)]
-    pub environment_declarations: Option<deis_wire::EnvironmentDeclarations>,
-    #[serde(default)]
-    pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
-    #[serde(default)]
-    pub environment_snapshot_id: Option<String>,
+    pub compatibility: deis_bundle::DeclaredCompatibility,
+    pub environment_declarations: deis_wire::EnvironmentDeclarations,
+    pub environment_snapshot: deis_wire::EnvironmentBindingSnapshot,
+    pub environment_snapshot_id: String,
 }
 
 /// Hand-written so a `{:?}` on an assignment - in a log line, in an error
@@ -150,23 +134,8 @@ impl std::fmt::Debug for Assignment {
 
 impl Assignment {
     fn into_order(self) -> Result<DeploymentOrder, String> {
-        let standard_environment_id = self
-            .canonical_environment_id
-            .as_ref()
-            .map(ToString::to_string);
-        let canonical_tenant = match (self.canonical_application_id, self.canonical_environment_id)
-        {
-            (Some(application), Some(environment)) => {
-                Some(CanonicalTenantId::new(application, environment))
-            }
-            (None, None) => None,
-            (None, Some(_)) => {
-                return Err("canonical_application_id is missing".to_string());
-            }
-            (Some(_), None) => {
-                return Err("canonical_environment_id is missing".to_string());
-            }
-        };
+        let canonical_tenant =
+            CanonicalTenantId::new(self.canonical_application_id, self.canonical_environment_id);
 
         // Resolved here, per application, so that a declaration this build
         // cannot read costs only the cross-check in `install` and not the
@@ -175,50 +144,30 @@ impl Assignment {
         // bundle's own manifest - which this node is about to unpack, and
         // which is what the digest covers - is what actually refuses a version
         // this node cannot honour.
-        let resolved = self.compatibility.as_ref().and_then(|declared| {
-            match deis_bundle::CompatibilityProfile::resolve(declared) {
-                Ok(profile) => Some(profile),
-                Err(reason) => {
-                    warn!(
-                        app_id = %self.app_id,
-                        environment = %self.environment,
-                        version_id = %self.version_id,
-                        reason = %reason,
-                        "The assignment list names platform behaviour this node's build does \
-                         not have. The declaration inside the bundle decides, and if it says \
-                         the same thing this version is refused when it is unpacked; nothing \
-                         else on this list is affected"
-                    );
-                    None
-                }
+        let resolved = match deis_bundle::CompatibilityProfile::resolve(&self.compatibility) {
+            Ok(profile) => Some(profile),
+            Err(reason) => {
+                warn!(
+                    app_id = %self.app_id,
+                    environment = %self.environment,
+                    version_id = %self.version_id,
+                    reason = %reason,
+                    "The assignment list names platform behaviour this node's build does \
+                     not have. The declaration inside the bundle decides, and if it says \
+                     the same thing this version is refused when it is unpacked; nothing \
+                     else on this list is affected"
+                );
+                None
             }
-        });
+        };
 
-        let standard_environment = match (
+        let standard_environment = super::StandardEnvironmentOrder::new_without_secrets(
             self.environment_declarations,
             self.environment_snapshot,
             self.environment_snapshot_id,
-        ) {
-            (None, None, None) => None,
-            (Some(declarations), Some(snapshot), Some(snapshot_id)) => {
-                Some(super::StandardEnvironmentOrder::new_without_secrets(
-                    declarations,
-                    snapshot,
-                    snapshot_id,
-                    &self.version_id,
-                    standard_environment_id.as_deref().ok_or_else(|| {
-                        "EC_ENV_SNAPSHOT_INVALID: canonical environment identity is missing"
-                            .to_string()
-                    })?,
-                )?)
-            }
-            _ => {
-                return Err(
-                    "EC_ENV_SNAPSHOT_INVALID: assignment environment fields are incomplete"
-                        .to_string(),
-                );
-            }
-        };
+            &self.version_id,
+            &self.canonical_environment_id.to_string(),
+        )?;
 
         Ok(DeploymentOrder {
             app_id: self.app_id,
@@ -237,13 +186,11 @@ impl Assignment {
     }
 }
 
-/// Assignment-list phase. The default preserves compatibility with control
-/// planes that predate durable deployment plans.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+/// Assignment-list phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssignmentDeploymentAction {
     Prepare,
-    #[default]
     Activate,
 }
 
@@ -888,7 +835,7 @@ impl<'a> Reconciler<'a> {
         report_drift(&assigned, &running, complete, &self.absent_before);
         let assigned_deployments: HashSet<String> = assignments
             .iter()
-            .filter_map(|assignment| assignment.deployment_id.clone())
+            .map(|assignment| assignment.deployment_id.clone())
             .collect();
 
         let mut outcome = SyncOutcome {
@@ -1265,13 +1212,11 @@ pub async fn run_control_loop(
     deployer.report_readiness_to(Arc::clone(&health));
 
     let Some(client) = client else {
-        let recovered = deployer.recover_from_disk().await;
         info!(
-            apps = recovered,
             "No control plane endpoint is configured (control.endpoint), so this node runs only \
-             what is on its disk and what is pushed to it; it is ready"
+             what is pushed to it; it is ready"
         );
-        health.mark_ready(recovered);
+        health.mark_ready(0);
         return;
     };
 
@@ -1405,16 +1350,15 @@ pub async fn run_control_loop(
                         (Some(cache), false) => restore_offline(cache, &deployer).await,
                         _ => 0,
                     };
-                    let recovered = restored + deployer.recover_from_disk().await;
                     warn!(
                         url = client.url(),
                         error = %e,
-                        recovered,
+                        recovered = restored,
                         "The control plane could not be reached at startup. This node is NOT \
-                         running a list anyone confirmed: it loaded {} app(s) from its own disk \
-                         and will keep retrying, starting at {}s and backing off. It reports \
-                         unhealthy until the control plane answers",
-                        recovered,
+                         running a list anyone confirmed: it restored {} app(s) from its offline \
+                         cache and will keep retrying, starting at {}s and backing off. It \
+                         reports unhealthy until the control plane answers",
+                        restored,
                         retry_interval.as_secs()
                     );
                 } else {

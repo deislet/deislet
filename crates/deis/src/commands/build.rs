@@ -604,9 +604,9 @@ mod tests {
             path: root.path().join("bundle.zip"),
             digest: digest_of(&bytes),
             bytes: bytes.clone(),
-            manifest: deis_bundle::Manifest::parse(
-                r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#,
-            )
+            manifest: deis_bundle::Manifest::parse(&deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js"}"#,
+            ))
             .expect("manifest"),
             lineage: Some(BundleLineage {
                 canonical_root: root.path().to_path_buf(),

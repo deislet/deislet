@@ -817,9 +817,9 @@ mod tests {
         // A misspelling reaches the author the same way a newer key reaches
         // an operator: named, at `warn`, when the bundle is read.
         assert_eq!(
-            crate::forward::unknown_fields(
-                r#"{"schema":1,"app":"d","entry":"e.js","compatibility":{"compatibilityDate":"2026-09-01"}}"#
-            ),
+            crate::forward::unknown_fields(&crate::complete_manifest_json(
+                r#"{"app":"d","entry":"e.js","compatibility":{"compatibilityDate":"2026-09-01"}}"#
+            )),
             vec!["compatibility.compatibilityDate".to_string()]
         );
     }

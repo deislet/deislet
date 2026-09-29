@@ -76,21 +76,12 @@ pub struct VersionRecord {
     /// Immutable coordinator intent that owns `routing_generation`.
     pub deployment_id: Option<String>,
     /// Immutable deployment generation accepted on the trusted proxy hop.
-    /// `None` is the rolling-compatible legacy/local path.
+    /// `None` for a version installed without a deployment behind it (`deis
+    /// dev`, tests).
     pub routing_generation: Option<String>,
     /// Immutable standard environment snapshot materialized in this isolate.
-    /// `None` identifies the legacy schema-1 environment path.
+    /// `None` for a version installed without a deployment behind it.
     pub environment_snapshot_id: Option<String>,
-    /// Whether the `env` this copy is running with came from the control
-    /// plane.
-    ///
-    /// False means the version was loaded from this node's own disk, where
-    /// secret *values* are deliberately never written: the code is the right
-    /// code but every secret the app declares is missing. Two copies of one
-    /// version are therefore not interchangeable, and this is what stops a
-    /// later delivery of the same version id from being waved through as
-    /// "already running" - see `DeploymentManager::apply_from_assignment`.
-    pub env_confirmed: bool,
     pub entry_point: String,
     /// Bundled module source. Kept because an isolate is built from it, and
     /// a version change builds a second one while this record is still the
@@ -107,7 +98,6 @@ impl std::fmt::Debug for VersionRecord {
             .field("version_id", &self.version_id)
             .field("routing_generation", &self.routing_generation)
             .field("environment_snapshot_id", &self.environment_snapshot_id)
-            .field("env_confirmed", &self.env_confirmed)
             .field("entry_point", &self.entry_point)
             .field("assets", &self.assets)
             .finish()
@@ -128,9 +118,6 @@ pub struct VersionInstall {
     /// Carries the decrypted `env`; see [`AppConfig`] for why it neither
     /// serialises nor prints its values.
     pub config: AppConfig,
-    /// See [`VersionRecord::env_confirmed`]. False for a version recovered
-    /// from local disk.
-    pub env_confirmed: bool,
     pub assets: Arc<AssetBundle>,
 }
 
@@ -140,8 +127,6 @@ pub struct InstalledVersion {
     pub version_id: String,
     pub routing_generation: Option<String>,
     pub environment_snapshot_id: Option<String>,
-    /// See [`VersionRecord::env_confirmed`].
-    pub env_confirmed: bool,
 }
 
 /// Why a scheduled run did not complete.
@@ -868,7 +853,6 @@ impl ApplicationManager {
             entry_point,
             code,
             config,
-            env_confirmed,
             assets,
         } = install;
 
@@ -877,7 +861,6 @@ impl ApplicationManager {
             deployment_id,
             routing_generation,
             environment_snapshot_id,
-            env_confirmed,
             entry_point: entry_point.clone(),
             code: code.clone(),
             config: config.clone(),
@@ -967,7 +950,6 @@ impl ApplicationManager {
             environment = %key.environment(),
             version_id = %version_id,
             replaced_version = previous.as_ref().map(|p| p.version_id.as_str()),
-            env_confirmed,
             assets = assets.len(),
             asset_bytes = assets.total_bytes(),
             "App {} is now serving version {} of environment {}",
@@ -990,7 +972,6 @@ impl ApplicationManager {
             entry_point,
             code,
             config,
-            env_confirmed,
             assets,
         } = install;
         let generation = routing_generation
@@ -1022,7 +1003,6 @@ impl ApplicationManager {
             deployment_id,
             routing_generation: Some(generation.clone()),
             environment_snapshot_id,
-            env_confirmed,
             entry_point,
             code,
             config,
@@ -1228,7 +1208,6 @@ impl ApplicationManager {
             version_id: e.version_id.clone(),
             routing_generation: e.routing_generation.clone(),
             environment_snapshot_id: e.environment_snapshot_id.clone(),
-            env_confirmed: e.env_confirmed,
         })
     }
 
@@ -1243,7 +1222,6 @@ impl ApplicationManager {
                         version_id: e.version_id.clone(),
                         routing_generation: e.routing_generation.clone(),
                         environment_snapshot_id: e.environment_snapshot_id.clone(),
-                        env_confirmed: e.env_confirmed,
                     },
                 )
             })
@@ -1939,7 +1917,6 @@ mod memory_ceiling {
                 entry_point: "app.ts".to_string(),
                 code: ARMED_RUNAWAY.to_string(),
                 config: limits(64),
-                env_confirmed: true,
                 assets: Arc::new(AssetBundle::empty(Arc::from("max-age=60"))),
             })
             .await

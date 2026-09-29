@@ -171,18 +171,15 @@ message ApplyDeploymentRequest {
     // GET /api/nodes/{node_id}/assignments.
     CompatibilityDeclaration compatibility = 8;
 
-    // Permanent application identity used to derive storage authority. This
-    // is additive for rolling upgrades: both canonical fields are empty when
-    // the producer predates canonical identity. A node must accept both empty
-    // or validate both as lowercase UUIDv7; it must reject a one-sided or
-    // malformed pair rather than guess and attach data to the wrong tenant.
+    // Permanent application identity used to derive storage authority.
+    // Required, as a lowercase UUIDv7; a node rejects a missing or malformed
+    // one rather than guess and attach data to the wrong tenant.
     string canonical_application_id = 9;
 
-    // Permanent environment identity. Together with
-    // `canonical_application_id` it spells the logical tenant
-    // `v1/<application UUIDv7>/<environment UUIDv7>`. The human environment
-    // name in field 3 remains what application code sees and what rolling
-    // upgrade routing uses; it is no longer the future storage authority.
+    // Permanent environment identity, required like field 9. Together they
+    // spell the tenant `v1/<application UUIDv7>/<environment UUIDv7>`. The
+    // environment name in field 3 is what application code sees and what
+    // routing uses; it is never the storage authority.
     string canonical_environment_id = 10;
 
     // Exact Edge Canon declaration and version-bound binding snapshot. JSON is
@@ -196,9 +193,9 @@ message ApplyDeploymentRequest {
     reserved 14;
     reserved "secret_values_by_revision";
 
-    // Durable control-plane operation identity. Empty only for an older
-    // producer or local development. It is echoed in every observation so a
-    // retry cannot be mistaken for a different deployment.
+    // Durable control-plane operation identity, required. It is echoed in
+    // every observation so a retry cannot be mistaken for a different
+    // deployment.
     string deployment_id = 15;
 
     // Immutable routing generation. For Deislet this is the deployment's
@@ -214,11 +211,9 @@ message ApplyDeploymentRequest {
 }
 
 enum DeploymentAction {
+    // Refused: every deployment names its action.
     DEPLOYMENT_ACTION_UNSPECIFIED = 0;
-    // LEGACY_APPLY = 1 was the historical one-call apply.  Schema-1 bundles
-    // are removed; a deployment now always arrives as Prepare + Activate.
     reserved 1;
-    reserved "LEGACY_APPLY";
     PREPARE = 2;
     ACTIVATE = 3;
     ABORT = 4;
@@ -257,12 +252,12 @@ message ApplyDeploymentResponse {
     string version_id = 3;
 
     // Correlates the observation to the durable plan and immutable routing
-    // generation that produced it. Empty for a legacy request.
+    // generation that produced it.
     string deployment_id = 4;
     string routing_generation = 5;
 
-    // Machine-readable observed state: prepared, active, aborted, rejected,
-    // or legacy_applied. `success` alone cannot distinguish readiness from
+    // Machine-readable observed state: prepared, active, aborted, drained,
+    // draining or rejected. `success` alone cannot distinguish readiness from
     // production activation.
     string observed_state = 6;
 }

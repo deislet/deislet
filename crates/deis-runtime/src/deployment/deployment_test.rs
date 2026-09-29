@@ -46,9 +46,47 @@ export default async function handler(context) {
 }
 "#;
 
-/// Build a bundle the way `deis build --target deislet` lays one out.
-fn bundle(app: &str, code: &str, assets: &[(&str, &str)], env: &[(&str, &str)]) -> TestBundle {
-    bundle_with_services(app, code, assets, env, &[])
+/// Build a bundle the way `deis build --target deislet` lays one out, for a
+/// version that declares no environment.
+fn bundle(app: &str, code: &str, assets: &[(&str, &str)]) -> TestBundle {
+    bundle_with_services(app, code, assets, &[])
+}
+
+/// The declaration document of a version that declares no environment.
+fn no_declarations() -> deis_wire::EnvironmentDeclarations {
+    deis_wire::EnvironmentDeclarations::new(
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        Vec::new(),
+    )
+}
+
+/// The canonical tenant the control plane would name for `key`.
+fn tenant_of(key: &AppKey) -> deis_wire::CanonicalTenantId {
+    deis_wire::CanonicalTenantId::derived_from_label(&key.tenant_id())
+}
+
+/// The environment snapshot of `version` of `key` when the version declares
+/// nothing: complete, and empty.
+fn empty_environment(key: &AppKey, version: &str) -> StandardEnvironmentOrder {
+    let declarations = no_declarations();
+    let environment_id = tenant_of(key).environment_id().to_string();
+    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        version,
+        environment_id.clone(),
+        declarations.identity().unwrap(),
+        Vec::new(),
+    );
+    StandardEnvironmentOrder::new_without_secrets(
+        declarations,
+        snapshot.clone(),
+        snapshot.identity().unwrap(),
+        version,
+        &environment_id,
+    )
+    .unwrap()
+    .with_secrets(HashMap::new())
+    .unwrap()
 }
 
 /// The same, for an app whose manifest declares which day's platform it was
@@ -58,7 +96,7 @@ fn bundle_with_compatibility(
     code: &str,
     compatibility: serde_json::Value,
 ) -> TestBundle {
-    bundle_inner(app, code, &[], &[], &[], Some(compatibility))
+    bundle_inner(app, code, &[], &[], &no_declarations(), Some(compatibility))
 }
 
 /// The same, for an app whose manifest declares platform services.
@@ -66,18 +104,81 @@ fn bundle_with_services(
     app: &str,
     code: &str,
     assets: &[(&str, &str)],
-    env: &[(&str, &str)],
     services: &[&str],
 ) -> TestBundle {
-    bundle_inner(app, code, assets, env, services, None)
+    bundle_inner(app, code, assets, services, &no_declarations(), None)
+}
+
+/// The same, for a version that declares a required `config/string` value
+/// for each of `names`.
+fn bundle_declaring(app: &str, code: &str, assets: &[(&str, &str)], names: &[&str]) -> TestBundle {
+    bundle_inner(app, code, assets, &[], &declaring(names), None)
+}
+
+/// A declaration document with a required `config/string` value for each
+/// of `names`.
+fn declaring(names: &[&str]) -> deis_wire::EnvironmentDeclarations {
+    deis_wire::EnvironmentDeclarations::new(
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        names
+            .iter()
+            .map(|name| deis_wire::EnvironmentDeclaration {
+                name: (*name).to_string(),
+                kind: deis_wire::EnvironmentKind::Config,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            })
+            .collect(),
+    )
+}
+
+/// The snapshot of `version` of `key` binding each of `values` as the
+/// `config/string` value [`declaring`] declared.
+fn environment_with(
+    key: &AppKey,
+    version: &str,
+    values: &[(&str, &str)],
+) -> StandardEnvironmentOrder {
+    let names: Vec<&str> = values.iter().map(|(name, _)| *name).collect();
+    let declarations = declaring(&names);
+    let environment_id = tenant_of(key).environment_id().to_string();
+    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        version,
+        environment_id.clone(),
+        declarations.identity().unwrap(),
+        values
+            .iter()
+            .map(|(name, value)| {
+                deis_wire::EnvironmentBinding::Config(
+                    deis_wire::EnvironmentConfigBinding::new(
+                        *name,
+                        deis_wire::EnvironmentValueType::String,
+                        serde_json::json!(value),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect(),
+    );
+    StandardEnvironmentOrder::new_without_secrets(
+        declarations,
+        snapshot.clone(),
+        snapshot.identity().unwrap(),
+        version,
+        &environment_id,
+    )
+    .unwrap()
+    .with_secrets(HashMap::new())
+    .unwrap()
 }
 
 fn bundle_inner(
     app: &str,
     code: &str,
     assets: &[(&str, &str)],
-    env: &[(&str, &str)],
     services: &[&str],
+    declarations: &deis_wire::EnvironmentDeclarations,
     compatibility: Option<serde_json::Value>,
 ) -> TestBundle {
     let asset_entries: Vec<serde_json::Value> = assets
@@ -90,22 +191,17 @@ fn bundle_inner(
             })
         })
         .collect();
-    let env_map: serde_json::Map<String, serde_json::Value> = env
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), serde_json::Value::from(*v)))
-        .collect();
-
     let service_map: serde_json::Map<String, serde_json::Value> = services
         .iter()
         .map(|name| ((*name).to_string(), serde_json::Value::from(true)))
         .collect();
 
     let mut manifest = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "app": app,
         "entry": "worker/index.js",
         "runtime": "standard-v1",
-        "env": env_map,
+        "environment": declarations,
         "services": service_map,
         "routes": [{ "pattern": "/api/users/:id", "methods": [] }],
         "assets": asset_entries,
@@ -277,7 +373,7 @@ fn order_for(
 ) -> DeploymentOrder {
     DeploymentOrder {
         app_id: key.app_id().to_string(),
-        canonical_tenant: None,
+        canonical_tenant: tenant_of(key),
         version_id: version.to_string(),
         environment: key.environment().to_string(),
         bundle_url: url,
@@ -286,11 +382,11 @@ fn order_for(
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect(),
-        standard_environment: None,
+        standard_environment: empty_environment(key, version),
         limits: None,
         compatibility: None,
-        deployment_id: None,
-        routing_generation: None,
+        deployment_id: deis_wire::CanonicalId::new_v7().to_string(),
+        routing_generation: deis_wire::CanonicalId::new_v7().to_string(),
     }
 }
 
@@ -302,8 +398,8 @@ fn demo() -> AppKey {
 #[tokio::test]
 async fn prepared_generations_are_exactly_addressable_before_and_after_activation() {
     let dir = tempfile::tempdir().unwrap();
-    let v1 = bundle("demo", ECHO_HANDLER, &[], &[]);
-    let v2 = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let v1 = bundle_declaring("demo", ECHO_HANDLER, &[], &["RELEASE"]);
+    let v2 = bundle_declaring("demo", ECHO_HANDLER, &[], &["RELEASE"]);
     let control = ControlPlane::serving(HashMap::from([
         ("v1".to_string(), v1.bytes.clone()),
         ("v2".to_string(), v2.bytes.clone()),
@@ -314,50 +410,30 @@ async fn prepared_generations_are_exactly_addressable_before_and_after_activatio
     let generation1 = deis_wire::CanonicalId::new_v7().to_string();
     let generation2 = deis_wire::CanonicalId::new_v7().to_string();
 
-    let mut first = order(
-        "demo",
-        "v1",
-        control.url("v1"),
-        &v1.sha256,
-        &[("RELEASE", "v1")],
-    );
-    first.deployment_id = Some(uuid::Uuid::new_v4().to_string());
-    first.routing_generation = Some(generation1.clone());
+    let mut first = order("demo", "v1", control.url("v1"), &v1.sha256, &[]);
+    first.standard_environment = environment_with(&demo(), "v1", &[("RELEASE", "v1")]);
+    first.deployment_id = uuid::Uuid::new_v4().to_string();
+    first.routing_generation = generation1.clone();
     deployer.apply(first).await.unwrap();
 
-    let mut candidate = order(
-        "demo",
-        "v2",
-        control.url("v2"),
-        &v2.sha256,
-        &[("RELEASE", "v2")],
-    );
+    let mut candidate = order("demo", "v2", control.url("v2"), &v2.sha256, &[]);
+    candidate.standard_environment = environment_with(&demo(), "v2", &[("RELEASE", "v2")]);
     let candidate_plan_id = uuid::Uuid::new_v4().to_string();
-    candidate.deployment_id = Some(candidate_plan_id.clone());
-    candidate.routing_generation = Some(generation2.clone());
+    candidate.deployment_id = candidate_plan_id.clone();
+    candidate.routing_generation = generation2.clone();
     deployer.prepare(candidate).await.unwrap();
-    let mut repeated_candidate = order(
-        "demo",
-        "v2",
-        control.url("v2"),
-        &v2.sha256,
-        &[("RELEASE", "v2")],
-    );
-    repeated_candidate.deployment_id = Some(candidate_plan_id);
-    repeated_candidate.routing_generation = Some(generation2.clone());
+    let mut repeated_candidate = order("demo", "v2", control.url("v2"), &v2.sha256, &[]);
+    repeated_candidate.standard_environment = environment_with(&demo(), "v2", &[("RELEASE", "v2")]);
+    repeated_candidate.deployment_id = candidate_plan_id;
+    repeated_candidate.routing_generation = generation2.clone();
     deployer
         .prepare(repeated_candidate)
         .await
         .expect("a lost PREPARE response is safe to retry");
-    let mut conflicting_intent = order(
-        "demo",
-        "v2",
-        control.url("v2"),
-        &v2.sha256,
-        &[("RELEASE", "v2")],
-    );
-    conflicting_intent.deployment_id = Some(uuid::Uuid::new_v4().to_string());
-    conflicting_intent.routing_generation = Some(generation2.clone());
+    let mut conflicting_intent = order("demo", "v2", control.url("v2"), &v2.sha256, &[]);
+    conflicting_intent.standard_environment = environment_with(&demo(), "v2", &[("RELEASE", "v2")]);
+    conflicting_intent.deployment_id = uuid::Uuid::new_v4().to_string();
+    conflicting_intent.routing_generation = generation2.clone();
     assert!(
         deployer.prepare(conflicting_intent).await.is_err(),
         "one routing generation must never be rebound to another deployment intent"
@@ -404,15 +480,10 @@ async fn prepared_generations_are_exactly_addressable_before_and_after_activatio
     );
 
     let aborted_generation = deis_wire::CanonicalId::new_v7().to_string();
-    let mut abandoned = order(
-        "demo",
-        "v1",
-        control.url("v1"),
-        &v1.sha256,
-        &[("RELEASE", "abandoned")],
-    );
-    abandoned.deployment_id = Some(uuid::Uuid::new_v4().to_string());
-    abandoned.routing_generation = Some(aborted_generation.clone());
+    let mut abandoned = order("demo", "v1", control.url("v1"), &v1.sha256, &[]);
+    abandoned.standard_environment = environment_with(&demo(), "v1", &[("RELEASE", "abandoned")]);
+    abandoned.deployment_id = uuid::Uuid::new_v4().to_string();
+    abandoned.routing_generation = aborted_generation.clone();
     deployer.prepare(abandoned).await.unwrap();
     deployer
         .abort_prepared(&demo(), &aborted_generation)
@@ -456,7 +527,6 @@ async fn installs_a_version_and_indexes_its_assets() {
         "demo",
         ECHO_HANDLER,
         &[("index.html", "<h1>hi</h1>"), ("css/app.css", "body{}")],
-        &[],
     );
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
@@ -490,8 +560,8 @@ async fn installs_a_version_and_indexes_its_assets() {
 #[tokio::test]
 async fn a_digest_that_does_not_match_leaves_the_running_version_untouched() {
     let dir = tempfile::tempdir().unwrap();
-    let good = bundle("demo", ECHO_HANDLER, &[("index.html", "v1")], &[]);
-    let next = bundle("demo", ECHO_HANDLER, &[("index.html", "v2")], &[]);
+    let good = bundle("demo", ECHO_HANDLER, &[("index.html", "v1")]);
+    let next = bundle("demo", ECHO_HANDLER, &[("index.html", "v2")]);
     let control = ControlPlane::serving(HashMap::from([
         ("v1".to_string(), good.bytes.clone()),
         ("v2".to_string(), next.bytes.clone()),
@@ -535,7 +605,7 @@ async fn a_digest_that_does_not_match_leaves_the_running_version_untouched() {
 #[tokio::test]
 async fn a_bundle_filed_under_another_app_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("someone-else", ECHO_HANDLER, &[], &[]);
+    let bundle = bundle("someone-else", ECHO_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -577,7 +647,7 @@ async fn a_missing_bundle_url_does_not_disturb_anything() {
 #[tokio::test]
 async fn redelivering_the_same_version_reuses_the_bundle_already_on_disk() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let bundle = bundle("demo", ECHO_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -699,20 +769,17 @@ export default async function handler(context) {
     deployer
         .apply(DeploymentOrder {
             app_id: "demo".to_string(),
-            canonical_tenant: Some(deis_wire::CanonicalTenantId::new(
-                application_id,
-                environment_id,
-            )),
+            canonical_tenant: deis_wire::CanonicalTenantId::new(application_id, environment_id),
             version_id: "v1".to_string(),
             environment: "production".to_string(),
             bundle_url: control.url("v1"),
             bundle_sha: bundle.sha256.clone(),
             env: HashMap::new(),
-            standard_environment: Some(standard_environment),
+            standard_environment,
             limits: None,
             compatibility: None,
-            deployment_id: None,
-            routing_generation: None,
+            deployment_id: deis_wire::CanonicalId::new_v7().to_string(),
+            routing_generation: deis_wire::CanonicalId::new_v7().to_string(),
         })
         .await
         .unwrap();
@@ -902,20 +969,17 @@ export default function handler(context) {
     deployer
         .apply(DeploymentOrder {
             app_id: "demo".to_string(),
-            canonical_tenant: Some(deis_wire::CanonicalTenantId::new(
-                application_id,
-                environment_id,
-            )),
+            canonical_tenant: deis_wire::CanonicalTenantId::new(application_id, environment_id),
             version_id: "v1".to_string(),
             environment: "production".to_string(),
             bundle_url: control.url("v1"),
             bundle_sha: bundle.sha256.clone(),
             env: HashMap::new(),
-            standard_environment: Some(standard_environment),
+            standard_environment,
             limits: None,
             compatibility: None,
-            deployment_id: None,
-            routing_generation: None,
+            deployment_id: deis_wire::CanonicalId::new_v7().to_string(),
+            routing_generation: deis_wire::CanonicalId::new_v7().to_string(),
         })
         .await
         .unwrap();
@@ -982,20 +1046,17 @@ export default function handler(context) {
         .apply_from_assignment(
             DeploymentOrder {
                 app_id: "demo".to_string(),
-                canonical_tenant: Some(deis_wire::CanonicalTenantId::new(
-                    application_id,
-                    environment_id,
-                )),
+                canonical_tenant: deis_wire::CanonicalTenantId::new(application_id, environment_id),
                 version_id: "v1".to_string(),
                 environment: "production".to_string(),
                 bundle_url: control.url("v1"),
                 bundle_sha: bundle.sha256.clone(),
                 env: HashMap::new(),
-                standard_environment: Some(rotated_environment),
+                standard_environment: rotated_environment,
                 limits: None,
                 compatibility: None,
-                deployment_id: None,
-                routing_generation: None,
+                deployment_id: deis_wire::CanonicalId::new_v7().to_string(),
+                routing_generation: deis_wire::CanonicalId::new_v7().to_string(),
             },
             as_of,
         )
@@ -1024,7 +1085,7 @@ export default function handler(context) {
 #[tokio::test]
 async fn an_assignment_skips_an_app_already_on_that_version() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let bundle = bundle("demo", ECHO_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1068,7 +1129,7 @@ async fn an_assignment_reinstalls_an_app_whose_isolate_is_gone() {
     // the air for good. The record is not the isolate, and the assignment is
     // only satisfied while both are there.
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let bundle = bundle("demo", ECHO_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1124,7 +1185,7 @@ async fn an_assignment_older_than_a_push_does_not_roll_it_back() {
     // which instruction is the later of the two. What the node can order is
     // when each one reached it, which is what the change stamp is.
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let bundle = bundle("demo", ECHO_HANDLER, &[]);
     let control = ControlPlane::serving(HashMap::from([
         ("v1".to_string(), bundle.bytes.clone()),
         ("v2".to_string(), bundle.bytes.clone()),
@@ -1183,7 +1244,24 @@ async fn an_assignment_older_than_a_push_does_not_roll_it_back() {
 #[tokio::test]
 async fn secrets_reach_the_isolate_and_never_the_disk() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[("LOG_LEVEL", "info")]);
+    let declarations = deis_wire::EnvironmentDeclarations::new(
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        vec![
+            deis_wire::EnvironmentDeclaration {
+                name: "API_KEY".to_string(),
+                kind: deis_wire::EnvironmentKind::Secret,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            },
+            deis_wire::EnvironmentDeclaration {
+                name: "LOG_LEVEL".to_string(),
+                kind: deis_wire::EnvironmentKind::Config,
+                value_type: deis_wire::EnvironmentValueType::String,
+                required: true,
+            },
+        ],
+    );
+    let bundle = standard_bundle("demo", ECHO_HANDLER, &declarations);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1191,16 +1269,38 @@ async fn secrets_reach_the_isolate_and_never_the_disk() {
     let deployer = deployer_in(dir.path(), apps.clone()).await;
 
     let secret = "s3cr3t-value-nothing-else-uses";
-    deployer
-        .apply(order(
-            "demo",
-            "v1",
-            control.url("v1"),
-            &bundle.sha256,
-            &[("API_KEY", secret)],
-        ))
-        .await
-        .unwrap();
+    let environment_id = tenant_of(&demo()).environment_id().to_string();
+    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        "v1",
+        environment_id.clone(),
+        declarations.identity().unwrap(),
+        vec![
+            deis_wire::EnvironmentBinding::Secret(deis_wire::EnvironmentSecretBinding::new(
+                "API_KEY", "r1",
+            )),
+            deis_wire::EnvironmentBinding::Config(
+                deis_wire::EnvironmentConfigBinding::new(
+                    "LOG_LEVEL",
+                    deis_wire::EnvironmentValueType::String,
+                    serde_json::json!("info"),
+                )
+                .unwrap(),
+            ),
+        ],
+    );
+    let mut deployment = order("demo", "v1", control.url("v1"), &bundle.sha256, &[]);
+    deployment.standard_environment = StandardEnvironmentOrder::new_without_secrets(
+        declarations,
+        snapshot.clone(),
+        snapshot.identity().unwrap(),
+        "v1",
+        &environment_id,
+    )
+    .unwrap()
+    .with_secrets(HashMap::from([("r1".to_string(), secret.to_string())]))
+    .unwrap();
+    deployer.apply(deployment).await.unwrap();
 
     let (status, _headers, body) = apps
         .execute_app(
@@ -1217,12 +1317,12 @@ async fn secrets_reach_the_isolate_and_never_the_disk() {
     assert_eq!(seen["env"]["API_KEY"], secret, "the secret never arrived");
     assert_eq!(
         seen["env"]["LOG_LEVEL"], "info",
-        "the manifest's own variables must survive the merge"
+        "the config value never arrived"
     );
 
     // Nothing under the node's data directory may contain the value. The
-    // bundle carries only secret names, and the installed-version record is
-    // written without any env at all.
+    // bundle carries only declarations, and the installed-version record is
+    // written without any value at all.
     assert!(
         !tree_contains(dir.path(), secret.as_bytes()),
         "a decrypted secret was written to disk"
@@ -1237,7 +1337,7 @@ async fn secrets_reach_the_isolate_and_never_the_disk() {
 #[tokio::test]
 async fn a_declared_service_gets_a_client_built_from_the_address_the_order_carried() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle_with_services("demo", KV_PROBE_HANDLER, &[], &[], &["kv"]);
+    let bundle = bundle_with_services("demo", KV_PROBE_HANDLER, &[], &["kv"]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1290,7 +1390,7 @@ async fn a_declared_service_gets_a_client_built_from_the_address_the_order_carri
 #[tokio::test]
 async fn an_app_that_declares_no_service_is_told_so_rather_than_given_one() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", KV_PROBE_HANDLER, &[], &[]);
+    let bundle = bundle("demo", KV_PROBE_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1335,8 +1435,8 @@ async fn a_version_that_will_not_load_never_interrupts_the_one_serving() {
     // answering requests, so a bundle that cannot be built never reaches
     // traffic and there is nothing to put back.
     let dir = tempfile::tempdir().unwrap();
-    let working = bundle("demo", ECHO_HANDLER, &[("index.html", "v1")], &[]);
-    let broken = bundle("demo", BROKEN_HANDLER, &[], &[]);
+    let working = bundle("demo", ECHO_HANDLER, &[("index.html", "v1")]);
+    let broken = bundle("demo", BROKEN_HANDLER, &[]);
     let control = ControlPlane::serving(HashMap::from([
         ("v1".to_string(), working.bytes.clone()),
         ("v2".to_string(), broken.bytes.clone()),
@@ -1441,7 +1541,7 @@ async fn a_version_written_against_the_fix_sends_every_set_cookie() {
 #[tokio::test]
 async fn a_version_with_no_date_still_gets_only_the_last_set_cookie() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", TWO_COOKIES_HANDLER, &[], &[]);
+    let bundle = bundle("demo", TWO_COOKIES_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1592,7 +1692,7 @@ async fn a_cached_response_keeps_every_set_cookie_it_was_stored_with() {
 #[tokio::test]
 async fn a_cached_response_is_folded_by_the_same_gate_the_fresh_one_is() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", TWO_COOKIES_THROUGH_THE_CACHE, &[], &[]);
+    let bundle = bundle("demo", TWO_COOKIES_THROUGH_THE_CACHE, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1653,152 +1753,10 @@ async fn a_date_this_build_cannot_honour_is_refused_rather_than_approximated() {
     );
 }
 
-/// The reason the bundle's manifest is the authority on the node and the
-/// delivery message is not.
-///
-/// A node that comes back without a control plane reads its own disk, where no
-/// order was ever stored. If the date lived only in the delivery, every node
-/// restart would quietly move undated-by-accident applications onto today's
-/// answers - the exact unscheduled fleet-wide change this whole mechanism is
-/// for.
-#[tokio::test]
-async fn a_versions_compatibility_date_comes_back_with_it_from_disk() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle_with_compatibility(
-        "demo",
-        TWO_COOKIES_HANDLER,
-        serde_json::json!({ "date": deis_bundle::PLATFORM_KNOWN_THROUGH.to_string() }),
-    );
-    let control =
-        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
-
-    {
-        let apps = Arc::new(ApplicationManager::new());
-        let deployer = deployer_in(dir.path(), apps.clone()).await;
-        deployer
-            .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
-            .await
-            .unwrap();
-    }
-
-    // A restart with nobody to ask: the order is gone, the bundle is not.
-    let apps = Arc::new(ApplicationManager::new());
-    let deployer = deployer_in(dir.path(), apps.clone()).await;
-    assert_eq!(deployer.recover_from_disk().await, 1);
-
-    assert_eq!(
-        cookies_from(&apps, &demo()).await.len(),
-        2,
-        "a restart must not change which answers an application gets"
-    );
-}
-
-#[tokio::test]
-async fn recovers_its_versions_from_disk_when_there_is_no_control_plane() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[("index.html", "hi")], &[]);
-    let control =
-        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
-
-    {
-        let apps = Arc::new(ApplicationManager::new());
-        let deployer = deployer_in(dir.path(), apps.clone()).await;
-        deployer
-            .apply(order("demo", "v1", control.url("v1"), &bundle.sha256, &[]))
-            .await
-            .unwrap();
-    }
-
-    // A restart with nobody to ask: same bundle directory, no URL usable.
-    let apps = Arc::new(ApplicationManager::new());
-    let deployer = deployer_in(dir.path(), apps.clone()).await;
-    let recovered = deployer.recover_from_disk().await;
-
-    assert_eq!(recovered, 1);
-    assert_eq!(apps.installed_version(&demo()).unwrap().version_id, "v1");
-    assert_eq!(apps.assets(&demo()).unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn a_standard_snapshot_is_not_recovered_without_its_memory_only_values() {
-    let dir = tempfile::tempdir().unwrap();
-    let declarations = deis_wire::EnvironmentDeclarations::new(
-        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
-        vec![deis_wire::EnvironmentDeclaration {
-            name: "LABEL".to_string(),
-            kind: deis_wire::EnvironmentKind::Config,
-            value_type: deis_wire::EnvironmentValueType::String,
-            required: true,
-        }],
-    );
-    let application_id = deis_wire::CanonicalId::new_v7();
-    let environment_id = deis_wire::CanonicalId::new_v7();
-    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
-        declarations.standard_version.clone(),
-        "v1",
-        environment_id.to_string(),
-        declarations.identity().unwrap(),
-        vec![deis_wire::EnvironmentBinding::Config(
-            deis_wire::EnvironmentConfigBinding::new(
-                "LABEL",
-                deis_wire::EnvironmentValueType::String,
-                serde_json::json!("edge"),
-            )
-            .unwrap(),
-        )],
-    );
-    let standard_environment = StandardEnvironmentOrder::new_without_secrets(
-        declarations.clone(),
-        snapshot.clone(),
-        snapshot.identity().unwrap(),
-        "v1",
-        &environment_id.to_string(),
-    )
-    .unwrap()
-    .with_secrets(HashMap::new())
-    .unwrap();
-    let bundle = standard_bundle("demo", ECHO_HANDLER, &declarations);
-    let control =
-        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
-
-    {
-        let apps = Arc::new(ApplicationManager::new());
-        let deployer = deployer_in(dir.path(), apps).await;
-        deployer
-            .apply(DeploymentOrder {
-                app_id: "demo".to_string(),
-                canonical_tenant: Some(deis_wire::CanonicalTenantId::new(
-                    application_id,
-                    environment_id,
-                )),
-                version_id: "v1".to_string(),
-                environment: "production".to_string(),
-                bundle_url: control.url("v1"),
-                bundle_sha: bundle.sha256,
-                env: HashMap::new(),
-                standard_environment: Some(standard_environment),
-                limits: None,
-                compatibility: None,
-                deployment_id: None,
-                routing_generation: None,
-            })
-            .await
-            .unwrap();
-    }
-
-    let apps = Arc::new(ApplicationManager::new());
-    let deployer = deployer_in(dir.path(), apps.clone()).await;
-    assert_eq!(deployer.recover_from_disk().await, 0);
-    assert!(
-        apps.installed_version(&demo()).is_none(),
-        "schema-2 started with a snapshot it could not reconstruct exactly"
-    );
-}
-
 #[tokio::test]
 async fn unloading_an_app_takes_its_bundles_and_its_record_with_it() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let bundle = bundle("demo", ECHO_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1833,7 +1791,7 @@ async fn unloading_an_app_takes_its_bundles_and_its_record_with_it() {
 #[tokio::test]
 async fn a_delivery_and_an_unload_move_what_a_degraded_node_says_it_serves() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let bundle = bundle("demo", ECHO_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -1919,8 +1877,18 @@ fn a_deployment_order_never_prints_a_secret_value() {
 #[tokio::test]
 async fn a_preview_deployment_does_not_touch_production() {
     let dir = tempfile::tempdir().unwrap();
-    let live = bundle("demo", ECHO_HANDLER, &[("index.html", "live")], &[]);
-    let next = bundle("demo", ECHO_HANDLER, &[("index.html", "preview")], &[]);
+    let live = bundle_declaring(
+        "demo",
+        ECHO_HANDLER,
+        &[("index.html", "live")],
+        &["API_KEY"],
+    );
+    let next = bundle_declaring(
+        "demo",
+        ECHO_HANDLER,
+        &[("index.html", "preview")],
+        &["API_KEY"],
+    );
     let control = ControlPlane::serving(HashMap::from([
         ("v1".to_string(), live.bytes.clone()),
         ("v2".to_string(), next.bytes.clone()),
@@ -1933,26 +1901,14 @@ async fn a_preview_deployment_does_not_touch_production() {
     let production = demo();
     let preview = AppKey::new("demo", "preview-3");
 
-    deployer
-        .apply(order_for(
-            &production,
-            "v1",
-            control.url("v1"),
-            &live.sha256,
-            &[("API_KEY", "production-secret")],
-        ))
-        .await
-        .unwrap();
-    deployer
-        .apply(order_for(
-            &preview,
-            "v2",
-            control.url("v2"),
-            &next.sha256,
-            &[("API_KEY", "preview-secret")],
-        ))
-        .await
-        .unwrap();
+    let mut production_order = order_for(&production, "v1", control.url("v1"), &live.sha256, &[]);
+    production_order.standard_environment =
+        environment_with(&production, "v1", &[("API_KEY", "production-secret")]);
+    deployer.apply(production_order).await.unwrap();
+    let mut preview_order = order_for(&preview, "v2", control.url("v2"), &next.sha256, &[]);
+    preview_order.standard_environment =
+        environment_with(&preview, "v2", &[("API_KEY", "preview-secret")]);
+    deployer.apply(preview_order).await.unwrap();
 
     // Each environment keeps its own version, its own assets and its own
     // secrets.
@@ -1982,8 +1938,7 @@ async fn a_preview_deployment_does_not_touch_production() {
     assert_eq!(secret_seen(&apps, &production).await, "production-secret");
     assert_eq!(secret_seen(&apps, &preview).await, "preview-secret");
 
-    // On disk too: one directory each, and one record line each, so a restart
-    // without a control plane brings both back rather than one of them twice.
+    // On disk too: one directory each, and one record line each.
     assert!(dir
         .path()
         .join("bundles/apps/demo/production/v1.zip")
@@ -2003,7 +1958,7 @@ async fn a_preview_deployment_does_not_touch_production() {
 #[tokio::test]
 async fn unloading_one_environment_leaves_the_others_serving() {
     let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
+    let bundle = bundle("demo", ECHO_HANDLER, &[]);
     let control =
         ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
 
@@ -2038,74 +1993,6 @@ async fn unloading_one_environment_leaves_the_others_serving() {
     assert_eq!(unloaded, vec!["production".to_string()]);
     assert!(apps.installed_version(&production).is_none());
     assert!(deployer.store().records().await.is_empty());
-}
-
-/// A version recovered from local disk is running the right code with an
-/// empty environment, because secret values are never written to disk. The
-/// control plane's delivery of that same version has to reinstall it.
-///
-/// Before this, the version ids matched and the delivery was skipped as
-/// redundant: the app kept serving with no secrets and no storage addresses
-/// for the life of the process, while the node reported itself ready.
-#[tokio::test]
-async fn a_version_recovered_from_disk_is_reinstalled_when_the_real_one_arrives() {
-    let dir = tempfile::tempdir().unwrap();
-    let bundle = bundle("demo", ECHO_HANDLER, &[], &[]);
-    let control =
-        ControlPlane::serving(HashMap::from([("v1".to_string(), bundle.bytes.clone())])).await;
-
-    // A first life: the control plane delivers v1 with its secret.
-    {
-        let apps = Arc::new(ApplicationManager::new());
-        let deployer = deployer_in(dir.path(), apps).await;
-        deployer
-            .apply(order(
-                "demo",
-                "v1",
-                control.url("v1"),
-                &bundle.sha256,
-                &[("API_KEY", "from the control plane")],
-            ))
-            .await
-            .unwrap();
-    }
-
-    // A restart with the control plane down: the bundle is on disk, the
-    // secret is not.
-    let apps = Arc::new(ApplicationManager::new());
-    let deployer = deployer_in(dir.path(), apps.clone()).await;
-    assert_eq!(deployer.recover_from_disk().await, 1);
-    assert!(
-        !apps.installed_version(&demo()).unwrap().env_confirmed,
-        "a copy loaded from disk cannot have a confirmed environment"
-    );
-    assert_eq!(secret_seen(&apps, &demo()).await, "");
-
-    // The control plane comes back and hands out the same version id.
-    let as_of = deployer.change_stamp();
-    let applied = deployer
-        .apply_from_assignment(
-            order(
-                "demo",
-                "v1",
-                control.url("v1"),
-                &bundle.sha256,
-                &[("API_KEY", "from the control plane")],
-            ),
-            as_of,
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        applied,
-        Applied::Installed {
-            reused_bundle: true
-        },
-        "the delivery that carries the secrets was skipped as already running"
-    );
-    assert!(apps.installed_version(&demo()).unwrap().env_confirmed);
-    assert_eq!(secret_seen(&apps, &demo()).await, "from the control plane");
 }
 
 /// What one environment's isolate sees as `context.env.API_KEY`.
@@ -2149,9 +2036,9 @@ fn tree_contains(root: &std::path::Path, needle: &[u8]) -> bool {
 
 /// A manifest with a `limits` block, as a bundle carries it.
 fn manifest_declaring(limits: &str) -> deis_bundle::Manifest {
-    deis_bundle::Manifest::parse(&format!(
-        r#"{{"schema":1,"app":"demo","entry":"worker/index.js","limits":{limits}}}"#
-    ))
+    deis_bundle::Manifest::parse(&deis_bundle::complete_manifest_json(&format!(
+        r#"{{"app":"demo","entry":"worker/index.js","limits":{limits}}}"#
+    )))
     .expect("the manifest parses")
 }
 
@@ -2216,9 +2103,10 @@ fn the_manifest_fills_gaps_and_never_overrides_what_was_delivered() {
 #[test]
 fn a_manifest_without_a_limits_block_changes_nothing() {
     let key = AppKey::new("demo", "production");
-    let bare =
-        deis_bundle::Manifest::parse(r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#)
-            .expect("the manifest parses");
+    let bare = deis_bundle::Manifest::parse(&deis_bundle::complete_manifest_json(
+        r#"{"app":"demo","entry":"worker/index.js"}"#,
+    ))
+    .expect("the manifest parses");
 
     assert!(limits_with_manifest(None, &bare, &key).is_none());
     assert_eq!(

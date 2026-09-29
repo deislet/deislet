@@ -28,8 +28,8 @@ pub const ROUTING_TABLE_PATH: &str = deis_wire::conventions::ROUTING_TABLE_ROUTE
 pub struct RoutingEntry {
     pub app_id: String,
     pub environment: String,
-    /// Immutable deployment selected for this target. Absent only while
-    /// reading a routing table produced by an older control plane.
+    /// Immutable deployment selected for this target. Absent only when the
+    /// environment has never been deployed.
     #[serde(default)]
     pub deployment_generation: Option<String>,
     /// Absent means "any domain". `*.example.com` is a wildcard.

@@ -141,8 +141,8 @@ impl RestoreApiState {
     }
 }
 
-/// `prefix` is where the routes are mounted: `"/api"` for the legacy flat
-/// tree, `""` inside a `/api/v1` nest.
+/// `prefix` is where the routes are mounted: `"/api"` mounts them flat, which
+/// only the unit-test harnesses do, and `""` inside a `/api/v1` nest.
 pub fn router(prefix: &str, state: RestoreApiState) -> Router {
     Router::new()
         .route(&format!("{prefix}/installation"), get(get_installation))

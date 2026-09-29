@@ -543,7 +543,7 @@ fn unclassified() -> Requirement {
     .operator()
 }
 
-/// The route table proper, over segments already in the legacy spelling.
+/// The route table proper, over segments already in the unprefixed spelling.
 fn classify_canonical(
     method: &Method,
     segments: &[&str],
@@ -2024,7 +2024,7 @@ mod tests {
         classify(&Method::from_bytes(method.as_bytes()).unwrap(), path, query)
     }
 
-    /// The route table, spelled out in the legacy form: every route the
+    /// The route table, spelled out unprefixed: every route the
     /// human router mounts, with the action and verb the table gives it.
     /// Shared by the tests below, which read it three ways - as the routes
     /// that must classify, as the routes whose `/api/v1` or `/api/platform`
@@ -2617,7 +2617,7 @@ mod tests {
     /// classify to something other than the closing arm - a route that fell
     /// through would answer to `admin:*/*` under one prefix and to its own
     /// narrower demand under another - and must classify identically under
-    /// its versioned and its legacy spelling.
+    /// its versioned and its unprefixed spelling.
     #[test]
     fn every_documented_operation_is_classified_the_same_under_both_prefixes() {
         let document: serde_json::Value =
@@ -2637,14 +2637,14 @@ mod tests {
                     "{method} {filled} is described in the OpenAPI document and the route table \
                      does not know it, so it answers to the closing arm"
                 );
-                let legacy =
+                let unprefixed =
                     filled
                         .replacen("/api/v1/", "/api/", 1)
                         .replacen("/api/platform/", "/api/", 1);
                 assert_eq!(
-                    requirement(&method, &legacy),
+                    requirement(&method, &unprefixed),
                     versioned,
-                    "{method} {filled} and its legacy spelling {legacy} are classified differently"
+                    "{method} {filled} and its unprefixed spelling {unprefixed} are classified differently"
                 );
                 seen += 1;
             }
@@ -2706,7 +2706,7 @@ mod tests {
         assert!(checked >= 6, "the platform reads are not being reached");
     }
 
-    /// The prefix a legacy route is served under once it has moved.
+    /// The prefix an unprefixed route of the table is served under.
     fn successor_prefix(requirement: &Requirement) -> &'static str {
         match requirement.scope {
             RequirementScope::Product => ApiSurface::V1.prefix(),
@@ -2719,11 +2719,11 @@ mod tests {
     /// claim and scope. The table is written once; this is what says a
     /// versioned path is not a second table that can drift.
     #[test]
-    fn a_versioned_path_is_classified_exactly_like_its_legacy_spelling() {
+    fn a_versioned_path_is_classified_exactly_like_its_unprefixed_spelling() {
         for (method, path, _, _) in mounted_routes() {
-            let legacy = requirement(method, path);
-            let moved = path.replacen("/api", successor_prefix(&legacy), 1);
-            assert_eq!(requirement(method, &moved), legacy, "{method} {moved}");
+            let unprefixed = requirement(method, path);
+            let moved = path.replacen("/api", successor_prefix(&unprefixed), 1);
+            assert_eq!(requirement(method, &moved), unprefixed, "{method} {moved}");
         }
 
         // The one arm that reads the query string narrows the same way on
@@ -2734,14 +2734,14 @@ mod tests {
             "?environment=production&environment=preview",
             "?environment=%70roduction",
         ] {
-            let legacy = requirement("DELETE", &format!("/api/runtime/n1/apps/demo{query}"));
-            assert_eq!(legacy.action, "node.app.unload");
+            let unprefixed = requirement("DELETE", &format!("/api/runtime/n1/apps/demo{query}"));
+            assert_eq!(unprefixed.action, "node.app.unload");
             assert_eq!(
                 requirement(
                     "DELETE",
                     &format!("/api/platform/runtime/n1/apps/demo{query}")
                 ),
-                legacy,
+                unprefixed,
                 "{query:?}"
             );
         }
@@ -4814,7 +4814,7 @@ mod gate_tests {
     /// differently means judging one application and creating another - and
     /// since no scope can contain a space, the credential that owns the
     /// application is the one that gets refused.
-    /// A versioned path is the legacy route with its surface named: the
+    /// A versioned path is the unprefixed route with its surface named: the
     /// credential that may call one may call the other, the one that may
     /// not still may not, and the audit line records the path as it was
     /// spelled, so an operator can see which surface a client is on.

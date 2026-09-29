@@ -239,7 +239,10 @@ prepare_reserved_env_source() {
   "functionRoot": "./functions",
   "compatibilityDate": "2026-09-01",
   "environment": {
-    "variables": {
+    "declarations": [
+      {"name": "ASSETS", "kind": "config", "valueType": "string", "required": true}
+    ],
+    "values": {
       "ASSETS": "an-application-cannot-take-this-name"
     }
   },

@@ -74,17 +74,19 @@ mod tests {
     /// where a malformed date and an unknown key are caught and this module
     /// only ever sees what survived it.
     fn read(block: &str) -> Result<CompatibilityProfile, String> {
-        let json = format!(
-            r#"{{"schema":1,"app":"demo","entry":"worker/index.js","compatibility":{block}}}"#
-        );
+        let json = deis_bundle::complete_manifest_json(&format!(
+            r#"{{"app":"demo","entry":"worker/index.js","compatibility":{block}}}"#
+        ));
         let manifest = Manifest::parse(&json).map_err(|e| e.to_string())?;
         declared_compatibility(&manifest)
     }
 
     #[test]
     fn a_manifest_without_the_block_is_held_to_the_oldest_behaviour() {
-        let manifest =
-            Manifest::parse(r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#).unwrap();
+        let manifest = Manifest::parse(&deis_bundle::complete_manifest_json(
+            r#"{"app":"demo","entry":"worker/index.js"}"#,
+        ))
+        .unwrap();
         let profile = declared_compatibility(&manifest).unwrap();
         assert_eq!(profile.date(), None);
         assert!(!profile.is_on(Flag::MultipleSetCookieHeaders));

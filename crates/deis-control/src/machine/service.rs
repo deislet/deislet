@@ -476,15 +476,7 @@ impl MachineChannel for MachineChannelService {
                     .refuse_secret_fetch(&proved, Some(&entry.deployment_id), refusal)
                     .await);
             };
-            let Some(snapshot_id) = deployment.snapshot_id.as_deref() else {
-                let refusal = Status::permission_denied(format!(
-                    "deployment {} binds no secret revisions",
-                    entry.deployment_id
-                ));
-                return Err(self
-                    .refuse_secret_fetch(&proved, Some(&entry.deployment_id), refusal)
-                    .await);
-            };
+            let snapshot_id = deployment.snapshot_id.as_str();
             let revisions: BTreeSet<String> = entry.revisions.iter().cloned().collect();
             wanted.push((entry, deployment.env_id.as_str(), snapshot_id, revisions));
         }
@@ -1253,7 +1245,7 @@ mod tests {
         let snapshot = h
             .state
             .store
-            .get_environment_snapshot(current.snapshot_id.as_deref().unwrap())
+            .get_environment_snapshot(&current.snapshot_id)
             .await
             .unwrap();
         let plan = h
@@ -1263,7 +1255,7 @@ mod tests {
                 &env,
                 &version,
                 crate::catalog::store::DeploymentPlanSpec {
-                    snapshot: Some(snapshot),
+                    snapshot,
                     expected_secret_heads: Default::default(),
                     compare_secret_heads: false,
                     target_ids: vec!["runtime-test".to_string()],

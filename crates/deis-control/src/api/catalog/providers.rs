@@ -2099,8 +2099,8 @@ pub async fn begin_provider_deployment(
 /// The environment snapshot a provider deployment of `version_id` binds:
 /// the version's declarations, the config values given for it and the
 /// environment's current secret revisions, prepared and checked exactly as
-/// a Deislet deployment's is. `None` for a version that declares no
-/// `environment`, which may then be given no config either.
+/// a Deislet deployment's is. `None` when the version does not resolve,
+/// which the catalog refuses after it has checked the target grant.
 async fn provider_environment_snapshot(
     state: &CatalogState,
     environment: &crate::catalog::Environment,
@@ -2124,19 +2124,10 @@ async fn provider_environment_snapshot(
             "stored manifest of version {version_id} no longer parses: {error}"
         )))
     })?;
-    let given_config = !config_values.is_empty();
-    let Some(prepared) = state
+    let prepared = state
         .deliverer
         .prepare_environment_snapshot(environment, &version, &manifest, config_values, None)
-        .await?
-    else {
-        if given_config {
-            return Err(ApiError::from(CatalogError::invalid(
-                "EC_ENV_BINDING_UNDECLARED: deployment config was given for a version that declares no environment",
-            )));
-        }
-        return Ok(None);
-    };
+        .await?;
     let invalid = |error: deis_wire::EnvironmentError| CatalogError::invalid(error.to_string());
     let document = String::from_utf8(prepared.snapshot.canonical_json().map_err(invalid)?)
         .map_err(|_| {
@@ -2923,10 +2914,11 @@ pub(crate) mod tests {
                      DELETE FROM api_idempotency_records;
                      INSERT INTO api_idempotency_records
                         (record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
-                         request_sha256, state, response_status, resource_kind, resource_id,
-                         resource_revision, created_at, completed_at, expires_at)
+                         digest_scheme, request_sha256, state, response_status, resource_kind,
+                         resource_id, resource_revision, created_at, completed_at, expires_at)
                      SELECT record_id, organization_id, actor_id, route_id, idempotency_key_sha256,
-                            request_sha256, state, response_status, resource_kind, resource_id,
+                            digest_scheme, request_sha256, state, response_status, resource_kind,
+                            resource_id,
                             resource_revision, 1, completed_at - created_at + 1, 2
                        FROM aged;
                      DROP TABLE aged;",
@@ -3168,7 +3160,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        // The legacy `/api` body carries only the message; the structured
+        // The plain body a handler writes carries only the message; the structured
         // code travels in the extension the versioned surfaces render.
         let detail = response
             .extensions()
@@ -4792,9 +4784,7 @@ pub(crate) mod tests {
                     "INSERT INTO versions
                        (id, canonical_id, app_id, number, bundle_sha, bundle_path,
                         manifest, canonical_artifact_id, provider_derivation_sha256, created_at)
-                     VALUES (?1, ?2, ?3, 1, ?4, '/test/bundle.zip',
-                             '{\"schema\":1,\"app\":\"demo\",\"entry\":\"worker/index.js\"}',
-                             ?5, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, 1, ?4, '/test/bundle.zip', ?8, ?5, ?6, ?7)",
                     rusqlite::params![
                         uuid::Uuid::new_v4().to_string(),
                         artifact_version_id.to_string(),
@@ -4803,6 +4793,9 @@ pub(crate) mod tests {
                         artifact_id.to_string(),
                         "4".repeat(64),
                         now,
+                        deis_bundle::complete_manifest_json(
+                            r#"{"app":"demo","entry":"worker/index.js"}"#
+                        ),
                     ],
                 )?;
                 Ok::<(), crate::catalog::CatalogError>(())

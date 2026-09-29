@@ -343,7 +343,7 @@ impl<'de> Deserialize<'de> for DeclaredBindings {
             // string, an `app` that is not one - is a shape this format has
             // never had, which is a change no older build could have ignored
             // safely and therefore takes a new `schema` number rather than
-            // arriving inside schema 1. Those still fail here, by name.
+            // arriving inside this one. Those still fail here, by name.
             if let Some(kind) = value.get("kind").and_then(serde_json::Value::as_str)
                 && BindingKind::from_name(kind).is_none()
             {

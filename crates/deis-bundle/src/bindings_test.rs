@@ -47,9 +47,9 @@ fn a_misspelled_key_is_still_refused_once_the_binding_is_judged() {
 
     // And the key itself is named, so the author sees the spelling too.
     assert_eq!(
-        crate::forward::unknown_fields(
-            r#"{"schema":1,"app":"d","entry":"e.js","bindings":{"AUTH":{"kind":"service","App":"a"}}}"#
-        ),
+        crate::forward::unknown_fields(&crate::complete_manifest_json(
+            r#"{"app":"d","entry":"e.js","bindings":{"AUTH":{"kind":"service","App":"a"}}}"#
+        )),
         vec!["bindings.AUTH.App".to_string()]
     );
 }
@@ -196,9 +196,9 @@ fn a_callable_by_entry_this_build_cannot_read_consents_to_nobody_and_costs_nothi
         vec!["checkout/production"]
     );
 
-    let manifest = crate::Manifest::parse(
-        r#"{"schema":1,"app":"api","entry":"e.js","callable_by":["storefront","checkout/production"]}"#,
-    )
+    let manifest = crate::Manifest::parse(&crate::complete_manifest_json(
+        r#"{"app":"api","entry":"e.js","callable_by":["storefront","checkout/production"]}"#,
+    ))
     .expect("a manifest from a newer builder must still load");
     assert_eq!(manifest.callable_by, vec!["storefront".to_string()]);
     assert!(callable_by_allows(&manifest.callable_by, "storefront"));
@@ -216,9 +216,9 @@ fn a_callable_by_entry_this_build_cannot_read_consents_to_nobody_and_costs_nothi
     // A padded id is readable and is kept exactly as written, because the
     // node trims when it compares and the manifest keeps what the author
     // wrote.
-    let padded = crate::Manifest::parse(
-        r#"{"schema":1,"app":"api","entry":"e.js","callable_by":[" storefront ","*"]}"#,
-    )
+    let padded = crate::Manifest::parse(&crate::complete_manifest_json(
+        r#"{"app":"api","entry":"e.js","callable_by":[" storefront ","*"]}"#,
+    ))
     .unwrap();
     assert_eq!(
         padded.callable_by,

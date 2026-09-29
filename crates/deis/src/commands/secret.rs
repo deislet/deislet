@@ -122,11 +122,7 @@ pub async fn list(app: Option<String>, environment: Option<String>, output: Outp
         // a scoped credential is not necessarily the operator reading this.
         table.row(vec![
             escaped(&secret.name),
-            secret
-                .revision
-                .as_deref()
-                .map(escaped)
-                .unwrap_or_else(|| "-".to_string()),
+            escaped(&secret.revision),
             timestamp(secret.updated_at),
             age(secret.updated_at),
         ]);

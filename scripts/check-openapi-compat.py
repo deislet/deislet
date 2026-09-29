@@ -818,19 +818,28 @@ def self_check() -> None:
 # notice - has no subject yet. That is the only thing this list stands on,
 # and it goes away when v1 ships.
 #
-# What is here now is the identity migration's two routes. They moved data
-# from name-keyed tenants to canonical ids, and with no installation that
-# ever held name-keyed data there is nothing for them to move: the subsystem
-# behind them is gone, and restoring the routes would mean serving an
-# operation that cannot run. Each removal is named in full: an entry that
-# does not match a reported change exactly does nothing, and a removal that
-# is not listed is still refused.
+# What is here now is compatibility with a release that never existed: the
+# identity migration's two routes (they moved data from name-keyed tenants to
+# canonical ids, and no installation ever held name-keyed data), members
+# nothing wrote and a code nothing emitted. Each removal is named in full: an
+# entry that does not match a reported change exactly does nothing, and a
+# removal that is not listed is still refused.
 #
 # The list is meant to be emptied rather than grown. Once these are on
 # `origin/main` the baseline carries them and the comparison stops reporting
 # them, which the run says so that the entries can be deleted.
 PRERELEASE_CORRECTIONS = frozenset(
     {
+        # A reserved error code nothing ever emitted, and three members of the
+        # canonical artifact record nothing ever wrote; they were kept only
+        # for compatibility with clients of a release that does not exist.
+        "GET /api/platform/commands 400 application/json.error.code: enum values removed: ['offset-out-of-range']",
+        "GET /api/v1/apps/{app_id}/artifacts 200 application/json.items[]: response property artifactSha256 removed",
+        "GET /api/v1/apps/{app_id}/artifacts 200 application/json.items[]: response property contentRootSha256 removed",
+        "GET /api/v1/apps/{app_id}/artifacts 200 application/json.items[]: response property standardVersion removed",
+        "POST /api/v1/apps/{app_id}/artifacts 200 application/json.artifact: response property artifactSha256 removed",
+        "POST /api/v1/apps/{app_id}/artifacts 200 application/json.artifact: response property contentRootSha256 removed",
+        "POST /api/v1/apps/{app_id}/artifacts 200 application/json.artifact: response property standardVersion removed",
         "GET /api/v1/apps/{application_name}/identity-migration: operation removed",
         "POST /api/v1/apps/{application_name}/identity-migration: operation removed",
         "GET /api/v1/apps/{app_name}/environments/{environment_name}/provider-deployments 200 application/json.items[].operation.kind: enum values removed: ['migrate']",

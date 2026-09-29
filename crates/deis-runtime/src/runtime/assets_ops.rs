@@ -24,9 +24,9 @@
 //! refused when it is built and again whenever the bundle is read - by the
 //! control plane at upload and by a node at load - since a declaration of that
 //! name is not a legal environment declaration
-//! (`deis_wire::EnvironmentDeclaration::validate`). A schema-1 bundle, which
-//! carries its variables in the manifest instead of declaring them, has the
-//! key lifted out of the map before the map becomes `ctx.env`
+//! (`deis_wire::EnvironmentDeclaration::validate`). An isolate built from a
+//! plain string map - a test, `deis dev` - has the key lifted out of the map
+//! before the map becomes `ctx.env`
 //! ([`crate::runtime::bindings::ASSETS_BINDING_KEY`] is reserved exactly as
 //! the storage endpoints are). And whatever reached the map, `js/runtime.js`
 //! installs this binding *after* the declared values are copied, so ordering

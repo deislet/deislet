@@ -1643,8 +1643,6 @@ impl Compiler {
         derived_config.environment = Some(deis_build_core::EnvironmentConfig {
             declarations: environment.declarations.clone(),
             values: None,
-            variables: None,
-            secrets: None,
         });
         derived_config.vendors = None;
         derived_config.build = Some(deis_build_core::BuildConfig {
@@ -3653,7 +3651,7 @@ impl Compiler {
         let standard_version = Self::locked_standard_version()?;
         let environment =
             deis_build_core::resolve_environment_declarations(config, &standard_version)?;
-        let manifest = deis_build_adapter_deislet::build_manifest_with_environment(
+        let manifest = deis_build_adapter_deislet::build_manifest(
             config,
             &function_paths,
             &assets,

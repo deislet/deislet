@@ -1091,10 +1091,32 @@ async fn seed_deployments(
         .with_connection(move |connection| {
             let transaction = connection.unchecked_transaction()?;
             let base = now_secs() - 86_400;
+            // Every pointer names a snapshot; one empty snapshot per version
+            // is enough for rows that are only ever paged through.
+            for version_id in &version_ids {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO environment_binding_snapshots
+                       (snapshot_id, app_id, env_id, version_id, declarations_sha256, document,
+                        created_at)
+                     SELECT ?1, ?2, ?3, ?4, 'seed',
+                            json_object('deploymentVersionId', ?4,
+                                        'environmentId', canonical_id,
+                                        'declarationsSha256', 'seed'),
+                            ?5
+                       FROM environments WHERE id = ?3",
+                    params![
+                        format!("seed-snapshot-{version_id}"),
+                        app_id,
+                        env_id,
+                        version_id,
+                        base
+                    ],
+                )?;
+            }
             let mut insert = transaction.prepare(
                 "INSERT INTO deployments
                    (id, canonical_id, app_id, env_id, version_id, created_at, note, snapshot_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
             )?;
             let mut canonical_ids = Vec::with_capacity(deployments);
             for index in 0..deployments {
@@ -1108,6 +1130,7 @@ async fn seed_deployments(
                     // Ties on the second are deliberate: the tie-breaker is
                     // what the index and the cursor have to agree on.
                     base + (index / 7) as i64,
+                    format!("seed-snapshot-{}", version_ids[index % version_ids.len()]),
                 ])?;
                 canonical_ids.push(canonical_id);
             }

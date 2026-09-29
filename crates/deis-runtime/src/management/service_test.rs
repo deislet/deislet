@@ -31,6 +31,32 @@ const HANDLER: &str = r#"
     export default function handler() { return new Response("ok"); }
 "#;
 
+/// The canonical identity and complete empty environment documents a push of
+/// `version_id` carries, as `(application id, environment id, declarations
+/// JSON, snapshot JSON, snapshot id)`.
+fn empty_environment_on_the_wire(version_id: &str) -> (String, String, String, String, String) {
+    let application_id = "018f2518-7e38-7f80-8000-000000000001".to_string();
+    let environment_id = "018f2518-7e38-7f80-8000-000000000002".to_string();
+    let declarations = deis_wire::EnvironmentDeclarations::new(
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        Vec::new(),
+    );
+    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        version_id,
+        environment_id.clone(),
+        declarations.identity().unwrap(),
+        Vec::new(),
+    );
+    (
+        application_id,
+        environment_id,
+        String::from_utf8(declarations.canonical_json().unwrap()).unwrap(),
+        String::from_utf8(snapshot.canonical_json().unwrap()).unwrap(),
+        snapshot.identity().unwrap(),
+    )
+}
+
 /// A management service in front of the shared isolate host, with `app_id`
 /// loaded in the environments named and a process start time far enough back
 /// that an uptime of zero would be a bug.
@@ -337,9 +363,15 @@ async fn deployment_phase_identity_is_validated_before_payload_work() {
             "018f2518-7e38-7f80-8000-000000000011",
             "",
             DeploymentAction::Prepare,
-            "present together",
+            "requires deployment_id and routing_generation",
         ),
         ("", "", DeploymentAction::Activate, "requires deployment_id"),
+        (
+            "018f2518-7e38-7f80-8000-000000000011",
+            "018f2518-7e38-7f80-8000-000000000012",
+            DeploymentAction::Unspecified,
+            "names its action",
+        ),
     ] {
         let response = service
             .apply_deployment(Request::new(ApplyDeploymentRequest {
@@ -385,6 +417,7 @@ async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_an
     let dir = tempfile::tempdir().unwrap();
     let guard = test_host::take();
     let (apps, service) = service_with(dir.path(), "compat-app", &["production"]).await;
+    let wire = empty_environment_on_the_wire("v9");
 
     let response = service
         .apply_deployment(Request::new(ApplyDeploymentRequest {
@@ -400,14 +433,14 @@ async fn a_deployment_naming_a_date_this_node_cannot_honour_is_refused_before_an
                 date: "2099-01-01".to_string(),
                 flags: Vec::new(),
             }),
-            canonical_application_id: String::new(),
-            canonical_environment_id: String::new(),
-            environment_declarations_json: String::new(),
-            environment_snapshot_json: String::new(),
-            environment_snapshot_id: String::new(),
-            deployment_id: String::new(),
-            routing_generation: String::new(),
-            action: DeploymentAction::Unspecified as i32,
+            canonical_application_id: wire.0,
+            canonical_environment_id: wire.1,
+            environment_declarations_json: wire.2,
+            environment_snapshot_json: wire.3,
+            environment_snapshot_id: wire.4,
+            deployment_id: "018f2518-7e38-7f80-8000-000000000011".to_string(),
+            routing_generation: "018f2518-7e38-7f80-8000-000000000012".to_string(),
+            action: DeploymentAction::Prepare as i32,
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -444,6 +477,7 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_i
     let dir = tempfile::tempdir().unwrap();
     let guard = test_host::take();
     let (apps, service) = service_with(dir.path(), "flag-app", &["production"]).await;
+    let wire = empty_environment_on_the_wire("v9");
 
     let response = service
         .apply_deployment(Request::new(ApplyDeploymentRequest {
@@ -458,14 +492,14 @@ async fn a_deployment_naming_a_flag_this_node_does_not_know_is_not_refused_for_i
                 date: String::new(),
                 flags: vec!["behaviour_from_a_later_build".to_string()],
             }),
-            canonical_application_id: String::new(),
-            canonical_environment_id: String::new(),
-            environment_declarations_json: String::new(),
-            environment_snapshot_json: String::new(),
-            environment_snapshot_id: String::new(),
-            deployment_id: String::new(),
-            routing_generation: String::new(),
-            action: DeploymentAction::Unspecified as i32,
+            canonical_application_id: wire.0,
+            canonical_environment_id: wire.1,
+            environment_declarations_json: wire.2,
+            environment_snapshot_json: wire.3,
+            environment_snapshot_id: wire.4,
+            deployment_id: "018f2518-7e38-7f80-8000-000000000011".to_string(),
+            routing_generation: "018f2518-7e38-7f80-8000-000000000012".to_string(),
+            action: DeploymentAction::Prepare as i32,
         }))
         .await
         .expect("the call itself succeeds; the answer is the refusal")
@@ -512,9 +546,9 @@ async fn a_partial_canonical_identity_is_refused_before_the_bundle_is_fetched() 
             environment_declarations_json: String::new(),
             environment_snapshot_json: String::new(),
             environment_snapshot_id: String::new(),
-            deployment_id: String::new(),
-            routing_generation: String::new(),
-            action: DeploymentAction::Unspecified as i32,
+            deployment_id: "018f2518-7e38-7f80-8000-000000000011".to_string(),
+            routing_generation: "018f2518-7e38-7f80-8000-000000000012".to_string(),
+            action: DeploymentAction::Prepare as i32,
         }))
         .await
         .unwrap()

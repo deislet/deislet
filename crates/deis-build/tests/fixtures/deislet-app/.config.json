@@ -5,18 +5,48 @@
   "language": "typescript",
   "functionRoot": "./functions",
   "environment": {
-    "variables": { "LOG_LEVEL": "info" },
-    "secrets": ["API_KEY"]
+    "declarations": [
+      {
+        "name": "API_KEY",
+        "kind": "secret",
+        "valueType": "string",
+        "required": true
+      },
+      {
+        "name": "LOG_LEVEL",
+        "kind": "config",
+        "valueType": "string",
+        "required": true
+      }
+    ],
+    "values": {
+      "LOG_LEVEL": "info"
+    }
   },
   "services": {
-    "kv": { "enabled": true },
-    "database": { "enabled": true }
+    "kv": {
+      "enabled": true
+    },
+    "database": {
+      "enabled": true
+    }
   },
-  "cron": ["0 */6 * * *"],
-  "queues": [{ "name": "jobs", "batchSize": 10 }],
-  "assets": { "dir": "./public" },
+  "cron": [
+    "0 */6 * * *"
+  ],
+  "queues": [
+    {
+      "name": "jobs",
+      "batchSize": 10
+    }
+  ],
+  "assets": {
+    "dir": "./public"
+  },
   "vendors": {
-    "deislet": { "enabled": true }
+    "deislet": {
+      "enabled": true
+    }
   },
   "build": {
     "outDir": "./dist"

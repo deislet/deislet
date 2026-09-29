@@ -48,8 +48,11 @@ fn project() -> deis_build_core::ProjectConfig {
         "queues": [{"name": "ORDERS"}, {"name": "JOBS"}],
         "cron": ["*/5 * * * *"],
         "environment": {
-            "variables": {"GREETING": "unused-at-build"},
-            "secrets": ["API_KEY"]
+            "declarations": [
+                {"name": "GREETING", "kind": "config", "valueType": "string", "required": true},
+                {"name": "API_KEY", "kind": "secret", "valueType": "string", "required": true}
+            ],
+            "values": {"GREETING": "unused-at-build"}
         }
     }))
     .expect("project config parses")

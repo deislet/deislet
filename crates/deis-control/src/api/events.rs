@@ -283,7 +283,7 @@ mod tests {
         );
     }
 
-    /// The event log answers in the unified envelope on the legacy and the
+    /// The event log answers in the unified envelope on the unprefixed and the
     /// platform path alike: exact total, newest first, an opaque cursor that
     /// is bound to the filters and survives a change of page size.
     #[tokio::test]

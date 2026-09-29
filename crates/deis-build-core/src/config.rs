@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, HashMap};
 
 use deis_wire::{
     EnvironmentConfigBinding, EnvironmentDeclaration, EnvironmentDeclarations, EnvironmentKind,
-    EnvironmentValueType,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +104,13 @@ fn default_function_root() -> String {
     "./functions".to_string()
 }
 
+/// A project's `environment` block.
+///
+/// Unknown keys are refused rather than ignored: a key this build does not
+/// read would otherwise be a value the author set that no deployment ever
+/// sees.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentConfig {
     /// Portable runtime-binding declarations. These are the only environment
     /// facts that enter the canonical artifact.
@@ -115,21 +120,12 @@ pub struct EnvironmentConfig {
     /// declarations and never participate in canonical build identity.
     #[serde(default)]
     pub values: Option<HashMap<String, serde_json::Value>>,
-    /// Legacy config/string values. Each name implies a required
-    /// `config/string` declaration; the value remains deployment-only.
-    #[serde(default)]
-    pub variables: Option<HashMap<String, String>>,
-    /// Legacy required `secret/string` declaration names. Secret plaintext is
-    /// never accepted in the project file.
-    #[serde(default)]
-    pub secrets: Option<Vec<String>>,
 }
 
 /// Build the one standard declaration document implied by a project.
 ///
-/// The legacy `variables` and `secrets` spellings remain readable, but only as
-/// shorthand for required declarations. Variable values do not enter this
-/// result, so changing a deployment value cannot move canonical identity.
+/// Config values do not enter this result, so changing a deployment value
+/// cannot move canonical identity.
 pub fn resolve_environment_declarations(
     config: &ProjectConfig,
     standard_version: &str,
@@ -161,31 +157,6 @@ pub fn resolve_environment_declaration_entries(
                 );
             }
         }
-
-        if let Some(variables) = &environment.variables {
-            for name in variables.keys() {
-                insert_legacy_declaration(
-                    &mut declarations,
-                    name,
-                    EnvironmentKind::Config,
-                    EnvironmentValueType::String,
-                )?;
-            }
-        }
-        if let Some(secrets) = &environment.secrets {
-            for name in secrets {
-                let name = name.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                insert_legacy_declaration(
-                    &mut declarations,
-                    name,
-                    EnvironmentKind::Secret,
-                    EnvironmentValueType::String,
-                )?;
-            }
-        }
     }
 
     if declarations.len() > deis_wire::ENVIRONMENT_BINDING_COUNT_LIMIT {
@@ -204,32 +175,6 @@ pub fn resolve_environment_declaration_entries(
     Ok(declarations.into_values().collect())
 }
 
-fn insert_legacy_declaration(
-    declarations: &mut BTreeMap<String, EnvironmentDeclaration>,
-    name: &str,
-    kind: EnvironmentKind,
-    value_type: EnvironmentValueType,
-) -> anyhow::Result<()> {
-    match declarations.get(name) {
-        Some(existing) if existing.kind == kind && existing.value_type == value_type => Ok(()),
-        Some(_) => anyhow::bail!(
-            "EC_ENV_BINDING_TYPE_MISMATCH: a legacy environment entry conflicts with its explicit declaration"
-        ),
-        None => {
-            declarations.insert(
-                name.to_string(),
-                EnvironmentDeclaration {
-                    name: name.to_string(),
-                    kind,
-                    value_type,
-                    required: true,
-                },
-            );
-            Ok(())
-        }
-    }
-}
-
 /// Resolve only deployment-time non-secret values and validate them against
 /// the canonical declaration document.
 pub fn resolve_environment_config_values(
@@ -241,18 +186,9 @@ pub fn resolve_environment_config_values(
         return Ok(values);
     };
 
-    if let Some(legacy) = &environment.variables {
-        for (name, value) in legacy {
-            values.insert(name.clone(), serde_json::Value::String(value.clone()));
-        }
-    }
     if let Some(configured) = &environment.values {
         for (name, value) in configured {
-            if values.insert(name.clone(), value.clone()).is_some() {
-                anyhow::bail!(
-                    "EC_ENV_DUPLICATE_NAME: config value is supplied by both variables and values"
-                );
-            }
+            values.insert(name.clone(), value.clone());
         }
     }
 
@@ -693,19 +629,11 @@ mod tests {
     const STANDARD: &str = "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654";
 
     #[test]
-    fn legacy_environment_values_become_declarations_without_entering_the_document() {
+    fn an_environment_key_this_build_does_not_read_is_refused() {
         let mut json = minimal();
-        json["environment"] = serde_json::json!({
-            "variables": {"PUBLIC_NAME": "sentinel-must-not-enter"},
-            "secrets": ["TOKEN"]
-        });
-        let config = parse(json);
-        let declarations = resolve_environment_declarations(&config, STANDARD).unwrap();
-        assert_eq!(declarations.declarations.len(), 2);
-        let encoded = serde_json::to_string(&declarations).unwrap();
-        assert!(!encoded.contains("sentinel-must-not-enter"));
-        assert!(encoded.contains("PUBLIC_NAME"));
-        assert!(encoded.contains("TOKEN"));
+        json["environment"] = serde_json::json!({"variables": {"PUBLIC_NAME": "x"}});
+        let error = serde_json::from_value::<ProjectConfig>(json).unwrap_err();
+        assert!(error.to_string().contains("variables"), "{error}");
     }
 
     #[test]
@@ -755,8 +683,7 @@ mod tests {
     }
 
     /// The names the platform publishes on `context.env` itself are refused
-    /// where a project writes them, in both spellings a project can write
-    /// them in: the legacy `variables` shorthand and an explicit declaration.
+    /// where a project declares them.
     ///
     /// A build that accepted one would mint a *required* declaration for it,
     /// so every layer after this - the manifest, the upload, the deployment -
@@ -768,18 +695,6 @@ mod tests {
     #[test]
     fn a_project_cannot_declare_a_name_the_platform_publishes() {
         for name in ["ASSETS", "DEIS_STORE_ENDPOINT"] {
-            let mut shorthand = minimal();
-            shorthand["environment"] = serde_json::json!({
-                "variables": {name: "an-application-cannot-take-this-name"}
-            });
-            let error = resolve_environment_declarations(&parse(shorthand), STANDARD)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.starts_with("EC_ENV_NAMESPACE_COLLISION"),
-                "variables.{name} was accepted: {error}"
-            );
-
             let mut explicit = minimal();
             explicit["environment"] = serde_json::json!({
                 "declarations": [

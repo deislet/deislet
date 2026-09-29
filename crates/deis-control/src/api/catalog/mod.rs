@@ -109,8 +109,8 @@ pub struct CatalogState {
 /// and the CLI call about applications. The caller merges it into the
 /// API-key-guarded router.
 ///
-/// `prefix` is where the routes are mounted: `"/api"` for the legacy flat
-/// tree, `""` inside a `/api/v1` nest. The one catalog route that is not
+/// `prefix` is where the routes are mounted: `"/api"` mounts them flat, which
+/// only the unit-test harnesses do, and `""` inside a `/api/v1` nest. The one catalog route that is not
 /// about an application, the global route table, is [`platform_router`].
 pub fn router(prefix: &str, state: CatalogState) -> Router {
     let at = |path: &str| format!("{prefix}{path}");
@@ -1155,7 +1155,9 @@ pub(crate) mod tests {
 
         // A second, different bundle becomes version 2.
         let bundle2 = crate::catalog::bundle::tests::bundle_with_manifest(
-            r#"{"schema":1,"app":"demo","entry":"worker/index.js","env":{"LOG_LEVEL":"debug"}}"#,
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js","env":{"LOG_LEVEL":"debug"}}"#,
+            ),
             true,
         );
         let (status, body) = call(
@@ -1392,7 +1394,9 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         let second_bundle = crate::catalog::bundle::tests::bundle_with_manifest(
-            r#"{"schema":1,"app":"pagination-alpha","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"pagination-alpha","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            ),
             true,
         );
         let (status, _) = call(
@@ -1491,7 +1495,9 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let v1 = body["version"]["id"].as_str().unwrap().to_string();
         let second_bundle = crate::catalog::bundle::tests::bundle_with_manifest(
-            r#"{"schema":1,"app":"paged","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            &deis_bundle::complete_manifest_json(
+                r#"{"app":"paged","entry":"worker/index.js","env":{"PAGE":"two"}}"#,
+            ),
             true,
         );
         let (status, body) = call(

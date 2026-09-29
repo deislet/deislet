@@ -130,8 +130,9 @@ secret / logs / tail），后来又加了读调用轨迹的 `trace` 和数据面
 新构建的部署链不再只把 Deislet bundle 当作来源。CLI 先上传同一 provider-neutral Edge Canon
 Build Output；Control 在隔离目录中完整验证并按 application UUIDv7/manifest SHA-256 保存，再接收
 绑定该 parent 的 Deislet derivation 与 native bundle。版本记录同时保存两项 lineage，后续 deployment
-继续引用不可变 version。历史 `--bundle` 仍可经兼容入口上传，但没有 lineage；它不会被标成已验证
-canonical artifact。当前 Edge Canon 锁仍是 proposal，因而 catalog record 的 `deployable` 保持 false，
+继续引用不可变 version。CLI 只走这条链路：没有 canonical artifact 与 derivation 证据的 bundle
+不部署。控制面的 native bundle 直传入口仍在，由它上传的版本没有 lineage，也就不能派生到其他
+provider。当前 Edge Canon 锁仍是 proposal，因而 catalog record 的 `deployable` 保持 false，
 这与实验性自建后端允许测试部署是两个不同状态，也不构成 provider compliance/support 证据。
 
 ### deis-runtime 的定位变化
@@ -758,8 +759,8 @@ fence，不把这种管理能力交给普通 producer/reader。
 **租户边界一点没动**：绑定名是在能力令牌验过之后、由
 `deis_wire::conventions::namespace_id` 拼到租户后面的（`shop.production@HOT`），
 分隔符 `@` 在租户两段和绑定名里都非法，所以这个拼法是单射的——没有哪一对
-`(租户, 绑定)` 能拼出另一对的命名空间。schema 1 原生 bundle 仍能读取旧的无名
-`services` 声明，使既有部署与数据可迁移；生成的标准 HTTP context 不暴露这套入口。
+`(租户, 绑定)` 能拼出另一对的命名空间。无名 `services` 声明只有手工拼出的 bundle 才会
+携带（构建拒绝启用它的项目），生成的标准 HTTP context 不暴露这套入口。
 绑定名判重
 不分大小写（它会变成 deis-store 里的目录名和文件名），`ASSETS` 和 `DEIS_` 开头的名字
 是保留的。队列绑定不需要这套拼法：deis-queue 本来就是按 `(租户, 队列名, id)` 存的。

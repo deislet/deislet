@@ -131,12 +131,12 @@ pub struct AssignmentView {
     /// node would have to guess, which is the one thing this field exists to
     /// stop.
     pub compatibility: crate::catalog::DeclaredCompatibility,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment_declarations: Option<deis_wire::EnvironmentDeclarations>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment_snapshot: Option<deis_wire::EnvironmentBindingSnapshot>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub environment_snapshot_id: Option<String>,
+    /// The version's environment declaration, the deployment's snapshot and
+    /// its identity - the same three documents the push carries. Secret
+    /// values are not in them; a node fetches those by revision.
+    pub environment_declarations: deis_wire::EnvironmentDeclarations,
+    pub environment_snapshot: deis_wire::EnvironmentBindingSnapshot,
+    pub environment_snapshot_id: String,
 }
 
 /// GET /api/nodes/:id/assignments (machine channel)
@@ -287,15 +287,9 @@ pub(crate) async fn assignments_for(
             env,
             limits,
             compatibility,
-            environment_declarations: standard_environment
-                .as_ref()
-                .map(|(declarations, _, _)| declarations.clone()),
-            environment_snapshot: standard_environment
-                .as_ref()
-                .map(|(_, snapshot, _)| snapshot.clone()),
-            environment_snapshot_id: standard_environment
-                .as_ref()
-                .map(|(_, _, identity)| identity.clone()),
+            environment_declarations: standard_environment.0,
+            environment_snapshot: standard_environment.1,
+            environment_snapshot_id: standard_environment.2,
         });
     }
 
@@ -341,9 +335,9 @@ pub(crate) struct VisibleDeployment {
     /// Primary key of the environment row: the half of a secret revision's
     /// storage key and AAD that the snapshot does not carry.
     pub env_id: String,
-    /// `None` for a deployment that predates typed snapshots, which binds no
-    /// secret revisions and so has nothing to fetch.
-    pub snapshot_id: Option<String>,
+    /// The environment snapshot the deployment binds: the only secret
+    /// revisions a node may fetch for it.
+    pub snapshot_id: String,
     /// `v1/<application id>/<environment id>`: the tenant a store, queue or
     /// telemetry capability names.
     pub canonical_tenant: String,

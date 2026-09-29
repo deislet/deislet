@@ -35,10 +35,107 @@ const HANDLER: &str = "export default function handler() { return new Response('
 /// exactly the way one naming the wrong machine is.
 const TRUST_DOMAIN: &str = "deis.internal";
 
+/// The declaration document of a version that declares no environment.
+fn no_declarations() -> deis_wire::EnvironmentDeclarations {
+    deis_wire::EnvironmentDeclarations::new(
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        Vec::new(),
+    )
+}
+
+/// Fill in what every assignment line carries and a test about something
+/// else leaves out: the canonical identity derived from the app and
+/// environment names, a deployment and routing generation derived from the
+/// version (stable across fetches, as a real pointer is), `activate`, an
+/// empty compatibility declaration, and a complete empty environment
+/// snapshot bound to the version. Anything the line already says is kept.
+fn complete(mut line: serde_json::Value) -> serde_json::Value {
+    let object = line.as_object_mut().expect("an assignment is an object");
+    let app = object["app_id"].as_str().unwrap().to_string();
+    let environment = object["environment"].as_str().unwrap().to_string();
+    let version = object["version_id"].as_str().unwrap().to_string();
+    let tenant = deis_wire::CanonicalTenantId::derived_from_label(&format!("{app}.{environment}"));
+    let derived = |what: &str| {
+        deis_wire::CanonicalId::derived_from_label(&format!("{app}.{environment}/{version}/{what}"))
+            .to_string()
+    };
+    object
+        .entry("canonical_application_id")
+        .or_insert_with(|| serde_json::json!(tenant.application_id().to_string()));
+    object
+        .entry("canonical_environment_id")
+        .or_insert_with(|| serde_json::json!(tenant.environment_id().to_string()));
+    object
+        .entry("deployment_id")
+        .or_insert_with(|| serde_json::json!(derived("deployment")));
+    object
+        .entry("routing_generation")
+        .or_insert_with(|| serde_json::json!(derived("generation")));
+    object
+        .entry("deployment_action")
+        .or_insert_with(|| serde_json::json!("activate"));
+    object
+        .entry("compatibility")
+        .or_insert_with(|| serde_json::json!({}));
+    if !object.contains_key("environment_snapshot") {
+        let declarations = no_declarations();
+        let environment_id = object["canonical_environment_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+            declarations.standard_version.clone(),
+            version.clone(),
+            environment_id,
+            declarations.identity().unwrap(),
+            Vec::new(),
+        );
+        object.insert(
+            "environment_snapshot_id".to_string(),
+            serde_json::json!(snapshot.identity().unwrap()),
+        );
+        object.insert(
+            "environment_declarations".to_string(),
+            serde_json::to_value(&declarations).unwrap(),
+        );
+        object.insert(
+            "environment_snapshot".to_string(),
+            serde_json::to_value(&snapshot).unwrap(),
+        );
+    }
+    line
+}
+
+/// The order a push of `version_id` of `app` in production would carry,
+/// pointed at `bundle_url`.
+fn pushed(app: &str, version_id: &str, bundle_url: &str, sha: &str) -> DeploymentOrder {
+    serde_json::from_value::<Assignment>(complete(serde_json::json!({
+        "app_id": app,
+        "version_id": version_id,
+        "environment": "production",
+        "bundle_url": bundle_url,
+        "bundle_sha": sha,
+    })))
+    .unwrap()
+    .into_order()
+    .unwrap()
+}
+
+/// [`complete`] over every line of an assignment list.
+fn complete_all(list: serde_json::Value) -> serde_json::Value {
+    match list {
+        serde_json::Value::Array(lines) => {
+            serde_json::Value::Array(lines.into_iter().map(complete).collect())
+        }
+        other => other,
+    }
+}
+
 fn bundle(app: &str) -> (Vec<u8>, String) {
     let manifest = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "app": app,
+        "environment": no_declarations(),
         "entry": "worker/index.js",
         "assets": [{
             "path": "index.html",
@@ -167,7 +264,7 @@ impl MachineChannel for AssignmentsService {
 
         let (complete, withheld) = *self.completeness.lock();
         Ok(tonic::Response::new(FetchAssignmentsResponse {
-            assignments_json: self.assignments.lock().to_string(),
+            assignments_json: complete_all(self.assignments.lock().clone()).to_string(),
             complete,
             withheld,
         }))
@@ -517,9 +614,9 @@ async fn an_inflight_assignment_prepares_without_starting_the_current_version() 
 #[test]
 fn an_assignment_carries_the_environment_a_push_would_have() {
     // Before the list carried this, a node that restarted came back running
-    // the right code with no secrets and no storage addresses, and stayed
-    // that way until somebody deployed again.
-    let assignment: Assignment = serde_json::from_value(serde_json::json!({
+    // the right code with no storage addresses, and stayed that way until
+    // somebody deployed again.
+    let assignment: Assignment = serde_json::from_value(complete(serde_json::json!({
         "app_id": "demo",
         "canonical_application_id": "018f2518-7e38-7f80-8000-000000000001",
         "version_id": "v1",
@@ -527,16 +624,15 @@ fn an_assignment_carries_the_environment_a_push_would_have() {
         "canonical_environment_id": "018f2518-7e38-7f80-8000-000000000002",
         "bundle_url": "http://control/bundle",
         "bundle_sha": "abc",
-        "env": { "API_KEY": "s3cr3t", "DEIS_STORE_ENDPOINT": "http://127.0.0.1:8090" },
-    }))
+        "env": { "DEIS_STORE_ENDPOINT": "http://127.0.0.1:8090" },
+    })))
     .unwrap();
 
     let order = assignment.into_order().unwrap();
     assert_eq!(
-        order.canonical_tenant.unwrap().to_string(),
+        order.canonical_tenant.to_string(),
         "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002"
     );
-    assert_eq!(order.env.get("API_KEY").unwrap(), "s3cr3t");
     assert_eq!(
         order.env.get(crate::runtime::STORE_ENDPOINT_KEY).unwrap(),
         "http://127.0.0.1:8090"
@@ -544,44 +640,35 @@ fn an_assignment_carries_the_environment_a_push_would_have() {
 }
 
 #[test]
-fn an_assignment_without_an_environment_still_loads() {
-    // A control plane that predates the field must not stop a node dead; the
-    // app runs on its manifest's own variables until the next push.
-    let assignment: Assignment = serde_json::from_value(serde_json::json!({
+fn an_assignment_without_its_identity_or_snapshot_is_refused() {
+    let whole = complete(serde_json::json!({
         "app_id": "demo",
         "version_id": "v1",
         "environment": "production",
         "bundle_url": "http://control/bundle",
         "bundle_sha": "abc",
-    }))
-    .unwrap();
-
-    let order = assignment.into_order().unwrap();
-    assert!(order.env.is_empty());
-    assert!(order.canonical_tenant.is_none());
-}
-
-#[test]
-fn an_assignment_cannot_supply_only_half_of_canonical_identity() {
-    let assignment: Assignment = serde_json::from_value(serde_json::json!({
-        "app_id": "demo",
-        "canonical_application_id": "018f2518-7e38-7f80-8000-000000000001",
-        "version_id": "v1",
-        "environment": "production",
-        "bundle_url": "http://control/bundle",
-        "bundle_sha": "abc"
-    }))
-    .unwrap();
-
-    assert!(assignment
-        .into_order()
-        .unwrap_err()
-        .contains("canonical_environment_id"));
+    }));
+    for missing in [
+        "canonical_application_id",
+        "canonical_environment_id",
+        "deployment_id",
+        "routing_generation",
+        "deployment_action",
+        "compatibility",
+        "environment_declarations",
+        "environment_snapshot",
+        "environment_snapshot_id",
+    ] {
+        let mut line = whole.clone();
+        line.as_object_mut().unwrap().remove(missing);
+        let error = serde_json::from_value::<Assignment>(line).unwrap_err();
+        assert!(error.to_string().contains(missing), "{missing}: {error}");
+    }
 }
 
 #[test]
 fn an_assignment_cannot_smuggle_a_non_v7_identity() {
-    let error = serde_json::from_value::<Assignment>(serde_json::json!({
+    let error = serde_json::from_value::<Assignment>(complete(serde_json::json!({
         "app_id": "demo",
         "canonical_application_id": "550e8400-e29b-41d4-a716-446655440000",
         "version_id": "v1",
@@ -589,7 +676,7 @@ fn an_assignment_cannot_smuggle_a_non_v7_identity() {
         "canonical_environment_id": "018f2518-7e38-7f80-8000-000000000002",
         "bundle_url": "http://control/bundle",
         "bundle_sha": "abc"
-    }))
+    })))
     .unwrap_err();
 
     assert!(error.to_string().contains("UUIDv7"), "{error}");
@@ -597,14 +684,14 @@ fn an_assignment_cannot_smuggle_a_non_v7_identity() {
 
 #[test]
 fn debugging_an_assignment_never_prints_a_secret() {
-    let assignment: Assignment = serde_json::from_value(serde_json::json!({
+    let assignment: Assignment = serde_json::from_value(complete(serde_json::json!({
         "app_id": "demo",
         "version_id": "v1",
         "environment": "production",
         "bundle_url": "http://control/bundle",
         "bundle_sha": "abc",
         "env": { "API_KEY": "s3cr3t-value" },
-    }))
+    })))
     .unwrap();
 
     let rendered = format!("{assignment:?}");
@@ -805,20 +892,7 @@ async fn a_refused_push_degrades_a_node_that_has_no_next_reconcile_pass() {
 
     // A bundle URL nothing answers on: the push is refused after the control
     // plane has already been told this node would run the version.
-    let refused = DeploymentOrder {
-        app_id: "demo".to_string(),
-        canonical_tenant: None,
-        version_id: "v1".to_string(),
-        environment: "production".to_string(),
-        bundle_url: "http://127.0.0.1:1/bundle".to_string(),
-        bundle_sha: "0".repeat(64),
-        env: std::collections::HashMap::new(),
-        standard_environment: None,
-        limits: None,
-        compatibility: None,
-        deployment_id: None,
-        routing_generation: None,
-    };
+    let refused = pushed("demo", "v1", "http://127.0.0.1:1/bundle", &"0".repeat(64));
     let err = deployer
         .apply(refused)
         .await
@@ -1340,20 +1414,12 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_rolled_back() {
     let (outcome, ()) = tokio::join!(async { reconciler.once().await.unwrap() }, async {
         plane.was_asked().await;
         deployer
-            .apply(DeploymentOrder {
-                app_id: "demo".to_string(),
-                canonical_tenant: None,
-                version_id: "v2".to_string(),
-                environment: "production".to_string(),
-                bundle_url: format!("{}/bundle", plane.base()),
-                bundle_sha: sha.clone(),
-                env: HashMap::new(),
-                standard_environment: None,
-                limits: None,
-                compatibility: None,
-                deployment_id: None,
-                routing_generation: None,
-            })
+            .apply(pushed(
+                "demo",
+                "v2",
+                &format!("{}/bundle", plane.base()),
+                &sha,
+            ))
             .await
             .unwrap();
         plane.answers_now();
@@ -1396,20 +1462,12 @@ async fn a_push_that_lands_while_the_list_is_in_flight_is_not_unloaded_either() 
     let (outcome, ()) = tokio::join!(async { reconciler.once().await.unwrap() }, async {
         plane.was_asked().await;
         deployer
-            .apply(DeploymentOrder {
-                app_id: "demo".to_string(),
-                canonical_tenant: None,
-                version_id: "v2".to_string(),
-                environment: "production".to_string(),
-                bundle_url: format!("{}/bundle", plane.base()),
-                bundle_sha: sha.clone(),
-                env: HashMap::new(),
-                standard_environment: None,
-                limits: None,
-                compatibility: None,
-                deployment_id: None,
-                routing_generation: None,
-            })
+            .apply(pushed(
+                "demo",
+                "v2",
+                &format!("{}/bundle", plane.base()),
+                &sha,
+            ))
             .await
             .unwrap();
         plane.answers_now();
@@ -1543,13 +1601,13 @@ fn test_identity(node_id: &str) -> Arc<MachineIdentity> {
 }
 
 fn one_assignment_json() -> String {
-    serde_json::json!([{
+    complete_all(serde_json::json!([{
         "app_id": "demo",
         "version_id": "v1",
         "environment": "production",
         "bundle_url": "https://control.internal:8443/bundle",
         "bundle_sha": "abc",
-    }])
+    }]))
     .to_string()
 }
 
@@ -1974,7 +2032,7 @@ mod secret_fetch {
         let (endpoint, control_identity) = serve_machine_channel(
             &ca,
             SecretPlane {
-                assignments: serde_json::json!([line]),
+                assignments: serde_json::json!([complete(line)]),
                 secrets: HashMap::from([(
                     (deployment_id.clone(), revision.to_string()),
                     "s3cret-value".to_string(),
@@ -2094,9 +2152,8 @@ async fn run_loop_until(
 }
 
 /// A node that restarts while its control plane is down comes back from its
-/// offline cache: the deployment as the last sync handed it over, not the
-/// bare record in its bundle store. With the cache tampered with, it falls
-/// back to the bundle store alone.
+/// offline cache: the deployment as the last sync handed it over. With the
+/// cache tampered with, it serves nothing until the control plane answers.
 #[tokio::test]
 async fn a_restart_with_the_control_plane_down_keeps_serving_from_the_offline_cache() {
     use super::super::offline_cache::OfflineCache;
@@ -2142,16 +2199,12 @@ async fn a_restart_with_the_control_plane_down_keeps_serving_from_the_offline_ca
     let installed = installed.expect("the assigned version is installed again");
     assert_eq!(installed.version_id, "v1");
     assert!(hosted, "an isolate serves it");
-    assert!(
-        installed.env_confirmed,
-        "restored from the offline cache, with the environment the last sync confirmed"
-    );
 
     let (installed, _) = restart_with_control_down(dir.path(), &key, true).await;
-    let installed = installed.expect("the bundle store still brings the code back");
     assert!(
-        !installed.env_confirmed,
-        "a tampered cache is not believed; the node falls back to its bundle store alone"
+        installed.is_none(),
+        "a tampered cache is not believed, and a bundle on disk without its environment \
+         snapshot is not a deployment"
     );
 }
 

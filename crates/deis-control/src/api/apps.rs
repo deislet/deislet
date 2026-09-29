@@ -454,7 +454,9 @@ mod tests {
     use crate::database::Database;
     use axum::body::to_bytes;
 
-    const MANIFEST: &str = r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#;
+    static MANIFEST: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        deis_bundle::complete_manifest_json(r#"{"app":"demo","entry":"worker/index.js"}"#)
+    });
 
     /// A control plane whose catalog deploys `demo` to production, and a fleet
     /// with one node. Nothing is ever dialled: every test here has to be
@@ -469,7 +471,7 @@ mod tests {
             .await
             .unwrap();
         let (version, _) = catalog
-            .create_version("demo", &format!("{:064x}", 7), "/tmp/demo.zip", MANIFEST)
+            .create_version("demo", &format!("{:064x}", 7), "/tmp/demo.zip", &MANIFEST)
             .await
             .unwrap();
         catalog.deploy(&env, &version.id, None).await.unwrap();

@@ -226,10 +226,6 @@ enum Commands {
         #[arg(long)]
         note: Option<String>,
 
-        /// Deploy this bundle instead of building one.
-        #[arg(long, value_name = "PATH", conflicts_with = "no_build")]
-        bundle: Option<std::path::PathBuf>,
-
         /// Use the bundle the last build left behind.
         #[arg(long)]
         no_build: bool,
@@ -1324,7 +1320,6 @@ async fn run(cli: Cli) -> Result<()> {
             target,
             format,
             note,
-            bundle,
             no_build,
             no_minify,
             deploy_target,
@@ -1335,7 +1330,6 @@ async fn run(cli: Cli) -> Result<()> {
                     app: target.app,
                     environment: target.environment,
                     note,
-                    bundle,
                     no_build,
                     no_minify,
                     target: deploy_target,

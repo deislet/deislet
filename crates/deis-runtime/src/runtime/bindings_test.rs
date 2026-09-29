@@ -21,7 +21,8 @@ mod tests {
     }
 
     fn manifest(json: &str) -> deis_bundle::Manifest {
-        deis_bundle::Manifest::parse(json).expect("test manifest parses")
+        deis_bundle::Manifest::parse(&deis_bundle::complete_manifest_json(json))
+            .expect("test manifest parses")
     }
 
     #[test]

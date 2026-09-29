@@ -85,7 +85,7 @@ pub async fn run(options: Options) -> Result<()> {
 
     let secrets =
         load_secret_values(options.secrets_file.as_deref(), options.secrets_stdin).await?;
-    let env = deployment_env(&bundle, &secrets, &options);
+    let env = deployment_env(&options);
     let config_values = crate::commands::deploy::deployment_config_values(&dir, &bundle.manifest)?;
     report_gaps(&bundle, &secrets, &options);
 
@@ -234,7 +234,7 @@ async fn reload(
         return;
     }
 
-    let env = deployment_env(&bundle, secrets, options);
+    let env = deployment_env(options);
     let config_values =
         match crate::commands::deploy::deployment_config_values(dir, &bundle.manifest) {
             Ok(values) => values,
@@ -281,26 +281,12 @@ async fn coalesce(changes: &mut watcher::Changes) {
     {}
 }
 
-/// What `context.env` will hold.
-///
-/// Built in the same order the control plane builds it, so the precedence a
-/// developer sees locally is the one that will apply in production: the
-/// manifest's plain variables first, then secrets, then the platform's own
-/// reserved keys, which win.
-fn deployment_env(
-    bundle: &Bundle,
-    secrets: &BTreeMap<String, String>,
-    options: &Options,
-) -> HashMap<String, String> {
-    let mut env: HashMap<String, String> = bundle
-        .manifest
-        .env
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    for (name, value) in secrets {
-        env.insert(name.clone(), value.clone());
-    }
+/// The platform's wiring the dev node is sent beside the snapshot, as the
+/// control plane sends it: the storage addresses. The application's config
+/// values and secrets reach the isolate through the snapshot the dev node
+/// builds from the project file and the local secrets.
+fn deployment_env(options: &Options) -> HashMap<String, String> {
+    let mut env = HashMap::new();
     if let Some(store) = &options.store {
         env.insert(
             deis_wire::conventions::STORE_ENDPOINT_ENV.to_string(),
@@ -357,16 +343,10 @@ fn report_gaps(bundle: &Bundle, secrets: &BTreeMap<String, String>, options: &Op
     let declared_secrets = bundle
         .manifest
         .environment
-        .as_ref()
-        .map(|environment| {
-            environment
-                .declarations
-                .iter()
-                .filter(|declaration| declaration.kind == deis_wire::EnvironmentKind::Secret)
-                .map(|declaration| declaration.name.as_str())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| bundle.manifest.secrets.iter().map(String::as_str).collect());
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.kind == deis_wire::EnvironmentKind::Secret)
+        .map(|declaration| declaration.name.as_str());
     for name in declared_secrets {
         if !secrets.contains_key(name) {
             println!(

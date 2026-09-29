@@ -28,8 +28,7 @@ CREATE TABLE api_idempotency_records (
                                           AND lower(route_id) = route_id
                                           AND route_id NOT GLOB '*[^a-z0-9._-]*'),
             idempotency_key_sha256 TEXT NOT NULL,
-            digest_scheme          TEXT NOT NULL DEFAULT 'sha256-v1'
-                                        CHECK(digest_scheme IN ('sha256-v1', 'hmac-sha256-v1')),
+            digest_scheme          TEXT NOT NULL CHECK(digest_scheme IN ('hmac-sha256-v1')),
             request_sha256         TEXT NOT NULL,
             state                  TEXT NOT NULL CHECK(state IN ('pending', 'completed')),
             response_status        INTEGER CHECK(response_status IS NULL
@@ -265,7 +264,7 @@ CREATE TABLE deployment_plans (
             app_id                   TEXT NOT NULL,
             env_id                   TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
             version_id               TEXT NOT NULL REFERENCES versions(id),
-            snapshot_id              TEXT,
+            snapshot_id              TEXT NOT NULL,
             previous_deployment_id   TEXT,
             previous_generation      TEXT,
             expected_secret_heads    TEXT NOT NULL CHECK(json_valid(expected_secret_heads)),
@@ -329,8 +328,9 @@ CREATE TABLE deployments (
             env_id       TEXT NOT NULL REFERENCES environments(id),
             version_id   TEXT NOT NULL REFERENCES versions(id),
             created_at   INTEGER NOT NULL,
-            note         TEXT
-        , snapshot_id TEXT REFERENCES environment_binding_snapshots(snapshot_id));
+            note         TEXT,
+            snapshot_id  TEXT NOT NULL REFERENCES environment_binding_snapshots(snapshot_id)
+        );
 
 -- table domain_grants
 CREATE TABLE domain_grants (
@@ -1898,7 +1898,6 @@ CREATE TRIGGER trg_deployment_plan_lease_identity_v1
 -- trigger trg_deployment_plan_snapshot_owner_v1
 CREATE TRIGGER trg_deployment_plan_snapshot_owner_v1
         BEFORE INSERT ON deployment_plans
-        WHEN NEW.snapshot_id IS NOT NULL
         BEGIN
             SELECT CASE WHEN NOT EXISTS (
                 SELECT 1 FROM environment_binding_snapshots snapshot
@@ -1967,7 +1966,7 @@ CREATE TRIGGER trg_deployments_canonical_id_validate_insert_v1
 -- trigger trg_deployments_snapshot_insert_v1
 CREATE TRIGGER trg_deployments_snapshot_insert_v1
         BEFORE INSERT ON deployments
-        WHEN NEW.snapshot_id IS NOT NULL AND NOT EXISTS (
+        WHEN NOT EXISTS (
             SELECT 1 FROM environment_binding_snapshots
              WHERE snapshot_id = NEW.snapshot_id
                AND app_id = NEW.app_id

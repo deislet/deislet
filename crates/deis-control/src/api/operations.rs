@@ -47,7 +47,7 @@ pub(crate) struct ProviderWorkflowCancel<'a> {
     /// the route, so each route keeps its own wording for a missing or
     /// malformed header.
     pub expected_revision: u64,
-    /// The route the request came in on, in the legacy spelling the
+    /// The route the request came in on, in the unprefixed spelling the
     /// idempotency fingerprint is built from. Two routes are two requests:
     /// a key replayed across them is refused as a different request.
     pub fingerprint_route: &'a str,
@@ -938,7 +938,7 @@ mod tests {
     }
 }
 /// The generic operation routes behind the real gate, the way the human API
-/// mounts them: the legacy `/api` spelling and the versioned `/api/v1`
+/// mounts them: the unprefixed `/api` spelling and the versioned `/api/v1`
 /// spelling, each under its own request context and error rendering, with
 /// the authorization gate outside both. Everything below asserts on what a
 /// credential is answered and on what the audit log then holds.

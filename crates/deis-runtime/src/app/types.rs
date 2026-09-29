@@ -23,9 +23,10 @@ pub struct AppConfig {
     #[serde(default, skip_serializing)]
     pub env: std::collections::HashMap<String, String>,
 
-    /// Materialized EC-ENV config/secret values for schema-2 deployments.
-    /// `None` selects the legacy string map above; `Some` (including empty)
-    /// selects the typed, declaration-filtered standard environment.
+    /// Materialized EC-ENV config/secret values of the deployment's
+    /// environment snapshot. Every deployment carries one (`Some`, possibly
+    /// empty); `None` is an application loaded without a deployment behind
+    /// it - a test or `deis dev` - which reads the string map above.
     #[serde(default, skip_serializing)]
     pub standard_env: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 

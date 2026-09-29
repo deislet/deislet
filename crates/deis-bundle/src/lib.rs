@@ -74,8 +74,6 @@ pub use site::{
 /// and the only one that is about the document rather than one value in it.
 /// See [`forward`] for the rule and what it costs an operator rolling back.
 pub const SUPPORTED_SCHEMA: u32 = 2;
-/// Oldest native bundle schema this release can still load for rollback.
-pub const MIN_SUPPORTED_SCHEMA: u32 = 1;
 
 /// Name of the manifest at the root of the archive.
 pub const MANIFEST_ENTRY: &str = "manifest.json";
@@ -188,14 +186,13 @@ pub struct Manifest {
     pub entry: String,
     #[serde(default)]
     pub runtime: Option<String>,
-    /// Which platform services the app declares it uses. Absent means false.
-    ///
-    /// Legacy unnamed service declarations carried for older native bundles.
+    /// Which unnamed platform services the app uses through
+    /// `context.services`. Absent means false.
     ///
     /// The standard HTTP context does not expose `context.services`; its
     /// logical resources are named [`Self::bindings`] entries reached through
-    /// `context.env.<NAME>`. These flags remain part of schema 1 so an older
-    /// bundle and its unnamed data can still be loaded during migration.
+    /// `context.env.<NAME>`, and the build refuses a project that turns one
+    /// of these on. Only a hand-made bundle can carry `true` here.
     #[serde(default)]
     pub services: BTreeMap<String, bool>,
 
@@ -244,17 +241,11 @@ pub struct Manifest {
         deserialize_with = "bindings::readable_callable_by"
     )]
     pub callable_by: Vec<String>,
-    /// Plain environment variables. Secret values never appear here.
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    /// Secret names only; the values are held by the control plane and
-    /// delivered to a node at deploy time, never carried in a bundle.
-    #[serde(default)]
-    pub secrets: Vec<String>,
-    /// Exact Edge Canon environment declaration carried by schema 2 bundles.
-    /// Runtime values and secret plaintext never belong here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub environment: Option<deis_wire::EnvironmentDeclarations>,
+    /// The exact Edge Canon environment declaration: which config values and
+    /// secrets the application reads, never their values. Config values are
+    /// given at deployment and secrets are held by the control plane; both
+    /// reach a node only through the deployment's environment snapshot.
+    pub environment: deis_wire::EnvironmentDeclarations,
     #[serde(default)]
     pub routes: Vec<Route>,
     /// Cron expressions this app wants to be triggered on.
@@ -375,7 +366,7 @@ impl Manifest {
 
     /// Checks that hold regardless of who is reading the bundle.
     pub fn validate(&self) -> Result<()> {
-        if !(MIN_SUPPORTED_SCHEMA..=SUPPORTED_SCHEMA).contains(&self.schema) {
+        if self.schema != SUPPORTED_SCHEMA {
             return Err(BundleError::UnsupportedSchema {
                 found: self.schema,
                 supported: SUPPORTED_SCHEMA,
@@ -405,61 +396,15 @@ impl Manifest {
             .map_err(BundleError::InvalidManifest)?;
         validate_callable_by(&self.callable_by).map_err(BundleError::InvalidManifest)?;
 
-        match (self.schema, &self.environment) {
-            (1, Some(_)) => {
-                return Err(BundleError::InvalidManifest(
-                    "schema 1 cannot carry the mandatory Edge Canon environment declaration; use schema 2"
-                        .into(),
-                ));
-            }
-            (2, Some(environment)) => {
-                environment
-                    .validate(
-                        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
-                        self.bindings.all_names(),
-                    )
-                    .map_err(|error| BundleError::InvalidManifest(error.to_string()))?;
-                if !self.env.is_empty() || !self.secrets.is_empty() {
-                    return Err(BundleError::InvalidManifest(
-                        "schema 2 keeps runtime config and secret values outside the bundle; legacy env/secrets fields must be empty"
-                            .into(),
-                    ));
-                }
-            }
-            (2, None) => {
-                return Err(BundleError::InvalidManifest(
-                    "schema 2 requires an Edge Canon environment declaration".into(),
-                ));
-            }
-            _ => {}
-        }
-
-        // A binding is published on the environment table beside the
-        // application's own variables, and the platform's property wins, so a
-        // variable of the same name would be a value the author set and the
-        // handler never sees. Refused here rather than silently overwritten.
-        //
-        // Over every name the manifest declares, not only the ones this build
-        // can read a kind for: a binding whose kind came from a newer release
-        // is still published on `env` by the build that has that kind, so the
-        // collision is real there and refusing it only here would mean two
-        // builds disagreeing about whether the same bundle is loadable.
-        for name in self.bindings.all_names() {
-            if self.env.contains_key(name) {
-                return Err(BundleError::InvalidManifest(format!(
-                    "{name:?} is both a binding and an environment variable. Bindings are \
-                     published on the environment table and the platform's property wins, so the \
-                     variable would be set by this bundle and never seen by a handler"
-                )));
-            }
-            if self.secrets.iter().any(|secret| secret == name) {
-                return Err(BundleError::InvalidManifest(format!(
-                    "{name:?} is both a binding and a secret. Bindings are published on the \
-                     environment table and the platform's property wins, so the secret would be \
-                     delivered to this node and never seen by a handler"
-                )));
-            }
-        }
+        // Also refuses a declaration that shares a name with a binding: a
+        // binding is published on the environment table and the platform's
+        // property wins, so the value would never reach a handler.
+        self.environment
+            .validate(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                self.bindings.all_names(),
+            )
+            .map_err(|error| BundleError::InvalidManifest(error.to_string()))?;
 
         for asset in &self.assets {
             if asset.path.starts_with('/') {
@@ -533,6 +478,29 @@ impl Manifest {
     pub fn route_patterns(&self) -> Vec<String> {
         self.routes.iter().map(|r| r.pattern.clone()).collect()
     }
+}
+
+/// Complete a manifest written by hand: set `schema` to [`SUPPORTED_SCHEMA`]
+/// and, unless `partial` declares one, an `environment` declaring nothing.
+///
+/// For fixtures - tests across the workspace and the demo's hand-made
+/// bundles - that are about some other part of the manifest and would
+/// otherwise each spell out the whole Edge Canon declaration document.
+/// `partial` must be a JSON object; anything else is returned unchanged, so
+/// the parse that follows reports it.
+pub fn complete_manifest_json(partial: &str) -> String {
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str(partial) else {
+        return partial.to_string();
+    };
+    object.insert("schema".to_string(), serde_json::json!(SUPPORTED_SCHEMA));
+    object.entry("environment").or_insert_with(|| {
+        serde_json::to_value(deis_wire::EnvironmentDeclarations::new(
+            deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+            Vec::new(),
+        ))
+        .expect("an environment declaration serializes")
+    });
+    serde_json::Value::Object(object).to_string()
 }
 
 /// A manifest read out of an archive, together with the exact text it came
@@ -621,36 +589,40 @@ mod tests {
         buf
     }
 
-    const MINIMAL: &str = r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#;
+    fn minimal() -> String {
+        complete_manifest_json(r#"{"app":"demo","entry":"worker/index.js"}"#)
+    }
 
     #[test]
     fn reads_a_minimal_bundle() {
-        let z = zip_with(&[(MANIFEST_ENTRY, MINIMAL), ("worker/index.js", "export {}")]);
+        let minimal = minimal();
+        let z = zip_with(&[(MANIFEST_ENTRY, &minimal), ("worker/index.js", "export {}")]);
         let parsed = read_manifest(&z).unwrap();
         assert_eq!(parsed.manifest.app, "demo");
-        assert_eq!(parsed.json, MINIMAL, "the verbatim text must survive");
+        assert_eq!(parsed.json, minimal, "the verbatim text must survive");
     }
 
     #[test]
     fn keeps_fields_it_does_not_understand() {
-        let json = r#"{"schema":1,"app":"demo","entry":"e.js","futureKey":{"a":1}}"#;
-        let z = zip_with(&[(MANIFEST_ENTRY, json), ("e.js", "")]);
+        let json = complete_manifest_json(r#"{"app":"demo","entry":"e.js","futureKey":{"a":1}}"#);
+        let z = zip_with(&[(MANIFEST_ENTRY, &json), ("e.js", "")]);
         let parsed = read_manifest(&z).unwrap();
         assert!(parsed.json.contains("futureKey"));
     }
 
     #[test]
     fn rejects_a_missing_entry_point() {
-        let z = zip_with(&[(MANIFEST_ENTRY, MINIMAL)]);
+        let z = zip_with(&[(MANIFEST_ENTRY, &minimal())]);
         let err = read_manifest(&z).unwrap_err();
         assert!(matches!(err, BundleError::InvalidManifest(_)), "{err}");
     }
 
     #[test]
     fn rejects_a_future_schema() {
-        let json = r#"{"schema":99,"app":"demo","entry":"e.js"}"#;
+        let json = complete_manifest_json(r#"{"app":"demo","entry":"e.js"}"#)
+            .replace("\"schema\":2", "\"schema\":99");
         assert_eq!(
-            Manifest::parse(json).unwrap_err(),
+            Manifest::parse(&json).unwrap_err(),
             BundleError::UnsupportedSchema {
                 found: 99,
                 supported: SUPPORTED_SCHEMA
@@ -659,10 +631,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_two_requires_only_the_standard_environment_declaration() {
+    fn a_manifest_requires_the_standard_environment_declaration() {
         let missing = r#"{"schema":2,"app":"demo","entry":"e.js"}"#;
         let error = Manifest::parse(missing).unwrap_err().to_string();
-        assert!(error.contains("requires an Edge Canon environment declaration"));
+        assert!(error.contains("environment"), "{error}");
 
         let declaration = serde_json::to_value(deis_wire::EnvironmentDeclarations::new(
             "edge-canon.next@a41a4caadeaf8e5751ebe57ef5be673d18384654",
@@ -681,9 +653,7 @@ mod tests {
             "environment": declaration
         });
         let parsed = Manifest::parse(&valid.to_string()).unwrap();
-        assert!(parsed.environment.is_some());
-        assert!(parsed.env.is_empty());
-        assert!(parsed.secrets.is_empty());
+        assert_eq!(parsed.environment.declarations.len(), 1);
 
         let mut foreign_revision = valid.clone();
         foreign_revision["environment"]["standardVersion"] =
@@ -693,19 +663,15 @@ mod tests {
             .to_string();
         assert!(error.contains("EC_ENV_STANDARD_PIN_INVALID"), "{error}");
 
-        let mut carries_legacy_value = valid.clone();
-        carries_legacy_value["env"] = serde_json::json!({"TOKEN":"must-not-enter"});
-        let error = Manifest::parse(&carries_legacy_value.to_string())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("outside the bundle"));
-
-        let mut legacy_with_declaration = valid;
-        legacy_with_declaration["schema"] = serde_json::json!(1);
-        let error = Manifest::parse(&legacy_with_declaration.to_string())
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("schema 1 cannot carry"));
+        let mut schema_one = valid;
+        schema_one["schema"] = serde_json::json!(1);
+        assert_eq!(
+            Manifest::parse(&schema_one.to_string()).unwrap_err(),
+            BundleError::UnsupportedSchema {
+                found: 1,
+                supported: SUPPORTED_SCHEMA
+            }
+        );
     }
 
     /// The other half of the reserved-name rule, on the environment side.
@@ -751,33 +717,53 @@ mod tests {
 
     #[test]
     fn rejects_an_asset_path_that_escapes_the_bundle() {
-        let json = r#"{"schema":1,"app":"d","entry":"e.js","assets":[{"path":"../etc/passwd"}]}"#;
+        let json = complete_manifest_json(
+            r#"{"app":"d","entry":"e.js","assets":[{"path":"../etc/passwd"}]}"#,
+        );
         assert!(matches!(
-            Manifest::parse(json).unwrap_err(),
+            Manifest::parse(&json).unwrap_err(),
             BundleError::InvalidManifest(_)
         ));
     }
 
     #[test]
     fn rejects_a_bundle_filed_under_another_app() {
-        let m = Manifest::parse(MINIMAL).unwrap();
+        let m = Manifest::parse(&minimal()).unwrap();
         assert!(m.check_app("demo").is_ok());
         assert!(m.check_app("other").is_err());
     }
 
     #[test]
-    fn rejects_a_binding_that_would_be_shadowed_by_a_variable() {
-        // Both halves of the same hazard: a binding is published on the
-        // environment table and the platform's property wins, so a variable or
-        // a secret of the same name is a value the author set and no handler
-        // will ever read. Refused where it is written.
-        let json = r#"{"schema":1,"app":"d","entry":"e.js","bindings":{"HOT":{"kind":"kv"}},"env":{"HOT":"x"}}"#;
-        let err = Manifest::parse(json).unwrap_err();
-        assert!(err.to_string().contains("environment variable"), "{err}");
-
-        let json = r#"{"schema":1,"app":"d","entry":"e.js","bindings":{"HOT":{"kind":"kv"}},"secrets":["HOT"]}"#;
-        let err = Manifest::parse(json).unwrap_err();
-        assert!(err.to_string().contains("secret"), "{err}");
+    fn rejects_a_binding_that_would_be_shadowed_by_a_declaration() {
+        // A binding is published on the environment table and the platform's
+        // property wins, so a config value or a secret of the same name is a
+        // value the author set and no handler will ever read. Refused where
+        // it is written.
+        for kind in [
+            deis_wire::EnvironmentKind::Config,
+            deis_wire::EnvironmentKind::Secret,
+        ] {
+            let environment = serde_json::to_value(deis_wire::EnvironmentDeclarations::new(
+                deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+                vec![deis_wire::EnvironmentDeclaration {
+                    name: "HOT".into(),
+                    kind,
+                    value_type: deis_wire::EnvironmentValueType::String,
+                    required: true,
+                }],
+            ))
+            .unwrap();
+            let json = serde_json::json!({
+                "schema": 2, "app": "d", "entry": "e.js",
+                "bindings": {"HOT": {"kind": "kv"}},
+                "environment": environment,
+            });
+            let err = Manifest::parse(&json.to_string()).unwrap_err();
+            assert!(
+                err.to_string().contains("EC_ENV_NAMESPACE_COLLISION"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -786,8 +772,10 @@ mod tests {
         // carries two names that are one namespace on a case-insensitive
         // filesystem never reaches a node - and if one somehow did, the node
         // would refuse it rather than run it.
-        let json = r#"{"schema":1,"app":"d","entry":"e.js","bindings":{"HOT":{"kind":"kv"},"hot":{"kind":"kv"}}}"#;
-        let err = Manifest::parse(json).unwrap_err();
+        let json = complete_manifest_json(
+            r#"{"app":"d","entry":"e.js","bindings":{"HOT":{"kind":"kv"},"hot":{"kind":"kv"}}}"#,
+        );
+        let err = Manifest::parse(&json).unwrap_err();
         assert!(err.to_string().contains("differ only in case"), "{err}");
     }
 
@@ -796,7 +784,7 @@ mod tests {
         // Every application written before bindings existed. The field is
         // absent from what it serialises back out, so a round trip does not
         // start writing an empty object into everybody's manifest.
-        let manifest = Manifest::parse(MINIMAL).unwrap();
+        let manifest = Manifest::parse(&minimal()).unwrap();
         assert!(manifest.bindings.is_empty());
         assert!(manifest.callable_by.is_empty());
         let json = serde_json::to_string(&manifest).unwrap();
@@ -840,9 +828,9 @@ mod tests {
         // This one used to be accepted here and paid for on every node that
         // fetched the version: the control plane only checked that the member
         // existed, and the node read it with no ceiling at all.
-        let json = r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#;
+        let json = minimal();
         let module = "/".repeat((MAX_ENTRY_BYTES + 1) as usize);
-        let z = zip_with(&[(MANIFEST_ENTRY, json), (WORKER_ENTRY, &module)]);
+        let z = zip_with(&[(MANIFEST_ENTRY, &json), (WORKER_ENTRY, &module)]);
 
         let err = read_manifest(&z).expect_err("no node will read a module this size");
         assert!(
@@ -863,7 +851,7 @@ mod tests {
         // Read once, here, under a ceiling - so that nothing downstream has
         // to unpack the same member a second time to get at it.
         let z = zip_with(&[
-            (MANIFEST_ENTRY, MINIMAL),
+            (MANIFEST_ENTRY, &minimal()),
             (WORKER_ENTRY, "export default 1"),
         ]);
         let parsed = read_manifest(&z).unwrap();

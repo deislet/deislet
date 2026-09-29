@@ -68,12 +68,12 @@ async fn the_record_survives_being_written_and_read_back() {
     let (_dir, store) = store().await;
     let record = InstalledRecord {
         app_id: "my-app".into(),
-        canonical_application_id: None,
+        canonical_application_id: "018f2518-7e38-7f80-8000-000000000001".parse().unwrap(),
         version_id: "v1".into(),
         environment: "production".into(),
-        canonical_environment_id: None,
+        canonical_environment_id: "018f2518-7e38-7f80-8000-000000000002".parse().unwrap(),
         bundle_sha: "abc123".into(),
-        environment_snapshot_id: None,
+        environment_snapshot_id: "snapshot-1".into(),
     };
 
     store.remember(record.clone()).await;
@@ -85,45 +85,25 @@ async fn canonical_identity_survives_the_installed_record() {
     let (_dir, store) = store().await;
     let record = InstalledRecord {
         app_id: "my-app".into(),
-        canonical_application_id: Some("018f2518-7e38-7f80-8000-000000000001".parse().unwrap()),
+        canonical_application_id: "018f2518-7e38-7f80-8000-000000000001".parse().unwrap(),
         version_id: "v1".into(),
         environment: "production".into(),
-        canonical_environment_id: Some("018f2518-7e38-7f80-8000-000000000002".parse().unwrap()),
+        canonical_environment_id: "018f2518-7e38-7f80-8000-000000000002".parse().unwrap(),
         bundle_sha: "abc123".into(),
-        environment_snapshot_id: Some("snapshot-1".into()),
+        environment_snapshot_id: "snapshot-1".into(),
     };
 
     store.remember(record.clone()).await;
     let read = store.records().await;
     assert_eq!(read, vec![record]);
     assert_eq!(
-        read[0].canonical_tenant().unwrap().unwrap().to_string(),
+        read[0].canonical_tenant().to_string(),
         "v1/018f2518-7e38-7f80-8000-000000000001/018f2518-7e38-7f80-8000-000000000002"
     );
 }
 
 #[tokio::test]
-async fn a_partial_canonical_identity_is_not_recovered() {
-    let (_dir, store) = store().await;
-    let path = store.root.join(RECORD_FILE);
-    tokio::fs::write(
-        path,
-        r#"[{
-          "app_id":"my-app",
-          "canonical_application_id":"018f2518-7e38-7f80-8000-000000000001",
-          "version_id":"v1",
-          "environment":"production",
-          "bundle_sha":"abc123"
-        }]"#,
-    )
-    .await
-    .unwrap();
-
-    assert!(store.records().await.is_empty());
-}
-
-#[tokio::test]
-async fn canonical_identity_can_be_learned_but_never_reassigned_or_erased() {
+async fn canonical_identity_can_never_be_reassigned() {
     let (_dir, store) = store().await;
     let application = "018f2518-7e38-7f80-8000-000000000001".parse().unwrap();
     let environment = "018f2518-7e38-7f80-8000-000000000002".parse().unwrap();
@@ -131,29 +111,23 @@ async fn canonical_identity_can_be_learned_but_never_reassigned_or_erased() {
     store
         .remember(InstalledRecord {
             app_id: "my-app".into(),
-            canonical_application_id: Some(application),
+            canonical_application_id: application,
             version_id: "v1".into(),
             environment: "production".into(),
-            canonical_environment_id: Some(environment),
+            canonical_environment_id: environment,
             bundle_sha: "abc123".into(),
-            environment_snapshot_id: None,
+            environment_snapshot_id: "snapshot-1".into(),
         })
         .await;
 
     let key = AppKey::production("my-app");
-    let mut omitted_by_old_control = None;
-    store
-        .reconcile_canonical_tenant(&key, &mut omitted_by_old_control)
-        .await
-        .unwrap();
-    assert_eq!(omitted_by_old_control, Some(stored));
+    store.check_canonical_tenant(&key, stored).await.unwrap();
 
     let other_environment = "018f2518-7e38-7f80-8000-000000000003".parse().unwrap();
     let received = deis_wire::CanonicalTenantId::new(application, other_environment);
-    let mut reassigned = Some(received);
     assert_eq!(
         store
-            .reconcile_canonical_tenant(&key, &mut reassigned)
+            .check_canonical_tenant(&key, received)
             .await
             .unwrap_err(),
         CanonicalTenantConflict::Changed { stored, received }
@@ -167,12 +141,12 @@ async fn a_second_version_of_an_app_replaces_its_line_rather_than_adding_one() {
         store
             .remember(InstalledRecord {
                 app_id: "my-app".into(),
-                canonical_application_id: None,
+                canonical_application_id: "018f2518-7e38-7f80-8000-000000000001".parse().unwrap(),
                 version_id: version.into(),
                 environment: "production".into(),
-                canonical_environment_id: None,
+                canonical_environment_id: "018f2518-7e38-7f80-8000-000000000002".parse().unwrap(),
                 bundle_sha: "sha".into(),
-                environment_snapshot_id: None,
+                environment_snapshot_id: "snapshot-1".into(),
             })
             .await;
     }
@@ -194,12 +168,12 @@ async fn forgetting_an_app_removes_its_bundles_and_its_line() {
     store
         .remember(InstalledRecord {
             app_id: "my-app".into(),
-            canonical_application_id: None,
+            canonical_application_id: "018f2518-7e38-7f80-8000-000000000001".parse().unwrap(),
             version_id: "v1".into(),
             environment: "production".into(),
-            canonical_environment_id: None,
+            canonical_environment_id: "018f2518-7e38-7f80-8000-000000000002".parse().unwrap(),
             bundle_sha: "sha".into(),
-            environment_snapshot_id: None,
+            environment_snapshot_id: "snapshot-1".into(),
         })
         .await;
 

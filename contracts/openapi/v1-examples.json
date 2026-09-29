@@ -284,6 +284,7 @@
             "env_id": "018f2518-7e38-7f80-8000-000000000001",
             "id": "018f2518-7e38-7f80-8000-000000000001",
             "note": null,
+            "snapshot_id": "0000000000000000000000000000000000000000000000000000000000000000",
             "version_id": "018f2518-7e38-7f80-8000-000000000001"
           }
         ],
@@ -482,10 +483,23 @@
             "manifest": {
               "app": "demo",
               "entry": "worker/index.js",
-              "schema": 1,
-              "secrets": [
-                "API_KEY"
-              ],
+              "environment": {
+                "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
+                "access": {
+                  "extraProviderBindings": "excluded",
+                  "surface": "context.env"
+                },
+                "declarations": [],
+                "format": "edge-canon.environment-secrets/v1",
+                "limits": {
+                  "bindingCount": 64,
+                  "measurement": "utf-8",
+                  "valueBytes": 5120
+                },
+                "schemaVersion": 1,
+                "standardVersion": "edge-canon.next@0000000000000000000000000000000000000000"
+              },
+              "schema": 2,
               "services": {
                 "kv": true
               }
@@ -607,6 +621,7 @@
           },
           "proxy_ids": [],
           "routing_generation": "018f2518-7e38-7f80-8000-000000000001",
+          "snapshot_id": "0000000000000000000000000000000000000000000000000000000000000000",
           "state": "active",
           "target_ids": [
             "runtime-test"
@@ -651,6 +666,7 @@
           "env_id": "018f2518-7e38-7f80-8000-000000000001",
           "id": "018f2518-7e38-7f80-8000-000000000001",
           "note": null,
+          "snapshot_id": "0000000000000000000000000000000000000000000000000000000000000000",
           "version_id": "018f2518-7e38-7f80-8000-000000000001"
         },
         "environment": "production",
@@ -682,6 +698,7 @@
           },
           "proxy_ids": [],
           "routing_generation": "018f2518-7e38-7f80-8000-000000000001",
+          "snapshot_id": "0000000000000000000000000000000000000000000000000000000000000000",
           "state": "active",
           "target_ids": [
             "runtime-test"
@@ -699,10 +716,23 @@
           "manifest": {
             "app": "demo",
             "entry": "worker/index.js",
-            "schema": 1,
-            "secrets": [
-              "API_KEY"
-            ],
+            "environment": {
+              "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
+              "access": {
+                "extraProviderBindings": "excluded",
+                "surface": "context.env"
+              },
+              "declarations": [],
+              "format": "edge-canon.environment-secrets/v1",
+              "limits": {
+                "bindingCount": 64,
+                "measurement": "utf-8",
+                "valueBytes": 5120
+              },
+              "schemaVersion": 1,
+              "standardVersion": "edge-canon.next@0000000000000000000000000000000000000000"
+            },
+            "schema": 2,
             "services": {
               "kv": true
             }
@@ -896,14 +926,12 @@
       "body": {
         "delivery": {
           "app_id": "demo",
-          "delivered": [
-            "runtime-test"
-          ],
+          "delivered": [],
           "environment": "production",
           "failed": [],
-          "phase": "apply",
+          "phase": "none",
           "reason": "secret_change",
-          "skipped": null,
+          "skipped": "secret API_KEY is not declared by the running version; its active snapshot is unchanged",
           "version_id": "018f2518-7e38-7f80-8000-000000000001"
         },
         "secret": {
@@ -920,14 +948,12 @@
         "deleted": "API_KEY",
         "delivery": {
           "app_id": "demo",
-          "delivered": [
-            "runtime-test"
-          ],
+          "delivered": [],
           "environment": "production",
           "failed": [],
-          "phase": "apply",
+          "phase": "none",
           "reason": "secret_change",
-          "skipped": null,
+          "skipped": "secret API_KEY is not declared by the running version; its active snapshot is unchanged",
           "version_id": "018f2518-7e38-7f80-8000-000000000001"
         }
       },
@@ -956,10 +982,23 @@
           "manifest": {
             "app": "demo",
             "entry": "worker/index.js",
-            "schema": 1,
-            "secrets": [
-              "API_KEY"
-            ],
+            "environment": {
+              "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
+              "access": {
+                "extraProviderBindings": "excluded",
+                "surface": "context.env"
+              },
+              "declarations": [],
+              "format": "edge-canon.environment-secrets/v1",
+              "limits": {
+                "bindingCount": 64,
+                "measurement": "utf-8",
+                "valueBytes": 5120
+              },
+              "schemaVersion": 1,
+              "standardVersion": "edge-canon.next@0000000000000000000000000000000000000000"
+            },
+            "schema": 2,
             "services": {
               "kv": true
             }
@@ -981,10 +1020,23 @@
         "manifest": {
           "app": "demo",
           "entry": "worker/index.js",
-          "schema": 1,
-          "secrets": [
-            "API_KEY"
-          ],
+          "environment": {
+            "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
+            "access": {
+              "extraProviderBindings": "excluded",
+              "surface": "context.env"
+            },
+            "declarations": [],
+            "format": "edge-canon.environment-secrets/v1",
+            "limits": {
+              "bindingCount": 64,
+              "measurement": "utf-8",
+              "valueBytes": 5120
+            },
+            "schemaVersion": 1,
+            "standardVersion": "edge-canon.next@0000000000000000000000000000000000000000"
+          },
+          "schema": 2,
           "services": {
             "kv": true
           }

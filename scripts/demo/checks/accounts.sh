@@ -189,7 +189,7 @@ check_a_scoped_token_reaches_one_environment_and_no_other() {
   # values here would quietly relabel preview and break that claim one run
   # later.
   local config_values
-  config_values=$(jq -c '.environment.variables // {}' \
+  config_values=$(jq -c '.environment.values // {}' \
     < "${DEMO_DIR}/app-v2/.config.json" 2>/dev/null || echo '{}')
 
   local allowed refused_env refused_secret refused_platform refused_token

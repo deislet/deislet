@@ -219,7 +219,6 @@ table are pinned to each other by tests.
 |---|---|---|---|
 | `invalid-argument` | 400 | no | Malformed body, query or path value; validation failed. |
 | `limit-out-of-range` | 400 | no | A `limit` outside `1..=1000` on any list route. `target` is `{resource: "query", field: "limit"}`. |
-| `offset-out-of-range` | 400 | no | Reserved, and emitted by nothing: offset paging was retired before any route shipped it. Kept in the closed enum because a published code is never withdrawn. |
 | `cursor-invalid` | 400 | no | A cursor that was not issued for this collection and these filters, or has expired. `target` is `{resource: "query", field: "cursor"}`. |
 | `idempotency-key-required` | 400 | no | A mutation that replays under a key was sent without one. `target` is `{resource: "request", field: "Idempotency-Key"}`. |
 | `unauthenticated` | 401 | no | Nothing usable was presented. From the authorization gate. |
@@ -252,12 +251,6 @@ four codes marked above, on every answer that carries one of them, and
 `retryable: true`; it advises how long to wait, and its absence means the
 client picks its own backoff. Everything not retryable is a defect in the
 request: retrying it unchanged produces the same answer.
-
-One code is marked *reserved*: `offset-out-of-range`. Nothing emits it and
-nothing will - every list is keyset-paged behind an opaque cursor and no
-route takes an offset - but it stays in the closed enum, because a code that
-has been published is never withdrawn from it and a client that already
-branches on it must keep compiling.
 
 A refusal that decomposes into named members carries them in `violations`,
 each `{field, code, message}` with the field in dotted path form

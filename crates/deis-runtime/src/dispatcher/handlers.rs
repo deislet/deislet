@@ -407,7 +407,8 @@ pub async fn handle_request(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    // The legacy/direct path has no immutable generation to distinguish a
+    // A request with no generation (a direct call: tests, `deis dev`, a
+    // probe) has no immutable generation to distinguish a
     // not-yet-prepared deployment from a name this node has never seen. Keep
     // the established API contract for that path: an unknown application is
     // a 404. Exact-generation requests are checked below and deliberately
@@ -433,7 +434,7 @@ pub async fn handle_request(
         tracing::warn!(
             app_id = %key.app_id(),
             environment = %key.environment(),
-            routing_generation = routing_generation.unwrap_or("<legacy>"),
+            routing_generation = routing_generation.unwrap_or("<none>"),
             "This node does not have the exact deployment generation selected by the edge; refusing instead of substituting another version"
         );
         return (

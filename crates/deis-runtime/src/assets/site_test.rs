@@ -40,8 +40,10 @@ impl Site {
     fn new() -> Self {
         Self {
             files: Vec::new(),
-            manifest: Manifest::parse(r#"{"schema":1,"app":"demo","entry":"worker/index.js"}"#)
-                .expect("the minimal manifest parses"),
+            manifest: Manifest::parse(&deis_bundle::complete_manifest_json(
+                r#"{"app":"demo","entry":"worker/index.js"}"#,
+            ))
+            .expect("the minimal manifest parses"),
         }
     }
 

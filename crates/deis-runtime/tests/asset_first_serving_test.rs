@@ -20,7 +20,9 @@ use axum::routing::{any, get};
 use axum::Router;
 use deis_runtime::app::ApplicationManager;
 use deis_runtime::config::RuntimeConfig;
-use deis_runtime::deployment::{sha256_hex, DeploymentManager, DeploymentOrder};
+use deis_runtime::deployment::{
+    sha256_hex, DeploymentManager, DeploymentOrder, StandardEnvironmentOrder,
+};
 use deis_runtime::dispatcher::{handlers, AppState};
 
 /// The handler is only reached on an asset miss, and says so.
@@ -33,10 +35,19 @@ export default function handler(context) {
 const INDEX_HTML: &str = "<!doctype html><h1>from the bundle</h1>";
 const APP_CSS: &str = "body { margin: 0 }";
 
+/// The declaration document of a version that declares no environment.
+fn no_declarations() -> deis_wire::EnvironmentDeclarations {
+    deis_wire::EnvironmentDeclarations::new(
+        deis_wire::CURRENT_EDGE_CANON_STANDARD_VERSION,
+        Vec::new(),
+    )
+}
+
 fn bundle() -> (Vec<u8>, String) {
     let manifest = serde_json::json!({
-        "schema": 1,
+        "schema": 2,
         "app": "site",
+        "environment": no_declarations(),
         "entry": "worker/index.js",
         "runtime": "standard-v1",
         "routes": [{ "pattern": "/api/hello", "methods": [] }],
@@ -113,20 +124,38 @@ async fn a_bundled_site_is_served_from_its_assets_and_falls_through_on_a_miss() 
         .await
         .unwrap();
 
+    let tenant = deis_wire::CanonicalTenantId::derived_from_label("site.production");
+    let environment_id = tenant.environment_id().to_string();
+    let declarations = no_declarations();
+    let snapshot = deis_wire::EnvironmentBindingSnapshot::new(
+        declarations.standard_version.clone(),
+        "v1",
+        environment_id.clone(),
+        declarations.identity().unwrap(),
+        Vec::new(),
+    );
+    let standard_environment = StandardEnvironmentOrder::new_without_secrets(
+        declarations,
+        snapshot.clone(),
+        snapshot.identity().unwrap(),
+        "v1",
+        &environment_id,
+    )
+    .unwrap();
     deployer
         .apply(DeploymentOrder {
             app_id: "site".to_string(),
-            canonical_tenant: None,
+            canonical_tenant: tenant,
             version_id: "v1".to_string(),
             environment: "production".to_string(),
             bundle_url: format!("http://{bundle_addr}/bundle"),
             bundle_sha: sha,
             env: HashMap::new(),
-            standard_environment: None,
+            standard_environment,
             limits: None,
             compatibility: None,
-            deployment_id: None,
-            routing_generation: None,
+            deployment_id: deis_wire::CanonicalId::new_v7().to_string(),
+            routing_generation: deis_wire::CanonicalId::new_v7().to_string(),
         })
         .await
         .expect("the deployment should have been applied");

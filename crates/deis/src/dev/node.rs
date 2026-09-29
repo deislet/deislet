@@ -235,7 +235,8 @@ impl DevNode {
             environment_declarations_json,
             environment_snapshot_json,
             environment_snapshot_id,
-        ) = if let Some(declarations) = manifest.environment.as_ref() {
+        ) = {
+            let declarations = &manifest.environment;
             let application_id = *self
                 .canonical_application_id
                 .get_or_insert_with(deis_wire::CanonicalId::new_v7);
@@ -305,68 +306,71 @@ impl DevNode {
                 String::from_utf8(snapshot.canonical_json().map_err(anyhow::Error::new)?)?,
                 snapshot_id,
             )
-        } else {
-            (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-            )
         };
-        let response = self
-            .client
-            .apply_deployment(ApplyDeploymentRequest {
-                app_id: app.to_string(),
-                // A dev node holds one build at a time, and the digest is
-                // what actually distinguishes two of them.
-                version_id,
-                environment: environment.to_string(),
-                bundle_url: bundle_url.to_string(),
-                bundle_sha: bundle_sha.to_string(),
-                env,
-                // No per-application ceilings locally: in production the
-                // control plane fills these in from the manifest it stored
-                // with the version, and a dev node has no catalog to read
-                // one out of. It therefore runs on its own defaults, which
-                // are the same defaults an application with no declared
-                // limits gets in production.
-                limits: None,
-                compatibility: Some(CompatibilityDeclaration {
-                    date: compatibility
-                        .date
-                        .map(|date| date.to_string())
-                        .unwrap_or_default(),
-                    flags: compatibility.flags,
-                }),
-                // Local dev has no catalog object from which to obtain
-                // permanent product identities. Both empty is the explicit
-                // additive/legacy form; one-sided identity would be refused
-                // by the node.
-                canonical_application_id,
-                canonical_environment_id,
-                environment_declarations_json,
-                environment_snapshot_json,
-                environment_snapshot_id,
-                deployment_id: String::new(),
-                routing_generation: String::new(),
-                action: proto::DeploymentAction::Unspecified as i32,
-            })
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "the dev node refused the bundle: {}\nIts own output above says why.",
-                    e.message()
-                )
-            })?
-            .into_inner();
+        // A dev node is driven the way the control plane drives every node:
+        // prepare the generation, then activate it.
+        let deployment_id = deis_wire::CanonicalId::new_v7().to_string();
+        let routing_generation = deis_wire::CanonicalId::new_v7().to_string();
+        let request = ApplyDeploymentRequest {
+            app_id: app.to_string(),
+            // A dev node holds one build at a time, and the digest is
+            // what actually distinguishes two of them.
+            version_id,
+            environment: environment.to_string(),
+            bundle_url: bundle_url.to_string(),
+            bundle_sha: bundle_sha.to_string(),
+            env,
+            // No per-application ceilings locally: in production the
+            // control plane fills these in from the manifest it stored
+            // with the version, and a dev node has no catalog to read
+            // one out of. It therefore runs on its own defaults, which
+            // are the same defaults an application with no declared
+            // limits gets in production.
+            limits: None,
+            compatibility: Some(CompatibilityDeclaration {
+                date: compatibility
+                    .date
+                    .map(|date| date.to_string())
+                    .unwrap_or_default(),
+                flags: compatibility.flags,
+            }),
+            // Local dev has no catalog to take permanent identities from,
+            // so this session mints its own and keeps them for its life.
+            canonical_application_id,
+            canonical_environment_id,
+            environment_declarations_json,
+            environment_snapshot_json,
+            environment_snapshot_id,
+            deployment_id,
+            routing_generation,
+            action: proto::DeploymentAction::Prepare as i32,
+        };
+        for action in [
+            proto::DeploymentAction::Prepare,
+            proto::DeploymentAction::Activate,
+        ] {
+            let response = self
+                .client
+                .apply_deployment(ApplyDeploymentRequest {
+                    action: action as i32,
+                    ..request.clone()
+                })
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "the dev node refused the bundle: {}\nIts own output above says why.",
+                        e.message()
+                    )
+                })?
+                .into_inner();
 
-        if !response.success {
-            bail!(
-                "the dev node could not load the bundle: {}\nThis is the same failure a real \
-                 deployment would hit, so it is worth fixing before deploying.",
-                response.message
-            );
+            if !response.success {
+                bail!(
+                    "the dev node could not load the bundle: {}\nThis is the same failure a \
+                     real deployment would hit, so it is worth fixing before deploying.",
+                    response.message
+                );
+            }
         }
         Ok(())
     }

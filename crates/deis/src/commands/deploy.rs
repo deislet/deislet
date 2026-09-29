@@ -11,7 +11,7 @@
 //! on a Cloudflare provider target (`POST
 //! /api/v1/apps/{app}/environments/{env}/provider-target-grants`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
@@ -57,8 +57,6 @@ pub struct Args {
     pub app: Option<String>,
     pub environment: Option<String>,
     pub note: Option<String>,
-    /// Deploy this bundle instead of building one.
-    pub bundle: Option<PathBuf>,
     /// Use the bundle the last build left behind instead of building again.
     pub no_build: bool,
     pub no_minify: bool,
@@ -79,9 +77,9 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     let dir = project_dir()?;
 
     if args.target != DeployTarget::Deislet {
-        if args.bundle.is_some() || args.no_build {
+        if args.no_build {
             bail!(
-                "--bundle and --no-build deploy a prebuilt Deislet bundle; a {} deployment builds \
+                "--no-build deploys a prebuilt Deislet bundle; a {} deployment builds \
                  the bundle and the provider payload together so both derive from one canonical \
                  artifact",
                 args.target.build_target()
@@ -112,15 +110,13 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
 
     // Build (or read) the bundle first: an application that does not compile
     // must not create an app, an environment or a version.
-    let bundle = match &args.bundle {
-        Some(path) => build::read_bundle(path)?,
-        None if args.no_build => build::last_deislet_bundle(&dir)?,
-        None => {
-            // The compiler reports its progress on stdout; in --json mode
-            // that would land in front of the document. See crate::quiet.
-            let _quiet = output.json.then(crate::quiet::StdoutToStderr::start);
-            build::deislet_bundle(&dir, !args.no_minify).await?
-        }
+    let bundle = if args.no_build {
+        build::last_deislet_bundle(&dir)?
+    } else {
+        // The compiler reports its progress on stdout; in --json mode that
+        // would land in front of the document. See crate::quiet.
+        let _quiet = output.json.then(crate::quiet::StdoutToStderr::start);
+        build::deislet_bundle(&dir, !args.no_minify).await?
     };
 
     if bundle.manifest.app != app {
@@ -134,11 +130,19 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     }
 
     let config_values = deployment_config_values(&dir, &bundle.manifest)?;
-    let lineage_transport = if bundle.lineage.is_some() {
-        Some((bundle.canonical_transport()?, bundle.provider_envelope()?))
-    } else {
-        None
+    // A version is always recorded with the provider-neutral artifact it was
+    // derived from; a bundle that arrived without that evidence cannot say
+    // what it was built from, and is not deployed.
+    let Some(lineage) = bundle.lineage.as_ref() else {
+        bail!(
+            "{} carries no canonical artifact or derivation evidence, so the control plane \
+             cannot record what this version was built from. Build it again with `deis build \
+             --target deislet`, or deploy without --no-build",
+            bundle.path.display()
+        );
     };
+    let canonical_transport = bundle.canonical_transport()?;
+    let provider_envelope = bundle.provider_envelope()?;
 
     output.line(format!(
         "  {} built {} ({}, sha256 {})",
@@ -165,10 +169,7 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
     }
 
     let size = bundle.bytes.len();
-    let (upload, artifact_record) = if let Some((canonical_transport, provider_envelope)) =
-        lineage_transport
-    {
-        let lineage = bundle.lineage.as_ref().expect("checked above");
+    let (upload, artifact_record) = {
         let artifact = session
             .control
             .upload_canonical_artifact(&app, canonical_transport, &lineage.artifact_sha256)
@@ -208,18 +209,6 @@ pub async fn execute(args: Args, output: Output) -> Result<()> {
             bail!("the control plane version does not preserve the uploaded artifact lineage");
         }
         (upload, Some(artifact.artifact))
-    } else {
-        output.line(format!(
-            "  {} this manually supplied bundle has no canonical/derivation evidence; using the legacy compatibility upload",
-            "•".yellow()
-        ));
-        (
-            session
-                .control
-                .upload_version(&app, bundle.bytes.clone(), &bundle.digest)
-                .await?,
-            None,
-        )
     };
 
     if upload.created {
@@ -550,9 +539,7 @@ pub(crate) fn deployment_config_values(
     project_dir: &Path,
     manifest: &deis_bundle::Manifest,
 ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
-    let Some(declarations) = manifest.environment.as_ref() else {
-        return Ok(Default::default());
-    };
+    let declarations = &manifest.environment;
     let config = deis_build::load_project_config(&project_dir.to_string_lossy())
         .context("reading deployment-time environment config from .config.json")?;
     let supplied =
@@ -646,7 +633,7 @@ pub fn fail_on_incomplete_delivery(
 
 /// Where a previous build left the bundle, honouring `build.outDir`.
 #[cfg(test)]
-pub fn default_bundle_path(project_dir: &Path) -> Result<PathBuf> {
+pub fn default_bundle_path(project_dir: &Path) -> Result<std::path::PathBuf> {
     let config = deis_build::load_project_config(&project_dir.to_string_lossy())
         .context("reading .config.json to find where the last build wrote its bundle")?;
     let out_dir = config

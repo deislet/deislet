@@ -261,9 +261,9 @@ mod tests {
     use crate::identity::{Authority, PrincipalKind, Role, Scope};
 
     fn manifest_with(bindings: &str) -> Manifest {
-        Manifest::parse(&format!(
-            r#"{{"schema":1,"app":"frontend","entry":"worker/index.js","bindings":{bindings}}}"#
-        ))
+        Manifest::parse(&deis_bundle::complete_manifest_json(&format!(
+            r#"{{"app":"frontend","entry":"worker/index.js","bindings":{bindings}}}"#
+        )))
         .expect("the manifest itself is valid")
     }
 

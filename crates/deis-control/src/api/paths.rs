@@ -3,7 +3,7 @@
 //! A handler that writes a path into its answer - the `Location` of a
 //! deployment plan, of an operation, of a provider resource - has to spell
 //! it under the prefix the client used: a caller on `/api/v1` is pointed at
-//! `/api/v1/operations/..`, a legacy caller at `/api/operations/..`. The
+//! `/api/v1/operations/..`, one on `/api/platform` at `/api/platform/..`. The
 //! prefix is the one thing a handler cannot read off its own request, because
 //! the versioned mounts are nested and axum strips the prefix before the
 //! handler runs. It is read instead from the [`ApiSurface`] that

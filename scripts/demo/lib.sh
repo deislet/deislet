@@ -1953,10 +1953,8 @@ deploy_example_app() {
   # fails if a node does not take that.
   #
   # This is why the example app declares DEMO_SECRET with "required": false
-  # (scripts/demo-assets/example-app/.config.json) rather than under the older
-  # "secrets": [...] spelling. Under the locked standard that spelling is
-  # shorthand for a required secret, and the control plane refuses to point an
-  # environment at a version whose required secret has no value yet
+  # (scripts/demo-assets/example-app/.config.json). The control plane refuses
+  # to point an environment at a version whose required secret has no value yet
   # (EC_ENV_REQUIRED_MISSING) - so a required secret has to be set before the
   # deploy that needs it, and a secret can only be set on an environment that
   # exists. The demo's story is the other order: deploy first, then add the
