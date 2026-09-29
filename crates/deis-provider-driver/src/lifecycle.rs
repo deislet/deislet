@@ -145,7 +145,7 @@ pub fn validate_driver_request(
     match (effective_operation, request.rollback_target.as_ref()) {
         (DriverOperation::Rollback, None) => {
             return Err(DriverContractError(
-                "rollback driver request must name the activation it restores; a rollback recorded without one has to be issued again",
+                "rollback driver request must name the activation it restores",
             ));
         }
         (DriverOperation::Rollback, Some(_)) | (_, None) => {}
