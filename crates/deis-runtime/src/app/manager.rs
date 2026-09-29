@@ -2037,6 +2037,67 @@ mod memory_ceiling {
         let _ = manager.unload_app(&app).await;
     }
 
+    /// The CPU-time ceiling takes the same way out as the wall-clock one: the
+    /// spinning call is cut off, the isolate it ran on is recycled with
+    /// `reason="cpu"`, and the next call is answered by a fresh isolate.
+    ///
+    /// The wall-clock ceiling is set far above the CPU one, so the only
+    /// ceiling that can fire inside the test's time is the CPU one.
+    #[tokio::test]
+    async fn a_cpu_cut_off_recycles_its_isolate_and_the_next_request_is_served() {
+        use crate::runtime::metrics::ISOLATE_RECYCLES_TOTAL;
+
+        const ARMED_SPINNER: &str = r#"
+            export default function handler() {
+                if (globalThis.__armed) {
+                    for (;;) {}
+                }
+                globalThis.__armed = true;
+                return new Response("armed");
+            }
+        "#;
+
+        let manager = ApplicationManager::with_threads(Some(1)).with_memory_limit_mb(64);
+        let app = AppKey::production("cpu_spinner");
+        let mut config = limits(64);
+        if let Some(limits) = config.limits.as_mut() {
+            limits.timeout_ms = Some(20_000);
+            limits.cpu_time_limit_ms = Some(200);
+        }
+        manager
+            .load_app(app.clone(), ARMED_SPINNER.to_string(), config, None)
+            .await
+            .expect("the app loads");
+
+        let (status, _) = call(&manager, &app).await.expect("the first call arms");
+        assert_eq!(status, 200);
+        assert!(
+            call(&manager, &app).await.is_err(),
+            "the armed call spins and must be cut off"
+        );
+        let recycled = wait_for_counter(ISOLATE_RECYCLES_TOTAL, &app.tenant_id(), 1.0).await;
+        assert_eq!(recycled, 1.0, "the cut-off recycles exactly one isolate");
+        assert_eq!(
+            crate::runtime::metrics::recorder().recycled_for(
+                &app.tenant_id(),
+                crate::runtime::metrics::RECYCLE_REASON_CPU
+            ),
+            1.0,
+            "and names the CPU-time ceiling as the reason"
+        );
+
+        let (status, body) = call(&manager, &app)
+            .await
+            .expect("the request after a cut-off is served, on a fresh isolate");
+        assert_eq!(status, 200);
+        assert_eq!(
+            String::from_utf8(body.unwrap_or_default()).as_deref(),
+            Ok("armed"),
+            "only an isolate that has never run the handler answers \"armed\" again"
+        );
+        let _ = manager.unload_app(&app).await;
+    }
+
     /// The ArrayBuffer half of the memory ceiling (RA-2). Backing stores live
     /// outside the V8 heap, so the heap ceiling never saw them; the
     /// isolate's own allocator refuses one past the application's ceiling,
