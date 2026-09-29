@@ -4791,8 +4791,29 @@ mod tests {
         let requests_before = recorder().value(REQUESTS_TOTAL, app);
         let abandoned_before = recorder().value(ABANDONED_BEFORE_START_TOTAL, app);
 
-        // Posted, then abandoned before the thread reaches it.
-        drop(post_request(&pool, app, Instant::now()).await);
+        // Abandoned before the thread reaches it: the caller is gone by the
+        // time the message is even posted, so no scheduling of the runtime
+        // thread can have it run the request first.
+        {
+            let (tx, rx) = oneshot::channel();
+            drop(rx);
+            let placement = pool.placement.read().await;
+            let id = *placement
+                .of_app
+                .get(app)
+                .expect("the application is loaded on some thread");
+            placement.threads[id]
+                .send(RuntimeMessage::ExecuteRequest {
+                    app_id: app.to_string(),
+                    url: "http://localhost/".to_string(),
+                    method: "GET".to_string(),
+                    headers: Vec::new(),
+                    body: None,
+                    enqueued_at: Instant::now(),
+                    response: tx,
+                })
+                .expect("the thread takes the message");
+        }
 
         // The same thread handles this one after it, so once this answers, the
         // first has already been decided.

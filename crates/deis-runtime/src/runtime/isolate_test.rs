@@ -2072,9 +2072,27 @@ export default function handler(context: any): Response {
         let ResponseBody::Stream(mut reader) = body else {
             panic!("the Node env fixture must keep producing after its response head");
         };
-        let first = tokio::select! {
-            chunk = std::future::poll_fn(|cx| reader.poll_chunk(cx)) => chunk,
-            () = runtime.pump_response_streams() => panic!("the stream ended before its first chunk"),
+        // The pump can finish its turns - producing, and on a slow machine
+        // even closing, the stream - in the same poll the reader was last
+        // pending in, so its returning is not the stream ending: what the
+        // reader holds is read before anything is concluded.
+        let first = loop {
+            tokio::select! {
+                chunk = std::future::poll_fn(|cx| reader.poll_chunk(cx)) => break chunk,
+                () = runtime.pump_response_streams() => {
+                    if let std::task::Poll::Ready(chunk) = std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(reader.poll_chunk(cx))
+                    })
+                    .await
+                    {
+                        break chunk;
+                    }
+                    assert!(
+                        runtime.has_open_response_streams(),
+                        "the stream ended before its first chunk"
+                    );
+                }
+            }
         };
         assert_eq!(first.as_deref(), Some(&b"stream|configured|1\n"[..]));
 
