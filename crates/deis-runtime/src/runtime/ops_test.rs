@@ -215,9 +215,9 @@ mod tests {
         let before = kv_probe(
             "kv_upgrade_app.production",
             &store,
-            r#"await ctx.services.kv.put("legacy", "written-before-bindings");
+            r#"await ctx.services.kv.put("k1", "written-before-bindings");
                 return new Response(JSON.stringify({
-                    value: await ctx.services.kv.get("legacy"),
+                    value: await ctx.services.kv.get("k1"),
                 }));"#,
         )
         .await;
@@ -229,8 +229,8 @@ mod tests {
             &store,
             &["HOT"],
             r#"return new Response(JSON.stringify({
-                    unnamed: await ctx.services.kv.get("legacy"),
-                    hot: await ctx.bindings.HOT.get("legacy"),
+                    unnamed: await ctx.services.kv.get("k1"),
+                    hot: await ctx.bindings.HOT.get("k1"),
                     hotKeys: (await ctx.bindings.HOT.list()).keys.length,
                 }));"#,
         )

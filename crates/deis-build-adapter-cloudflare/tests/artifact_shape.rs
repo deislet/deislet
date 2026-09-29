@@ -110,7 +110,7 @@ fn standard_wait_until_is_backed_by_the_native_execution_context() {
 }
 
 #[test]
-fn an_unnamed_legacy_service_is_refused_with_the_named_spelling_suggested() {
+fn an_unnamed_service_is_refused_with_the_named_spelling_suggested() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let config = test_config("unnamed", true);
 

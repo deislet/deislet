@@ -64,7 +64,7 @@ pub fn generate_with_node_compat(
 ) -> anyhow::Result<AdapterArtifacts> {
     // The plan is the gate and the source of truth. A project that asks for
     // something this target does not map - a service binding, `callableBy`,
-    // an unnamed legacy service, a name the provider environment cannot
+    // an unnamed service, a name the provider environment cannot
     // spell - fails here with `EC_BINDING_TARGET_UNIMPLEMENTED`, before any
     // artifact is emitted. Everything below plans only what the plan agreed
     // to.

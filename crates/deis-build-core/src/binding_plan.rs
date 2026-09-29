@@ -188,7 +188,7 @@ fn is_provider_binding_name(name: &str) -> bool {
 ///   proposed and accepted, this is unimplemented, not optional.
 /// * **`callableBy`** - the consenting half of the same feature, refused for
 ///   the same reason.
-/// * **legacy unnamed services** (`"services": { "kv": ... }`) - the unnamed
+/// * **unnamed services** (`"services": { "kv": ... }`) - the unnamed
 ///   tenant namespace has no name to bind a provider resource by. The
 ///   Cloudflare target maps named bindings; an author with an unnamed
 ///   service declares one instead. This is a D-0 break, not a compatibility
@@ -260,7 +260,7 @@ pub fn build_binding_plan_for_target(
         );
     }
 
-    // The legacy unnamed services. Each enabled one is a resource the project
+    // The unnamed services. Each enabled one is a resource the project
     // asks for without naming it, and the provider mapping binds resources
     // *by name*, so there is nothing to bind.
     if let Some(services) = &config.services {
@@ -374,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unnamed_legacy_service_is_refused_and_told_the_named_spelling() {
+    fn an_unnamed_service_is_refused_and_told_the_named_spelling() {
         let mut config = config_with(serde_json::json!({}));
         config.services = Some(ServicesConfig {
             kv: Some(ServiceConfig { enabled: true }),
@@ -389,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_legacy_service_is_not_a_plan_failure() {
+    fn a_disabled_unnamed_service_is_not_a_plan_failure() {
         let mut config = config_with(serde_json::json!({"HOT": {"kind": "kv"}}));
         config.services = Some(ServicesConfig {
             kv: Some(ServiceConfig { enabled: false }),

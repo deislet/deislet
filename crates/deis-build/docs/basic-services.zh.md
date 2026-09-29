@@ -36,7 +36,6 @@ Cache API 是 Web API，不是 context 便利字段。使用 `caches.default` �
 `await caches.open(name)`。Deislet 当前实现是进程内、按 isolate 隔离；在选定标准版本
 明确以前，应用不能假设它跨节点持久。
 
-schema 1 bundle 仍可携带旧的无名 `services` 标记，用于迁移既有部署和数据；新模板与
-标准 handler 不得再使用。比如把 `context.services.kv` 改成显式声明的
-`context.env.SESSIONS`，把 `context.services.cache` 改成 `caches.default`。标准 context
-刻意不提供兼容别名。
+运行时原生的 `context.services` 位于生成桥之下，不属于标准 context；构建会拒绝开启
+无名 `services` 标记的项目。无名 KV 请改用显式声明的绑定（如 `context.env.SESSIONS`），
+缓存用 `caches.default`。标准 context 不为二者提供别名。

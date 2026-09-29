@@ -41,9 +41,8 @@ The Cache API is a Web API rather than a context convenience. Use
 in-process and isolate-local; no application may assume cross-node persistence
 until a selected standard version says so.
 
-Schema-1 bundles can still carry the old unnamed `services` flags so deployed
-data can be migrated. New templates and standard handlers must not use them.
-Replace, for example, `context.services.kv` with a declared binding such as
-`context.env.SESSIONS`; replace `context.services.cache` with
-`caches.default`. The standard context intentionally has no compatibility
-alias.
+The runtime's native `context.services` table is below the generated bridge
+and is not part of the standard context; the build refuses a project that
+turns on an unnamed `services` flag. Use a declared binding such as
+`context.env.SESSIONS` instead of an unnamed KV, and `caches.default` for the
+cache. The standard context has no alias for either.

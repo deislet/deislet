@@ -1033,7 +1033,7 @@ import value from './static.js';
 export { value as named } from './reexport.js';
 export * from './all.js';
 const lazy = import('./lazy.js');
-const legacy = require('./legacy.cjs');
+const common = require('./common.cjs');
 export default async function handler() { return new Response(String(value)); }
 "#,
                 "functions/index.js",
@@ -1047,7 +1047,7 @@ export default async function handler() { return new Response(String(value)); }
                 "./reexport.js",
                 "./all.js",
                 "./lazy.js",
-                "./legacy.cjs",
+                "./common.cjs",
             ]
         );
         assert_eq!(info.non_literal_module_loads, 0);

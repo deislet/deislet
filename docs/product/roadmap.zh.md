@@ -26,6 +26,7 @@
 - **Cloudflare 部署**：构建与经控制面部署的路径已实现，只对照模拟的 `wrangler` 验证过；在 [`scripts/cloudflare-smoke.sh`](../../scripts/cloudflare-smoke.sh) 于真实账号跑通之前，口径是「已实现，未经真实账号验证」。见 [Cloudflare 运维文档](../operations/cloudflare.md)。
 - **控制面单实例**：一个 SQLite 数据库，用 Litestream 做持续备份与恢复，不做多实例接管。
 - **可信租户**：部署到同一安装中的应用代码视为可信；V8 isolate 是资源隔离，不是安全沙箱。平台是多应用，不是互不信任的多租户。
+- **机队配置面保留**：`/api/platform/{commands,configs,events,sessions}`（向节点下发命令与配置、查看事件与会话）是运维者管理自托管机队的工具，按「适度瘦身」的决定有意保留，不扩展成独立产品；读取需要 `read:*/*`、下发需要 `admin:*/*`，不属于应用部署 API。
 - **provider driver 的签名发布治理冻结**：只修缺陷，不加功能，只支持 Unix 主机。见 [provider-driver-governance.md](../operations/provider-driver-governance.md)。
 
 ## 进行中的工作项
@@ -35,7 +36,7 @@
 - `P0-SPEC-002`：逐能力族冻结 normative 语义、fixture 与 oracle。
 - `P0-MODEL-001`：canonical ID、operation、artifact、binding 与 driver 的共享模型。
 - `P1-BUILD-001`：从源码到 canonical artifact 的统一构建链。
-- `P1-DEPLOY-001`：统一 provider driver API 与 CLI 生命周期（Cloudflare 真实账号验证、secret/config 下发、下线 API 待完成）。
+- `P1-DEPLOY-001`：统一 provider driver API 与 CLI 生命周期（secret/config 下发与下线 API 已实现；Cloudflare 真实账号验证待用户提供账号）。
 - `P1-PLAT-001`：开发工具在 Linux/macOS/Windows 上的 CI 与确定性。
 - `P2-NODE-001`：Node 24 LTS 子集与 npm 构建解析。
 - `P2-DATA-001`：env/secrets/KV/cache/SQL/blob/queue/cron/service binding 的统一模型。

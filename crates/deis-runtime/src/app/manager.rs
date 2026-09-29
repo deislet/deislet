@@ -1028,7 +1028,7 @@ impl ApplicationManager {
     }
 
     /// Make one prepared generation the current version for triggers and
-    /// legacy/direct traffic. Generation-addressed HTTP was already possible
+    /// direct traffic that names no generation. Generation-addressed HTTP was already possible
     /// after prepare; this method does not need to rebuild it.
     pub async fn activate_prepared(&self, key: &AppKey, generation: &str) -> Result<()> {
         let record = self
@@ -1442,7 +1442,7 @@ impl ApplicationManager {
     }
 
     /// Execute the exact generation selected by the trusted routing layer.
-    /// `None` is the legacy/direct path and preserves the existing current
+    /// `None` is the direct path (no generation named) and preserves the existing current
     /// selector; `Some` never falls back to it.
     pub async fn execute_app_generation(
         &self,

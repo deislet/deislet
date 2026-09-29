@@ -2051,7 +2051,7 @@ impl Compiler {
                 ),
             ] {
                 if enabled {
-                    declarations.push(format!("legacy service {name}"));
+                    declarations.push(format!("unnamed service {name}"));
                 }
             }
         }

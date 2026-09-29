@@ -157,7 +157,8 @@
 //! record a pointer; `check_service_bindings` has exactly one caller, the
 //! upload handler), so rolling a control plane back does not make an accepted
 //! version undeployable. Today no such kind exists; the gate is here so that
-//! the day one does, the older control plane fails closed instead of open.
+//! the day one does, a control plane that predates it fails closed instead of
+//! open.
 //!
 //! # Applying this to a field that is not one of the six
 //!

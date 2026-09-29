@@ -227,8 +227,8 @@ into an app:
    independently;
 5. answers 404 when nothing matched.
 
-Named logical resources are reached as `context.env.<NAME>`. Legacy native
-`context.services` and `context.bindings`, and conveniences such as
+Named logical resources are reached as `context.env.<NAME>`. The runtime's
+native `context.services` and `context.bindings`, and conveniences such as
 `context.path`, are deliberately not copied into the standard context.
 
 ## The `.config.json` keys this target reads

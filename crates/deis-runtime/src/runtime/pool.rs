@@ -1418,7 +1418,7 @@ struct Placement {
     of_app: HashMap<String, usize>,
     /// Immutable deployment slots addressable by the routing generation the
     /// trusted edge selected. Active, prepared and retained rollback slots all
-    /// live here; `of_app` remains the selector for triggers and legacy calls.
+    /// live here; `of_app` remains the selector for triggers and direct calls.
     generations: HashMap<(String, String), GenerationSlot>,
     active_generation: HashMap<String, String>,
     /// Tenant -> the thread building a replacement isolate for it. The entry
@@ -2207,7 +2207,7 @@ impl RuntimePool {
     /// Publish a warm staged isolate under an immutable generation without
     /// moving the tenant's production selector or starting asynchronous
     /// consumers. HTTP addressed to this generation can now be verified and
-    /// served explicitly while legacy/current traffic keeps using `of_app`.
+    /// served explicitly while direct traffic keeps using `of_app`.
     pub async fn prepare_generation(
         &self,
         staged: StagedVersion,
@@ -2341,7 +2341,7 @@ impl RuntimePool {
         Ok(())
     }
 
-    /// Discard one generation that is not the current trigger/legacy selector.
+    /// Discard one generation that is not the current trigger/direct selector.
     pub async fn discard_generation(&self, tenant: &str, generation: &str) -> Result<()> {
         let slot = {
             let mut placement = self.placement.write().await;

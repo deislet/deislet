@@ -206,7 +206,7 @@ check_a_scoped_token_reaches_one_environment_and_no_other() {
   refused_token=$(control_status GET "/api/v1/tokens" "$token")
 
   # `/api/v1` answers a refusal in the structured envelope, so the sentence
-  # the caller is shown is `.error.message` - which is the legacy `error`
+  # the caller is shown is `.error.message` - which is the `error`
   # and `details` strings joined, and still the one that names the scope
   # that would have worked.
   local told

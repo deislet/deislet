@@ -1822,7 +1822,7 @@ mod a_refused_request_is_answered_503_rather_than_500 {
 
 /// The exact-generation dispatch is the other door into a thread's queue: the
 /// edge selected a particular generation, that generation's thread is at
-/// capacity, and the answer must be the same 503 the legacy path gets rather
+/// capacity, and the answer must be the same 503 the direct path gets rather
 /// than a 500 that reads as the application failing.
 mod a_refused_generation_request_is_answered_503 {
     use std::sync::Arc;

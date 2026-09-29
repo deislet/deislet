@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn a_sample_recorded_under_a_bare_application_id_gets_no_environment_label() {
         let registry = MetricsRegistry::new();
-        registry.record_rate_limit_cutoff("legacy-app");
+        registry.record_rate_limit_cutoff("plain-app");
 
         let samples = registry.snapshot(1);
         let cutoffs = samples
@@ -678,7 +678,7 @@ mod tests {
             .find(|s| s.name == RATE_LIMIT_CUTOFFS_TOTAL)
             .expect("cutoff counter");
 
-        assert_eq!(cutoffs.app_id, "legacy-app");
+        assert_eq!(cutoffs.app_id, "plain-app");
         assert!(cutoffs.labels.iter().all(|(k, _)| *k != "environment"));
     }
 

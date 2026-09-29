@@ -36,8 +36,8 @@ export type Violation = Schemas["ErrorViolation"];
 /**
  * The body of a refusal, which the document renders as `ErrorBody` around
  * `ErrorEnvelope`. Read leniently below: the guard asks only for the code
- * and the message, so a member the document promises but an older control
- * plane leaves out does not stop those two from being read.
+ * and the message, so a member the document promises but a body leaves out
+ * does not stop those two from being read.
  */
 type ErrorBody = Schemas["ErrorBody"];
 
@@ -74,7 +74,7 @@ export interface RefusalDetail {
  * `sentence` is the same text without the id, for the places that show the
  * id on a line of its own. `code` is the stable class from the envelope
  * (`not-found`, `insufficient-scope`, ...), absent on a refusal that arrived
- * in the flat legacy shape or with no body at all.
+ * in the flat `{ "error": ... }` shape or with no body at all.
  */
 export class ApiError extends Error {
   status: number;
@@ -148,7 +148,7 @@ export interface RefusalHeaders {
 
 /**
  * Turn a non-2xx answer into an `ApiError`, whichever shape it arrived in:
- * the versioned envelope, the flat legacy `{ "error": "<message>" }` that
+ * the versioned envelope, the flat `{ "error": "<message>" }` that
  * the authorization gate still answers with, or no JSON at all.
  *
  * `now` is a parameter so that an HTTP-date `Retry-After` can be measured
@@ -176,7 +176,7 @@ export function refusalFrom(
       violations: Array.isArray(violations) ? violations : [],
       retryable: retryable === true,
       // The envelope's own advice first; the header is the fallback for a
-      // control plane that sends the header and an older body.
+      // body that carries no `retryAfterSeconds`.
       retryAfterSeconds: retryAfterSeconds ?? advised,
     });
   }
@@ -230,8 +230,8 @@ function kindOf(status: number, code: string | undefined): RefusalKind {
   if (status === 409) return "conflict";
   if (status === 429) return "rate-limited";
   if (status === 503) return "unavailable";
-  // A dependency the control plane itself dials can be reported with a 500
-  // by an older build; the code is the more precise of the two, so it wins.
+  // A dependency the control plane itself dials can be reported with a 500;
+  // the code is the more precise of the two, so it wins.
   if (code === "backend-unavailable" || code === "database-unavailable") return "unavailable";
   if (status >= 500) return "server";
   return "refused";

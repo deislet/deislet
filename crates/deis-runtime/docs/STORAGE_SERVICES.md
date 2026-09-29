@@ -50,7 +50,7 @@ missing client. An application that sees this error has a configuration
 problem — an undeclared service or a control plane that was not told the
 storage addresses — not a degraded mode to work around.
 
-That message is the answer for the legacy tenant *unnamed* namespace. A
+That message is the answer for the tenant's *unnamed* namespace. A
 **named** logical binding that is not there is a different mistake and gets a
 different message from
 `ops.rs::bound_client`:
@@ -267,9 +267,9 @@ every other failure throws, and must not be retried as it stands.
 
 ## Cache
 
-`globalThis.caches.default` names the standard default cache. The legacy
-schema-1 `context.services.cache` object names the same internal instance but
-does not cross the standard HTTP bridge.
+`globalThis.caches.default` names the standard default cache. The native
+`context.services.cache` object names the same internal instance but does not
+cross the standard HTTP bridge.
 `caches.open(name)` gives an application caches of its own beside it: there is
 one store per isolate and a name is a namespace inside it, composed by
 `cache_ops.rs::namespaced`, so opening a name costs nothing and two names

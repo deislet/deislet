@@ -1745,9 +1745,10 @@ impl CatalogStore {
                 // The old generation lives on the previous plan's frozen
                 // runtime set, not necessarily on this plan's set. A scale
                 // change between the two deployments must not strand an old
-                // isolate on a node removed from the new serving set. Legacy
-                // deployment rows have no plan to consult, so the current
-                // serving set is the only truthful fallback available.
+                // isolate on a node removed from the new serving set. A
+                // deployment activated directly (`activate_deployment` and its
+                // siblings) has no plan to consult, so the current serving set
+                // is the only truthful fallback available.
                 let previous_targets_json: Option<String> =
                     if let Some(previous_id) = plan.previous_deployment_id.as_deref() {
                         tx.query_row(
@@ -3674,8 +3675,8 @@ impl CatalogStore {
     }
 
     /// Move or remove a secret head without changing a deployment pointer.
-    /// Used when no version is active, the active version is legacy, or the
-    /// standard version does not declare this name.
+    /// Used when no version is active or the active version does not declare
+    /// this name.
     pub async fn promote_secret_change(
         &self,
         env: &Environment,

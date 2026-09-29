@@ -73,7 +73,7 @@
 //! the control plane that accepted it, and neither a deploy nor a rollback
 //! runs this gate again, so rolling a control plane back never makes an
 //! accepted version undeployable. Today no such kind exists; the gate is here
-//! so that the day one does, the older control plane fails closed.
+//! so that the day one does, a control plane that predates it fails closed.
 
 use deis_bundle::{BindingKind, Manifest, ServiceEnvironment};
 
