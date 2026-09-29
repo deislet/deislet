@@ -1181,18 +1181,46 @@
           "id": "P3-HA-001",
           "title": "实现单实例控制面与数据服务的持久层、备份恢复（Litestream）和迁移",
           "owner": "deislet",
-          "status": "queued",
+          "status": "active",
           "dependsOn": [
             "P2-DATA-001",
             "P2-STATE-001"
           ],
           "outputs": [
             {
-              "type": "planned-path",
-              "value": "PostgreSQL/S3-compatible reference topology"
+              "type": "local-path",
+              "value": "docs/adr/012-pluggable-persistence.md"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/canary/litestream.yml"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/canary/systemd/litestream.service"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/canary-release.sh"
+            },
+            {
+              "type": "local-path",
+              "value": "scripts/control-restore-drill.sh"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/product/evidence/control-restore-drill.schema.json"
+            },
+            {
+              "type": "local-path",
+              "value": "docs/control-backup-and-restore.md"
+            },
+            {
+              "type": "local-path",
+              "value": "crates/deis-control/src/catalog/backend_restore_driver.rs"
             }
           ],
-          "verification": "单节点/存储/网络故障满足声明的 RPO/RTO"
+          "verification": "控制面是单实例：一个 SQLite 库（WAL、synchronous=FULL），不做多实例接管，也不引入 PostgreSQL 或其他外部元数据库。已交付：ADR-012「embedded 模式的 control：单实例 + Litestream 持续备份」一节写明 RPO（control 库约 1 秒、bundles 约 1 分钟）、RTO（≤ 15 分钟，人工按 runbook）与备份材料清单；scripts/canary/litestream.yml 与 litestream.service 为样例配置和 systemd 单元；canary-release.sh 下载并按 sha256 校验 pin 住的 Litestream 0.5.17，安装时装好二进制、配置与环境文件并启用服务；scripts/control-restore-drill.sh 在隔离目录中 restore、integrity_check、--check-config、启动并探活，按 schema 写出 JSON 证据；store、queue、telemetry 的恢复走 ADR-024 的内置单实例恢复驱动。剩余：还没有一份对真实副本跑出的演练证据（docs/product/evidence/control-restore-drill-*.json），RTO 实测值因此仍空缺，故保持 active。"
         },
         {
           "id": "P3-OBS-001",
