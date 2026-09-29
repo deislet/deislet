@@ -118,11 +118,17 @@ impl Harness {
 
     /// Start with a fully custom config.
     async fn start_with(config: Config) -> Self {
+        Self::start_listening_on("127.0.0.1:0", config).await
+    }
+
+    /// Start on `listen` instead of loopback. The endpoint the tests dial is
+    /// still `127.0.0.1:<port>`, which a wildcard bind answers as well.
+    async fn start_listening_on(listen: &str, config: Config) -> Self {
         let data = TempDir::new().unwrap();
         let signing_key = test_signing_key();
         let keys = KeyRing::from_keys([signing_key.verifying_key()]);
         let config = Config {
-            listen: "127.0.0.1:0".to_string(),
+            listen: listen.to_string(),
             data_dir: data.path().to_path_buf(),
             max_attempts: MAX_ATTEMPTS,
             max_body_bytes: MAX_BODY_BYTES,
@@ -131,7 +137,7 @@ impl Harness {
         // Bind first, so the port is known before anything is spawned and no
         // test has to wait for the server to come up.
         let listener = server::bind(&config).await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let port = listener.local_addr().unwrap().port();
         let (shutdown, rx) = oneshot::channel();
         let fleet = TestFleet::new();
         let identity = fleet.service_identity(ServiceKind::Queue);
@@ -151,7 +157,7 @@ impl Harness {
         });
         Self {
             _data: data,
-            endpoint: format!("https://{addr}"),
+            endpoint: format!("https://127.0.0.1:{port}"),
             shutdown: Some(shutdown),
             signing_key,
             fleet,
@@ -1614,51 +1620,33 @@ async fn a_wrong_binding_tokens_is_refused() {
 }
 
 #[tokio::test]
-async fn refusing_to_start_is_what_an_unauthenticated_public_bind_does() {
-    // The fail-closed half. An operator who widens `listen` and changes
-    // nothing else gets a process that stops with an explanation, rather than
-    // one whose queues anyone on the network can drain.
-    let data = TempDir::new().unwrap();
-    let config = Config {
-        listen: "127.0.0.1:0".to_string(),
-        data_dir: data.path().to_path_buf(),
-        ..Config::default()
-    };
-    let public = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
-    public.set_nonblocking(true).unwrap();
-    let public = tokio::net::TcpListener::from_std(public).unwrap();
+async fn a_public_bind_still_refuses_every_call_without_a_capability() {
+    // An operator who widens `listen` and changes nothing else must not get a
+    // queue anyone on the network can drain. Nothing about the bind address
+    // switches authentication on or off: the capability interceptor runs on
+    // every call, so the same tokenless call that loopback refuses is refused
+    // on the wildcard address too, and a capability still gets through.
+    let harness = Harness::start_listening_on("0.0.0.0:0", Config::default()).await;
+    let mut client = harness.client().await;
 
-    // The check for an unauthenticated public bind has been superseded by
-    // the capability interceptor, which always enforces auth regardless of
-    // bind address.
-    let keys = KeyRing::from_keys([test_signing_key().verifying_key()]);
-    let fleet = TestFleet::new();
-    let result = server::serve(
-        config,
-        public,
-        async {},
-        keys,
-        fake_control().client(),
-        fleet.service_identity(ServiceKind::Queue),
-    )
-    .await;
-    // The serve call itself may still succeed (it was the old auth_secret
-    // check that failed; now auth is always enforced regardless of bind
-    // address). What matters is that the server starts and enforces
-    // capabilities on every call.
-    //
-    // If the server starts, verify that calls are refused without a token.
-    if result.is_ok() {
-        // The server started on the public interface. Verify that a call
-        // without a capability token is still refused, proving that auth
-        // is enforced regardless of bind address.
-        tracing::info!(
-            "serve() accepted a public bind with capability auth; auth is \
-             enforced by the interceptor on every call regardless of bind \
-             address"
-        );
-    }
-    // If the server refuses to start for another reason (e.g. the queue
-    // database can't be opened on the temp dir), that's also fine — the
-    // old auth_secret refusal no longer exists.
+    let status = client
+        .send(Request::new(SendRequest {
+            queue_name: "jobs".to_string(),
+            message_body: b"work".to_vec(),
+        }))
+        .await
+        .expect_err("a tokenless call on a public bind must be refused");
+    assert_eq!(status.code(), Code::Unauthenticated);
+
+    client
+        .send(as_tenant(
+            &harness,
+            "demo",
+            SendRequest {
+                queue_name: "jobs".to_string(),
+                message_body: b"work".to_vec(),
+            },
+        ))
+        .await
+        .expect("a call carrying a capability is served on the same bind");
 }
