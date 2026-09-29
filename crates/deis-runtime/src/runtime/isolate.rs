@@ -1260,7 +1260,7 @@ impl AppRuntime {
     /// live; only the declared ones are constructed, and none of them dials
     /// anything until the app makes a call. Pass
     /// [`ServiceWiring::default()`] for an isolate that should reach no
-    /// storage at all -- every `ctx.services` call then answers "service not
+    /// storage at all -- every storage call then answers "service not
     /// available", which is what an app that declared nothing should get.
     /// Must be called from inside a tokio runtime context. V8 posts delayed
     /// tasks while the isolate is being built, and deno_core hands those to
@@ -1467,16 +1467,6 @@ impl AppRuntime {
             &storage_tenant
         });
         let services = AppServices::connect(&storage_tenant, wiring)?;
-        if services.is_empty() && !wiring.declaration.is_empty() {
-            tracing::warn!(
-                app_id = %app_id,
-                declared = %wiring.declaration.to_csv(),
-                "App {} declared services ({}) but none could be bound; ctx.services calls will \
-                 fail with \"service not available\"",
-                app_id,
-                wiring.declaration.to_csv()
-            );
-        }
 
         let startup_snapshot = load_or_create_startup_snapshot()?;
         let (residual_lazy_js_sources, residual_lazy_esm_sources) = if startup_snapshot.is_some() {

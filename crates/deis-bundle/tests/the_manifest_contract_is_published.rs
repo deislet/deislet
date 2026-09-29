@@ -58,7 +58,6 @@ fn a_manifest_holding_every_field() -> Manifest {
         app: "demo".to_string(),
         entry: "worker/index.js".to_string(),
         runtime: Some("standard-v1".to_string()),
-        services: [("kv".to_string(), true)].into_iter().collect(),
         bindings,
         callable_by: vec!["storefront".to_string()],
         environment: deis_wire::EnvironmentDeclarations::new(

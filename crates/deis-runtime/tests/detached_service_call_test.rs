@@ -179,7 +179,7 @@ async fn a_service_call_the_handler_did_not_await_ends_with_its_invocation() {
                 const url = new URL(context.request.url);
                 if (url.pathname === "/report") return new Response(outcome);
                 if (url.pathname === "/alice") {
-                    context.bindings.SLOW.fetch("/work").then(async () => {
+                    context.env.SLOW.fetch("/work").then(async () => {
                         const kept = await caches.default.put(
                             "https://example.invalid/page",
                             new Response("alice-private-page for " +
@@ -382,7 +382,7 @@ async fn a_method_a_service_call_cannot_carry_is_refused_before_the_callee_is_en
                 const url = new URL(context.request.url);
                 const method = url.searchParams.get("method");
                 try {
-                    const answer = await context.bindings.CALLEE.fetch("/hello", { method });
+                    const answer = await context.env.CALLEE.fetch("/hello", { method });
                     return new Response("status=" + answer.status + " body=" + await answer.text());
                 } catch (e) {
                     return new Response("threw: " + e.name + ": " + e.message);

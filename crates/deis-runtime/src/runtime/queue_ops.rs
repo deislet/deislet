@@ -1,4 +1,4 @@
-//! `ctx.services.queue.send` and `.sendBatch`: the producer half of queueing.
+//! `ctx.env.QUEUE.send` and `.sendBatch`: the producer half of queueing.
 //!
 //! Consumption is the other half and does not go through an op at all: the
 //! node polls deis-queue and calls the app's `queue` handler, see
@@ -44,8 +44,7 @@ use super::ops::escape_control;
 fn queue_unavailable(queue_name: &str) -> JsErrorBox {
     JsErrorBox::generic(format!(
         "queue service is not available to this app: the message for queue {queue_name:?} was \
-         not enqueued. Either the manifest does not declare \"queue\" or the deployment carried \
-         no deis-queue address"
+         not enqueued. The deployment carried no deis-queue address"
     ))
 }
 

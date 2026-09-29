@@ -7,8 +7,6 @@
 //! control plane parses, and the symptom - a bundle that uploads and then does
 //! not run - would show up a long way from the cause.
 
-use std::collections::BTreeMap;
-
 use anyhow::{bail, Result};
 use deis_build_core::ProjectConfig;
 use deis_bundle::{
@@ -32,14 +30,6 @@ pub use deis_bundle::WORKER_ENTRY;
 /// against ("typescript", "node"), while this says which set of globals and
 /// bindings deis-runtime has to hand the isolate. There is one profile today.
 pub const RUNTIME_PROFILE: &str = "standard-v1";
-
-/// The four unnamed services a manifest answers yes or no for.
-///
-/// The standard HTTP context has exactly four fields and does not expose
-/// `context.services`; an application declares a binding and receives it as
-/// `context.env.<NAME>`, and the binding plan refuses a project that turns
-/// one of these on, so a build writes each of them down as a no.
-const SERVICE_NAMES: [&str; 4] = ["kv", "database", "blob", "queue"];
 
 /// Assemble the manifest for one build.
 ///
@@ -83,7 +73,6 @@ pub fn build_manifest(
         app: app.to_string(),
         entry: WORKER_ENTRY.to_string(),
         runtime: Some(RUNTIME_PROFILE.to_string()),
-        services: services(config),
         bindings: bindings(config)?,
         callable_by: callable_by(config),
         environment,
@@ -284,32 +273,6 @@ fn callable_by(config: &ProjectConfig) -> Vec<String> {
     names
 }
 
-/// Which platform services the app declares it uses.
-///
-/// All four are written out, including the false ones, so the manifest reads
-/// as a complete answer rather than leaving a reader to wonder whether a
-/// missing key means "no" or "the builder forgot".
-fn services(config: &ProjectConfig) -> BTreeMap<String, bool> {
-    let declared = config.services.as_ref();
-    let enabled = |service: Option<&deis_build_core::ServiceConfig>| {
-        service.map(|s| s.enabled).unwrap_or(false)
-    };
-
-    SERVICE_NAMES
-        .iter()
-        .map(|name| {
-            let on = match *name {
-                "kv" => enabled(declared.and_then(|s| s.kv.as_ref())),
-                "database" => enabled(declared.and_then(|s| s.database.as_ref())),
-                "blob" => enabled(declared.and_then(|s| s.blob.as_ref())),
-                "queue" => enabled(declared.and_then(|s| s.queue.as_ref())),
-                _ => false,
-            };
-            (name.to_string(), on)
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,28 +318,6 @@ mod tests {
         assert_eq!(manifest.schema, SUPPORTED_SCHEMA);
         assert_eq!(manifest.app, "demo");
         assert_eq!(manifest.runtime.as_deref(), Some(RUNTIME_PROFILE));
-    }
-
-    #[test]
-    fn every_service_is_answered_yes_or_no() {
-        let manifest = build_manifest(
-            &config(serde_json::json!({
-                "services": {
-                    "kv": { "enabled": true },
-                    "database": { "enabled": true },
-                    "blob": { "enabled": false }
-                }
-            })),
-            &[],
-            &[],
-        )
-        .unwrap();
-
-        assert!(manifest.uses_service("kv"));
-        assert!(manifest.uses_service("database"));
-        assert!(!manifest.uses_service("blob"));
-        // Undeclared, but still written down as a no.
-        assert_eq!(manifest.services.get("queue"), Some(&false));
     }
 
     #[test]

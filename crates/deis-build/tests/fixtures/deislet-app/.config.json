@@ -23,14 +23,6 @@
       "LOG_LEVEL": "info"
     }
   },
-  "services": {
-    "kv": {
-      "enabled": true
-    },
-    "database": {
-      "enabled": true
-    }
-  },
   "cron": [
     "0 */6 * * *"
   ],

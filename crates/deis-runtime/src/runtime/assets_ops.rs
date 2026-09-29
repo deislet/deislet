@@ -10,8 +10,8 @@
 //!
 //! # Why it is a binding and not a service
 //!
-//! `ctx.services.*` is what an application *declares*: a manifest asks for kv
-//! or a queue, the control plane hands down an address, and a client is dialled.
+//! A storage binding is what an application *declares*: a manifest asks for a
+//! kv namespace or a queue, the control plane hands down an address, and a client is dialled.
 //! Nothing is declared or dialled here. The bundle is already in memory, it
 //! belongs to this exact version, and every application has one. So it arrives
 //! the way Cloudflare's does, as a name on the environment table -

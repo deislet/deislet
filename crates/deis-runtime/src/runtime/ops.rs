@@ -21,21 +21,19 @@ use std::time::Instant;
 /// The message an app gets when it reaches for a service it does not have.
 pub(super) fn unavailable_message(service: &str) -> String {
     format!(
-        "{service} service is not available to this app: its manifest does not declare \"{service}\", \
-         or the control plane sent no address for it"
+        "{service} service is not available to this app: its manifest declares no {service} \
+         binding, or the control plane sent no address for it"
     )
 }
 
 /// The client of one kind for one binding name, out of the set this isolate
 /// holds.
 ///
-/// `binding` is the empty string for the tenant's unnamed namespace - what
-/// `context.services.kv` and its three siblings reach - and a declared name
-/// otherwise. **There is no fallback between the two.** A named binding that
-/// is not there answers "no such binding" rather than quietly using the
-/// unnamed namespace, because an application that asked for `HOT` and silently
-/// got the unnamed one would be reading and writing the wrong namespace with
-/// nothing failing.
+/// `binding` is the name the manifest declared. A name that is not there -
+/// including the empty string, which no manifest can declare - answers "no
+/// such binding" rather than reaching some other namespace, because an
+/// application that asked for `HOT` and silently got another one would be
+/// reading and writing the wrong namespace with nothing failing.
 ///
 /// One function rather than the same twelve lines in every op: the thing that
 /// must not vary is which namespace a call ends up in.
@@ -48,7 +46,7 @@ pub(super) fn bound_client<T: Clone + 'static>(
     let name = binding.trim();
     match set.as_ref().and_then(|set| set.get(name)) {
         Some(client) => Ok(client.clone()),
-        None if name.is_empty() => Err(unavailable_message(service)),
+        None if set.is_none() => Err(unavailable_message(service)),
         None => {
             let declared = set
                 .as_ref()
@@ -79,10 +77,7 @@ pub(super) fn service_call_failed(call: &str, error: impl std::fmt::Display) -> 
 
 /// KV Get operation.
 ///
-/// Every KV op takes the binding name first, and the empty string is the
-/// tenant's unnamed namespace - the one `context.services.kv` reaches and the
-/// one every application deployed before named bindings existed has been
-/// using. It is a parameter rather than a second op per binding because which
+/// Every KV op takes the binding name first. It is a parameter rather than a second op per binding because which
 /// namespace a call lands in must be one decision made in one place; see
 /// [`bound_client`].
 ///
@@ -108,7 +103,7 @@ async fn op_kv_get(
         .map_err(|e| service_call_failed("kv.get", e))
 }
 
-/// What `ctx.services.kv.put` may attach to a write.
+/// What `ctx.env.KV.put` may attach to a write.
 ///
 /// deis-store has accepted both since wave A; until now nothing sent them, so
 /// every value written through the runtime was permanent and metadata-less no
@@ -128,7 +123,7 @@ pub struct KvSetOptions {
     pub metadata: Option<String>,
 }
 
-/// What `ctx.services.kv.getWithMetadata` hands back to JavaScript.
+/// What `ctx.env.KV.getWithMetadata` hands back to JavaScript.
 ///
 /// A missing key is `null` on the JavaScript side, not a record with a null
 /// value: "no such key" and "a key whose metadata is null" are different
@@ -220,7 +215,7 @@ async fn op_kv_delete(
         .map_err(|e| service_call_failed("kv.delete", e))
 }
 
-/// What `ctx.services.kv.list` may ask a listing for.
+/// What `ctx.env.KV.list` may ask a listing for.
 ///
 /// All three are optional and every combination is legal: no prefix lists the
 /// whole tenant, no limit takes deis-store's page size, no cursor starts at
@@ -246,7 +241,7 @@ pub struct KvListOptions {
     pub cursor: Option<String>,
 }
 
-/// One listed key, as `ctx.services.kv.list` reports it.
+/// One listed key, as `ctx.env.KV.list` reports it.
 ///
 /// `name` rather than `key`, because that is the member applications written
 /// for this shape already read. `metadata` stays the string deis-store

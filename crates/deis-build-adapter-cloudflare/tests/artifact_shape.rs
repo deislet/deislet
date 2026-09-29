@@ -12,17 +12,14 @@ use deis_build_core::{ProjectConfig, StaticAsset};
 /// carry it.
 const PINNED_DATE: &str = "2026-09-01";
 
-fn test_config(name: &str, kv_enabled: bool) -> ProjectConfig {
-    let mut v = serde_json::json!({
+fn test_config(name: &str) -> ProjectConfig {
+    let v = serde_json::json!({
         "version": "1.0",
         "name": name,
         "runtime": "edge",
         "language": "typescript",
         "compatibilityDate": PINNED_DATE,
     });
-    if kv_enabled {
-        v["services"] = serde_json::json!({ "kv": { "enabled": true } });
-    }
     serde_json::from_value(v).expect("valid test project config")
 }
 
@@ -38,7 +35,7 @@ fn wrangler_toml(result: &deis_build_core::AdapterArtifacts) -> &str {
 #[test]
 fn test_entry_point_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("test-worker", false);
+    let config = test_config("test-worker");
 
     let result = generate(&routes, &config, &[]).unwrap();
 
@@ -55,7 +52,7 @@ fn test_entry_point_format() {
 #[test]
 fn test_handler_parameters() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("test-worker", false);
+    let config = test_config("test-worker");
 
     let result = generate(&routes, &config, &[]).unwrap();
 
@@ -68,7 +65,7 @@ fn test_handler_parameters() {
 #[test]
 fn test_context_includes_env_bindings() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("test-worker", false);
+    let config = test_config("test-worker");
 
     let result = generate(&routes, &config, &[]).unwrap();
 
@@ -80,7 +77,7 @@ fn test_context_includes_env_bindings() {
 #[test]
 fn standard_context_does_not_expose_cloudflare_objects() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("test-worker", false);
+    let config = test_config("test-worker");
 
     let result = generate(&routes, &config, &[]).unwrap();
 
@@ -96,7 +93,7 @@ fn standard_context_does_not_expose_cloudflare_objects() {
 #[test]
 fn standard_wait_until_is_backed_by_the_native_execution_context() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("test-worker", false);
+    let config = test_config("test-worker");
 
     let result = generate(&routes, &config, &[]).unwrap();
 
@@ -107,18 +104,6 @@ fn standard_wait_until_is_backed_by_the_native_execution_context() {
     assert!(runtime.contains("EC_WAIT_UNTIL_CLOSED"));
     assert!(runtime.contains("EC_WAIT_UNTIL_PROMISE_REQUIRED"));
     assert!(runtime.contains("EC_BACKGROUND_REJECTED"));
-}
-
-#[test]
-fn an_unnamed_service_is_refused_with_the_named_spelling_suggested() {
-    let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("unnamed", true);
-
-    let error =
-        generate(&routes, &config, &[]).expect_err("the unnamed namespace has no name to bind");
-    let error = error.to_string();
-    assert!(error.contains("EC_BINDING_TARGET_UNIMPLEMENTED"), "{error}");
-    assert!(error.contains("named bindings"), "{error}");
 }
 
 #[test]
@@ -281,7 +266,7 @@ fn an_absent_max_retries_is_declared_at_the_standard_default() {
 #[test]
 fn test_wrangler_toml_format() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("test-worker", false);
+    let config = test_config("test-worker");
 
     let result = generate(&routes, &config, &[]).unwrap();
 
@@ -305,7 +290,7 @@ fn test_wrangler_toml_format() {
 #[test]
 fn test_error_handling_present() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("test-worker", false);
+    let config = test_config("test-worker");
 
     let result = generate(&routes, &config, &[]).unwrap();
 
@@ -318,7 +303,7 @@ fn test_error_handling_present() {
 #[test]
 fn test_research_snapshot_reference_in_comments() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let config = test_config("test-worker", false);
+    let config = test_config("test-worker");
 
     let result = generate(&routes, &config, &[]).unwrap();
 
@@ -333,7 +318,7 @@ fn the_wrangler_toml_carries_the_date_the_project_pinned() {
     // pinned, so a Worker ran under semantics its author had never tested
     // against and nothing anywhere said so.
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let result = generate(&routes, &test_config("dated", false), &[]).unwrap();
+    let result = generate(&routes, &test_config("dated"), &[]).unwrap();
     let content = wrangler_toml(&result);
 
     assert!(
@@ -349,7 +334,7 @@ fn the_wrangler_toml_carries_the_date_the_project_pinned() {
 #[test]
 fn nothing_the_author_did_not_write_is_in_the_wrangler_toml() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let result = generate(&routes, &test_config("plain", false), &[]).unwrap();
+    let result = generate(&routes, &test_config("plain"), &[]).unwrap();
     let content = wrangler_toml(&result);
 
     // `nodejs_compat` turns on Node built-ins in the Worker. The bundler
@@ -372,7 +357,7 @@ fn nothing_the_author_did_not_write_is_in_the_wrangler_toml() {
 #[test]
 fn a_project_with_no_compatibility_date_is_refused_and_told_what_to_add() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let mut config = test_config("undated", false);
+    let mut config = test_config("undated");
     config.compatibility_date = None;
 
     let error = generate(&routes, &config, &[])
@@ -389,7 +374,7 @@ fn a_project_with_compatibility_flags_is_refused_rather_than_half_translated() {
     // dropping them builds a Worker that behaves differently from the one the
     // author pinned. Neither is something to do quietly.
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let mut config = test_config("flagged", false);
+    let mut config = test_config("flagged");
     config.compatibility_flags = vec!["single_set_cookie_header".to_string()];
 
     let error = generate(&routes, &config, &[])
@@ -408,7 +393,7 @@ fn the_static_files_are_declared_so_wrangler_serves_them() {
         content_type: "text/css; charset=utf-8".to_string(),
     }];
 
-    let with_assets = generate(&routes, &test_config("site", false), &assets).unwrap();
+    let with_assets = generate(&routes, &test_config("site"), &assets).unwrap();
     let content = wrangler_toml(&with_assets);
     assert!(content.contains("[assets]"), "{content}");
     assert!(
@@ -418,7 +403,7 @@ fn the_static_files_are_declared_so_wrangler_serves_them() {
 
     // And a project with no static files gets no empty declaration, which
     // wrangler would read as a directory it could not find.
-    let without = generate(&routes, &test_config("site", false), &[]).unwrap();
+    let without = generate(&routes, &test_config("site"), &[]).unwrap();
     assert!(!wrangler_toml(&without).contains("[assets]"));
 }
 
@@ -427,7 +412,7 @@ fn a_validated_node_graph_enables_the_provider_runtime_explicitly() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
     let result = deis_build_adapter_cloudflare::generate_with_node_compat(
         &routes,
-        &test_config("node-app", false),
+        &test_config("node-app"),
         &[],
         true,
     )
@@ -446,7 +431,7 @@ fn a_root_queue_handler_is_exported_not_published_as_a_route() {
         ("/".to_string(), "./src/index.ts".to_string()),
         ("/_queue".to_string(), "../src/_queue.ts".to_string()),
     ];
-    let result = generate(&routes, &test_config("consumer", false), &[]).unwrap();
+    let result = generate(&routes, &test_config("consumer"), &[]).unwrap();
     let router = &result.router_code;
 
     assert!(
@@ -476,7 +461,7 @@ fn a_root_scheduled_handler_is_exported_the_same_way() {
             "../src/_scheduled.ts".to_string(),
         ),
     ];
-    let result = generate(&routes, &test_config("cronic", false), &[]).unwrap();
+    let result = generate(&routes, &test_config("cronic"), &[]).unwrap();
     let router = &result.router_code;
 
     assert!(
@@ -493,7 +478,7 @@ fn a_root_scheduled_handler_is_exported_the_same_way() {
 #[test]
 fn an_app_with_no_event_handlers_exports_neither() {
     let routes = vec![("/".to_string(), "./src/index.ts".to_string())];
-    let result = generate(&routes, &test_config("plain", false), &[]).unwrap();
+    let result = generate(&routes, &test_config("plain"), &[]).unwrap();
     assert!(!result.router_code.contains("export async function queue"));
     assert!(!result
         .router_code

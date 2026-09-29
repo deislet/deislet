@@ -48,27 +48,11 @@ pub fn generate_with_node_runtime(
     let environment_declarations =
         deis_build_core::resolve_environment_declaration_entries(config)?;
     let environment_declarations_json = serde_json::to_string(&environment_declarations)?;
-    let has_kv = config
-        .services
-        .as_ref()
-        .and_then(|s| s.kv.as_ref())
-        .map(|kv| kv.enabled)
-        .unwrap_or(false);
-
     // 1. Generate Context Builder Code
-    let context_builder_code =
-        generate_context_builder_code(has_kv, &environment_declarations_json);
-
-    // 2. Generate KV Adapter Code
-    let kv_adapter_code = if has_kv {
-        Some(generate_kv_adapter_code())
-    } else {
-        None
-    };
+    let context_builder_code = generate_context_builder_code(&environment_declarations_json);
 
     // 3. Generate Router Code
-    let router_code =
-        generate_router_code(routes, has_kv, node_runtime, &environment_declarations_json);
+    let router_code = generate_router_code(routes, node_runtime, &environment_declarations_json);
 
     // 4. Generate Config Files
     let mut config_files = Vec::new();
@@ -98,7 +82,6 @@ pub fn generate_with_node_runtime(
     Ok(AdapterArtifacts {
         router_code,
         context_builder_code,
-        kv_adapter_code,
         config_files,
         support_files: vec![(
             "edge-canon-runtime.js".to_string(),
@@ -108,18 +91,7 @@ pub fn generate_with_node_runtime(
 }
 
 fn refuse_unplanned_resources(config: &ProjectConfig) -> anyhow::Result<()> {
-    let enabled_service = config.services.as_ref().is_some_and(|services| {
-        [
-            services.kv.as_ref(),
-            services.database.as_ref(),
-            services.blob.as_ref(),
-            services.queue.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|service| service.enabled)
-    });
-    if !config.bindings.is_empty() || enabled_service || !config.callable_by.is_empty() {
+    if !config.bindings.is_empty() || !config.callable_by.is_empty() {
         anyhow::bail!(
             "EC_BINDING_TARGET_UNIMPLEMENTED: the tencent adapter requires a resolved standard binding plan"
         );
@@ -129,7 +101,6 @@ fn refuse_unplanned_resources(config: &ProjectConfig) -> anyhow::Result<()> {
 
 fn generate_router_code(
     routes: &[(String, String)],
-    _has_kv: bool,
     node_runtime: bool,
     environment_declarations_json: &str,
 ) -> String {
@@ -265,24 +236,7 @@ fn route_to_build_output(route: &str) -> anyhow::Result<(String, String)> {
     Ok((source, destination))
 }
 
-fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &str) -> String {
-    let kv_init = if has_kv {
-        r#"
-  // Initialize KV adapter if available
-  let kv = undefined;
-  if (typeof globalThis.EdgeKV !== 'undefined') {
-    kv = createKVAdapter(globalThis.EdgeKV);
-  }"#
-    } else {
-        r#"
-  const kv = undefined;"#
-    };
-
-    let kv_import = if has_kv {
-        "import { createKVAdapter } from './kv-adapter';\n"
-    } else {
-        ""
-    };
+fn generate_context_builder_code(environment_declarations_json: &str) -> String {
     format!(
         r#"/**
  * Edge Canon context bridge for EdgeOne.
@@ -290,19 +244,17 @@ fn generate_context_builder_code(has_kv: bool, environment_declarations_json: &s
  * Provider fields and globals remain behind this bridge. The application sees
  * exactly request, env, params and waitUntil.
  */
-{kv_import}import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
+import {{ createEdgeCanonContext, extractParams, materializeEdgeCanonEnvironment }} from '../edge-canon-runtime.js';
 
 const EDGE_CANON_ENVIRONMENT_DECLARATIONS = {environment_declarations_json};
 
 export function buildEnhancedContext(context, route, wildcardName) {{
   const request = context.request;
   const url = new URL(request.url);
-{kv_init}
   const standardEnv = materializeEdgeCanonEnvironment(
     context.env,
     EDGE_CANON_ENVIRONMENT_DECLARATIONS
   );
-  if (kv !== undefined) standardEnv.KV = kv;
   const params = extractParams(url.pathname, route, wildcardName);
   return createEdgeCanonContext(
     request,
@@ -315,61 +267,6 @@ export function buildEnhancedContext(context, route, wildcardName) {{
 }}
 "#
     )
-}
-
-fn generate_kv_adapter_code() -> String {
-    r#"/**
- * EdgeOne KV Adapter
- *
- * Provides a simplified interface to EdgeOne KV storage
- * Spec: EdgeOne KV may be available via globalThis.EdgeKV
- */
-
-export function createKVAdapter(kvNamespace) {
-  return {
-    get: function(key, options) {
-      options = options || {};
-      return kvNamespace.get(key, options.type || 'text');
-    },
-
-    getJSON: function(key) {
-      return kvNamespace.get(key, 'json');
-    },
-
-    put: function(key, value, options) {
-      options = options || {};
-      return kvNamespace.put(key, value, options);
-    },
-
-    putJSON: function(key, value, options) {
-      options = options || {};
-      return kvNamespace.put(key, JSON.stringify(value), options);
-    },
-
-    delete: function(key) {
-      return kvNamespace.delete(key);
-    },
-
-    list: function(options) {
-      options = options || {};
-      return kvNamespace.list(options).then(function(result) {
-        return {
-          keys: result.keys || [],
-          list_complete: result.list_complete !== false,
-          cursor: result.cursor
-        };
-      });
-    },
-
-    exists: function(key) {
-      return kvNamespace.get(key).then(function(value) {
-        return value !== null;
-      });
-    }
-  };
-}
-"#
-    .to_string()
 }
 
 #[cfg(test)]

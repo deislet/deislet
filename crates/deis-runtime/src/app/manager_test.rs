@@ -316,12 +316,12 @@ mod tests {
                 const url = new URL(context.request.url);
 
                 if (url.pathname === "/set") {
-                    await context.services.kv.put("counter", "42");
+                    await context.env.KV.put("counter", "42");
                     return new Response("set");
                 }
 
                 if (url.pathname === "/get") {
-                    const val = await context.services.kv.get("counter");
+                    const val = await context.env.KV.get("counter");
                     return new Response(val || "not found");
                 }
 

@@ -58,7 +58,7 @@ pub mod parser;
 pub use deis_build_core::{
     config::{
         resolve_environment_config_values, resolve_environment_declarations, ProjectConfig,
-        ServicesConfig, VendorsConfig,
+        VendorsConfig,
     },
     error::{DeniError, Result},
     target_artifact_coverage::{

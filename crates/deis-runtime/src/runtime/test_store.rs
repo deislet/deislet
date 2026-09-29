@@ -10,7 +10,45 @@
 
 use tokio::sync::oneshot;
 
-use super::bindings::{ServiceDeclaration, ServiceEndpoints, ServiceWiring};
+use super::bindings::{ServiceEndpoints, ServiceWiring};
+
+/// Wiring that declares one binding of each named kind, named after it, with
+/// a store address nothing listens on and no queue address.
+///
+/// A storage binding is published on `env` only once its client is built, so
+/// the store address is there to build one; every call through it fails at
+/// the transport. A queue binding is published whether or not there is an
+/// address, and every send through this one answers "not available". For
+/// tests of what JavaScript checks before an op is reached.
+pub(crate) fn wiring_declaring(kinds: &[&str]) -> ServiceWiring {
+    let mut wiring = ServiceWiring {
+        endpoints: ServiceEndpoints {
+            store: Some("http://127.0.0.1:1".to_string()),
+            queue: None,
+        },
+        ..ServiceWiring::default()
+    };
+    for kind in kinds {
+        let (name, kind) = binding_for_kind(kind);
+        wiring
+            .bindings
+            .insert(name, deis_bundle::Binding::storage(kind));
+    }
+    wiring
+}
+
+/// The binding a test declares for one storage kind, and the name it reaches
+/// it by: `kv` is `env.KV`, `database` is `env.DB`, `blob` is `env.BLOB` and
+/// `queue` is `env.QUEUE`.
+pub(crate) fn binding_for_kind(kind: &str) -> (&'static str, deis_bundle::BindingKind) {
+    match kind {
+        "kv" => ("KV", deis_bundle::BindingKind::Kv),
+        "database" => ("DB", deis_bundle::BindingKind::Database),
+        "blob" => ("BLOB", deis_bundle::BindingKind::Blob),
+        "queue" => ("QUEUE", deis_bundle::BindingKind::Queue),
+        other => panic!("no storage binding kind is called {other:?}"),
+    }
+}
 
 /// The one authority every test store in this process is issued a
 /// certificate by, and the trust the clients under test check it against.
@@ -174,29 +212,38 @@ impl TestStore {
         self.wiring_for_tenant(tenant, ["kv"])
     }
 
-    /// Wiring that declares the named services and points them all at this
-    /// store, minting a capability token for `tenant`. The queue endpoint
-    /// stays empty: deis-queue is a separate process and nothing here speaks
-    /// to it.
+    /// Wiring that declares one binding of each named kind and points them
+    /// all at this store, minting a capability token for `tenant`.
+    ///
+    /// The bindings are named after their kind - [`binding_for_kind`] - so a
+    /// test reaches them as `env.KV`, `env.DB`, `env.BLOB` and `env.QUEUE`. The
+    /// queue endpoint stays empty: deis-queue is a separate process and nothing
+    /// here speaks to it.
     pub(crate) fn wiring_for_tenant<'a>(
         &self,
         tenant: &str,
-        names: impl IntoIterator<Item = &'a str>,
+        kinds: impl IntoIterator<Item = &'a str>,
     ) -> ServiceWiring {
-        ServiceWiring {
+        let mut wiring = ServiceWiring {
             storage_token: Some(self.capability_token_for_all_bindings(tenant)),
-            declaration: ServiceDeclaration::from_names(names),
             endpoints: ServiceEndpoints {
                 store: Some(self.endpoint.clone()),
                 queue: None,
             },
             consumers: Vec::new(),
             ..ServiceWiring::default()
+        };
+        for kind in kinds {
+            let (name, kind) = binding_for_kind(kind);
+            wiring
+                .bindings
+                .insert(name, deis_bundle::Binding::storage(kind));
         }
+        wiring
     }
 
-    /// The same, with named bindings of one kind declared beside the unnamed
-    /// namespace this store already serves.
+    /// The same, with further named bindings of one kind declared beside the
+    /// ones [`Self::wiring_for_tenant`] names after their kind.
     ///
     /// Every name becomes a second namespace inside the same tenant, which is
     /// the property the tests below actually check.

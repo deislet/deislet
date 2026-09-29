@@ -1198,16 +1198,19 @@ impl DeploymentManager {
 
         // The two halves of the storage wiring meet here. The control plane
         // knows the addresses and puts them in the deployment env; only the
-        // bundle's manifest says which services this app declared and which
+        // bundle's manifest says which bindings this app declared and which
         // queues it consumes. Without this call the reserved keys are
-        // incomplete, no storage client is ever built, and every
-        // `ctx.services.*` call answers "service not available".
+        // incomplete, no storage client is ever built, and every binding
+        // answers "service not available".
         crate::runtime::wire_deployment_env(&manifest, &mut env);
-        let wired_services = env
-            .get(crate::runtime::SERVICES_KEY)
-            .cloned()
-            .unwrap_or_default();
-        if !wired_services.is_empty()
+        let wired_services = manifest.bindings.describe();
+        let wants_storage = manifest
+            .bindings
+            .kinds()
+            .into_iter()
+            .any(deis_bundle::BindingKind::is_storage)
+            || !manifest.queues.is_empty();
+        if wants_storage
             && !env.contains_key(crate::runtime::STORE_ENDPOINT_KEY)
             && !env.contains_key(crate::runtime::QUEUE_ENDPOINT_KEY)
         {
@@ -1215,10 +1218,10 @@ impl DeploymentManager {
                 app_id = %key.app_id(),
                 environment = %key.environment(),
                 version_id = %order.version_id,
-                services = %wired_services,
-                "This deployment carries no storage addresses, so the services this app \
-                 declares cannot be built; every ctx.services call it makes will fail until \
-                 the control plane is configured with store_endpoint / queue_endpoint"
+                bindings = %wired_services,
+                "This deployment carries no storage addresses, so the bindings and queue \
+                 consumers this app declares cannot be built; every call through them will fail \
+                 until the control plane is configured with store_endpoint / queue_endpoint"
             );
         }
 

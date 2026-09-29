@@ -16,8 +16,6 @@
 //! spelled out once per component - two copies of a format drift, and the
 //! symptom is a bundle that one side accepts and another rejects.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 pub mod archive;
@@ -186,22 +184,9 @@ pub struct Manifest {
     pub entry: String,
     #[serde(default)]
     pub runtime: Option<String>,
-    /// Which unnamed platform services the app uses through
-    /// `context.services`. Absent means false.
-    ///
-    /// The standard HTTP context does not expose `context.services`; its
-    /// logical resources are named [`Self::bindings`] entries reached through
-    /// `context.env.<NAME>`, and the build refuses a project that turns one
-    /// of these on. Only a hand-made bundle can carry `true` here.
-    #[serde(default)]
-    pub services: BTreeMap<String, bool>,
-
-    /// The namespaces and the applications this app reaches by name.
-    ///
-    /// Empty for every application written before bindings existed, which is
-    /// exactly right: such an application has its unnamed KV, database, object
-    /// store and default queue and nothing else, and both the code and the
-    /// data behind it are untouched by this field existing.
+    /// The namespaces and the applications this app reaches by name, as
+    /// `context.env.<NAME>`. These are the only platform resources an
+    /// application has: there is no unnamed namespace beside them.
     ///
     /// Judged by [`Self::validate`], unlike [`Self::limits`] and
     /// [`Self::compatibility`], because what is wrong with a binding
@@ -466,11 +451,6 @@ impl Manifest {
             }
             None => Ok(CompatibilityProfile::default()),
         }
-    }
-
-    /// Whether the app declared it uses a given platform service.
-    pub fn uses_service(&self, name: &str) -> bool {
-        self.services.get(name).copied().unwrap_or(false)
     }
 
     /// Route patterns in declaration order, which is what the runtime's

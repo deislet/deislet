@@ -3300,7 +3300,7 @@ mod tests {
             const url = new URL(context.request.url);
             const name = url.searchParams.get("binding");
             try {
-                const answer = await context.bindings[name].fetch("/hello?from=caller");
+                const answer = await context.env[name].fetch("/hello?from=caller");
                 return new Response(await answer.text(), { status: answer.status });
             } catch (e) {
                 return new Response("threw: " + e.message, { status: 599 });
@@ -3508,7 +3508,7 @@ mod tests {
         let bounce = r#"
             export default async function handler(context) {
                 try {
-                    const answer = await context.bindings.BACK.fetch("/back");
+                    const answer = await context.env.BACK.fetch("/back");
                     return new Response("unexpectedly reached: " + await answer.text(), { status: 200 });
                 } catch (e) {
                     return new Response("threw: " + e.message, { status: 598 });
@@ -3565,7 +3565,7 @@ mod tests {
         let link = r#"
             export default async function handler(context) {
                 try {
-                    const answer = await context.bindings.NEXT.fetch("/on");
+                    const answer = await context.env.NEXT.fetch("/on");
                     return new Response(await answer.text(), { status: answer.status });
                 } catch (e) {
                     return new Response("threw: " + e.message, { status: 596 });
@@ -3648,9 +3648,9 @@ mod tests {
 
         let twice = r#"
             export default async function handler(context) {
-                const first = await context.bindings.AUTH.fetch("/one");
+                const first = await context.env.AUTH.fetch("/one");
                 try {
-                    await context.bindings.AUTH.fetch("/two");
+                    await context.env.AUTH.fetch("/two");
                     return new Response("both went through", { status: 200 });
                 } catch (e) {
                     return new Response(
@@ -3955,7 +3955,7 @@ mod tests {
             export default async function handler(ctx) {
                 let kv = "no call";
                 try {
-                    await ctx.services.kv.get("k");
+                    await ctx.env.KV.get("k");
                 } catch (e) {
                     kv = String(e.message || e);
                 }
@@ -3964,7 +3964,7 @@ mod tests {
         "#;
 
         let env: HashMap<String, String> = [
-            ("DEIS_SERVICES", "kv"),
+            ("DEIS_BINDINGS", "KV:kv"),
             // Nothing listens on port 1: enough to prove a client was built.
             ("DEIS_STORE_ENDPOINT", "http://127.0.0.1:1"),
             ("LOG_LEVEL", "info"),
@@ -4001,7 +4001,7 @@ mod tests {
             .expect("the handler answers JSON");
         assert!(body.contains("LOG_LEVEL"), "{body}");
         assert!(
-            !body.contains("DEIS_STORE_ENDPOINT") && !body.contains("DEIS_SERVICES"),
+            !body.contains("DEIS_STORE_ENDPOINT") && !body.contains("DEIS_BINDINGS"),
             "platform wiring leaked into ctx.env: {body}"
         );
         assert!(
@@ -4613,7 +4613,7 @@ mod tests {
         "#;
         let forger = r#"
             export default async function handler(context) {
-                const answer = await context.bindings.AUTH.fetch("/probe", {
+                const answer = await context.env.AUTH.fetch("/probe", {
                     headers: {
                         "x-deis-caller": "admin-app.production",
                         "x-deis-tenant": "victim.production",
@@ -4694,7 +4694,7 @@ mod tests {
                         ["authorization", "Bearer caller"],
                     ],
                 });
-                const answer = await context.bindings.AUTH.fetch(outbound, {
+                const answer = await context.env.AUTH.fetch(outbound, {
                     headers: { authorization: "Bearer init" },
                 });
                 return new Response(await answer.text(), { status: answer.status });

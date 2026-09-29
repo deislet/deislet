@@ -106,8 +106,9 @@ pub fn is_valid_tenant_part(part: &str) -> bool {
 
 /// Header naming which namespace inside the tenant a storage call wants.
 ///
-/// Absent means the tenant's unnamed namespace, the one
-/// `context.services.kv` reaches. This header is deliberately *not* a
+/// Every call an application makes through a binding carries it; the store
+/// keys a call without one by the tenant alone, which no application
+/// reaches. This header is deliberately *not* a
 /// credential and does not need to be: the tenant is the one the caller's
 /// capability names, never something the request says, and a binding only
 /// selects a namespace inside that tenant, so the worst a forged value can
@@ -216,7 +217,7 @@ pub const STREAM_CHUNK_BYTES: usize = 1024 * 1024;
 ///
 /// It lives here rather than in either component because both ends have to
 /// spell it identically; a disagreement would show up as an application whose
-/// `ctx.services.kv` silently answers "service not available".
+/// storage bindings are silently never built.
 pub const STORE_ENDPOINT_ENV: &str = "DEIS_STORE_ENDPOINT";
 
 /// Deployment-env key carrying the deis-queue gRPC address, e.g.

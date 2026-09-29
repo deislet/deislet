@@ -137,7 +137,6 @@ pub struct HandlerInfo {
     pub route: String,
     pub has_default_export: bool,
     pub named_exports: Vec<String>,
-    pub used_services: Vec<String>,
     pub imports: Vec<String>,
     /// Every module specifier literal in the file, in source order. See
     /// `SpecifierLiteral` for why this exists next to `imports`.
@@ -268,7 +267,6 @@ pub struct StaticAsset {
 pub struct AdapterArtifacts {
     pub router_code: String,
     pub context_builder_code: String,
-    pub kv_adapter_code: Option<String>,
     pub config_files: Vec<(String, String)>,
     /// Provider-neutral JavaScript modules imported by generated adapter code.
     /// Paths are relative to the compiler's `_deis_internal/` directory.

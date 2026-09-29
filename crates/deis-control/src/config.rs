@@ -140,16 +140,16 @@ pub struct ControlConfig {
     /// deployment (docs/architecture.zh.md section 6); it is deliberately not
     /// a node-side setting, so moving deis-store does not mean editing every
     /// node's file. Leave it unset and applications that declare `kv`,
-    /// `database` or `blob` load fine but every `ctx.services` call they make
-    /// answers "service not available".
+    /// `database` or `blob` bindings load fine but those bindings are not
+    /// available to them.
     ///
     /// It is an address, not a credential: it is logged like any other
     /// variable.
     #[serde(default)]
     pub store_endpoint: Option<String>,
     /// gRPC address of deis-queue, same contract as [`Self::store_endpoint`].
-    /// Without it an app's `ctx.services.queue` fails and its declared queue
-    /// consumers never start, so messages pile up in deis-queue unread.
+    /// Without it an app's queue bindings fail every send and its declared
+    /// queue consumers never start, so messages pile up in deis-queue unread.
     #[serde(default)]
     pub queue_endpoint: Option<String>,
     /// Absolute path of the reviewed embedded-backend topology driver. When

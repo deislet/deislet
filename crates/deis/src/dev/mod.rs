@@ -14,8 +14,8 @@
 //! `context.env` are the production ones, not a local imitation of them.
 //! The parts that are genuinely absent are named in the banner rather than
 //! faked: without `--store` and `--queue` there is no KV, database, blob or
-//! queue, and `ctx.services.*` fails exactly as it would on a node that was
-//! never given their addresses.
+//! queue, and the bindings that need them fail exactly as they would on a node
+//! that was never given their addresses.
 
 pub mod node;
 pub mod pki;
@@ -304,37 +304,34 @@ fn deployment_env(options: &Options) -> HashMap<String, String> {
 
 /// Say plainly which parts of the platform are not present, and what the
 /// symptom will be. A dev server that stays quiet about this turns into a
-/// bug report about `ctx.services.kv` being broken.
+/// bug report about `env.KV` being broken.
 fn report_gaps(bundle: &Bundle, secrets: &BTreeMap<String, String>, options: &Options) {
-    let declared: Vec<&str> = bundle
+    let store_bindings: Vec<&str> = bundle
         .manifest
-        .services
+        .bindings
         .iter()
-        .filter(|(_, enabled)| **enabled)
-        .map(|(name, _)| name.as_str())
+        .filter(|(_, binding)| binding.kind.needs_store())
+        .map(|(name, _)| name)
         .collect();
+    let wants_queue = !bundle.manifest.queues.is_empty()
+        || bundle
+            .manifest
+            .bindings
+            .iter()
+            .any(|(_, binding)| binding.kind == deis_bundle::BindingKind::Queue);
 
-    let wants_queue = declared.contains(&"queue") || !bundle.manifest.queues.is_empty();
-    let wants_store = declared.iter().any(|s| *s != "queue");
-
-    if wants_store && options.store.is_none() {
+    if !store_bindings.is_empty() && options.store.is_none() {
         println!(
-            "  {} this app declares {} but no --store address was given, so every \
-             ctx.services.{{kv,database,blob}} call will fail. Start deis-store and pass --store \
-             http://127.0.0.1:8090.",
+            "  {} this app declares the storage binding(s) {} but no --store address was given, \
+             so they are not on env. Start deis-store and pass --store http://127.0.0.1:8090.",
             "!".yellow(),
-            declared
-                .iter()
-                .filter(|s| **s != "queue")
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", ")
+            store_bindings.join(", ")
         );
     }
     if wants_queue && options.queue.is_none() {
         println!(
-            "  {} this app uses a queue but no --queue address was given, so ctx.services.queue \
-             will fail and nothing will be consumed. Start deis-queue and pass --queue \
+            "  {} this app uses a queue but no --queue address was given, so every send will \
+             fail and nothing will be consumed. Start deis-queue and pass --queue \
              http://127.0.0.1:8091.",
             "!".yellow()
         );

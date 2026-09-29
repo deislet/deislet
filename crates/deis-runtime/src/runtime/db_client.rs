@@ -67,8 +67,7 @@ impl DbClient {
     /// Shares the channel: the tonic client is a reference-counted handle over
     /// one HTTP/2 connection, so a version declaring four namespaces holds
     /// four identities and one connection rather than four. `None` gives the
-    /// tenant's unnamed namespace, which is what an application that declares
-    /// no binding of this kind has always used.
+    /// tenant-level client this one was derived from.
     pub(crate) fn for_binding(&self, binding: Option<&str>) -> Result<Self> {
         let identity = self.identity.for_binding(binding)?;
         tracing::debug!(

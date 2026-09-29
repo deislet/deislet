@@ -2,7 +2,7 @@
 mod tests {
     use crate::config::ExecutionLimits;
     use crate::logging::{LogBuffer, RuntimeLayer};
-    use crate::runtime::bindings::{ServiceDeclaration, ServiceEndpoints, ServiceWiring};
+    use crate::runtime::bindings::{ServiceEndpoints, ServiceWiring};
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
     use crate::runtime::metrics::{
         recorder, CPU_CUTOFFS_TOTAL, CPU_MS_SUM, EXECUTION_MS_COUNT, REQUESTS_TOTAL,
@@ -276,7 +276,7 @@ export default function handler(context: any): Response {
                 if (env.QUEUE_GREETING !== "hello") {
                     throw new Error("env is not in the env position: " + JSON.stringify(env));
                 }
-                if (typeof context.services.kv !== "object") {
+                if (context.env !== env) {
                     throw new Error("context is not in the context position");
                 }
                 if (typeof context.log.info !== "function") {
@@ -426,7 +426,7 @@ export default function handler(context: any): Response {
                 if (env.CRON_GREETING !== "hello") {
                     throw new Error("env is not in the env position: " + JSON.stringify(env));
                 }
-                if (typeof context.services.kv !== "object") throw new Error("no services");
+                if (context.env !== env) throw new Error("context.env is not the env table");
                 if (typeof context.log.info !== "function") throw new Error("no context.log");
             }
         "#;
@@ -823,15 +823,16 @@ export default function handler(context: any): Response {
     #[tokio::test]
     async fn an_app_can_name_the_queue_it_sends_to() {
         // A consumer polls a named queue, so a producer has to be able to
-        // name one; without this everything an app sends lands in "default"
-        // and nothing consuming "jobs" would ever see it. An empty name is
-        // refused rather than silently turned into the default queue.
+        // name one; without this everything an app sends lands in the queue
+        // its binding names and nothing consuming "jobs" would ever see it. An
+        // empty name is refused rather than silently turned into another
+        // queue.
         let code = r#"
             export default async function handler(ctx) {
-                const named = ctx.services.queue.to("jobs");
+                const named = ctx.env.QUEUE.to("jobs");
                 let outcome = named && named.name === "jobs" ? "named jobs" : "wrong queue";
                 try {
-                    ctx.services.queue.to("");
+                    ctx.env.QUEUE.to("");
                     outcome += ", an empty name was accepted";
                 } catch (e) {
                     outcome += ", empty name rejected";
@@ -845,7 +846,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
-            &ServiceWiring::default(),
+            &crate::runtime::test_store::wiring_declaring(&["queue"]),
             // No pool behind this isolate, so a service call it made would be
             // refused as "not deployed on this node", which is what it is.
             ServiceRouter::detached(),
@@ -881,7 +882,7 @@ export default function handler(context: any): Response {
         let code = r#"
             export default async function handler(ctx) {
                 try {
-                    await ctx.services.queue.send({ work: 1 });
+                    await ctx.env.QUEUE.send({ work: 1 });
                     return new Response("accepted");
                 } catch (e) {
                     return new Response("refused: " + String(e.message || e));
@@ -894,7 +895,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
-            &ServiceWiring::default(),
+            &crate::runtime::test_store::wiring_declaring(&["queue"]),
             // No pool behind this isolate, so a service call it made would be
             // refused as "not deployed on this node", which is what it is.
             ServiceRouter::detached(),
@@ -1109,62 +1110,19 @@ export default function handler(context: any): Response {
     // --- bindings ----------------------------------------------------------
 
     #[tokio::test]
-    async fn a_service_the_app_did_not_declare_answers_that_it_is_unavailable() {
-        // The failure has to reach the app as a catchable error, not as a
-        // dead isolate.
-        let code = r#"
-            export default async function handler(ctx) {
-                try {
-                    await ctx.services.kv.get("anything");
-                    return new Response("unexpectedly reached the store");
-                } catch (e) {
-                    return new Response(String(e.message || e));
-                }
-            }
-        "#;
-
-        let mut runtime = AppRuntime::new(
-            "no_services_app".to_string(),
-            code.to_string(),
-            None,
-            IsolateSpec::default(),
-            &ServiceWiring::default(),
-            // No pool behind this isolate, so a service call it made would be
-            // refused as "not deployed on this node", which is what it is.
-            ServiceRouter::detached(),
-        )
-        .unwrap();
-        runtime.init_module().await.unwrap();
-
-        let (tx, rx) = oneshot::channel();
-        runtime
-            .execute_fetch(
-                "http://localhost/".to_string(),
-                "GET".to_string(),
-                Vec::new(),
-                None,
-                tx,
-            )
-            .await
-            .unwrap();
-        let (status, _, body) = rx.await.unwrap().unwrap();
-        let body = text(body);
-
-        assert_eq!(status, 200);
-        let body = body.unwrap_or_default();
-        assert!(
-            body.contains("not available"),
-            "an undeclared service must say so rather than hang or crash: {body}"
-        );
-    }
-
-    #[tokio::test]
     async fn a_declared_service_is_bound_and_its_failure_stays_inside_the_request() {
         // Nothing listens on port 1: the client exists, the call fails, and
         // the isolate survives to serve the next request.
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
+            bindings: {
+                let mut bindings = deis_bundle::DeclaredBindings::default();
+                bindings.insert(
+                    "KV",
+                    deis_bundle::Binding::storage(deis_bundle::BindingKind::Kv),
+                );
+                bindings
+            },
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:1".to_string()),
                 queue: None,
@@ -1176,7 +1134,7 @@ export default function handler(context: any): Response {
         let code = r#"
             export default async function handler(ctx) {
                 try {
-                    await ctx.services.kv.get("anything");
+                    await ctx.env.KV.get("anything");
                     return new Response("unexpectedly reached the store");
                 } catch (e) {
                     return new Response("call failed: " + String(e.message || e));
@@ -1277,7 +1235,7 @@ export default function handler(context: any): Response {
         let store = TestStore::start().await;
         let writer = r#"
             export default async function handler(ctx) {
-                await ctx.services.kv.put("proof", "separate-authority");
+                await ctx.env.KV.put("proof", "separate-authority");
                 return new Response("written");
             }
         "#;
@@ -1298,7 +1256,7 @@ export default function handler(context: any): Response {
 
         let reader = r#"
             export default async function handler(ctx) {
-                return new Response(JSON.stringify(await ctx.services.kv.get("proof")));
+                return new Response(JSON.stringify(await ctx.env.KV.get("proof")));
             }
         "#;
         assert_eq!(
@@ -1331,14 +1289,14 @@ export default function handler(context: any): Response {
         let store = TestStore::start().await;
         let code = r#"
             export default async function handler(ctx) {
-                await ctx.services.kv.put("avatar", "png-bytes", {
+                await ctx.env.KV.put("avatar", "png-bytes", {
                     metadata: { contentType: "image/png", width: 64 },
                 });
-                await ctx.services.kv.put("plain", "no-metadata-here");
+                await ctx.env.KV.put("plain", "no-metadata-here");
                 return new Response(JSON.stringify({
-                    withMetadata: await ctx.services.kv.getWithMetadata("avatar"),
-                    without: await ctx.services.kv.getWithMetadata("plain"),
-                    missing: await ctx.services.kv.getWithMetadata("never-written"),
+                    withMetadata: await ctx.env.KV.getWithMetadata("avatar"),
+                    without: await ctx.env.KV.getWithMetadata("plain"),
+                    missing: await ctx.env.KV.getWithMetadata("never-written"),
                 }));
             }
         "#;
@@ -1381,9 +1339,9 @@ export default function handler(context: any): Response {
                 const written = new Uint8Array(256);
                 for (let i = 0; i < 256; i++) written[i] = i;
 
-                await ctx.services.kv.put("blob", written);
+                await ctx.env.KV.put("blob", written);
                 const read = new Uint8Array(
-                    await ctx.services.kv.get("blob", { type: "arrayBuffer" })
+                    await ctx.env.KV.get("blob", { type: "arrayBuffer" })
                 );
 
                 let identical = read.length === written.length;
@@ -1423,12 +1381,12 @@ export default function handler(context: any): Response {
         let store = TestStore::start().await;
         let code = r#"
             export default async function handler(ctx) {
-                await ctx.services.kv.put("doc", JSON.stringify({ n: 7 }));
+                await ctx.env.KV.put("doc", JSON.stringify({ n: 7 }));
 
-                const plain = await ctx.services.kv.get("doc");
-                const asText = await ctx.services.kv.get("doc", { type: "text" });
-                const asJson = await ctx.services.kv.get("doc", { type: "json" });
-                const asBuffer = await ctx.services.kv.get("doc", { type: "arrayBuffer" });
+                const plain = await ctx.env.KV.get("doc");
+                const asText = await ctx.env.KV.get("doc", { type: "text" });
+                const asJson = await ctx.env.KV.get("doc", { type: "json" });
+                const asBuffer = await ctx.env.KV.get("doc", { type: "arrayBuffer" });
 
                 return new Response(JSON.stringify({
                     plainIsString: typeof plain === "string",
@@ -1438,7 +1396,7 @@ export default function handler(context: any): Response {
                     n: asJson.n,
                     bufferIsArrayBuffer: asBuffer instanceof ArrayBuffer,
                     bufferLength: asBuffer.byteLength,
-                    missing: await ctx.services.kv.get("absent", { type: "json" }),
+                    missing: await ctx.env.KV.get("absent", { type: "json" }),
                 }));
             }
         "#;
@@ -1473,11 +1431,11 @@ export default function handler(context: any): Response {
         let store = TestStore::start().await;
         let code = r#"
             export default async function handler(ctx) {
-                await ctx.services.kv.put("k", "v");
+                await ctx.env.KV.put("k", "v");
                 const attempts = {};
                 for (const type of ["stream", "nonsense"]) {
                     try {
-                        await ctx.services.kv.get("k", { type });
+                        await ctx.env.KV.get("k", { type });
                         attempts[type] = "accepted";
                     } catch (e) {
                         attempts[type] = String(e.message || e);
@@ -1519,26 +1477,26 @@ export default function handler(context: any): Response {
             export default async function handler(ctx) {
                 const bytes = new Uint8Array([104, 105]); // "hi"
 
-                await ctx.services.kv.put("as-string", "hi");
-                await ctx.services.kv.put("as-buffer", bytes.buffer);
-                await ctx.services.kv.put("as-view", bytes);
+                await ctx.env.KV.put("as-string", "hi");
+                await ctx.env.KV.put("as-buffer", bytes.buffer);
+                await ctx.env.KV.put("as-view", bytes);
                 // A view over part of a larger buffer must store its own
                 // window, not the whole allocation behind it.
                 const wide = new Uint8Array([0, 104, 105, 0]);
-                await ctx.services.kv.put("as-slice", wide.subarray(1, 3));
+                await ctx.env.KV.put("as-slice", wide.subarray(1, 3));
 
                 let refused = "accepted";
                 try {
-                    await ctx.services.kv.put("as-object", { not: "bytes" });
+                    await ctx.env.KV.put("as-object", { not: "bytes" });
                 } catch (e) {
                     refused = String(e.message || e);
                 }
 
                 return new Response(JSON.stringify({
-                    string: await ctx.services.kv.get("as-string"),
-                    buffer: await ctx.services.kv.get("as-buffer"),
-                    view: await ctx.services.kv.get("as-view"),
-                    slice: await ctx.services.kv.get("as-slice"),
+                    string: await ctx.env.KV.get("as-string"),
+                    buffer: await ctx.env.KV.get("as-buffer"),
+                    view: await ctx.env.KV.get("as-view"),
+                    slice: await ctx.env.KV.get("as-slice"),
                     refused,
                 }));
             }
@@ -1570,10 +1528,10 @@ export default function handler(context: any): Response {
         let store = TestStore::start().await;
         let code = r#"
             export default async function handler(ctx) {
-                await ctx.services.kv.put("session", "abc", { expirationTtl: 3600 });
-                await ctx.services.kv.put("forever", "abc");
-                const leased = await ctx.services.kv.getWithMetadata("session");
-                const permanent = await ctx.services.kv.getWithMetadata("forever");
+                await ctx.env.KV.put("session", "abc", { expirationTtl: 3600 });
+                await ctx.env.KV.put("forever", "abc");
+                const leased = await ctx.env.KV.getWithMetadata("session");
+                const permanent = await ctx.env.KV.getWithMetadata("forever");
                 return new Response(JSON.stringify({
                     expiration: leased.expiration,
                     permanent: permanent.expiration,
@@ -1614,12 +1572,12 @@ export default function handler(context: any): Response {
 
         let code = r#"
             export default async function handler(ctx) {
-                await ctx.services.kv.put("greeting", "hello", {
+                await ctx.env.KV.put("greeting", "hello", {
                     expirationTtl: 3600,
                     metadata: { source: "test" },
                 });
-                const value = await ctx.services.kv.get("greeting");
-                const missing = await ctx.services.kv.get("nothing-here");
+                const value = await ctx.env.KV.get("greeting");
+                const missing = await ctx.env.KV.get("nothing-here");
                 return new Response(JSON.stringify({ value, missing }));
             }
         "#;
@@ -1668,7 +1626,7 @@ export default function handler(context: any): Response {
         let code = r#"
             export default async function handler(ctx) {
                 try {
-                    await ctx.services.kv.put("k", "v", { expirationTtl: 0 });
+                    await ctx.env.KV.put("k", "v", { expirationTtl: 0 });
                     return new Response("accepted");
                 } catch (e) {
                     return new Response(String(e.message || e));
@@ -1681,7 +1639,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
-            &ServiceWiring::default(),
+            &crate::runtime::test_store::wiring_declaring(&["kv"]),
             // No pool behind this isolate, so a service call it made would be
             // refused as "not deployed on this node", which is what it is.
             ServiceRouter::detached(),
@@ -1717,7 +1675,7 @@ export default function handler(context: any): Response {
         let code = r#"
             export default async function handler(ctx) {
                 try {
-                    await ctx.services.kv.put("k", "v", { expirationTtl: 59 });
+                    await ctx.env.KV.put("k", "v", { expirationTtl: 59 });
                     return new Response("accepted");
                 } catch (e) {
                     return new Response(String(e.message || e));
@@ -1730,7 +1688,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
-            &ServiceWiring::default(),
+            &crate::runtime::test_store::wiring_declaring(&["kv"]),
             ServiceRouter::detached(),
         )
         .unwrap();
@@ -1763,7 +1721,7 @@ export default function handler(context: any): Response {
         let code = r#"
             export default async function handler(ctx) {
                 try {
-                    await ctx.services.kv.put("k", "v", { metadata: "m".repeat(1024) });
+                    await ctx.env.KV.put("k", "v", { metadata: "m".repeat(1024) });
                     return new Response("accepted");
                 } catch (e) {
                     return new Response(String(e.message || e));
@@ -1776,7 +1734,7 @@ export default function handler(context: any): Response {
             code.to_string(),
             None,
             IsolateSpec::default(),
-            &ServiceWiring::default(),
+            &crate::runtime::test_store::wiring_declaring(&["kv"]),
             ServiceRouter::detached(),
         )
         .unwrap();
@@ -3045,7 +3003,7 @@ export default function handler(context: any): Response {
         // `BroadcastChannel` would post messages that no receiver anywhere can
         // ever observe. A name that accepts every send and delivers none is a
         // silent data-loss bug in an application that trusted it. Use a queue
-        // (`context.services.queue`), which is durable and crosses nodes.
+        // (`context.env.QUEUE`), which is durable and crosses nodes.
         "BroadcastChannel",
     ];
 
@@ -4023,7 +3981,14 @@ export default function handler(context: any): Response {
         // widen it into deis-store by accident.
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
+            bindings: {
+                let mut bindings = deis_bundle::DeclaredBindings::default();
+                bindings.insert(
+                    "KV",
+                    deis_bundle::Binding::storage(deis_bundle::BindingKind::Kv),
+                );
+                bindings
+            },
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
                 queue: None,
@@ -4043,7 +4008,7 @@ export default function handler(context: any): Response {
 
         assert!(body.starts_with("refused:TypeError:"), "{body}");
         assert!(body.contains("platform"), "{body}");
-        assert!(body.contains("ctx.services"), "{body}");
+        assert!(body.contains("env.<NAME>"), "{body}");
     }
 
     // ---------------------------------------------------------------
@@ -5793,7 +5758,7 @@ export default function handler(context: any): Response {
 
         let code = r#"
             export default async function handler(ctx) {
-                const blob = ctx.services.blob;
+                const blob = ctx.env.BLOB;
 
                 // A string, which has to be encoded on the way in.
                 await blob.put("greeting.txt", "hello é€🚀");
@@ -5861,7 +5826,7 @@ export default function handler(context: any): Response {
     #[tokio::test]
     async fn an_app_lists_heads_ranges_and_conditionally_writes_through_its_blob_binding() {
         // The other four object-store verbs, exercised the only way that
-        // proves an application can reach them: through `ctx.services.blob` in
+        // proves an application can reach them: through `ctx.env.BLOB` in
         // a real isolate, against a real deis-store. Each of them exists on
         // the wire and in the client, and each of them would still be
         // unreachable if `js/runtime.js` did not spell the call.
@@ -5871,7 +5836,7 @@ export default function handler(context: any): Response {
 
         let code = r#"
             export default async function handler(ctx) {
-                const blob = ctx.services.blob;
+                const blob = ctx.env.BLOB;
 
                 await blob.put("img/a.png", "aaaa", { contentType: "image/png" });
                 await blob.put("img/b.png", "bbbb");

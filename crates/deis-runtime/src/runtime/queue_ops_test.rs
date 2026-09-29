@@ -5,13 +5,13 @@
 // `sendBatch` is decided and where the wiring between the two halves either
 // exists or does not. An op that is registered and called from nowhere is the
 // failure this repository keeps producing, so the second test drives the whole
-// path from `ctx.services.queue.sendBatch` down to the op and asserts on the
+// path from `ctx.env.QUEUE.sendBatch` down to the op and asserts on the
 // op's own answer.
 
 #[cfg(test)]
 mod tests {
     use crate::runtime::isolate::{AppRuntime, IsolateSpec};
-    use crate::runtime::{ServiceRouter, ServiceWiring};
+    use crate::runtime::ServiceRouter;
 
     /// Run one handler and hand back what it answered.
     async fn answer(code: &str) -> (u16, String) {
@@ -20,9 +20,10 @@ mod tests {
             code.to_string(),
             None,
             IsolateSpec::default(),
-            // No queue endpoint, so no queue client is installed: the ops are
-            // reached, and answer that the service is not available.
-            &ServiceWiring::default(),
+            // A queue binding and no queue endpoint, so no queue client is
+            // installed: the ops are reached, and answer that the service is
+            // not available.
+            &crate::runtime::test_store::wiring_declaring(&["queue"]),
             // No pool behind this isolate, so every service call it makes is
             // refused as "not deployed on this node" -- which is what it is.
             ServiceRouter::detached(),
@@ -62,7 +63,7 @@ mod tests {
             r#"
             export default async function handler(context) {
                 try {
-                    await context.services.queue.sendBatch(["a bare string"]);
+                    await context.env.QUEUE.sendBatch(["a bare string"]);
                     return new Response("no refusal");
                 } catch (e) {
                     return new Response(String(e));
@@ -96,7 +97,7 @@ mod tests {
             r#"
             export default async function handler(context) {
                 try {
-                    await context.services.queue.sendBatch([
+                    await context.env.QUEUE.sendBatch([
                         { body: "one" },
                         { body: { two: true } },
                         { body: new Uint8Array([1, 2, 3]) },
@@ -128,7 +129,7 @@ mod tests {
             r#"
             export default async function handler(context) {
                 try {
-                    await context.services.queue.sendBatch([]);
+                    await context.env.QUEUE.sendBatch([]);
                     return new Response("no refusal");
                 } catch (e) {
                     return new Response(String(e));

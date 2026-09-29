@@ -305,8 +305,8 @@ data_dir = "/var/lib/deis-control"
 # delivery has its own configuration.
 #
 # Leave them unset and applications that declare kv / database / blob /
-# queue still load, but every ctx.services call they make answers "service
-# not available" and their declared queue consumers never start.
+# queue bindings still load, but those bindings are not available to them
+# and their declared queue consumers never start.
 #
 # They are addresses, not credentials, and are logged like any variable. Both
 # services serve TLS only, so the addresses are https://: a node checks

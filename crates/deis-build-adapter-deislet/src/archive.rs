@@ -121,7 +121,6 @@ mod tests {
             app: "demo".to_string(),
             entry: WORKER_ENTRY.to_string(),
             runtime: Some("standard-v1".to_string()),
-            services: Default::default(),
             bindings: Default::default(),
             callable_by: Vec::new(),
             environment: deis_wire::EnvironmentDeclarations::new(

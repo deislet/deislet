@@ -225,7 +225,6 @@ mod tests {
             route: "/test".to_string(),
             has_default_export: has_default,
             named_exports: vec![],
-            used_services: vec![],
             imports: vec![],
             specifier_literals: vec![],
             module_references: vec![],

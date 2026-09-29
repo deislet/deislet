@@ -88,16 +88,17 @@ struct Target {
 ///
 /// Only `deis kv`, `deis db` and `deis blob` take it, because a binding is a
 /// namespace inside one tenant's storage and nothing else in this CLI is about
-/// storage. Leaving it out means the tenant's *unnamed* namespace, which is
-/// what `context.services.kv`, `.database` and `.blob` reach and where an
-/// application that declares no binding keeps everything it has.
+/// storage. An application reaches its data only through the bindings it
+/// declared, so this names one of those; leaving it out means the
+/// tenant-level namespace, which no application reaches.
 #[derive(Args, Clone, Debug, Default)]
 struct DataTarget {
     #[command(flatten)]
     target: Target,
 
-    /// Named binding to act in. Omitted means the namespace
-    /// `context.services.*` uses.
+    /// Binding to act in, as the application declared it (`env.<NAME>`).
+    /// Omitted means the tenant-level namespace, which no application
+    /// reaches.
     #[arg(long, value_name = "NAME")]
     binding: Option<String>,
 }
@@ -162,8 +163,8 @@ enum Commands {
         #[arg(long)]
         minify: bool,
 
-        /// deis-store address, if one is running. Without it every
-        /// ctx.services.{kv,database,blob} call fails.
+        /// deis-store address, if one is running. Without it the app's kv,
+        /// database and blob bindings are not available.
         #[arg(long, value_name = "URL")]
         store: Option<String>,
 

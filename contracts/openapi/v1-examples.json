@@ -482,6 +482,11 @@
             "id": "018f2518-7e38-7f80-8000-000000000001",
             "manifest": {
               "app": "demo",
+              "bindings": {
+                "KV": {
+                  "kind": "kv"
+                }
+              },
               "entry": "worker/index.js",
               "environment": {
                 "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
@@ -499,10 +504,7 @@
                 "schemaVersion": 1,
                 "standardVersion": "edge-canon.next@0000000000000000000000000000000000000000"
               },
-              "schema": 2,
-              "services": {
-                "kv": true
-              }
+              "schema": 2
             },
             "number": 1
           }
@@ -715,6 +717,11 @@
           "id": "018f2518-7e38-7f80-8000-000000000001",
           "manifest": {
             "app": "demo",
+            "bindings": {
+              "KV": {
+                "kind": "kv"
+              }
+            },
             "entry": "worker/index.js",
             "environment": {
               "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
@@ -732,10 +739,7 @@
               "schemaVersion": 1,
               "standardVersion": "edge-canon.next@0000000000000000000000000000000000000000"
             },
-            "schema": 2,
-            "services": {
-              "kv": true
-            }
+            "schema": 2
           },
           "number": 1
         }
@@ -981,6 +985,11 @@
           "id": "018f2518-7e38-7f80-8000-000000000001",
           "manifest": {
             "app": "demo",
+            "bindings": {
+              "KV": {
+                "kind": "kv"
+              }
+            },
             "entry": "worker/index.js",
             "environment": {
               "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
@@ -998,10 +1007,7 @@
               "schemaVersion": 1,
               "standardVersion": "edge-canon.next@0000000000000000000000000000000000000000"
             },
-            "schema": 2,
-            "services": {
-              "kv": true
-            }
+            "schema": 2
           },
           "number": 1
         }
@@ -1019,6 +1025,11 @@
         "id": "018f2518-7e38-7f80-8000-000000000001",
         "manifest": {
           "app": "demo",
+          "bindings": {
+            "KV": {
+              "kind": "kv"
+            }
+          },
           "entry": "worker/index.js",
           "environment": {
             "$schema": "https://github.com/deislet/edge-canon/schemas/environment-secrets.schema.json",
@@ -1036,10 +1047,7 @@
             "schemaVersion": 1,
             "standardVersion": "edge-canon.next@0000000000000000000000000000000000000000"
           },
-          "schema": 2,
-          "services": {
-            "kv": true
-          }
+          "schema": 2
         },
         "number": 1
       },

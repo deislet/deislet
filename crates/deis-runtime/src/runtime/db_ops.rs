@@ -9,13 +9,11 @@ use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// The client this isolate's `ctx.services.database` is wired to, or the
-/// `{ error }` the ops answer with when the application never declared the
-/// service. Returned rather than thrown for the same reason the calls below
+/// The client a database binding is wired to, or the `{ error }` the ops
+/// answer with when the application never declared it. Returned rather than thrown for the same reason the calls below
 /// report a store failure that way: `js/runtime.js` turns exactly one shape
 /// into an exception, so there is one place that decides what a handler sees.
-/// The database one call means: the tenant's unnamed one when `binding` is
-/// empty, and the named one otherwise.
+/// The database one call means: the binding `binding` names.
 ///
 /// A binding is a *second database file* in deis-store, not a schema inside
 /// one, so the handles this module hands out - a prepared statement, an open
@@ -28,7 +26,7 @@ fn db_client(state: &Rc<RefCell<OpState>>, binding: &str) -> Result<DbClient, Js
     bound_client(state, "database", binding).map_err(|error| serde_json::json!({ "error": error }))
 }
 
-/// What `ctx.services.database.transaction` may ask for when it opens one.
+/// What `ctx.env.DB.transaction` may ask for when it opens one.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionOptions {
@@ -185,7 +183,7 @@ fn decode_batch_statements(
 ///
 /// Sends several statements as one request, which deis-store runs inside one
 /// transaction: either every statement was applied or none was. It is the
-/// primitive behind `ctx.services.database.batch`, and the cheap half of the
+/// primitive behind `ctx.env.DB.batch`, and the cheap half of the
 /// pair it forms with `transaction` -- a batch is one round trip and cannot
 /// look at a result before sending the next statement; a transaction can, and
 /// pays for it by holding one of the tenant's connections open.

@@ -1249,7 +1249,7 @@ pub(crate) mod tests {
         assert!(assignments[0]["bundle_sha"].as_str().unwrap().len() == 64);
         // The list carries the environment a push would have carried. Without
         // it a node that restarts loads the right code with no storage
-        // address and no secret, and only its ctx.services calls tell it so.
+        // address and no secret, and only its missing bindings tell it so.
         assert_eq!(
             assignments[0]["env"][deis_wire::conventions::STORE_ENDPOINT_ENV],
             "http://127.0.0.1:8090"

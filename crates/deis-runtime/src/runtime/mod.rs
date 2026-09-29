@@ -35,9 +35,9 @@ pub(crate) mod test_store;
 mod ws_server_ops;
 
 pub use bindings::{
-    strip_reserved_env, wire_deployment_env, AppServices, QueueConsumerSpec, ServiceDeclaration,
-    ServiceEndpoints, ServiceKind, ServiceWiring, BINDINGS_KEY, CALLABLE_BY_KEY,
-    QUEUE_CONSUMERS_KEY, QUEUE_ENDPOINT_KEY, RESERVED_ENV_KEYS, SERVICES_KEY, STORE_ENDPOINT_KEY,
+    strip_reserved_env, wire_deployment_env, AppServices, QueueConsumerSpec, ServiceEndpoints,
+    ServiceKind, ServiceWiring, BINDINGS_KEY, CALLABLE_BY_KEY, QUEUE_CONSUMERS_KEY,
+    QUEUE_ENDPOINT_KEY, RESERVED_ENV_KEYS, STORE_ENDPOINT_KEY,
 };
 pub use blob_client::BlobClient;
 pub use blob_ops::init_blob_extension;

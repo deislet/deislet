@@ -4,7 +4,7 @@
 //! deis-runtime loads one ESM module per app, keeps its default export, and
 //! calls it once per request with a context it builds itself
 //! (`crates/deis-runtime/src/runtime/js/runtime.js`). That context carries
-//! `request`, `env`, platform services and `waitUntil`, and nothing about
+//! `request`, `env` and `waitUntil`, and nothing about
 //! *which* handler should run - the runtime has no idea an app has more than
 //! one. Provider-only fields stay behind this bridge.
 //!

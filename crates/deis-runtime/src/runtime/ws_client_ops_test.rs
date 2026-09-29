@@ -396,7 +396,7 @@ async fn an_outbound_websocket_to_a_platform_service_is_refused() {
 
     assert!(body.starts_with("refused:"), "{body}");
     assert!(body.contains("platform"), "{body}");
-    assert!(body.contains("ctx.services"), "{body}");
+    assert!(body.contains("env.<NAME>"), "{body}");
 }
 
 #[tokio::test]

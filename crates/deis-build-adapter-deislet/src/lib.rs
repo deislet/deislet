@@ -80,7 +80,6 @@ pub fn generate(
     Ok(AdapterArtifacts {
         router_code: generate_entry_module(&plan),
         context_builder_code: String::new(),
-        kv_adapter_code: None,
         config_files: Vec::new(),
         support_files: vec![(
             "edge-canon-runtime.js".to_string(),

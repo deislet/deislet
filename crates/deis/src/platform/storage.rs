@@ -87,10 +87,9 @@ struct Identity {
     tenant: String,
     /// Raw token string for building the Authorization: Bearer header.
     token: Option<String>,
-    /// Which namespace inside the tenant these calls act in, or `None` for the
-    /// tenant's unnamed one - the namespace an application reaches through
-    /// `context.services.kv` and the one every application had before named
-    /// bindings existed.
+    /// Which namespace inside the tenant these calls act in: a binding an
+    /// application declared, or `None` for the tenant-level namespace, which
+    /// no application reaches.
     ///
     /// Not part of the credential and deliberately not treated as one: the
     /// token authorises the tenant, and a binding is always inside the tenant
@@ -128,8 +127,8 @@ impl Identity {
                         bail!(
                             "{binding:?} is not a binding name: a name is 1 to 64 characters of \
                          ASCII letters, digits, '_' or '-', because it becomes part of a \
-                         directory and a database file name in deis-store. Leave --binding out \
-                         to read and write the namespace `context.services.kv` uses."
+                         directory and a database file name in deis-store. Name the binding \
+                         as the application declared it."
                         );
                     }
                     Some(binding.parse::<MetadataValue<Ascii>>().map_err(|_| {
@@ -155,7 +154,7 @@ impl Identity {
         }
         // Stamped here rather than per call for the reason the token is: a
         // call that named the tenant and forgot the binding would read and
-        // write the unnamed namespace while the operator believed they were
+        // write the tenant-level namespace while the operator believed they were
         // looking at the one they asked for, and nothing would fail.
         if let Some(binding) = &self.binding_header {
             request
@@ -385,10 +384,8 @@ impl StorageSession {
     /// socket yet - `connect_lazy` defers that to the first RPC - so a
     /// deis-store that is down does not stop this session from being built,
     /// only from doing anything.
-    /// `binding` names one of the tenant's named namespaces, or `None` for
-    /// its unnamed one - which is what `context.services.kv`, `.database` and
-    /// `.blob` reach, and where an application that declares no binding keeps
-    /// everything it has.
+    /// `binding` names one of the tenant's bindings, or `None` for the
+    /// tenant-level namespace, which no application reaches.
     pub fn connect(
         endpoint: &str,
         tenant: &str,

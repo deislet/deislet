@@ -1394,29 +1394,10 @@ impl Compiler {
         // Whether a backend conforms to their standard semantics is decided
         // by the Edge Canon suite, not assumed here.
 
-        // Detect extended service configuration
-        if let Some(ref services) = config.services {
-            if let Some(ref db) = services.database {
-                if db.enabled {
-                    features.push(Feature::SQLDatabase);
-                }
-            }
-            if let Some(ref blob) = services.blob {
-                if blob.enabled {
-                    features.push(Feature::ObjectStorage);
-                }
-            }
-            if let Some(ref queue) = services.queue {
-                if queue.enabled {
-                    features.push(Feature::Queues);
-                }
-            }
-        }
-
         // A declared consumer or schedule is a use of the feature just as much
         // as a binding is: an app whose cron never fires is broken whether or
         // not it also calls a service.
-        if !config.queues.is_empty() && !features.contains(&Feature::Queues) {
+        if !config.queues.is_empty() {
             features.push(Feature::Queues);
         }
         if !config.cron.is_empty() {
@@ -2048,27 +2029,6 @@ impl Compiler {
             .iter()
             .map(|(name, binding)| format!("{name} ({})", binding.kind))
             .collect::<Vec<_>>();
-        if let Some(services) = &config.services {
-            for (name, enabled) in [
-                ("kv", services.kv.as_ref().is_some_and(|item| item.enabled)),
-                (
-                    "database",
-                    services.database.as_ref().is_some_and(|item| item.enabled),
-                ),
-                (
-                    "blob",
-                    services.blob.as_ref().is_some_and(|item| item.enabled),
-                ),
-                (
-                    "queue",
-                    services.queue.as_ref().is_some_and(|item| item.enabled),
-                ),
-            ] {
-                if enabled {
-                    declarations.push(format!("unnamed service {name}"));
-                }
-            }
-        }
         if !config.callable_by.is_empty() {
             declarations.push("service-binding ingress policy".into());
         }
@@ -2570,16 +2530,6 @@ impl Compiler {
                 "_deis_internal/adapters/context-builder.ts".to_string(),
                 artifacts.context_builder_code.clone(),
             );
-        }
-
-        if let Some(ref kv) = artifacts.kv_adapter_code {
-            fs::write(adapters_dir.join("kv-adapter.ts"), kv)?;
-            if should_collect_memory {
-                memory_system_files.insert(
-                    "_deis_internal/adapters/kv-adapter.ts".to_string(),
-                    kv.clone(),
-                );
-            }
         }
 
         // Handle Code (Bundle or Skip)

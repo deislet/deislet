@@ -20,6 +20,17 @@ mod tests {
         }
     }
 
+    /// One binding of each named storage kind, named after it; see
+    /// [`crate::runtime::test_store::binding_for_kind`].
+    fn declaring(kinds: &[&str]) -> deis_bundle::DeclaredBindings {
+        let mut bindings = deis_bundle::DeclaredBindings::default();
+        for kind in kinds {
+            let (name, kind) = crate::runtime::test_store::binding_for_kind(kind);
+            bindings.insert(name, deis_bundle::Binding::storage(kind));
+        }
+        bindings
+    }
+
     fn manifest(json: &str) -> deis_bundle::Manifest {
         deis_bundle::Manifest::parse(&deis_bundle::complete_manifest_json(json))
             .expect("test manifest parses")
@@ -31,7 +42,7 @@ mod tests {
         // not the app's configuration, and an app variable spelled like one
         // of these must not be able to point a client somewhere else.
         let mut map = env(&[
-            ("DEIS_SERVICES", "kv,queue"),
+            ("DEIS_BINDINGS", "KV:kv,QUEUE:queue"),
             ("DEIS_STORE_ENDPOINT", "http://127.0.0.1:8090"),
             ("DEIS_QUEUE_ENDPOINT", "http://127.0.0.1:8091"),
             ("DEIS_QUEUE_CONSUMERS", "jobs:5"),
@@ -41,9 +52,10 @@ mod tests {
         let wiring = ServiceWiring::take_from_env(&mut map);
 
         assert_eq!(map, env(&[("LOG_LEVEL", "info")]));
-        assert!(wiring.declaration.declares(ServiceKind::Kv));
-        assert!(wiring.declaration.declares(ServiceKind::Queue));
-        assert!(!wiring.declaration.declares(ServiceKind::Blob));
+        let connected = wiring.connected_kinds();
+        assert!(connected.contains(&ServiceKind::Kv));
+        assert!(connected.contains(&ServiceKind::Queue));
+        assert!(!connected.contains(&ServiceKind::Blob));
         assert_eq!(
             wiring.endpoints.store.as_deref(),
             Some("http://127.0.0.1:8090")
@@ -69,7 +81,7 @@ mod tests {
     #[test]
     fn a_consumer_carries_its_concurrency_through_the_env_encoding() {
         let original = ServiceWiring {
-            declaration: ServiceDeclaration::from_names(["queue"]),
+            bindings: declaring(&["queue"]),
             endpoints: ServiceEndpoints {
                 store: None,
                 queue: Some("http://queue:8091".to_string()),
@@ -118,7 +130,7 @@ mod tests {
         // halves disagree the symptom is a service that is silently absent,
         // so they are the same code and this test holds them together.
         let original = ServiceWiring {
-            declaration: ServiceDeclaration::from_names(["kv", "database", "blob", "queue"]),
+            bindings: declaring(&["kv", "database", "blob", "queue"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://store:8090".to_string()),
                 queue: Some("http://queue:8091".to_string()),
@@ -163,13 +175,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_service_name_is_skipped() {
-        let declaration = ServiceDeclaration::from_names(["kv", "telepathy"]);
-        assert!(declaration.declares(ServiceKind::Kv));
-        assert_eq!(declaration.to_csv(), "kv");
-    }
-
-    #[test]
     fn a_consumer_with_an_unreadable_batch_size_keeps_the_queue() {
         // Losing the size means polling with the default; losing the queue
         // would mean never consuming it at all.
@@ -193,14 +198,14 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_declares_only_the_services_set_to_true() {
+    fn a_manifest_connects_only_what_its_bindings_and_consumers_need() {
         let wiring = ServiceWiring::from_manifest(
             &manifest(
                 r#"{
                     "schema": 1,
                     "app": "demo",
                     "entry": "worker/index.js",
-                    "services": { "kv": true, "database": false, "blob": false, "queue": true },
+                    "bindings": { "KV": { "kind": "kv" } },
                     "queues": [{ "name": "jobs", "batch_size": 4 }]
                 }"#,
             ),
@@ -210,7 +215,11 @@ mod tests {
             },
         );
 
-        assert_eq!(wiring.declaration.to_csv(), "kv,queue");
+        // The queue is connected for the consumer, with no queue binding.
+        assert_eq!(
+            wiring.connected_kinds().into_iter().collect::<Vec<_>>(),
+            vec![ServiceKind::Kv, ServiceKind::Queue]
+        );
         assert_eq!(wiring.consumers.len(), 1);
         assert_eq!(wiring.consumers[0].batch_size, Some(4));
     }
@@ -221,7 +230,7 @@ mod tests {
         // to one.
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
+            bindings: declaring(&["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
                 queue: Some("http://127.0.0.1:8091".to_string()),
@@ -231,9 +240,13 @@ mod tests {
         };
 
         let services = connect_or_panic("demo.production", &wiring);
-        assert!(services.kv.get("").is_some());
-        assert!(services.database.get("").is_none());
-        assert!(services.blob.get("").is_none());
+        assert!(services.kv.get("KV").is_some());
+        assert!(
+            services.kv.get("").is_none(),
+            "there is no namespace without a name"
+        );
+        assert!(services.database.is_empty());
+        assert!(services.blob.is_empty());
         assert!(services.queue.is_none(), "queue was not declared");
     }
 
@@ -241,7 +254,7 @@ mod tests {
     async fn every_declared_service_gets_a_client_stamped_with_the_tenant() {
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv", "database", "blob", "queue"]),
+            bindings: declaring(&["kv", "database", "blob", "queue"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
                 queue: Some("http://127.0.0.1:8091".to_string()),
@@ -256,15 +269,15 @@ mod tests {
         let services = connect_or_panic("demo-app.preview-7", &wiring);
         let tenant = crate::runtime::tenant::test_tenant("demo-app.preview-7");
         assert_eq!(
-            services.kv.get("").map(|c| c.tenant()),
+            services.kv.get("KV").map(|c| c.tenant()),
             Some(tenant.as_str())
         );
         assert_eq!(
-            services.database.get("").map(|c| c.tenant()),
+            services.database.get("DB").map(|c| c.tenant()),
             Some(tenant.as_str())
         );
         assert_eq!(
-            services.blob.get("").map(|c| c.tenant()),
+            services.blob.get("BLOB").map(|c| c.tenant()),
             Some(tenant.as_str())
         );
         assert_eq!(
@@ -281,7 +294,7 @@ mod tests {
         // must never touch.
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
+            bindings: declaring(&["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
                 queue: None,
@@ -306,7 +319,7 @@ mod tests {
         // rather than the node refusing to load the app.
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
+            bindings: declaring(&["kv"]),
             endpoints: ServiceEndpoints::default(),
             consumers: Vec::new(),
             ..ServiceWiring::default()
@@ -321,7 +334,7 @@ mod tests {
         // so it is reported at load time instead of on every call.
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
+            bindings: declaring(&["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("not a url".to_string()),
                 queue: None,
@@ -346,7 +359,7 @@ mod tests {
         // has to recover by itself once the store is back.
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
+            bindings: declaring(&["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:1".to_string()),
                 queue: None,
@@ -361,14 +374,14 @@ mod tests {
             Ok(services) => services,
             Err(error) => panic!("a lazy client is built even when nothing answers: {error}"),
         };
-        assert!(services.kv.get("").is_some());
+        assert!(services.kv.get("KV").is_some());
     }
 
     #[test]
     fn a_tenant_that_cannot_be_a_header_is_refused() {
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["kv"]),
+            bindings: declaring(&["kv"]),
             endpoints: ServiceEndpoints {
                 store: Some("http://127.0.0.1:8090".to_string()),
                 queue: None,
@@ -383,7 +396,7 @@ mod tests {
     fn consumers_are_not_started_without_a_queue_address() {
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["queue"]),
+            bindings: declaring(&["queue"]),
             endpoints: ServiceEndpoints::default(),
             consumers: vec![QueueConsumerSpec {
                 name: "jobs".to_string(),
@@ -396,10 +409,11 @@ mod tests {
     }
 
     #[test]
-    fn consumers_are_not_started_without_the_queue_service_declared() {
+    fn a_consumer_needs_no_queue_binding_to_be_started() {
+        // A consumer is handed its batches over deis-queue and settles them
+        // over the same connection, so declaring the consumer is enough.
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::new(),
             endpoints: ServiceEndpoints {
                 store: None,
                 queue: Some("http://127.0.0.1:8091".to_string()),
@@ -411,14 +425,15 @@ mod tests {
             }],
             ..ServiceWiring::default()
         };
-        assert!(wiring.active_consumers("demo.production").is_empty());
+        assert_eq!(wiring.active_consumers("demo.production").len(), 1);
+        assert!(wiring.connected_kinds().contains(&ServiceKind::Queue));
     }
 
     #[test]
     fn consumers_are_started_when_both_halves_are_present() {
         let wiring = ServiceWiring {
             storage_token: None,
-            declaration: ServiceDeclaration::from_names(["queue"]),
+            bindings: declaring(&["queue"]),
             endpoints: ServiceEndpoints {
                 store: None,
                 queue: Some("http://127.0.0.1:8091".to_string()),
@@ -450,7 +465,7 @@ mod tests {
                     "schema": 1,
                     "app": "demo",
                     "entry": "worker/index.js",
-                    "services": { "kv": true, "queue": true },
+                    "bindings": { "KV": { "kind": "kv" }, "QUEUE": { "kind": "queue" } },
                     "queues": [{ "name": "jobs", "batch_size": 3 }]
                 }"#,
             ),
@@ -458,8 +473,8 @@ mod tests {
         );
 
         assert_eq!(
-            map.get("DEIS_SERVICES").map(String::as_str),
-            Some("kv,queue")
+            map.get("DEIS_BINDINGS").map(String::as_str),
+            Some("KV:kv,QUEUE:queue")
         );
         assert_eq!(
             map.get("DEIS_QUEUE_CONSUMERS").map(String::as_str),
@@ -500,7 +515,7 @@ mod tests {
                     "schema": 1,
                     "app": "demo",
                     "entry": "worker/index.js",
-                    "services": { "kv": true, "queue": true }
+                    "bindings": { "KV": { "kind": "kv" }, "QUEUE": { "kind": "queue" } }
                 }"#,
             ),
             &mut map,
@@ -519,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deployment_without_addresses_declares_services_but_binds_none() {
+    fn a_deployment_without_addresses_declares_bindings_but_binds_none() {
         let mut map = env(&[("LOG_LEVEL", "info")]);
         wire_deployment_env(
             &manifest(
@@ -527,26 +542,26 @@ mod tests {
                     "schema": 1,
                     "app": "demo",
                     "entry": "worker/index.js",
-                    "services": { "kv": true }
+                    "bindings": { "KV": { "kind": "kv" } }
                 }"#,
             ),
             &mut map,
         );
 
         let wiring = ServiceWiring::take_from_env(&mut map);
-        assert!(wiring.declaration.declares(ServiceKind::Kv));
+        assert!(wiring.bindings.get("KV").is_some());
         assert_eq!(wiring.endpoints.store, None);
     }
 
     #[test]
-    fn a_manifest_cannot_leave_a_stale_service_list_behind() {
+    fn a_manifest_cannot_leave_a_stale_binding_table_behind() {
         // The previous version of this app declared kv and consumed a queue.
         // The new one declares neither. Writing without clearing first would
         // leave both keys standing: the isolate would be handed a KV client
-        // for a service this bundle never asked for, and a poller would keep
+        // for a namespace this bundle never asked for, and a poller would keep
         // leasing messages that nothing in the new code handles.
         let mut map = env(&[
-            ("DEIS_SERVICES", "kv,queue"),
+            ("DEIS_BINDINGS", "KV:kv,QUEUE:queue"),
             ("DEIS_QUEUE_CONSUMERS", "jobs:3"),
             ("DEIS_STORE_ENDPOINT", "http://store:8090"),
             ("LOG_LEVEL", "info"),
@@ -563,11 +578,11 @@ mod tests {
             &mut map,
         );
 
-        assert_eq!(map.get("DEIS_SERVICES"), None);
+        assert_eq!(map.get("DEIS_BINDINGS"), None);
         assert_eq!(map.get("DEIS_QUEUE_CONSUMERS"), None);
 
         let wiring = ServiceWiring::take_from_env(&mut map);
-        assert!(wiring.declaration.is_empty());
+        assert!(wiring.bindings.is_empty());
         assert!(wiring.consumers.is_empty());
         // The address survives: it is the control plane's half of the
         // wiring, and clearing it would unbind an app that still declares
@@ -599,14 +614,14 @@ mod tests {
                     "schema": 1,
                     "app": "demo",
                     "entry": "worker/index.js",
-                    "services": { "kv": true }
+                    "bindings": { "KV": { "kind": "kv" } }
                 }"#,
             ),
             &mut map,
         );
 
         let wiring = ServiceWiring::take_from_env(&mut map);
-        assert!(wiring.declaration.declares(ServiceKind::Kv));
+        assert!(wiring.bindings.get("KV").is_some());
         assert_eq!(
             wiring.endpoints.store, None,
             "the bundle's own address must not become the store this app talks to"
@@ -616,9 +631,9 @@ mod tests {
 
     #[test]
     fn stripping_reserved_keys_leaves_the_applications_own_variables() {
-        let mut map = env(&[("DEIS_SERVICES", "kv"), ("DEIS_LOG_LEVEL", "debug")]);
+        let mut map = env(&[("DEIS_BINDINGS", "KV:kv"), ("DEIS_LOG_LEVEL", "debug")]);
         let dropped = strip_reserved_env(&mut map);
-        assert_eq!(dropped, vec!["DEIS_SERVICES"]);
+        assert_eq!(dropped, vec!["DEIS_BINDINGS"]);
         // A variable that merely starts with DEIS_ is the application's own.
         assert_eq!(map, env(&[("DEIS_LOG_LEVEL", "debug")]));
     }
@@ -700,7 +715,7 @@ mod tests {
         let tenant = "demo.production";
         let store = crate::runtime::test_store::TestStore::start_with_secret(SECRET).await;
 
-        let mut map = env(&[("DEIS_SERVICES", "kv")]);
+        let mut map = env(&[("DEIS_BINDINGS", "KV:kv")]);
         map.insert("DEIS_STORE_ENDPOINT".to_string(), store.endpoint.clone());
         let mut hasher = sha2::Sha256::new();
         sha2::Digest::update(&mut hasher, SECRET.as_bytes());
@@ -725,7 +740,7 @@ mod tests {
         let services = connect_or_panic(tenant, &wiring);
         let kv = services
             .kv
-            .get("")
+            .get("KV")
             .cloned()
             .expect("kv was declared and an address was sent");
 
@@ -747,7 +762,7 @@ mod tests {
         const SECRET: &str = "the-secret-both-halves-hold";
         let store = crate::runtime::test_store::TestStore::start_with_secret(SECRET).await;
 
-        let mut map = env(&[("DEIS_SERVICES", "kv")]);
+        let mut map = env(&[("DEIS_BINDINGS", "KV:kv")]);
         map.insert("DEIS_STORE_ENDPOINT".to_string(), store.endpoint.clone());
 
         let wiring = ServiceWiring::take_from_env(&mut map);
@@ -755,7 +770,7 @@ mod tests {
         let services = connect_or_panic("demo.production", &wiring);
         let kv = services
             .kv
-            .get("")
+            .get("KV")
             .cloned()
             .expect("kv was declared and an address was sent");
 

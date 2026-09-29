@@ -89,8 +89,7 @@ impl KvClient {
     /// Shares the channel: the tonic client is a reference-counted handle over
     /// one HTTP/2 connection, so a version declaring four namespaces holds
     /// four identities and one connection rather than four. `None` gives the
-    /// tenant's unnamed namespace, which is what an application that declares
-    /// no binding of this kind has always used.
+    /// tenant-level client this one was derived from.
     pub(crate) fn for_binding(&self, binding: Option<&str>) -> Result<Self> {
         let identity = self.identity.for_binding(binding)?;
         tracing::debug!(
@@ -150,7 +149,7 @@ impl KvClient {
 
     /// Get a value together with the metadata and expiry stored with it.
     ///
-    /// Backs `ctx.services.kv.getWithMetadata`. It is a separate method rather
+    /// Backs `ctx.env.KV.getWithMetadata`. It is a separate method rather
     /// than a wider return type on [`Self::get`] because the two answer
     /// different questions and the plain read is the hot one; both are the
     /// same single `Get` call, so asking for metadata costs no extra round
@@ -251,7 +250,7 @@ impl KvClient {
     /// cursor rather than an error. `cursor` resumes a previous page and is
     /// `None` for the first one.
     ///
-    /// Every listing asks for metadata, because `ctx.services.kv.list`
+    /// Every listing asks for metadata, because `ctx.env.KV.list`
     /// promises it and the columns are on rows the scan already visits -- what
     /// the flag buys is response *size*, and a page of names alone is not a
     /// shape anything in this runtime wants.

@@ -188,11 +188,6 @@ fn is_provider_binding_name(name: &str) -> bool {
 ///   proposed and accepted, this is unimplemented, not optional.
 /// * **`callableBy`** - the consenting half of the same feature, refused for
 ///   the same reason.
-/// * **unnamed services** (`"services": { "kv": ... }`) - the unnamed
-///   tenant namespace has no name to bind a provider resource by. The
-///   Cloudflare target maps named bindings; an author with an unnamed
-///   service declares one instead. This is a D-0 break, not a compatibility
-///   hole: the named-binding form is the standard's only spelling.
 ///
 /// The errors use `EC_BINDING_TARGET_UNIMPLEMENTED`, because each of them
 /// means "this target does not implement the capability the project asks
@@ -260,35 +255,6 @@ pub fn build_binding_plan_for_target(
         );
     }
 
-    // The unnamed services. Each enabled one is a resource the project
-    // asks for without naming it, and the provider mapping binds resources
-    // *by name*, so there is nothing to bind.
-    if let Some(services) = &config.services {
-        let enabled = [
-            ("kv", services.kv.as_ref().is_some_and(|s| s.enabled)),
-            (
-                "database",
-                services.database.as_ref().is_some_and(|s| s.enabled),
-            ),
-            ("blob", services.blob.as_ref().is_some_and(|s| s.enabled)),
-            ("queue", services.queue.as_ref().is_some_and(|s| s.enabled)),
-        ]
-        .into_iter()
-        .filter(|(_, enabled)| *enabled)
-        .map(|(name, _)| name)
-        .collect::<Vec<_>>();
-        if !enabled.is_empty() {
-            anyhow::bail!(
-                "EC_BINDING_TARGET_UNIMPLEMENTED: the {target} target maps *named* bindings, and \
-                 this project enables the unnamed service(s) {}. The unnamed namespace has no \
-                 name to bind a provider resource by. Declare named bindings instead - \
-                 `\"bindings\": {{ \"MY_KV\": {{ \"kind\": \"kv\" }} }}` - and reach them as \
-                 `context.env.MY_KV`",
-                enabled.join(", ")
-            );
-        }
-    }
-
     let mut queue_consumers = config
         .queues
         .iter()
@@ -313,7 +279,7 @@ pub fn build_binding_plan_for_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ProjectConfig, QueueConsumerConfig, ServiceConfig, ServicesConfig};
+    use crate::config::{ProjectConfig, QueueConsumerConfig};
 
     fn config_with(bindings: serde_json::Value) -> ProjectConfig {
         let mut value = serde_json::json!({
@@ -371,34 +337,6 @@ mod tests {
         let error = build_binding_plan(&config).unwrap_err().to_string();
         assert!(error.contains("EC_BINDING_TARGET_UNIMPLEMENTED"), "{error}");
         assert!(error.contains("callableBy"), "{error}");
-    }
-
-    #[test]
-    fn an_unnamed_service_is_refused_and_told_the_named_spelling() {
-        let mut config = config_with(serde_json::json!({}));
-        config.services = Some(ServicesConfig {
-            kv: Some(ServiceConfig { enabled: true }),
-            database: None,
-            blob: None,
-            queue: None,
-        });
-        let error = build_binding_plan(&config).unwrap_err().to_string();
-        assert!(error.contains("EC_BINDING_TARGET_UNIMPLEMENTED"), "{error}");
-        assert!(error.contains("kv"), "{error}");
-        assert!(error.contains("named bindings"), "{error}");
-    }
-
-    #[test]
-    fn a_disabled_unnamed_service_is_not_a_plan_failure() {
-        let mut config = config_with(serde_json::json!({"HOT": {"kind": "kv"}}));
-        config.services = Some(ServicesConfig {
-            kv: Some(ServiceConfig { enabled: false }),
-            database: None,
-            blob: None,
-            queue: None,
-        });
-        let plan = build_binding_plan(&config).expect("disabled services ask for nothing");
-        assert_eq!(plan.bindings.len(), 1);
     }
 
     #[test]

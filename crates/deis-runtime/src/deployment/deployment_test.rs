@@ -38,7 +38,7 @@ struct TestBundle {
 const KV_PROBE_HANDLER: &str = r#"
 export default async function handler(context) {
   try {
-    await context.services.kv.get("probe");
+    await context.env.KV.get("probe");
     return new Response(JSON.stringify({ outcome: "ok", env: context.env }));
   } catch (e) {
     return new Response(JSON.stringify({ outcome: String(e), env: context.env }));
@@ -191,9 +191,12 @@ fn bundle_inner(
             })
         })
         .collect();
-    let service_map: serde_json::Map<String, serde_json::Value> = services
+    let binding_map: serde_json::Map<String, serde_json::Value> = services
         .iter()
-        .map(|name| ((*name).to_string(), serde_json::Value::from(true)))
+        .map(|kind| {
+            let (name, _) = crate::runtime::test_store::binding_for_kind(kind);
+            (name.to_string(), serde_json::json!({ "kind": kind }))
+        })
         .collect();
 
     let mut manifest = serde_json::json!({
@@ -202,7 +205,7 @@ fn bundle_inner(
         "entry": "worker/index.js",
         "runtime": "standard-v1",
         "environment": declarations,
-        "services": service_map,
+        "bindings": binding_map,
         "routes": [{ "pattern": "/api/users/:id", "methods": [] }],
         "assets": asset_entries,
     });
@@ -1331,8 +1334,8 @@ async fn secrets_reach_the_isolate_and_never_the_disk() {
 
 /// The storage wiring only works if two halves meet at install time: the
 /// control plane knows the addresses, the bundle's manifest knows which
-/// services the app declared. Before they were joined here, every
-/// `ctx.services.*` call answered "service not available" no matter what was
+/// bindings the app declared. Before they were joined here, every
+/// storage call answered "service not available" no matter what was
 /// configured.
 #[tokio::test]
 async fn a_declared_service_gets_a_client_built_from_the_address_the_order_carried() {
@@ -1382,13 +1385,13 @@ async fn a_declared_service_gets_a_client_built_from_the_address_the_order_carri
     // The platform's own keys are lifted out before the app sees its
     // environment, so an app cannot read - or redirect - its own wiring.
     assert!(seen["env"][crate::runtime::STORE_ENDPOINT_KEY].is_null());
-    assert!(seen["env"][crate::runtime::SERVICES_KEY].is_null());
+    assert!(seen["env"][crate::runtime::BINDINGS_KEY].is_null());
 }
 
 /// An app that declares nothing gets no client, which is both cheaper and the
 /// honest answer to "what can this app reach".
 #[tokio::test]
-async fn an_app_that_declares_no_service_is_told_so_rather_than_given_one() {
+async fn an_app_that_declares_no_binding_has_none_on_its_env() {
     let dir = tempfile::tempdir().unwrap();
     let bundle = bundle("demo", KV_PROBE_HANDLER, &[]);
     let control =
@@ -1419,11 +1422,11 @@ async fn an_app_that_declares_no_service_is_told_so_rather_than_given_one() {
         .await
         .unwrap();
     let seen: serde_json::Value = serde_json::from_slice(&body.into_bytes().unwrap()).unwrap();
+    // No namespace without a name: `env.KV` is simply not there, so the probe
+    // fails reading `.get` off `undefined` rather than reaching a store.
+    assert!(seen["env"]["KV"].is_null(), "{seen}");
     assert!(
-        seen["outcome"]
-            .as_str()
-            .unwrap()
-            .contains("not available to this app"),
+        seen["outcome"].as_str().unwrap().contains("TypeError"),
         "{}",
         seen["outcome"]
     );

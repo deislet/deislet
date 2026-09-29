@@ -164,7 +164,6 @@ pub fn generate_with_node_compat(
     Ok(AdapterArtifacts {
         router_code,
         context_builder_code,
-        kv_adapter_code: None,
         config_files,
         support_files: vec![(
             "edge-canon-runtime.js".to_string(),

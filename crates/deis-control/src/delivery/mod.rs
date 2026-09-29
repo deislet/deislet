@@ -192,9 +192,9 @@ pub fn bundle_url(base: &str, app_id: &str, version_id: &str) -> String {
 /// deployment message can be replayed as access to a tenant.
 ///
 /// An unset address means "this platform has no such service": the deployment
-/// still goes out, the application still loads, and only its `ctx.services`
-/// calls fail - which is better than refusing to deploy an application that
-/// declared a service it never actually calls.
+/// still goes out, the application still loads, and only its storage
+/// bindings are missing - which is better than refusing to deploy an
+/// application that declared a binding it never actually uses.
 #[derive(Clone)]
 pub struct StorageWiring {
     /// deis-store: KV, per-app SQL and blobs.
@@ -1371,7 +1371,7 @@ impl DeploymentDeliverer {
     /// restarts asks for it and loads what it names. Until it carried an
     /// environment, an app that came back this way came back with no secrets
     /// and - worse, because it is silent - no storage addresses, so its
-    /// `ctx.services` calls failed until someone deployed again.
+    /// storage bindings were missing until someone deployed again.
     ///
     /// Errors are the caller's to report per row: one environment whose
     /// secrets will not decrypt must not stop a node from loading the rest.
@@ -2507,7 +2507,7 @@ mod tests {
     #[tokio::test]
     async fn the_wire_message_carries_the_storage_addresses_the_app_never_declared() {
         // Without these two keys deis-runtime builds no storage client at
-        // all and every ctx.services call answers "service not available".
+        // all, and no storage binding is published to the application.
         let (deliverer, store) = deliverer(true).await;
         let env = environment(&store).await;
 
@@ -2609,7 +2609,7 @@ mod tests {
     #[tokio::test]
     async fn a_control_plane_without_storage_configured_sends_no_addresses() {
         // A valid setup: the deployment still goes out, and only the app's
-        // ctx.services calls fail.
+        // storage bindings are missing.
         let (deliverer, store) = deliverer_with(true, no_services_wiring()).await;
         let env = environment(&store).await;
 

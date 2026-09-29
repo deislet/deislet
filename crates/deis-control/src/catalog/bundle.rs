@@ -340,7 +340,7 @@ pub(crate) mod tests {
     pub(crate) fn sample_bundle(app: &str) -> Vec<u8> {
         bundle_with_manifest(
             &deis_bundle::complete_manifest_json(&format!(
-                r#"{{"app":"{app}","entry":"worker/index.js","services":{{"kv":true}}}}"#
+                r#"{{"app":"{app}","entry":"worker/index.js","bindings":{{"KV":{{"kind":"kv"}}}}}}"#
             )),
             true,
         )

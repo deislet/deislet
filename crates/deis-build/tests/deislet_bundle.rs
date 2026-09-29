@@ -189,10 +189,6 @@ async fn the_manifest_carries_what_the_project_declared() {
     let bytes = build_bundle(project.path()).await;
     let manifest = read_manifest(&bytes).expect("a loadable manifest").manifest;
 
-    assert!(manifest.uses_service("kv"));
-    assert!(manifest.uses_service("database"));
-    assert!(!manifest.uses_service("blob"));
-
     let environment = &manifest.environment;
     assert!(environment.declarations.iter().any(|declaration| {
         declaration.name == "LOG_LEVEL"

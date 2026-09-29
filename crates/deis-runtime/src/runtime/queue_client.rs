@@ -1,4 +1,4 @@
-//! Queue client backing `ctx.services.queue` and the consumer poller.
+//! Queue client backing `ctx.env.QUEUE` and the consumer poller.
 //!
 //! Talks to deis-queue, which partitions messages by tenant -- one
 //! application in one environment: the tenant is the one named by the

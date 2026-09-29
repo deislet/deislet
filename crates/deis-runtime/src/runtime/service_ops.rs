@@ -1,4 +1,4 @@
-//! The op behind `context.bindings.<NAME>.fetch()`: one application calling
+//! The op behind `context.env.<NAME>.fetch()`: one application calling
 //! another.
 //!
 //! The reasoning - why this is not `fetch()`, what bounds a chain, whose
@@ -84,7 +84,7 @@ pub struct ServiceCallResult {
     pub body: ToJsBuffer,
 }
 
-/// What `context.bindings.<NAME>.fetch(input, init)` sends.
+/// What `context.env.<NAME>.fetch(input, init)` sends.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceRequest {
@@ -446,7 +446,7 @@ fn refuse(caller: &str, refusal: ServiceCallError) -> JsErrorBox {
     JsErrorBox::type_error(refusal.to_string())
 }
 
-/// One entry of the table `context.bindings` is built from.
+/// One entry of the table the bindings on `env` are built from.
 ///
 /// Only what JavaScript needs in order to construct the right object: the
 /// name, the kind, and - for a service binding - which copy of which
@@ -464,7 +464,7 @@ pub struct PublishedBinding {
     pub environment: Option<String>,
 }
 
-/// The bindings this isolate publishes on `context.bindings` and on `env`.
+/// The bindings this isolate publishes on `env`.
 ///
 /// **The names come from here and nowhere else.** `js/runtime.js` builds an
 /// object per entry; it never invents one and never takes one from the

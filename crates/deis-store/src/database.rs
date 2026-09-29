@@ -16,8 +16,8 @@
 //! which is every other tenant's path with one component changed; `ATTACH
 //! DATABASE` then opens that path for reading *and writing*; `VACUUM INTO`
 //! writes a copy of the tenant's data anywhere the process can write. All
-//! three are ordinary SQL, reachable from any application through
-//! `ctx.services.database`.
+//! three are ordinary SQL, reachable from any application through its
+//! database binding.
 //!
 //! So the file boundary is held by two things underneath the SQL, both
 //! installed on every connection of a tenant's pool by

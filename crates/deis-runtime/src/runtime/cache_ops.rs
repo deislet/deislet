@@ -1,4 +1,4 @@
-//! `ctx.services.cache`, `globalThis.caches.default` and `caches.open(name)`:
+//! `globalThis.caches.default` and `caches.open(name)`:
 //! the Cache API.
 //!
 //! Edge Canon makes an HTTP response cache a *basic* feature
@@ -36,9 +36,8 @@
 //! invents.
 //!
 //! These ops take whatever name they are given and know nothing about which
-//! one is the default. `caches.default` and `ctx.services.cache` are one
-//! object in `js/runtime.js` holding one name, so the two spellings cannot
-//! come apart -- and that name is refused to `caches.open` and
+//! one is the default. `caches.default` is one object in `js/runtime.js`
+//! holding one name, and that name is refused to `caches.open` and
 //! `caches.delete`, because an application opening a cache under a name it
 //! took from a request would otherwise hand a caller who sent `"default"` the
 //! namespace the rest of that application caches into.

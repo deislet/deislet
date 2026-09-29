@@ -322,7 +322,7 @@ impl std::fmt::Display for Refusal {
             Self::PlatformService => write!(
                 f,
                 "that address is one of the platform's own service endpoints, which no \
-                 application may call directly; use ctx.services instead"
+                 application may call directly; declare a binding and use env.<NAME> instead"
             ),
             Self::PortNotAllowed { host, port } => write!(
                 f,

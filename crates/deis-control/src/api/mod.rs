@@ -621,7 +621,7 @@ async fn build_catalog_state(
     );
     if storage.has_no_endpoints() {
         warn!(
-            "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so every ctx.services.kv / database / blob / queue call an application makes answers \"service not available\" and declared queue consumers never start"
+            "Neither store_endpoint nor queue_endpoint is configured; deployments carry no storage addresses, so no application's kv / database / blob / queue binding is available and declared queue consumers never start"
         );
     } else {
         info!(

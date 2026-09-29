@@ -122,7 +122,6 @@ impl TypeScriptParser {
             route: Self::path_to_route(filename),
             has_default_export: visitor.has_default_export,
             named_exports: visitor.named_exports,
-            used_services: visitor.used_services,
             imports: visitor.imports,
             specifier_literals: visitor.specifier_literals,
             module_references: visitor.module_references,
@@ -378,7 +377,6 @@ struct HandlerVisitor {
     unresolved_context: SyntaxContext,
     has_default_export: bool,
     named_exports: Vec<String>,
-    used_services: Vec<String>,
     imports: Vec<String>,
     specifier_literals: Vec<SpecifierLiteral>,
     module_references: Vec<ModuleReference>,
@@ -405,7 +403,6 @@ impl HandlerVisitor {
             unresolved_context,
             has_default_export: false,
             named_exports: Vec::new(),
-            used_services: Vec::new(),
             imports: Vec::new(),
             specifier_literals: Vec::new(),
             module_references: Vec::new(),
@@ -456,29 +453,6 @@ impl HandlerVisitor {
             .any(|existing| existing == &reference)
         {
             self.non_standard_context_references.push(reference);
-        }
-    }
-
-    fn check_service_usage(&mut self, expr: &Expr) {
-        // Check if this expression is context.services.X
-        if let Expr::Member(member_expr) = expr {
-            // Try to match pattern: context.services.X
-            if let MemberProp::Ident(service_prop) = &member_expr.prop {
-                if let Expr::Member(inner_member) = &*member_expr.obj {
-                    if let MemberProp::Ident(services_ident) = &inner_member.prop {
-                        if services_ident.sym.as_ref() == "services" {
-                            if let Expr::Ident(context_ident) = &*inner_member.obj {
-                                if context_ident.sym.as_ref() == "context" {
-                                    let service_name = service_prop.sym.to_string();
-                                    if !self.used_services.contains(&service_name) {
-                                        self.used_services.push(service_name);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -778,9 +752,6 @@ impl Visit for HandlerVisitor {
     }
 
     fn visit_expr(&mut self, n: &Expr) {
-        // Check any expression for service usage
-        self.check_service_usage(n);
-
         if let Expr::Member(member) = n {
             if let Some((field, span)) = self.static_context_field(member) {
                 self.record_context_field(field, span);
