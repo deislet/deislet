@@ -963,7 +963,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
     assert_eq!(active.active_deployment_id, PLAN);
     assert!(active.pending_deployment_id.is_empty());
 
-    let legacy = as_tenant(
+    let unstamped = as_tenant(
         &harness,
         tenant,
         PullRequest {
@@ -973,7 +973,7 @@ async fn consumer_generation_cutover_is_enforced_over_the_wire() {
         },
     );
     assert_eq!(
-        client.pull(legacy).await.unwrap_err().code(),
+        client.pull(unstamped).await.unwrap_err().code(),
         Code::FailedPrecondition,
         "an unstamped consumer must not cross the generation fence"
     );

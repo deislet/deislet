@@ -1419,6 +1419,13 @@ fn prepare_consumer_generation_tx(
     expected_previous_deployment_id: Option<&str>,
     now: i64,
 ) -> QueueResult<PrepareConsumerGenerationResponse> {
+    // The previous generation and the deployment that owns it come from the
+    // same pointer row: both, or neither for a first deployment.
+    if expected_previous_generation.is_some() != expected_previous_deployment_id.is_some() {
+        return Err(QueueError::ConsumerGenerationFenced(format!(
+            "tenant {tenant:?}: a previous generation and its owning deployment are named together"
+        )));
+    }
     let stored = load_consumer_fence(tx, tenant)?;
     let active_before = stored
         .as_ref()
@@ -1435,10 +1442,10 @@ fn prepare_consumer_generation_tx(
 
     match stored {
         None => {
-            // Adopt the generation already selected by a pre-fence control
-            // plane when one exists; otherwise the active side is the legacy
-            // unlabelled consumer generation. Either way pending closes all
-            // Pull admission before leases are inspected.
+            // The tenant's first fence: its active side is the deployment
+            // the control plane names as the previous one, or nothing for a
+            // first deployment. Either way pending closes all Pull admission
+            // before leases are inspected.
             tx.execute(
                 "INSERT INTO consumer_generation_fences
                    (tenant, active_generation, active_deployment_id, pending_generation,
@@ -1459,7 +1466,7 @@ fn prepare_consumer_generation_tx(
         }
         Some((
             active,
-            mut active_deployment,
+            active_deployment,
             pending,
             pending_deployment,
             stored_expected,
@@ -1468,33 +1475,8 @@ fn prepare_consumer_generation_tx(
             _,
         )) => {
             if active == generation && pending.is_none() {
-                if active_deployment.is_empty() {
-                    let Some(previous_owner) = expected_previous_deployment_id else {
-                        return Err(QueueError::ConsumerGenerationFenced(format!(
-                            "tenant {tenant:?} generation {generation:?} has no recorded deployment owner; PrepareConsumerGeneration must provide its legacy ownership baseline"
-                        )));
-                    };
-                    if expected_previous_generation != Some(active.as_str()) {
-                        return Err(QueueError::ConsumerGenerationFenced(format!(
-                            "tenant {tenant:?} cannot adopt generation {active:?} from a different previous generation"
-                        )));
-                    }
-                    let adopted_owner = if previous_owner.is_empty() {
-                        deployment_id
-                    } else if previous_owner == deployment_id {
-                        previous_owner
-                    } else {
-                        return Err(QueueError::ConsumerGenerationFenced(format!(
-                            "tenant {tenant:?} generation {generation:?} is reported as owned by deployment {previous_owner:?}, not {deployment_id:?}"
-                        )));
-                    };
-                    tx.execute(
-                        "UPDATE consumer_generation_fences
-                            SET active_deployment_id = ?2, updated_at = ?3
-                          WHERE tenant = ?1 AND active_deployment_id = ''",
-                        rusqlite::params![tenant, adopted_owner, now],
-                    )?;
-                } else if active_deployment != deployment_id {
+                // A retry after the generation was activated.
+                if active_deployment != deployment_id {
                     return Err(QueueError::ConsumerGenerationFenced(format!(
                         "tenant {tenant:?} generation {generation:?} is owned by deployment {active_deployment:?}, not {deployment_id:?}"
                     )));
@@ -1504,11 +1486,7 @@ fn prepare_consumer_generation_tx(
                     active_generation: active,
                     pending_generation: String::new(),
                     outstanding_leases: 0,
-                    active_deployment_id: if active_deployment.is_empty() {
-                        deployment_id.to_string()
-                    } else {
-                        active_deployment
-                    },
+                    active_deployment_id: active_deployment,
                     pending_deployment_id: String::new(),
                 });
             }
@@ -1523,46 +1501,14 @@ fn prepare_consumer_generation_tx(
                     )));
                 }
                 let stored_owner = stored_expected_owner.as_deref();
-                let adopts_known_legacy_owner = active_deployment.is_empty()
-                    && expected_previous_generation == Some(active.as_str())
-                    && expected_previous_deployment_id.is_some_and(|owner| !owner.is_empty())
-                    && stored_owner.is_none_or(str::is_empty);
-                if stored_owner != expected_previous_deployment_id && !adopts_known_legacy_owner {
+                if stored_owner != expected_previous_deployment_id {
                     return Err(QueueError::ConsumerGenerationFenced(format!(
                         "tenant {tenant:?} pending generation {pending:?} was prepared against deployment owner {:?}, not {:?}",
                         stored_owner.unwrap_or("<none>"),
                         expected_previous_deployment_id.unwrap_or("<none>")
                     )));
                 }
-                if active_deployment.is_empty()
-                    && expected_previous_generation == Some(active.as_str())
-                    && let Some(previous_owner) =
-                        expected_previous_deployment_id.filter(|owner| !owner.is_empty())
-                {
-                    tx.execute(
-                        "UPDATE consumer_generation_fences
-                            SET active_deployment_id = ?2,
-                                expected_previous_deployment_id = ?2,
-                                updated_at = ?3
-                          WHERE tenant = ?1 AND active_deployment_id = ''",
-                        rusqlite::params![tenant, previous_owner, now],
-                    )?;
-                }
             } else {
-                if active_deployment.is_empty()
-                    && !active.is_empty()
-                    && expected_previous_generation == Some(active.as_str())
-                    && let Some(previous_owner) =
-                        expected_previous_deployment_id.filter(|owner| !owner.is_empty())
-                {
-                    tx.execute(
-                        "UPDATE consumer_generation_fences
-                            SET active_deployment_id = ?2, updated_at = ?3
-                          WHERE tenant = ?1 AND active_deployment_id = ''",
-                        rusqlite::params![tenant, previous_owner, now],
-                    )?;
-                    active_deployment = previous_owner.to_string();
-                }
                 if !consumer_baseline_matches(
                     &active,
                     &active_deployment,
@@ -1572,7 +1518,7 @@ fn prepare_consumer_generation_tx(
                     return Err(QueueError::ConsumerGenerationFenced(format!(
                         "tenant {tenant:?} currently admits generation {active:?} owned by {:?}; deployment {deployment_id} expected generation {:?} owned by {:?}",
                         if active_deployment.is_empty() {
-                            "<legacy>"
+                            "<none>"
                         } else {
                             active_deployment.as_str()
                         },
@@ -1642,7 +1588,7 @@ fn activate_consumer_generation_tx(
         }
         if active_deployment.is_empty() {
             return Err(QueueError::ConsumerGenerationFenced(format!(
-                "tenant {tenant:?} generation {generation:?} has no recorded deployment owner; PrepareConsumerGeneration must explicitly adopt the legacy generation first"
+                "tenant {tenant:?} generation {generation:?} has no recorded deployment owner"
             )));
         }
         return Ok(ActivateConsumerGenerationResponse {
@@ -2445,78 +2391,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_legacy_active_generation_requires_explicit_owner_takeover() {
-        const LEGACY_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000071";
-        const CANDIDATE_PLAN: &str = "018f2518-7e38-7f80-8000-000000000072";
-        const CANDIDATE_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000073";
-        const ADOPTING_PLAN: &str = "018f2518-7e38-7f80-8000-000000000074";
-        let f = fixture().await;
-        let tenant = tenant("shop.production");
-
-        // A queue with no fence may be introduced to a control-plane
-        // generation whose historical deployment owner was never stored.
-        assert!(
-            f.service
-                .prepare_consumer_generation(
-                    &tenant,
-                    CANDIDATE_PLAN,
-                    CANDIDATE_GENERATION,
-                    Some(LEGACY_GENERATION),
-                    Some(""),
-                )
-                .await
-                .unwrap()
-                .prepared
-        );
-        f.service
-            .abort_consumer_generation(&tenant, CANDIDATE_PLAN, CANDIDATE_GENERATION)
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            f.service
-                .activate_consumer_generation(&tenant, ADOPTING_PLAN, LEGACY_GENERATION)
-                .await,
-            Err(QueueError::ConsumerGenerationFenced(_))
-        ));
-        assert!(matches!(
-            f.service
-                .prepare_consumer_generation(
-                    &tenant,
-                    ADOPTING_PLAN,
-                    LEGACY_GENERATION,
-                    Some(LEGACY_GENERATION),
-                    None,
-                )
-                .await,
-            Err(QueueError::InvalidArgument(_))
-        ));
-        let adopted = f
-            .service
-            .prepare_consumer_generation(
-                &tenant,
-                ADOPTING_PLAN,
-                LEGACY_GENERATION,
-                Some(LEGACY_GENERATION),
-                Some(""),
-            )
-            .await
-            .unwrap();
-        assert!(adopted.prepared);
-        assert_eq!(adopted.active_generation, LEGACY_GENERATION);
-        assert_eq!(adopted.active_deployment_id, ADOPTING_PLAN);
-        assert!(adopted.pending_generation.is_empty());
-        assert!(adopted.pending_deployment_id.is_empty());
-        assert!(
-            f.service
-                .activate_consumer_generation(&tenant, ADOPTING_PLAN, LEGACY_GENERATION)
-                .await
-                .unwrap()
-                .activated
-        );
-    }
-
-    #[tokio::test]
     async fn a_historical_uuidv4_previous_owner_is_a_valid_strict_baseline() {
         const HISTORICAL_PLAN: &str = "550e8400-e29b-41d4-a716-446655440000";
         const PREVIOUS_GENERATION: &str = "018f2518-7e38-7f80-8000-000000000081";
@@ -2672,7 +2546,7 @@ mod tests {
         let f = fixture().await;
         let tenant = tenant("shop.production");
         f.service
-            .send(&tenant, "jobs", b"still legacy".to_vec())
+            .send(&tenant, "jobs", b"unfenced".to_vec())
             .await
             .unwrap();
 
@@ -2690,7 +2564,7 @@ mod tests {
         ));
         assert_eq!(
             bodies(&f.service.pull(&tenant, "jobs", None, None).await.unwrap()),
-            ["still legacy"]
+            ["unfenced"]
         );
     }
 
