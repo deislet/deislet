@@ -167,10 +167,10 @@ jobs:
           systemd-analyze verify "$work"/*.service "$work/deislet.slice" \
             2> "$work/verify-err" || true
           echo "---- diagnostics for the shipped units ----"
-          grep -F -f <(printf '%s\n' "$work/deis-control.service" "$work/deis-proxy.service" \
-            "$work/deis-queue.service" "$work/deis-runtime.service" \
-            "$work/deis-store.service" "$work/deis-telemetry.service" \
-            "$work/deislet.slice") "$work/verify-err" > "$work/verify-shipped" || true
+          # The filter is the list of files that were verified, so a unit
+          # added to the directory is covered without editing this job.
+          grep -F -f <(printf '%s\n' "$work"/*.service "$work/deislet.slice") \
+            "$work/verify-err" > "$work/verify-shipped" || true
           cat "$work/verify-shipped"
           if [ -s "$work/verify-shipped" ]; then
             exit 1
