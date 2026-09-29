@@ -724,24 +724,16 @@ fence，不把这种管理能力交给普通 producer/reader。
 
 ## 8. 服务声明与密钥
 
-### 服务：先有「用不用」，后来又有了 bindings 表
+### 服务：只有具名绑定
 
-第一层是**用不用**某个服务，写在包的 manifest 里：
+应用用到的存储服务只有一种声明方式：manifest 里的**具名绑定**。没有「按种类开关」的
+无名声明，也没有与具名绑定并列的无名命名空间。节点按绑定表构造对应的客户端放进
+Isolate 的 `OpState`；没声明的绑定连接都不建，`context.env.<名字>` 上也就没有它。地址来自
+控制面下发的环境表里的保留键（`DEIS_STORE_ENDPOINT` / `DEIS_QUEUE_ENDPOINT` /
+`DEIS_BINDINGS` / `DEIS_QUEUE_CONSUMERS`），这些键在进 Isolate 之前被取走。
 
-```json
-{ "services": { "kv": true, "database": true, "blob": false, "queue": true } }
-```
-
-节点按这份声明构造对应的客户端放进 Isolate 的 `OpState`；没声明的服务连接都不建，
-对应的 `context.env.<binding>` 就是「不可用」。地址来自控制面下发的环境表里的保留键
-（`DEIS_STORE_ENDPOINT` / `DEIS_QUEUE_ENDPOINT` / `DEIS_SERVICES` /
-`DEIS_QUEUE_CONSUMERS`），这些键在进 Isolate 之前被取走。
-
-第二层是**具名绑定**。早前这里写的是「不做 bindings 表」，理由是那张表上的
-`namespace` 一列没内容可填：租户已经由 `(应用, 环境)` 唯一决定。这条判断后来被推翻了
-——不是因为租户变了，而是因为「一个应用一个环境只有一份 KV」本身就是个限制：热数据和
-冷数据、两套互不相干的索引，只能挤在同一个键空间里靠前缀分家。现在 manifest 里有一张
-`bindings` 表（形状定义在 `deis-bundle/src/bindings.rs`，构建 / 控制面 / 节点 / isolate
+一个应用一个环境可以有多个同种绑定：热数据和冷数据、两套互不相干的索引，各占一个
+命名空间，而不是挤在同一个键空间里靠前缀分家。manifest 里的 `bindings` 表（形状定义在 `deis-bundle/src/bindings.rs`，构建 / 控制面 / 节点 / isolate
 四方共用一份）：
 
 ```json
@@ -758,8 +750,7 @@ fence，不把这种管理能力交给普通 producer/reader。
 **租户边界一点没动**：绑定名是在能力令牌验过之后、由
 `deis_wire::conventions::namespace_id` 拼到租户后面的（`shop.production@HOT`），
 分隔符 `@` 在租户两段和绑定名里都非法，所以这个拼法是单射的——没有哪一对
-`(租户, 绑定)` 能拼出另一对的命名空间。无名 `services` 声明只有手工拼出的 bundle 才会
-携带（构建拒绝启用它的项目），生成的标准 HTTP context 不暴露这套入口。
+`(租户, 绑定)` 能拼出另一对的命名空间。
 绑定名判重
 不分大小写（它会变成 deis-store 里的目录名和文件名），`ASSETS` 和 `DEIS_` 开头的名字
 是保留的。队列绑定不需要这套拼法：deis-queue 本来就是按 `(租户, 队列名, id)` 存的。
@@ -1047,7 +1038,7 @@ Edge Canon 合规或正式支持；这些当前状态只来自
 | 环境变量 | 成立 | 控制面下发的 `env` 表注入 `context.env`，平台保留键先被取走 |
 | 路由参数 | 成立 | `runtime/route_match.rs` 按 manifest 的 `routes[].pattern` 匹配，填 `JsRequest.params`；支持 `:name` 与 `*` 捕获 |
 | KV 存储 | 成立 | `runtime/bindings.rs` 构造 `KvClient` → deis-store 的 `KvStore` 服务；值按字节走（`op_kv_get` 答 `Option<ToJsBuffer>`），不是文本。读写删之外还有四样：`put` 可带 `expirationTtl`（从写入起算的相对秒数）与一段不透明的 `metadata`；`get` 可以按 `type: text / json / arrayBuffer` 取；`getWithMetadata` 一次把值、metadata 和到期时刻取回来（它们本来就是同一行的三列）；`list({ prefix, limit, cursor })` 按游标翻页，每条自带 metadata 与到期时刻。服务端另有一个 `Has`，**目前没有任何调用方**——op 表、JS 绑定和命令行都够不到它，只有 `KvClient` 自己的测试在调 |
-| Cache API | 成立 | 标准应用入口是 `globalThis.caches.default`；`caches.open(name)` 另开一个互不串门的命名空间。原生迁移对象 `context.services.cache` 指向同一实例，但不会穿过标准 HTTP 桥。后端是 moka 进程内缓存，语义上是单 Isolate 缓存；body 已按字节传递 |
+| Cache API | 成立 | 标准应用入口是 `globalThis.caches.default`；`caches.open(name)` 另开一个互不串门的命名空间。后端是 moka 进程内缓存，语义上是单 Isolate 缓存；body 已按字节传递 |
 | 生命周期 `waitUntil` | HTTP Draft 语义已落实；其他事件待独立能力族 | HTTP context 在 handler 与响应 body 生命周期结束后关闭登记；多任务 all-settled，拒绝不截断同伴，短响应流结束也不会清掉仍被后台任务使用的定时器。后台宽限仍未冻结。WebSocket 消息处理器没有标准 tail，登记项会被丢弃并记录 warn，不能把该路径算作 HTTP 合规证据 |
 | 结构化日志 | 成立 | 环形缓冲 + `LogShipper` → deis-telemetry，`Query` 能查回来 |
 | Web 标准 | 成立（8.1 节的部分） | 见下方「Web 标准这一格的实情」 |
@@ -1208,7 +1199,7 @@ abort 掉，不让它的 socket 挂在节点进程上活到下一次请求。细
 | 对象存储 | Deislet 实现成立，标准仍 Draft | deis-store 的 `BlobStore`，Put/Get 流式分块，内容寻址落盘；标准 HTTP 应用从声明的 `context.env.<BLOB_BINDING>` 取得。读写之外还有 `list`、`head`、范围读取与条件写；当前接口仍等待 Edge Canon `logical-resource-bindings` 能力族冻结，不能只凭本地端到端测试宣称跨平台合规 |
 | 消息队列 | 成立 | deis-queue 的 `Send`/`SendBatch`/`Pull`/`Ack`/`Nack`/`ListDeadLetters`/`ReplayDeadLetters` + 节点的 `queue_consumer` 轮询任务；`sendBatch()` 一次投一批，落库是一个事务，所以整批要么都进去要么一条都没有，失败之后原样重发是安全的；试过太多次的消息进死信表，`deis queue dead-letters` 能看、`deis queue replay` 能放回；消息体按字节走（`queue.proto` 的 `body` 是 `bytes`），`send()` 接受字符串、普通对象或 `ArrayBuffer`/`ArrayBufferView`；消费端 `message.body` 是发送时的原文，body 不是合法 UTF-8 时为 `null`，只能靠 `message.bytes()` 读 |
 | 定时任务 | 成立 | 控制面按 `(app, environment)` 调度 → 节点 `Trigger.OnScheduled` → 跑 `scheduled` 导出 |
-| 具名绑定 | Deislet 实现成立，标准仍 Draft | manifest 的 `bindings` 块由构建、控制面、节点、isolate 共用。标准 HTTP 应用只从 `context.env.<名字>` 取得；`context.bindings` / `context.services` 不属于四字段 ABI。租户与命名空间隔离已实现，但跨平台资源接口和部署映射仍须由 Edge Canon 能力族及真实供应商证据冻结 |
+| 具名绑定 | Deislet 实现成立，标准仍 Draft | manifest 的 `bindings` 块由构建、控制面、节点、isolate 共用。应用只从 `context.env.<名字>` 取得；运行时没有 `context.bindings` / `context.services`，任何类型的 handler 读它们都会被构建拒绝。租户与命名空间隔离已实现，但跨平台资源接口和部署映射仍须由 Edge Canon 能力族及真实供应商证据冻结 |
 | 应用间调用（service bindings） | Deislet 实现成立，标准仍 Draft | `bindings` 里 `"kind": "service"` 的那一种，标准 HTTP 入口为 `context.env.AUTH.fetch(...)`。节点内无地址派发、双方授权、默认同环境、子请求计费、深度上限 4 与环拒绝均已实现；跨平台语义仍等待对应能力族冻结 |
 | 静态资产 | 成立 | 包里带资产与清单，节点建索引，命中不起 Isolate，带 ETag 并支持 `If-None-Match`。站点自己的规则也在：`_redirects`（按作者顺序，首条命中者胜；200 是改写、404 是带 404 状态返回目标）、`_headers`（所有命中的块叠加、靠后的覆盖靠前的，同一个块里一个名字写两遍就发两条——`Link` 与 `Set-Cookie` 不许合并成一条，`! 名字` 去掉前面设过的该名字的全部取值）、以及 `assets.notFound` 三选一的兜底（`none` / `404-page` / `single-page-app`）。三样都在构建期解析、写错就构建失败并报出行号，在节点装载那一版时编译成表。函数想主动取包里的文件走 `env.ASSETS.fetch()`——`ASSETS` 是保留键，应用设不了同名变量把它顶掉 |
 | WebAssembly | 成立 | V8 自带 |

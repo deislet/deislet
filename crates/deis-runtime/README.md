@@ -208,12 +208,11 @@ every one of them is sent.
 
 Those are the context's only four fields. Request metadata comes from
 `context.request`; application logs use `console`; the Cache API uses
-`caches.default`/`caches.open(name)`. Native `context.services`,
-`context.bindings` and `context.log` objects still exist below the generated
-bridge, and the queue and scheduled handlers' context still carries them. They
-are not part of the standard HTTP ABI: the build refuses an HTTP handler that
-reads them. Removing the unnamed `context.services` layer is outstanding work,
-not a supported surface. A logical binding the application did not declare is
+`caches.default`/`caches.open(name)`. Declared bindings are on `env` and
+nowhere else: there is no `context.services` or `context.bindings`, and no
+unnamed namespace beside the declared bindings. The queue and scheduled
+handlers' context additionally carries `context.log`, which is not part of the
+standard HTTP ABI. A logical binding the application did not declare is
 absent rather than simulated. Its concrete resource interfaces remain Draft
 until Edge Canon's `logical-resource-bindings` capability family is frozen.
 

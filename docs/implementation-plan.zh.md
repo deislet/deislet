@@ -110,7 +110,6 @@ assets/                  # 静态资产，原样保留目录结构
   "app": "my-app",
   "entry": "worker/index.js",
   "runtime": "standard-v1",
-  "services": { "kv": true, "database": true, "blob": false, "queue": true },
   "bindings": {
     "HOT": { "kind": "kv" },
     "DOCS": { "kind": "blob" },
@@ -198,8 +197,8 @@ assets/                  # 静态资产，原样保留目录结构
   不可变的 `environment-binding-snapshot/v1`，把它绑定到版本、环境、config revision 与 secret
   revision；`context.env` 只从该 snapshot 物化。manifest 没有携带运行时值的字段。
 - `assets[].path` 不带前导斜杠，相对 `assets/`。
-- `services` 的四个键是无名资源声明；构建会拒绝启用它们的项目，只有手工拼出的 bundle 才会
-  带 `true`。标准应用只声明 `bindings`，生成的 HTTP context 不暴露 `context.services`。
+- 存储资源只有 `bindings` 一种声明方式，没有无名命名空间；应用从 `context.env.<名字>`
+  取得它们。
 - `bindings` 是一张**平表**：名字 → `{ "kind": ... }`，`kind` 五选一
   （`kv` / `database` / `blob` / `queue` / `service`）。前四种是本租户内部又一个命名
   空间（租户边界一点没动：绑定名是验过能力令牌之后用
@@ -480,7 +479,7 @@ authoritative assignment 会按 durable plan state 发 `prepare` 或 `activate`�
 |---|---|---|---|
 | `DEIS_STORE_ENDPOINT` | deis-store 的 gRPC 地址 | deis-control（配置项 `store_endpoint`） | deis-runtime |
 | `DEIS_QUEUE_ENDPOINT` | deis-queue 的 gRPC 地址 | deis-control（配置项 `queue_endpoint`） | deis-runtime |
-| `DEIS_SERVICES` | 本应用声明了哪些服务 | deis-runtime（读包内 manifest 时补） | deis-runtime |
+| `DEIS_BINDINGS` | 本应用声明的绑定表 | deis-runtime（读包内 manifest 时补） | deis-runtime |
 | `DEIS_QUEUE_CONSUMERS` | 要消费哪些队列及批大小 | 同上 | deis-runtime |
 
 这四个键在进 Isolate 之前被**取出**而不是读取，所以应用的 `ctx.env` 里只剩它自己的变量；应用也无法用同名变量把存储客户端指到别处（拼装 payload 时平台值最后写入，覆盖 manifest 里的同名变量并告警）。

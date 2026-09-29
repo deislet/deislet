@@ -2,8 +2,8 @@
 
 The standard HTTP handler receives exactly four context fields:
 `request`, `env`, `params`, and `waitUntil`. A resource is therefore reached
-through a declared logical name in `context.env`; `context.services` and
-`context.bindings` are not portable APIs.
+through a declared logical name in `context.env`; there is no
+`context.services` or `context.bindings`.
 
 ```json
 {
@@ -41,8 +41,7 @@ The Cache API is a Web API rather than a context convenience. Use
 in-process and isolate-local; no application may assume cross-node persistence
 until a selected standard version says so.
 
-The runtime's native `context.services` table is below the generated bridge
-and is not part of the standard context; the build refuses a project that
-turns on an unnamed `services` flag. Use a declared binding such as
-`context.env.SESSIONS` instead of an unnamed KV, and `caches.default` for the
-cache. The standard context has no alias for either.
+There is no unnamed namespace: every KV, database, object store or queue an
+application reaches is a declared binding such as `context.env.SESSIONS`, and
+the cache is `caches.default`. The build refuses a handler of any kind that
+reads `context.services` or `context.bindings`.

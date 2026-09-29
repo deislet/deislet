@@ -140,8 +140,8 @@ deis dev --no-watch --debug
 
 What is genuinely absent locally is named in the banner rather than faked:
 without `--store` and `--queue` there is no KV, database, blob or queue, and
-`ctx.services.*` fails exactly as it would on a node that was never given
-their addresses. Nothing fires cron locally either — scheduling is the
+the bindings that need them fail exactly as they would on a node that was
+never given their addresses. Nothing fires cron locally either — scheduling is the
 control plane's job.
 
 The local environment name defaults to `development`, not `production`, so a

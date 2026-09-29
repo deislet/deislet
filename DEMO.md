@@ -138,8 +138,8 @@ scripts/demo-assets/example-app/
 
 最后四个（`stream` / `cookies` / `timers` / `objects`）不在仓库里，`start` 只在
 示例应用自己没带同名文件时才写进已构建好的副本，写法见下文；写 `objects.ts` 的同时还会
-把 `.config.json` 里的 `services.blob` 打开——一个不声明 `blob` 的应用调
-`context.services.blob` 拿到的是「这个服务对本应用不可用」，不是一个对象存储。
+在 `.config.json` 里声明 `BLOB` 绑定——一个不声明它的应用，`context.env.BLOB` 是
+`undefined`，不是一个对象存储。
 
 演示还部署了**第二个应用** `demo-auth`（源码由 `scripts/demo.sh::prepare_callee_source`
 现写到 `.demo/app-callee/`）。它是「应用间调用」那一组的被调方：同意谁能调它，写在它
@@ -271,7 +271,7 @@ API key 能不能从控制面领到那张令牌。
 | 密钥 | `deis secret list` | 只列出名字与最后修改时间；JSON 与人读两种输出都不含值，也没有任何命令能打印值 |
 | | 同一响应的 `secretPresent` | 加密存库的密钥被解开、随下发进了 Isolate |
 | | 递归 grep 数据目录与全部日志 | 解开后的明文哪儿都没落下 |
-| 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.services.kv` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
+| 存储 | `PUT` 再 `GET /api/kv/<key>`，然后直接问 deis-store 的 `KvStore.Get` | `ctx.env.KV` 真的走到了 deis-store 本身——deis-store 自己的 gRPC 接口对同一个 tenant/key 答出同一个值，而不是从节点某层缓存读回来的。这一发直接问是带着凭据令牌去的（下一行的反面） |
 | | 不带任何凭据令牌直接问同一个 `KvStore.Get` | 被拒绝在碰到任何数据之前（`Code: Unauthenticated`）。只验证「带对令牌能通」不够——deis-store、deis-queue、deis-control 三处但凡漏配一处这道认证，上一项照样全绿，这一项才是堵住那个口子的（`crates/deis-store/src/auth.rs`）；和「出网」小节那条一样，成功了反而算失败 |
 | | 明文连 deis-store 的 gRPC 端口 | 连不上：deis-store 只在 TLS 上应答，出示的是机队签给它的 `spiffe://…/deislet/store/…` 证书，调用方拿控制面的根去验它。同一个问题经 `-cacert` 走 TLS 才答得出来 |
 | | 领两张存储 capability，先用其一问 `KvStore.Get`，再 `DELETE /api/v1/capabilities/<jti>` 吊销它 | 吊销前答得出来；吊销后一次轮询（30 秒）之内 deis-store 就拒它（`PermissionDenied`），旁边那张没吊销的照常被服务。deis-store 从机器通道拉的是控制面签过名的吊销名单，所以吊销不必等 15 分钟过期 |
@@ -287,9 +287,9 @@ API key 能不能从控制面领到那张令牌。
 | | 处理函数把 `Range` 头原样交给 `blob.get`，再自己答 206 | `bytes=4-9` 与 `bytes=-4` 都取对了段、`content-range` 对得上真实大小；16 字节的对象上 `bytes=99-` 答 416，同一个 range 打不存在的 key 答 404——这两种失败应用必须能分开 |
 | | 同一个 key 连着两次 `onlyIf: { ifNoneMatch: "*" }` | 第一次落地、第二次被告知输了，对象里还是第一个写的值；拿当前 etag 去写能成，同一个 etag 在被顶替之后再用就不成，`delete` 也一样。每一次被拒的写都没动过对象——这是本平台唯一的原子协调原语 |
 | | `deis blob list` / `head` / `get --offset` | 命令行读到的就是应用写下的那些对象；`deis blob put --if-none-match '*'` 输了的时候退 3（它自己的退出码，不是「连不上存储」那个 1），`delete --if-match` 拿过期 etag 同样退 3，对象原封不动 |
-| 具名绑定 | 同一个 key 经 `ctx.bindings.HOT`、`ctx.bindings.COLD` 和 `ctx.services.kv` 各写一次，再直接问 `KvStore.Get` | 读回来是三个不同的值；直接问 deis-store 时带 `x-deis-binding: HOT` 拿到 HOT 那个、不带这个头拿到无名那个。所以具名的命名空间是开在无名那个**旁边**，不是盖在它上面——早先部署的应用数据一个字节没挪 |
+| 具名绑定 | 同一个 key 经 `ctx.env.HOT`、`ctx.env.COLD` 和 `ctx.env.KV` 各写一次，再直接问 `KvStore.Get` | 读回来是三个不同的值；直接问 deis-store 时带 `x-deis-binding: HOT` 拿到 HOT 那个、带 `x-deis-binding: KV` 拿到 KV 那个。同一应用的每个绑定各占一个命名空间，互不覆盖 |
 | | 把 `..`、`a.b`、`a@b`、`../../etc`、超长名字当作 binding 头发给 deis-store；再拿 `demo` 的令牌去点名 `demo-auth` | 五个恶意名字全部在碰到磁盘之前被拒（`is not a namespace id`）；换租户那一发即使带着合法 binding 也被拒。令牌管的是租户，binding 只在租户内部选命名空间——一个伪造的名字最坏够到调用方自己那个租户的另一个空命名空间 |
-| | `deis kv put --binding HOT` 写，再用三种方式读 | 带 `--binding HOT` 读得到，并把命名空间印成 `demo.production@HOT` 而不是光租户；同一条命令不带 `--binding` 读回 `found=false`；应用侧 `ctx.bindings.HOT` 读到的就是 CLI 写的那个值 |
+| | `deis kv put --binding HOT` 写，再用三种方式读 | 带 `--binding HOT` 读得到，并把命名空间印成 `demo.production@HOT` 而不是光租户；同一条命令不带 `--binding`（租户级命名空间，没有应用够得到）读回 `found=false`；应用侧 `ctx.env.HOT` 读到的就是 CLI 写的那个值 |
 | 队列 | `POST /api/enqueue` 后轮询 `/api/kv/job:<key>` | 消息进了 deis-queue，节点的轮询任务领到并交给 `_queue.ts` |
 | | 一次 `send()` 交一整个数组 | 走的是一次 `SendBatch` 而不是 n 次 `Send`，回话里 `queued` 就是这一批的条数，消费端把这一批的每一条都写了出来 |
 | | 项目里写 `maxConcurrency` | 节点报出它同时**持有**这么多批，并且明说这不是并行：一个应用在一个环境里就一只 Isolate。这一项还会自己现发一条消息、等它被消费出来：那行日志是消费任务**起来的时候**写的，之后一直躺在文件里——先前把 deis-queue 杀掉、端口都空了，这一项照过不误（实测） |

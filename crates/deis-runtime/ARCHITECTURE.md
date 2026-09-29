@@ -44,7 +44,7 @@ version of this document said and is no longer true.
                          ▼                    ▼ polled under a lease
                   deis-telemetry          deis-queue
                                               ▲
-                                      ctx.services.* → deis-store
+                                      env.<NAME> → deis-store
 ```
 
 Three of those arrows are the node dialling out and were added after the

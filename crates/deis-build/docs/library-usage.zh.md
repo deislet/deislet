@@ -462,12 +462,8 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. 检测使用的扩展特性
     let mut used_features = Vec::new();
-    if let Some(ref services) = config.services {
-        if let Some(ref db) = services.database {
-            if db.enabled {
-                used_features.push(Feature::SQLDatabase);
-            }
-        }
+    if !config.queues.is_empty() {
+        used_features.push(Feature::Queues);
     }
 
     // 3. 检查当前目标打包器覆盖

@@ -228,9 +228,10 @@ into an app:
 5. answers 404 when nothing matched.
 
 Named logical resources are reached as `context.env.<NAME>`. Conveniences
-such as `context.path`, `context.services` and `context.bindings` are not
-part of the standard context, and the build refuses a handler that reads
-them.
+such as `context.path` are not part of the standard HTTP context, and the
+build refuses an HTTP handler that reads them. `context.services` and
+`context.bindings` do not exist on this runtime at all, and the build refuses
+a handler of any kind - HTTP, queue or scheduled - that reads them.
 
 ## The `.config.json` keys this target reads
 

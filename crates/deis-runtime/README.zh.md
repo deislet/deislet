@@ -147,9 +147,10 @@ chunk 就是一次 op 派发，所以照默认值，一个生产者一秒最多�
 | `context.waitUntil(promise)` | 不让响应等的那部分工作 |
 
 context 只有这四个字段。请求元数据从 `context.request` 读取；应用日志使用
-`console`；Cache API 使用 `caches.default` / `caches.open(name)`。原生层的
-`context.services`、`context.bindings` 与 `context.log` 只在非 HTTP 事件内部使用，
-不会穿过生成桥进入标准 HTTP ABI。未声明的逻辑绑定直接缺席，不会模拟成功；
+`console`；Cache API 使用 `caches.default` / `caches.open(name)`。声明的绑定只在
+`env` 上：没有 `context.services` 与 `context.bindings`，声明的绑定之外也没有无名
+命名空间。queue 与 scheduled handler 的 context 另外带 `context.log`，它不属于标准
+HTTP ABI。未声明的逻辑绑定直接缺席，不会模拟成功；
 具体资源接口在 Edge Canon `logical-resource-bindings` 能力族冻结前仍是 Draft。
 
 ### 全局作用域——应用可以假设有什么

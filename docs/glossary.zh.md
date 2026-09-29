@@ -30,7 +30,7 @@
 | **bundle（应用包）** | `deislet` target 的产物：节点可以直接运行的一个 zip。 | package |
 | **provider payload** | 非 `deislet` target 的产物，从 artifact 派生，交给 provider driver。 | — |
 | **version（版本）** | 应用的一个不可变的已上传 bundle。 | release、revision |
-| **binding（绑定）** | 项目在 `.config.json` 的 `bindings` 下声明的具名资源（`kv`、`database`、`blob`、`queue`、`service`），在代码中通过 `context.env.<NAME>` 访问。`context.env` 是唯一的标准写法；应用源码里出现 `context.bindings` 或 `context.services` 会被构建拒绝。 | service（指存储绑定时） |
+| **binding（绑定）** | 项目在 `.config.json` 的 `bindings` 下声明的具名资源（`kv`、`database`、`blob`、`queue`、`service`），在代码中通过 `context.env.<NAME>` 访问。`context.env` 是唯一写法：运行时没有 `context.bindings` 与 `context.services`，任何类型的 handler（HTTP、queue、scheduled）读取它们都会被构建拒绝。声明的绑定之外没有无名命名空间。 | service（指存储绑定时） |
 
 ## 部署
 

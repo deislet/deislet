@@ -151,8 +151,10 @@ deis-runtime 只认一个默认导出，每个请求调一次。生成的入口�
 4. 只有 handler 与响应正文生命周期都结束后才关闭 `waitUntil` 登记；已登记任务逐项独立结算；
 5. 谁都没匹配上时返回 404。
 
-具名逻辑资源从 `context.env.<NAME>` 访问。`context.path`、`context.services`、
-`context.bindings` 等便利字段不属于标准 context，handler 读取它们时构建直接拒绝。
+具名逻辑资源从 `context.env.<NAME>` 访问。`context.path` 等便利字段不属于标准
+HTTP context，HTTP handler 读取它们时构建直接拒绝。`context.services` 与
+`context.bindings` 在本运行时根本不存在，任何类型的 handler（HTTP、queue、
+scheduled）读取它们时构建都会拒绝。
 
 ## `.config.json` 里与本目标相关的字段
 

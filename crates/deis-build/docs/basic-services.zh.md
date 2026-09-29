@@ -2,7 +2,7 @@
 
 标准 HTTP handler 的 context 只有 `request`、`env`、`params`、`waitUntil`
 四个字段。资源必须按声明的逻辑名称从 `context.env` 取得；
-`context.services` 和 `context.bindings` 都不是可移植 API。
+没有 `context.services` 与 `context.bindings`。
 
 ```json
 {
@@ -36,6 +36,6 @@ Cache API 是 Web API，不是 context 便利字段。使用 `caches.default` �
 `await caches.open(name)`。Deislet 当前实现是进程内、按 isolate 隔离；在选定标准版本
 明确以前，应用不能假设它跨节点持久。
 
-运行时原生的 `context.services` 位于生成桥之下，不属于标准 context；构建会拒绝开启
-无名 `services` 标记的项目。无名 KV 请改用显式声明的绑定（如 `context.env.SESSIONS`），
-缓存用 `caches.default`。标准 context 不为二者提供别名。
+没有无名命名空间：应用能够到的每个 KV、数据库、对象存储或队列都是声明过的绑定（如
+`context.env.SESSIONS`），缓存用 `caches.default`。任何类型的 handler 读取
+`context.services` 或 `context.bindings`，构建都会拒绝。

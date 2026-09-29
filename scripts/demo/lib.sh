@@ -1704,10 +1704,9 @@ add_blob_route() {
   local dest=$1
   local handler="${dest}/functions${BLOB_ROUTE}.ts"
 
-  # The binding only exists if the application asks for it: a handler calling
-  # `context.env.BLOB` in an app that does not declare BLOB gets the
-  # "this service is not available to this app" error rather than an object
-  # store. Enabled here, in the staged copy, for the same reason the handler
+  # The binding only exists if the application asks for it: in an app that
+  # does not declare BLOB, `context.env.BLOB` is undefined rather than an
+  # object store. Enabled here, in the staged copy, for the same reason the handler
   # is written here.
   local config="${dest}/.config.json"
   if [ -f "$config" ] && command -v jq >/dev/null 2>&1; then

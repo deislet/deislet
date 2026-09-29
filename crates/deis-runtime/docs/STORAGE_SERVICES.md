@@ -3,11 +3,9 @@
 How the logical resources exposed through `context.env.<NAME>` reach Deislet's
 runtime services: which op talks to which backend, what crosses the Rust/JS
 boundary as bytes versus text, and what happens when a resource was never
-wired up for this deployment. The runtime still contains an unnamed
-`context.services.*` layer, which the queue and scheduled handlers' context
-still carries. It is not part of the standard HTTP context, the build refuses
-an HTTP handler that reads it, and applications must not use it; removing it
-is outstanding work.
+wired up for this deployment. Declared bindings are the only way in: there is
+no `context.services` or `context.bindings`, and no unnamed namespace beside
+the declared bindings.
 
 | Service | Backend | Where |
 |---|---|---|
@@ -31,15 +29,16 @@ that authorises this node's calls (see `runtime/bindings.rs` and
 ## No fallback: an unwired service is a hard error, not a stand-in
 
 None of the four ever falls back to an in-memory store. A deployment's
-manifest declares which services it uses; `runtime/bindings.rs` builds a
-client for each declared service that the control plane gave an address for,
-and puts it in the isolate's `OpState`. An op whose client is missing —
-because the manifest never declared the service, or the control plane sent no
-address for it — returns its unavailable message immediately:
+manifest declares its bindings; `runtime/bindings.rs` builds a client for each
+declared binding whose service the control plane gave an address for, and puts
+it in the isolate's `OpState`. A storage binding without a client is not
+published on `env` at all. An op whose kind has no client — because no binding
+of that kind was declared, or the control plane sent no address for it —
+returns its unavailable message immediately:
 
 ```
-"{service} service is not available to this app: its manifest does not
- declare \"{service}\", or the control plane sent no address for it"
+"{service} service is not available to this app: its manifest declares no
+ {service} binding, or the control plane sent no address for it"
 ```
 
 (`ops.rs::unavailable_message`, used by the KV, database and blob ops. The
@@ -48,12 +47,11 @@ more thing to say: the message the application just handed over was not
 enqueued anywhere and will not be delivered later.) That is the whole of it:
 there has never been an in-memory `HashMap` or similar standing in for a
 missing client. An application that sees this error has a configuration
-problem — an undeclared service or a control plane that was not told the
+problem — an undeclared binding or a control plane that was not told the
 storage addresses — not a degraded mode to work around.
 
-That message is the answer for the tenant's *unnamed* namespace. A
-**named** logical binding that is not there is a different mistake and gets a
-different message from
+A binding name that is not among the declared ones of a kind that does have
+clients is a different mistake and gets a different message from
 `ops.rs::bound_client`:
 
 ```
@@ -61,8 +59,8 @@ different message from
  its manifest declares are: {declared}"
 ```
 
-There is deliberately no fallback between the two. An application that asked
-for `HOT` and silently got the unnamed namespace would read and write the
+There is deliberately no fallback to another namespace. An application that
+asked for `HOT` and silently got a different one would read and write the
 wrong namespace with nothing failing.
 
 ---
@@ -268,9 +266,7 @@ every other failure throws, and must not be retried as it stands.
 
 ## Cache
 
-`globalThis.caches.default` names the standard default cache. The native
-`context.services.cache` object names the same internal instance but does not
-cross the standard HTTP bridge.
+`globalThis.caches.default` names the standard default cache.
 `caches.open(name)` gives an application caches of its own beside it: there is
 one store per isolate and a name is a namespace inside it, composed by
 `cache_ops.rs::namespaced`, so opening a name costs nothing and two names

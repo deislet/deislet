@@ -42,7 +42,7 @@ the target id or the registry id.
 | **bundle** | The `deislet` target's payload: one zip a node can run. | `deis-bundle`, `bundle.zip` | package |
 | **provider payload** | A non-`deislet` target's payload, derived from an artifact and handed to a provider driver. | `/artifacts/{artifact_id}/provider-payloads` | — |
 | **version** | An immutable, uploaded bundle of an app, identified by its digest. | `deis versions`, `/apps/{app_id}/versions` | release, revision |
-| **binding** | A named resource a project declares under `bindings` in `.config.json` (`kv`, `database`, `blob`, `queue`, `service`) and reaches as `context.env.<NAME>`. `context.env` is the only standard spelling; the build refuses `context.bindings` and `context.services` in application source. | `.config.json`, `context.env.<NAME>` | service (for a storage binding) |
+| **binding** | A named resource a project declares under `bindings` in `.config.json` (`kv`, `database`, `blob`, `queue`, `service`) and reaches as `context.env.<NAME>`. `context.env` is the only spelling: the runtime has no `context.bindings` or `context.services`, and the build refuses a handler of any kind (HTTP, queue or scheduled) that reads them. There is no unnamed namespace beside the declared bindings. | `.config.json`, `context.env.<NAME>` | service (for a storage binding) |
 
 ## Deploying
 
