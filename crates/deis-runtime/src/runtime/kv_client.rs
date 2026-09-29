@@ -279,39 +279,17 @@ impl KvClient {
         let response = client.list(request).await?;
         let list_response = response.into_inner();
 
-        // `entries` is where a store that honoured `include_metadata` puts
-        // the page; `keys` is where one that did not put it. The second can
-        // only happen against a deis-store older than the flag, which is a
-        // version skew an operator has to fix -- the listing still answers,
-        // without the metadata it was asked for, rather than looking empty.
-        let keys = if list_response.entries.is_empty() && !list_response.keys.is_empty() {
-            tracing::warn!(
-                prefix = %prefix,
-                keys = list_response.keys.len(),
-                "deis-store answered a listing without the metadata it was asked for; it predates \
-                 ListRequest.include_metadata, so every listed key reports null metadata and null \
-                 expiration until the store is upgraded"
-            );
-            list_response
-                .keys
-                .into_iter()
-                .map(|name| KvListEntry {
-                    name,
-                    metadata: None,
-                    expiration: None,
-                })
-                .collect()
-        } else {
-            list_response
-                .entries
-                .into_iter()
-                .map(|entry| KvListEntry {
-                    name: entry.key,
-                    metadata: entry.metadata,
-                    expiration: entry.expires_at,
-                })
-                .collect()
-        };
+        // Asked with `include_metadata`, deis-store answers the page in
+        // `entries`, each key with its metadata and expiry.
+        let keys = list_response
+            .entries
+            .into_iter()
+            .map(|entry| KvListEntry {
+                name: entry.key,
+                metadata: entry.metadata,
+                expiration: entry.expires_at,
+            })
+            .collect();
 
         Ok(KvListPage {
             keys,

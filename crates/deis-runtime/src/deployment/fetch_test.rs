@@ -370,10 +370,9 @@ async fn a_bundle_that_is_not_what_was_promised_is_refused_over_the_machine_chan
     assert!(!temp.exists(), "a rejected download left its partial file");
 }
 
-/// The URL decides, and it has to: an older control plane serves bundles from
-/// its human listener, and `deis dev` serves them itself with no control plane
-/// anywhere. A node that has a machine channel still fetches those exactly as
-/// it did before.
+/// The URL decides, and it has to: `deis dev` serves bundles itself with no
+/// control plane anywhere. A node that has a machine channel still fetches
+/// such a URL the ordinary way.
 #[tokio::test]
 async fn a_bundle_url_that_is_not_the_machine_listener_goes_out_the_ordinary_way() {
     let fleet = fleet();

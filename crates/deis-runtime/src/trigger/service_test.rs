@@ -52,7 +52,7 @@ fn tick_for(app_id: &str, environment: &str) -> Request<ScheduledEvent> {
     })
 }
 
-/// A tick from a caller that predates `ScheduledEvent.environment`.
+/// A tick that names no environment.
 fn tick_without_an_environment(app_id: &str) -> Request<ScheduledEvent> {
     tick_for(app_id, "")
 }
@@ -221,25 +221,21 @@ async fn a_preview_tick_runs_the_preview_handler_and_not_productions() {
 }
 
 #[tokio::test]
-async fn a_tick_with_no_environment_still_means_production() {
-    // A control plane older than the field must keep working rather than
-    // having every tick fail on an environment named "".
+async fn a_tick_with_no_environment_is_refused() {
+    // A schedule belongs to one environment; a tick that names none cannot
+    // be run without guessing which copy of the application it is for.
     let _turn = test_host::take();
     let code = r#"
         export default function handler() { return new Response("unused"); }
         export async function scheduled() { return; }
     "#;
-    let (apps, service) = service_running("cron-default-env", code).await;
+    let (apps, service) = service_running("cron-no-env", code).await;
 
-    let response = service
-        .on_scheduled(tick_without_an_environment("cron-default-env"))
+    let status = service
+        .on_scheduled(tick_without_an_environment("cron-no-env"))
         .await
-        .expect("the RPC itself succeeds")
-        .into_inner();
+        .expect_err("a tick naming no environment is refused");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
-    assert!(response.success, "{}", response.error);
-
-    let _ = apps
-        .unload_app(&AppKey::production("cron-default-env"))
-        .await;
+    let _ = apps.unload_app(&AppKey::production("cron-no-env")).await;
 }
