@@ -459,8 +459,8 @@ FetchAssignments(node_id)
 各自拼字符串。历史上吃过这个亏：本文档此前把登记接口写成 `POST .../register`，而代码里
 一直是 `PUT .../registration`——这正是当初把这类名字单独放进 `deis-wire` 共用的理由，
 传输层换了，理由本身没变。`NODE_ASSIGNMENTS_ROUTE` / `NODE_REGISTRATION_ROUTE` /
-`node_assignments_path` / `node_registration_path` 这几个符号仍在
-`crates/deis-wire/src/conventions.rs` 里，但生产的控制面路由已经不再注册它们，只留给测试用。
+`node_assignments_path` / `node_registration_path` 这几个符号已从
+`crates/deis-wire/src/conventions.rs` 删除，守护它们的文档检查脚本也一并退役。
 
 每次部署都传 declaration 与精确 snapshot identity；secret 明文由节点按 immutable revision 经
 `FetchSecretValues` 取得。config/string、config/json 和 secret/string 只从该 snapshot 物化，平台
@@ -788,8 +788,8 @@ Rust 那一半；内存截断的计数器从来没人加过，于是运维从它
 
 - `crates/deis-build/.github/` —— 编译器还是独立仓库时留下的 workflow。嵌套的
   `.github` 在 GitHub 上不生效，已删除。仓库根后来建了 `.github/workflows/`，目前
-  只有 `checks.yml` 一个 workflow，跑的是不需要编译的检查（`check-doc-path-literals.sh`）；
-  它自己的注释写明了为什么还没有 cargo job：`deis-control` 在编译期嵌入
+  只有 `checks.yml` 一个 workflow，当时跑的是不需要编译的检查（`check-doc-path-literals.sh`，
+  随 HTTP 路径常量删除已退役）；它自己的注释写明了为什么还没有 cargo job：`deis-control` 在编译期嵌入
   `crates/deis-control/web/dist`，CI 里要先跑 `npm ci && npm run build`，否则构出来的
   二进制对每个面板页面都答 404。要补编译与测试的 job 时还要注意：旧文件里那个
   windows/macOS 矩阵不能照搬到工作区，deis-proxy 依赖 pingora，Windows 上构不出来。

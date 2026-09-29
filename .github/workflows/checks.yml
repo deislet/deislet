@@ -96,20 +96,13 @@ jobs:
       - name: Reject target status drift from the locked registry
         run: python3 scripts/generate-target-status.py --check
 
-  document-path-literals:
-    name: documents reference the path constants
+  document-counts:
+    name: documents carry no hand-written counts
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, deislet]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-
-      # Fails when a document spells out an HTTP path that
-      # `deis_wire::conventions` already defines a constant for, and when one
-      # is spelled nearly-but-not-quite right. The script explains both rules
-      # and names the constant to reference instead.
-      - name: Node-facing paths are referenced, not restated
-        run: ./scripts/check-doc-path-literals.sh
 
       # Fails when a maintained document writes down how many checks or tests
       # there are, and when `VERIFY_EXPECTED_CHECKS` disagrees with the sum of

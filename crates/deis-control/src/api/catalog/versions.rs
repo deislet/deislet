@@ -735,11 +735,8 @@ pub async fn get_version(
 /// inside a gRPC message.
 /// Where a machine downloads one version's bundle from.
 ///
-/// Spelled once because two listeners mount it: the machine channel, which is
-/// where it belongs, and - until the fleet has moved - the node router on the
-/// human listener. Two spellings of one route is the mistake
-/// `scripts/check-doc-path-literals.sh` exists to catch in documents, and it
-/// is no better in code.
+/// Spelled once so the machine channel's router and the tests that exercise
+/// it cannot disagree about the path.
 pub const BUNDLE_ROUTE: &str = "/api/apps/:app_id/versions/:version_id/bundle";
 
 pub async fn download_bundle(

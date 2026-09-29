@@ -478,11 +478,10 @@ assignments（全部环境的明文密钥、每个租户的存储 capability tok
 **协议名字不在这份文档里写死。** 机队通道认的是 `deis_wire::machine::MachineChannel`
 里的 `Register`、`Deregister`、`FetchAssignments`、`FetchRoutingTable`，定义在
 `crates/deis-wire/proto/machine.proto`。放进 deis-wire 是因为没有任何东西会检查
-两个 crate 有没有把同一个方法名对上——这正是从前这里的坑：`deis_wire::conventions::
-{NODE_REGISTRATION_ROUTE, NODE_ASSIGNMENTS_ROUTE}` 这两个 HTTP 路径常量当年就因为
-两边拼得不一样（节点请求 `/register`、控制面提供 `/registration`）造成过一支永远
-学不会自己有哪些节点的机队。那两个 HTTP 常量还在 deis-wire 里，但现在只挂在测试用的
-路由上；真正跑起来的节点和 proxy 走的是上面那几个 RPC 名字。上面时序图里的中文标注
+两个 crate 有没有把同一个方法名对上——这正是从前这里的坑：节点登记还走 HTTP 时，
+两边把路径拼得不一样（节点请求 `/register`、控制面提供 `/registration`），造成过一支
+永远学不会自己有哪些节点的机队。那组 HTTP 路径常量已随 HTTP 回落路径一起删除；节点和
+proxy 只走上面那几个 RPC 名字。上面时序图里的中文标注
 是为了看得懂，真值以 `machine.proto` 为准。
 
 ---

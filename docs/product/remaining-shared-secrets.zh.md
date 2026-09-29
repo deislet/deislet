@@ -156,7 +156,7 @@ id 不会。运维手上唯一的杠杆 `DELETE .../registration` 反而把失�
 > - 1. `node_preshared_keys` 字段已删除（a7ba508），配置写下此字段即启动失败
 >    `NodeKeyStatus`/`key_fingerprint` 已从源码删除，docs/ 中历史引用保留
 > - 2. HTTP 回落路径已移除：`node_registration_path()`/`node_assignments_path()` 死代码已删；
->    `NODE_REGISTRATION_ROUTE`/`NODE_ASSIGNMENTS_ROUTE`/`ROUTING_TABLE_ROUTE` 常量保留为文档锚点；
+>    `NODE_REGISTRATION_ROUTE`/`NODE_ASSIGNMENTS_ROUTE`/`ROUTING_TABLE_ROUTE` 常量随后也已删除；
 >    deis-control / deis-runtime / deis-proxy 的 doc comments 已更新为仅机器通道的描述
 > - 3. `TLS_SETUP.md` mTLS 问答已更新；DEPLOYMENT.md `node_preshared_keys` 段已重写为退役声明；
 >    canary 脚本已在 2026-09-11 迁移至 PKI 方式

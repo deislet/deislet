@@ -346,12 +346,12 @@ is not a statement about anything above.
 ### What runs without anyone remembering to
 
 `.github/workflows/checks.yml` is written to run, on every push to `main` and
-every pull request: the three document checks (path constants, link targets
-and written-down counts), the witness tests below, `cargo fmt --check`,
+every pull request: the document checks (link targets and written-down
+counts), the witness tests below, `cargo fmt --check`,
 `cargo clippy -D warnings`, `cargo build --workspace`, every test of every
 workspace crate (`cargo nextest run --workspace`, plus the doc tests), and a
-full `start` → `verify` → `stop`. Until it grew those jobs it held the
-document-path check alone, and nothing automatic had ever compiled this
+full `start` → `verify` → `stop`. Until it grew those jobs it held a single
+document check, and nothing automatic had ever compiled this
 workspace, run its tests, or run the verification the project's claims are
 quoted from. Status: the last green run is `33848760058`, 2026-09-04, on
 GitHub-hosted runners. Every run since then has failed within seconds — a
