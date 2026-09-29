@@ -132,10 +132,8 @@ pub struct Manifest {
     pub created_at: i64,
     /// Where it was taken from, for an operator staring at an old directory.
     pub source_data_dir: String,
-    /// Physical backend identity that produced the snapshot. Older format-1
-    /// manifests did not record it and deserialize as `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_backend_incarnation_id: Option<CanonicalId>,
+    /// Physical backend identity that produced the snapshot.
+    pub source_backend_incarnation_id: CanonicalId,
     /// Database files in this snapshot, relative to its root.
     pub databases: Vec<String>,
     /// Content files copied.
@@ -165,7 +163,7 @@ pub struct RestoreReport {
     /// still are. Not a restore failure: the snapshot never claimed they were
     /// good.
     pub damaged_objects: usize,
-    pub source_backend_incarnation_id: Option<CanonicalId>,
+    pub source_backend_incarnation_id: CanonicalId,
     /// Fresh identity assigned to the restored data. A snapshot never
     /// carries the source's incarnation record, so the restored directory
     /// can never claim to be the one it was copied from.
@@ -228,7 +226,7 @@ pub fn take(data_dir: &Path, out: &Path) -> StoreResult<Manifest> {
         format: SNAPSHOT_FORMAT,
         created_at: started,
         source_data_dir: data_dir.display().to_string(),
-        source_backend_incarnation_id: Some(source_backend_incarnation_id),
+        source_backend_incarnation_id,
         databases,
         objects: content.objects,
         object_bytes: content.bytes,
@@ -353,7 +351,7 @@ pub fn restore(snapshot: &Path, data_dir: &Path) -> StoreResult<RestoreReport> {
     }
 
     let restored_backend_incarnation_id = deis_wire::incarnation::load_or_create(data_dir)?;
-    if manifest.source_backend_incarnation_id == Some(restored_backend_incarnation_id) {
+    if manifest.source_backend_incarnation_id == restored_backend_incarnation_id {
         return Err(StoreError::Corrupt(
             "restore generated the same backend incarnation as its source".to_string(),
         ));
@@ -374,7 +372,7 @@ pub fn restore(snapshot: &Path, data_dir: &Path) -> StoreResult<RestoreReport> {
         objects = report.objects,
         object_bytes = report.object_bytes,
         damaged_objects = report.damaged_objects,
-        source_backend_incarnation_id = ?report.source_backend_incarnation_id,
+        source_backend_incarnation_id = %report.source_backend_incarnation_id,
         restored_backend_incarnation_id = %report.restored_backend_incarnation_id,
         "restore complete; start deis-store against this data directory"
     );
@@ -782,7 +780,7 @@ mod tests {
 
         let manifest = take(source.path(), &snapshot.path().join("snap")).unwrap();
         assert_eq!(manifest.format, SNAPSHOT_FORMAT);
-        let source_incarnation = manifest.source_backend_incarnation_id.unwrap();
+        let source_incarnation = manifest.source_backend_incarnation_id;
         assert_eq!(manifest.objects, 2);
         assert_eq!(manifest.dropped_objects, 0);
         assert!(manifest.damaged_objects.is_empty());
@@ -801,10 +799,7 @@ mod tests {
         let report = restore(&snapshot.path().join("snap"), &restored).unwrap();
         assert_eq!(report.objects, 2);
         assert_eq!(report.damaged_objects, 0);
-        assert_eq!(
-            report.source_backend_incarnation_id,
-            Some(source_incarnation)
-        );
+        assert_eq!(report.source_backend_incarnation_id, source_incarnation);
         assert_ne!(report.restored_backend_incarnation_id, source_incarnation);
         assert_eq!(
             deis_wire::incarnation::read(&restored).unwrap(),

@@ -404,7 +404,7 @@ async fn capture_restore_set_inner(
         ];
         let store_manifest = deis_store::snapshot::take(&config.store.data_dir, &snapshot_dirs[0])?;
         ensure!(
-            store_manifest.source_backend_incarnation_id == Some(source_ids[0]),
+            store_manifest.source_backend_incarnation_id == source_ids[0],
             "store changed identity while its stopped snapshot was captured"
         );
         let store_captured_at = Utc::now();
@@ -1152,10 +1152,10 @@ fn stage_component(
     let (source, restored) = match component.backend {
         RestoreBackend::DeisStore => {
             let report = deis_store::snapshot::restore(&snapshot, stage_dir)?;
-            let source = report.source_backend_incarnation_id.ok_or_else(|| {
-                anyhow!("store snapshot is legacy and cannot prove its source incarnation")
-            })?;
-            (source, report.restored_backend_incarnation_id)
+            (
+                report.source_backend_incarnation_id,
+                report.restored_backend_incarnation_id,
+            )
         }
         RestoreBackend::DeisQueue => {
             let report = deis_queue::snapshot::restore(&snapshot, stage_dir)?;

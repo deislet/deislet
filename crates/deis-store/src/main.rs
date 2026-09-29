@@ -157,9 +157,7 @@ fn take_snapshot(config: &Config, out: &std::path::Path) -> Result<()> {
     println!(
         "snapshot written to {}\n  backend:   {}\n  databases: {}\n  objects:   {} ({} bytes)\n  restore:   {}",
         out.display(),
-        manifest
-            .source_backend_incarnation_id
-            .map_or_else(|| "unknown".to_string(), |id| id.to_string()),
+        manifest.source_backend_incarnation_id,
         manifest.databases.len(),
         manifest.objects,
         manifest.object_bytes,
@@ -196,10 +194,7 @@ fn restore_snapshot(config: &Config, from: &std::path::Path, into: Option<PathBu
         "restored {} into {}\n  source backend:   {}\n  restored backend: {}\n  databases: {}\n  objects:   {} ({} bytes)",
         from.display(),
         target.display(),
-        report.source_backend_incarnation_id.map_or_else(
-            || "unknown (legacy snapshot)".to_string(),
-            |id| id.to_string()
-        ),
+        report.source_backend_incarnation_id,
         report.restored_backend_incarnation_id,
         report.databases,
         report.objects,
