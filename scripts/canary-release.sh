@@ -213,11 +213,14 @@ curl_noproxy() {
 # that reach it run on the host itself, where this installation's fleet PKI
 # lives (/etc/deis/pki, root-owned), presenting the proxy leaf exactly the
 # way deis-proxy does and verifying the node against the fleet root.
+# The arguments are re-quoted for the remote shell, which would otherwise split
+# a header such as 'x-deis-app-id: _system' into an empty header and a stray
+# URL.
 runtime_mtls() {
   ssh_host "sudo curl -fsS --max-time 5 --noproxy '*' \
     --cacert /etc/deis/pki/ca.crt \
     --cert /etc/deis/pki/proxy.crt --key /etc/deis/pki/proxy.key \
-    $*"
+    $(printf '%q ' "$@")"
 }
 
 cmd_verify() {
