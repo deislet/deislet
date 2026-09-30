@@ -282,7 +282,11 @@ What a caller with a proxy certificate can then reach:
 - Address **any application in any environment** on that node by sending
   `x-deis-app-id` and `x-deis-environment` headers. That includes preview
   environments and applications with no route in the catalog at all: the node
-  routes on the headers, and having no public address is not a defence.
+  routes on the headers, and having no public address is not a defence. The
+  proxy also sends `x-deis-deployment-generation`, which pins the request to
+  one prepared deployment; the node consumes it as routing input and never
+  hands it to the isolate. These three are the only `x-deis-` headers the node
+  accepts inbound - every other one is dropped and logged as forged.
 - Reach the inspector WebSocket - not here any more: it moved to the
   `[machine_identity] management_listen`, where the caller has already proved
   the control plane's name.
