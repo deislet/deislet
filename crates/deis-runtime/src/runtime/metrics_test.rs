@@ -538,6 +538,61 @@ mod tests {
     }
 
     #[test]
+    fn only_records_telemetry_can_own_are_shipped() {
+        // deis-telemetry refuses a record of an application that names no
+        // canonical tenant, on every push. The node's own health-probe
+        // application has none, so shipping its records made every push log
+        // a rejection. They stay local; a deployed tenant's records and the
+        // node's own facts still go out.
+        let tenant =
+            deis_wire::CanonicalTenantId::derived_from_label("shipped-app.production").to_string();
+        crate::telemetry::record_tenant("shipped-app.production", &tenant);
+        let system = format!("{}.production", crate::health::SYSTEM_APP_ID);
+
+        let registry = MetricsRegistry::new();
+        registry.record_request(
+            "shipped-app.production",
+            Duration::from_millis(1),
+            RequestOutcome::Ok,
+        );
+        registry.record_request(&system, Duration::from_millis(1), RequestOutcome::Ok);
+
+        let samples = shippable_samples(registry.snapshot(1));
+        assert!(
+            samples
+                .iter()
+                .all(|s| s.app_id != crate::health::SYSTEM_APP_ID),
+            "no sample of the tenantless system application is shipped: {samples:?}"
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|s| s.app_id == "shipped-app" && s.tenant == tenant),
+            "a deployed tenant's samples are shipped under its canonical tenant: {samples:?}"
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|s| s.name == PROCESS_START_TIME_SECONDS && s.app_id.is_empty()),
+            "the node's own start time is the platform's and is shipped: {samples:?}"
+        );
+
+        let records = shippable_traces(
+            traced(&registry)
+                .iter()
+                .map(|trace| trace.to_proto("node-a"))
+                .collect(),
+        );
+        assert_eq!(
+            records.len(),
+            1,
+            "only the tenant's trace is shipped: {records:?}"
+        );
+        assert_eq!(records[0].app_id, "shipped-app");
+        assert_eq!(records[0].tenant, tenant);
+    }
+
+    #[test]
     fn sampling_keeps_every_failure_whatever_the_rate() {
         // An operator asking "what is failing" is asking about exactly these
         // records; a sampled node that threw them away would answer with
