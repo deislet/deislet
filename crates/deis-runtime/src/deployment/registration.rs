@@ -47,6 +47,7 @@
 //! retried rather than fatal, and why a control plane that does not offer the
 //! endpoint at all is said out loud once instead of every interval.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,6 +165,34 @@ impl NodeRegistration {
                 .to_string(),
             port,
         }
+    }
+
+    /// Announce a routable address instead of the machine's hostname when the
+    /// configuration names one.
+    ///
+    /// A hostname is only an address where something resolves it, and the
+    /// control plane usually cannot: a node on a LAN announcing `server94`
+    /// hands it a name that routes nowhere. The data port's own bind address
+    /// is used when it is a specific one; a node bound to every interface
+    /// (`0.0.0.0`) falls back to the address its management plane listens on,
+    /// which is one of this same machine's addresses and the one the operator
+    /// already chose for the control plane to reach it at. Only when neither
+    /// names an address does the hostname stand.
+    pub fn advertised_at(mut self, data_ip: IpAddr, management_listen: Option<&str>) -> Self {
+        let routable = |ip: IpAddr| !ip.is_unspecified() && !ip.is_loopback();
+        let chosen = Some(data_ip).filter(|ip| routable(*ip)).or_else(|| {
+            management_listen
+                .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                .map(|addr| addr.ip())
+                .filter(|ip| routable(*ip))
+        });
+        if let Some(ip) = chosen {
+            self.host = match ip {
+                IpAddr::V4(v4) => v4.to_string(),
+                IpAddr::V6(v6) => format!("[{v6}]"),
+            };
+        }
+        self
     }
 }
 

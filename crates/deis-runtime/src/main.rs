@@ -612,7 +612,13 @@ async fn run(
     // reports separately as `machine_address`.
     let registrar = NodeRegistrar::from_config(
         &config,
-        NodeRegistration::of_this_node(node_id.clone(), data_addr.port()),
+        NodeRegistration::of_this_node(node_id.clone(), data_addr.port()).advertised_at(
+            data_addr.ip(),
+            config
+                .machine_identity
+                .as_ref()
+                .and_then(|identity| identity.management_listen.as_deref()),
+        ),
         Some(Arc::clone(&machine_identity)),
     )
     .context("building the node registration client")?;

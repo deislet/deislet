@@ -523,3 +523,35 @@ async fn an_address_without_an_identity_is_refused_and_an_identity_without_one_a
     )
     .is_err());
 }
+
+#[test]
+fn a_node_announces_a_routable_address_rather_than_its_hostname() {
+    let lan: std::net::IpAddr = "172.20.209.4".parse().unwrap();
+    let any: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+    let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+
+    // A data port bound to one address is announced at it.
+    let bound = NodeRegistration::of_this_node("node-a", 8086).advertised_at(lan, None);
+    assert_eq!(bound.address(), "http://172.20.209.4:8086");
+
+    // Bound to every interface, the management plane's address stands in.
+    let wildcard = NodeRegistration::of_this_node("node-a", 8086)
+        .advertised_at(any, Some("172.20.209.4:8087"));
+    assert_eq!(wildcard.address(), "http://172.20.209.4:8086");
+
+    let v6 = NodeRegistration::of_this_node("node-a", 8086)
+        .advertised_at(any, Some("[2001:db8::4]:8087"));
+    assert_eq!(v6.address(), "http://[2001:db8::4]:8086");
+
+    // Nothing routable named anywhere: the hostname is all there is.
+    let hostname = NodeRegistration::of_this_node("node-a", 8086);
+    for (ip, listen) in [
+        (any, None),
+        (loopback, Some("127.0.0.1:8087")),
+        (any, Some("0.0.0.0:8087")),
+        (any, Some("not an address")),
+    ] {
+        let node = NodeRegistration::of_this_node("node-a", 8086).advertised_at(ip, listen);
+        assert_eq!(node.address(), hostname.address(), "{ip} / {listen:?}");
+    }
+}
