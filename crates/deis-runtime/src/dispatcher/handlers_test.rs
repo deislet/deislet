@@ -825,34 +825,36 @@ mod the_platform_s_own_headers_are_the_platform_s {
     use tower::ServiceExt;
 
     use crate::app::types::AppConfig;
-    use crate::app::{AppKey, ApplicationManager};
+    use crate::app::{AppKey, ApplicationManager, VersionInstall};
+    use crate::assets::AssetBundle;
     use crate::config::default_max_request_body_bytes;
-    use crate::dispatcher::handlers::handle_request;
+    use crate::dispatcher::handlers::{forged_platform_headers, handle_request};
     use crate::dispatcher::AppState;
-    use crate::{APP_ID_HEADER, ENVIRONMENT_HEADER};
+    use crate::{APP_ID_HEADER, DEPLOYMENT_GENERATION_HEADER, ENVIRONMENT_HEADER};
 
     const APP: &str = "header-mirror";
 
     /// An application that reports every platform header it was given, in
     /// order, so a test can assert on absence as well as on value.
-    async fn mirror_router(environment: &str) -> Router {
-        let code = r#"
-            export default function handler(context) {
-                const seen = [];
-                for (const [name, value] of context.request.headers.entries()) {
-                    if (name.toLowerCase().startsWith("x-deis-")) {
-                        seen.push(name.toLowerCase() + "=" + value);
-                    }
+    const MIRROR_CODE: &str = r#"
+        export default function handler(context) {
+            const seen = [];
+            for (const [name, value] of context.request.headers.entries()) {
+                if (name.toLowerCase().startsWith("x-deis-")) {
+                    seen.push(name.toLowerCase() + "=" + value);
                 }
-                seen.sort();
-                return new Response(seen.join("\n"), { status: 200 });
             }
-        "#;
+            seen.sort();
+            return new Response(seen.join("\n"), { status: 200 });
+        }
+    "#;
+
+    async fn mirror_router(environment: &str) -> Router {
         let manager = Arc::new(ApplicationManager::with_threads(Some(1)));
         manager
             .load_app(
                 AppKey::new(APP, environment),
-                code.to_string(),
+                MIRROR_CODE.to_string(),
                 AppConfig::default(),
                 None,
             )
@@ -916,6 +918,78 @@ mod the_platform_s_own_headers_are_the_platform_s {
             seen,
             format!("x-deis-app-id={APP}\nx-deis-environment=production"),
             "a handler may only ever see platform headers this node wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_deployment_generation_routes_the_request_and_stops_at_the_node() {
+        // The generation the proxy selected picks which prepared deployment
+        // answers. It is this node's routing input, not the handler's.
+        let generation = deis_wire::CanonicalId::new_v7().to_string();
+        let manager = Arc::new(ApplicationManager::with_threads(Some(1)));
+        manager
+            .load_app(
+                AppKey::production(APP),
+                MIRROR_CODE.to_string(),
+                AppConfig::default(),
+                None,
+            )
+            .await
+            .expect("the current version loads");
+        manager
+            .prepare_version(VersionInstall {
+                key: AppKey::production(APP),
+                version_id: "mirror-gen".to_string(),
+                deployment_id: Some("mirror-gen-deployment".to_string()),
+                routing_generation: Some(generation.clone()),
+                environment_snapshot_id: None,
+                entry_point: "index.js".to_string(),
+                code: MIRROR_CODE.to_string(),
+                config: AppConfig::default(),
+                assets: Arc::new(AssetBundle::empty(Arc::from("max-age=300"))),
+            })
+            .await
+            .expect("the generation prepares");
+        let router = Router::new()
+            .fallback(any(handle_request))
+            .with_state(AppState::new(manager, default_max_request_body_bytes()));
+
+        let seen = seen_by_handler(
+            &router,
+            &[
+                (APP_ID_HEADER, APP),
+                (DEPLOYMENT_GENERATION_HEADER, generation.as_str()),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            seen,
+            format!("x-deis-app-id={APP}\nx-deis-environment=production"),
+            "the generation is consumed by the node and never handed to the isolate"
+        );
+    }
+
+    #[test]
+    fn the_proxy_s_routing_headers_are_consumed_rather_than_reported_as_forged() {
+        // deis-proxy stamps all three on every request it forwards over the
+        // authenticated data port. Counting the generation as a forgery made
+        // every proxied request log a warning about the platform's own header.
+        let swept: Vec<String> = [
+            APP_ID_HEADER,
+            ENVIRONMENT_HEADER,
+            DEPLOYMENT_GENERATION_HEADER,
+            "x-deis-caller",
+            "x-deis-not-invented-yet",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+
+        assert_eq!(
+            forged_platform_headers(&swept),
+            vec!["x-deis-caller", "x-deis-not-invented-yet"],
+            "only headers no platform component sends inbound are forgeries"
         );
     }
 

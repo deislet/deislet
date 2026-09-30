@@ -1433,6 +1433,40 @@ fn stamp_node(mut samples: Vec<MetricSample>, node_id: &str) -> Vec<MetricSample
     samples
 }
 
+/// Whether deis-telemetry can accept a record naming `app_id` and `tenant`.
+///
+/// Its rule (`deis-telemetry`'s `identity::owner`): a record of no
+/// application is the node's own and belongs to the platform; a record of an
+/// application must name that application's canonical tenant, and nothing
+/// else decides who may read it. A record of an application this node holds
+/// no canonical tenant for is one telemetry refuses on every push, whatever
+/// is in it.
+///
+/// Those records are this node's own applications rather than anyone's
+/// tenant: [`crate::health::SYSTEM_APP_ID`], which answers the edge's health
+/// probe several times a minute, and whatever is loaded without a deployment
+/// (`deis dev`, a test). Every deployed environment records its tenant
+/// before its isolate is built (`crate::telemetry::record_tenant`), so no
+/// tenant's record is lost by this. Relabelling them under the platform
+/// instead would put an application's counters into the node's own series,
+/// so they stay local: they are still counted, and the node's own log still
+/// has whatever those invocations logged.
+fn is_shippable(app_id: &str, tenant: &str) -> bool {
+    app_id.is_empty() || !tenant.is_empty()
+}
+
+/// The samples deis-telemetry can accept; see [`is_shippable`].
+fn shippable_samples(mut samples: Vec<MetricSample>) -> Vec<MetricSample> {
+    samples.retain(|sample| is_shippable(&sample.app_id, &sample.tenant));
+    samples
+}
+
+/// The trace records deis-telemetry can accept; see [`is_shippable`].
+fn shippable_traces(mut records: Vec<TraceRecord>) -> Vec<TraceRecord> {
+    records.retain(|record| is_shippable(&record.app_id, &record.tenant));
+    records
+}
+
 pub(super) fn now_us() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1451,7 +1485,10 @@ async fn push_once(
     // case to skip. A node that has served nothing still reports that it is
     // counting and since when, which is what makes the first counter after a
     // restart readable as a fresh one rather than as a total that fell.
-    let samples = stamp_node(registry.snapshot(now_us()), node_id);
+    //
+    // Samples of an application with no canonical tenant are left out here
+    // rather than sent to be refused; see `is_shippable`.
+    let samples = shippable_samples(stamp_node(registry.snapshot(now_us()), node_id));
     let count = samples.len();
 
     // The token goes in the request's gRPC metadata, where deis-telemetry's
@@ -1520,8 +1557,13 @@ async fn push_traces_once(
     if batch.is_empty() && gaps.is_empty() {
         return;
     }
-    let count = batch.len();
-    let records: Vec<TraceRecord> = batch.iter().map(|trace| trace.to_proto(node_id)).collect();
+    // Records of an application with no canonical tenant are left out
+    // rather than sent to be refused; see `is_shippable`.
+    let records = shippable_traces(batch.iter().map(|trace| trace.to_proto(node_id)).collect());
+    let count = records.len();
+    if count == 0 && gaps.is_empty() {
+        return;
+    }
 
     match client
         .push_traces(credential.stamp(PushTracesRequest {

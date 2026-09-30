@@ -327,6 +327,35 @@ fn usable_authority(authority: &str) -> bool {
 /// environment means [`crate::DEFAULT_ENVIRONMENT`], so a caller that predates
 /// previews still reaches production rather than being refused.
 ///
+/// The headers under the platform's prefix that the proxy sends this node on
+/// every request, and that this node consumes as its routing input.
+///
+/// All three arrive over the data port, which admits only a caller that
+/// proved a proxy's name in the mutual TLS handshake. The application and
+/// environment are put back for the handler with the values this node
+/// resolved; the deployment generation selects which prepared deployment
+/// answers and is not the handler's business, so it is consumed here and the
+/// isolate never sees it. None of them is a forgery when it arrives.
+const ROUTING_HEADERS: [&str; 3] = [
+    APP_ID_HEADER,
+    ENVIRONMENT_HEADER,
+    DEPLOYMENT_GENERATION_HEADER,
+];
+
+/// The swept `x-deis-` header names that no honest sender puts on a request.
+///
+/// `swept` is what the inbound sweep removed, lower-cased. The routing
+/// headers are ordinary, documented traffic from the proxy, so they are left
+/// out; anything else under the prefix has no honest sender and is worth a
+/// warning.
+pub(crate) fn forged_platform_headers(swept: &[String]) -> Vec<&str> {
+    swept
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !ROUTING_HEADERS.contains(name))
+        .collect()
+}
+
 /// The header names come from `deis_wire::conventions` rather than literals
 /// here: deis-proxy stamps them and this reads them, and a node that disagreed
 /// with the proxy about the spelling would reject every request with 400 while
@@ -596,14 +625,7 @@ pub async fn handle_request(
     // said the rest had been dropped.
     let (mut request_headers, swept) =
         header_list::from_header_map(&headers, |name| !is_platform_header(name));
-    // The two routing headers are ordinary, documented traffic on the way in;
-    // they are put back below with the values this node resolved. Anything
-    // else under the prefix has no honest sender.
-    let forged: Vec<&str> = swept
-        .iter()
-        .map(String::as_str)
-        .filter(|name| *name != APP_ID_HEADER && *name != ENVIRONMENT_HEADER)
-        .collect();
+    let forged = forged_platform_headers(&swept);
     if !forged.is_empty() {
         tracing::warn!(
             app_id = %key.app_id(),

@@ -50,7 +50,11 @@ OOMPolicy=stop
 TasksMax=256
 CPUWeight=100
 # The runtime listens on TCP only (HTTP, machine channel, management plane).
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK is for reading this machine's interface addresses at startup
+# (getifaddrs), which the outbound fetch policy needs so the node's own data
+# port is refused under every address it answers at; without it the process
+# exits before it serves anything.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # The default service set, minus what this process cannot do without. V8
 # writes generated code, so memory mappings cannot be made
 # non-executable-writable: MemoryDenyWriteExecute is left off deliberately.

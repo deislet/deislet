@@ -853,11 +853,15 @@ wait_tcp 127.0.0.1 "${QUEUE_PORT}" deis-queue
 wait_tcp 127.0.0.1 "${TELEMETRY_PORT}" deis-telemetry
 wait_tcp 127.0.0.1 "${PROXY_PORT}" deis-proxy
 
-# Only a first install (or a config rewrite) has a fresh database behind the
-# control plane, and only a database with no live token gets a bootstrap
-# token. An upgrade keeps the database, and with it every credential it
-# issued - operator.env already holds a live token, so nothing is minted.
-if ((FIRST_INSTALL)) || ((REWRITE_CONFIG)); then
+# Only a database with no live token gets a bootstrap token. An upgrade keeps
+# the database, and with it every credential it issued - operator.env already
+# holds a live token, so nothing is minted. The test is the state on disk
+# rather than whether this run is the first: a first install that stopped
+# after control started (a service that would not come up, say) leaves an
+# unused bootstrap token and no operator.env, and the rerun that fixes it has
+# to finish the login or the installation has no operator at all.
+if [[ ! -f /etc/deis/operator.env ]] \
+  && { ((FIRST_INSTALL)) || ((REWRITE_CONFIG)) || [[ -f /var/lib/deis/control/bootstrap.token ]]; }; then
   bootstrap_login
 fi
 
